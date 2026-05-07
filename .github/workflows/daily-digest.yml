@@ -1,0 +1,53 @@
+name: Daily Digest
+
+on:
+  schedule:
+    - cron: '0 14 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Target date (YYYY-MM-DD). Leave empty for auto-backfill.'
+        required: false
+      max_articles:
+        description: 'Max articles per feed (for testing). Leave empty for unlimited.'
+        required: false
+
+permissions:
+  contents: write
+  models: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jbangdev/setup-jbang@main
+
+      - name: Generate digest
+        env:
+          AI_PROVIDER: github
+          GITHUB_TOKEN: ${{ github.token }}
+          FB_APP: ${{ secrets.FB_APP }}
+          FB_SECRET: ${{ secrets.FB_SECRET }}
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.date }}" ]; then
+            ARGS="$ARGS --date ${{ inputs.date }}"
+          fi
+          if [ -n "${{ inputs.max_articles }}" ]; then
+            ARGS="$ARGS --max-articles ${{ inputs.max_articles }}"
+          fi
+          jbang scripts/DigestHelper.java generate $ARGS
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/digest-posts.json data/digest-swipe.json data/feeds.yml templates/full-content/
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "feat: add dev digest posts"
+            git push
+          fi
