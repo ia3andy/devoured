@@ -41,7 +41,6 @@ web/                        # CSS/JS (bundled by Quarkus Web Bundler)
   _custom.css
 scripts/
   DigestHelper.java         # JBang script for digest pipeline
-  generate-digest.sh        # Shell orchestrator
 ```
 
 ## Digest Post Format
@@ -74,16 +73,17 @@ Markdown body content
 JBang script with Picocli subcommands. Run with `jbang scripts/DigestHelper.java <command>`.
 
 Commands:
-- `tldr-articles <url>` - scrape TLDR newsletter, output JSON to stdout
+- `generate [--date YYYY-MM-DD] [--project-dir .]` - full pipeline: scrape, enrich, summarize, assemble post, write content, sync tags/swipe. Without `--date`, backfills from last post to yesterday. Reads `.env` for local config. Set `AI_PROVIDER=github` + `GITHUB_TOKEN` for GitHub Models API, or use Claude CLI by default.
+- `tldr-articles <url>` - scrape TLDR newsletter, output XML to stdout
 - `enrich <input.json> <output.json> <cacheDir>` - fetch article content, cache locally
-- `summarize <enriched.json> <feedName>` - call Claude for AI summaries, output to stdout
-- `write-content <index.md> <cacheDir> <feeds.yml>` - write post content from data
-- `resummarize <postDir> <cacheDir>` - re-summarize a post (supports stop/resume via backup dirs)
-- `resummarize-all <postsDir> <cacheDir>` - re-summarize all posts
-- `clean-all <postsDir> <cacheDir> <feeds.yml>` - clean all posts
-- `refresh-html <postsDir> <cacheDir>` - refresh cached HTML
-- `sync-tags <postsDir> <feeds.yml>` - synchronize tags
-- `generate-pages <postDir|postsDir> <articlesDir>` - generate article page files for sharing
+- `summarize <enriched.json> <feedName>` - AI summaries, output section JSON to stdout
+- `write-content <dataFile> <date> <cacheDir> <feeds.yml>` - write post content from data
+- `resummarize <dataFile> <date> <cacheDir>` - re-summarize a post (supports stop/resume)
+- `resummarize-all <dataFile> <cacheDir>` - re-summarize all posts
+- `clean-all <dataFile> <cacheDir> <feeds.yml>` - clean all posts
+- `refresh-html <dataFile> <date> <cacheDir>` - refresh cached HTML
+- `sync-tags <dataFile> <feeds.yml>` - synchronize tags
+- `sync-swipe <dataFile> <outputFile>` - sync swipe data
 
 Use `--help` on any command for parameter details.
 
