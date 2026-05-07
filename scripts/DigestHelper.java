@@ -1508,7 +1508,7 @@ public class DigestHelper implements Runnable {
             var usr = new JsonObject(); usr.addProperty("role", "user"); usr.addProperty("content", userMessage);
             messages.add(sys); messages.add(usr);
             payload.add("messages", messages);
-            payload.addProperty("max_tokens", 4000);
+            payload.addProperty("max_tokens", 8192);
 
             if (jsonSchema != null) {
                 var rf = new JsonObject();
