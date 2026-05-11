@@ -22,9 +22,25 @@ document.addEventListener('DOMContentLoaded', () => {
 
   var PLACEHOLDER_SUFFIX = 'article-placeholder.svg';
   var FALLBACK_BG_COUNT = 15;
-  var BULLET_ITEM_HEIGHT = 48;
   var BULLET_CHROME_HEIGHT = 180;
-  var BULLETS_PER_FRAME = Math.max(3, Math.floor((window.innerHeight - BULLET_CHROME_HEIGHT) / BULLET_ITEM_HEIGHT));
+  var BULLET_BUDGET = window.innerHeight - BULLET_CHROME_HEIGHT;
+
+  function chunkBullets(items, budget) {
+    var chunks = [];
+    var used = 0;
+    var start = 0;
+    for (var i = 0; i < items.length; i++) {
+      var h = items[i].dataset.priority === '4' ? 44 : 72;
+      if (used + h > budget && i > start) {
+        chunks.push(items.slice(start, i));
+        start = i;
+        used = 0;
+      }
+      used += h;
+    }
+    if (start < items.length) chunks.push(items.slice(start));
+    return chunks;
+  }
 
   function fallbackBg(id) {
     var hash = 0;
@@ -122,11 +138,13 @@ document.addEventListener('DOMContentLoaded', () => {
     stash[grouped.other[i].dataset.articleId] = grouped.other[i];
   }
 
-  var bulletFrames = [];
-  var bulletPageTotal = Math.ceil(grouped.other.length / BULLETS_PER_FRAME);
+  var bulletChunks = chunkBullets(grouped.other, BULLET_BUDGET);
 
-  for (var start = 0; start < grouped.other.length; start += BULLETS_PER_FRAME) {
-    var chunk = grouped.other.slice(start, start + BULLETS_PER_FRAME);
+  var bulletFrames = [];
+  var bulletPageTotal = bulletChunks.length;
+
+  for (var ci = 0; ci < bulletChunks.length; ci++) {
+    var chunk = bulletChunks[ci];
 
     var bf = document.createElement('div');
     bf.className = 'swipe-frame swipe-frame-bullets';
@@ -142,7 +160,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     var title = document.createElement('h3');
     title.className = 'swipe-bullets-title';
-    var bulletPage = Math.floor(start / BULLETS_PER_FRAME) + 1;
+    var bulletPage = ci + 1;
     title.textContent = bulletPageTotal > 1 ? 'Other News (' + bulletPage + '/' + bulletPageTotal + ')' : 'Other News';
     inner.appendChild(title);
 
@@ -155,21 +173,34 @@ document.addEventListener('DOMContentLoaded', () => {
       var item = document.createElement('button');
       item.className = 'swipe-bullet-item';
       item.dataset.articleId = article.dataset.articleId;
+      item.dataset.priority = article.dataset.priority || '3';
 
       var badge = document.createElement('span');
       badge.className = 'swipe-bullet-badge';
       badge.textContent = article.dataset.section || '';
 
+      var textWrap = document.createElement('span');
+      textWrap.className = 'swipe-bullet-text';
+
       var itemTitle = document.createElement('span');
       itemTitle.className = 'swipe-bullet-title';
       itemTitle.textContent = (article.querySelector('.swipe-card-title') || {}).textContent || '';
+      textWrap.appendChild(itemTitle);
+
+      var oneliner = (article.querySelector('.swipe-card-oneliner') || {}).textContent || '';
+      if (oneliner) {
+        var itemOneliner = document.createElement('span');
+        itemOneliner.className = 'swipe-bullet-oneliner';
+        itemOneliner.textContent = oneliner;
+        textWrap.appendChild(itemOneliner);
+      }
 
       var chevron = document.createElement('span');
       chevron.className = 'swipe-bullet-chevron';
       chevron.appendChild(createChevronSvg());
 
       item.appendChild(badge);
-      item.appendChild(itemTitle);
+      item.appendChild(textWrap);
       item.appendChild(chevron);
       list.appendChild(item);
     }
@@ -416,6 +447,12 @@ document.addEventListener('DOMContentLoaded', () => {
       var frame = getCurrentFrame();
       var sibling = e.key === 'ArrowDown' ? frame.nextElementSibling : frame.previousElementSibling;
       if (sibling) sibling.scrollIntoView({ behavior: 'smooth' });
+      return;
+    }
+
+    if (e.key === 'o' || e.key === 'O') {
+      var bf = track.querySelector('.swipe-frame-bullets');
+      if (bf) bf.scrollIntoView({ behavior: 'smooth' });
       return;
     }
 
