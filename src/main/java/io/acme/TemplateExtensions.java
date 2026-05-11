@@ -11,14 +11,22 @@ import io.vertx.core.json.JsonObject;
 @TemplateExtension
 public class TemplateExtensions {
 
-    static JsonArray sortByRatingDesc(JsonArray articles) {
-        var list = new ArrayList<JsonObject>();
-        for (int i = 0; i < articles.size(); i++) {
-            list.add(articles.getJsonObject(i));
+    static List<JsonObject> articlesByRating(JsonObject postData) {
+        var all = new ArrayList<JsonObject>();
+        var sections = postData.getJsonArray("sections");
+        if (sections == null) return all;
+        for (int i = 0; i < sections.size(); i++) {
+            var section = sections.getJsonObject(i);
+            var name = section.getString("name", "");
+            var articles = section.getJsonArray("articles");
+            if (articles == null) continue;
+            for (int j = 0; j < articles.size(); j++) {
+                var article = articles.getJsonObject(j).copy();
+                article.put("section", name);
+                all.add(article);
+            }
         }
-        list.sort(Comparator.comparingInt((JsonObject a) -> a.getInteger("rating", 3)).reversed());
-        var sorted = new JsonArray();
-        list.forEach(sorted::add);
-        return sorted;
+        all.sort(Comparator.comparingInt((JsonObject a) -> a.getInteger("rating", 3)).reversed());
+        return all;
     }
 }
