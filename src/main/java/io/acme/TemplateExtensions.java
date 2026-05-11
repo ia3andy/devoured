@@ -11,6 +11,15 @@ import io.vertx.core.json.JsonObject;
 @TemplateExtension
 public class TemplateExtensions {
 
+    static String join(JsonArray array, String separator) {
+        var sb = new StringBuilder();
+        for (int i = 0; i < array.size(); i++) {
+            if (i > 0) sb.append(separator);
+            sb.append(array.getValue(i));
+        }
+        return sb.toString();
+    }
+
     static List<JsonObject> articlesByRating(JsonObject postData) {
         var all = new ArrayList<JsonObject>();
         var sections = postData.getJsonArray("sections");
