@@ -115,17 +115,26 @@ document.addEventListener('DOMContentLoaded', function() {
   var catchupEl = document.getElementById('settings-catchup');
   var POST_DATES = (catchupEl.dataset.dates || '').split(',').filter(Boolean);
 
+  function isPostRead(date) {
+    var evt = new CustomEvent('digest-is-post-read', { detail: { date: date, result: false } });
+    document.dispatchEvent(evt);
+    return evt.detail.result;
+  }
+
   function renderCatchup() {
     catchupEl.textContent = '';
-    var readState = JSON.parse(localStorage.getItem('digest-read-posts') || '{}');
-    var currentReadBefore = readState.readBefore || '';
+    var effectiveReadBefore = '';
+    for (var i = POST_DATES.length - 1; i >= 0; i--) {
+      if (isPostRead(POST_DATES[i])) effectiveReadBefore = POST_DATES[i];
+      else break;
+    }
     var select = document.createElement('select');
     select.className = 'settings-catchup-select';
     var placeholder = document.createElement('option');
     placeholder.value = '';
     placeholder.textContent = 'Choose a date...';
     placeholder.disabled = true;
-    if (!currentReadBefore) placeholder.selected = true;
+    if (!effectiveReadBefore) placeholder.selected = true;
     select.appendChild(placeholder);
     for (var i = 0; i < POST_DATES.length; i++) {
       var date = POST_DATES[i];
@@ -133,23 +142,18 @@ document.addEventListener('DOMContentLoaded', function() {
       var opt = document.createElement('option');
       opt.value = date;
       opt.textContent = d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
-      if (date === currentReadBefore) opt.selected = true;
+      if (date === effectiveReadBefore) opt.selected = true;
       select.appendChild(opt);
     }
-    var btnLabel = currentReadBefore ? 'Update' : 'Mark as devoured';
+    var btnLabel = effectiveReadBefore ? 'Update' : 'Mark as devoured';
     var btn = document.createElement('button');
     btn.className = 'settings-catchup-btn';
     btn.textContent = btnLabel;
     btn.addEventListener('click', function() {
       if (!select.value) return;
-      var readState = JSON.parse(localStorage.getItem('digest-read-posts') || '{}');
-      readState.readBefore = select.value;
-      for (var key in readState) {
-        if (key !== 'readBefore' && key <= select.value) delete readState[key];
-      }
-      localStorage.setItem('digest-read-posts', JSON.stringify(readState));
+      document.dispatchEvent(new CustomEvent('digest-mark-all-read', { detail: { date: select.value } }));
       btn.textContent = 'Done!';
-      setTimeout(function() { btn.textContent = 'Update'; }, 2000);
+      setTimeout(function() { renderCatchup(); }, 2000);
     });
     catchupEl.appendChild(select);
     catchupEl.appendChild(btn);

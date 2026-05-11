@@ -390,8 +390,16 @@ document.addEventListener('DOMContentLoaded', () => {
     updateReadUI();
   });
 
+  document.addEventListener('digest-mark-all-read', function(e) {
+    markAllRead(e.detail.date);
+  });
+
   document.addEventListener('digest-is-article-read', function(e) {
     e.detail.result = isArticleRead(e.detail.date, e.detail.articleId);
+  });
+
+  document.addEventListener('digest-is-post-read', function(e) {
+    e.detail.result = isPostRead(e.detail.date);
   });
 
   updateReadUI();
