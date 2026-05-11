@@ -411,7 +411,11 @@ document.addEventListener('DOMContentLoaded', () => {
   function updateShare() {
     if (!shareBtn) return;
     var frame = getCurrentFrame();
-    if (!frame || frame.classList.contains('swipe-frame-completion')) return;
+    if (!frame || frame.classList.contains('swipe-frame-completion') || frame.classList.contains('swipe-frame-bullets')) {
+      shareBtn.style.display = 'none';
+      return;
+    }
+    shareBtn.style.display = '';
     var aid = frame.dataset.articleId || frame.dataset.activeArticle;
     shareBtn.dataset.shareArticle = aid || '';
     shareBtn.title = (frame.querySelector('.swipe-card-title') || {}).textContent || '';

@@ -286,8 +286,9 @@ document.addEventListener('DOMContentLoaded', () => {
     var cta = document.getElementById('digest-home-cta');
     if (!cta) return;
     var cards = document.querySelectorAll('.card.post[data-post-date]');
+    var allDates = (cta.dataset.allDates || '').split(',').filter(Boolean);
     var readCount = 0;
-    for (var j = 0; j < cards.length; j++) { if (isPostRead(cards[j].dataset.postDate)) readCount++; }
+    for (var j = 0; j < allDates.length; j++) { if (isPostRead(allDates[j])) readCount++; }
     var card = findFirstUnreadCard();
     if (!card) { cta.style.display = 'none'; return; }
     var label = 'Next read for you';
