@@ -304,7 +304,7 @@ public class DigestHelper implements Runnable {
                 var proc = new ProcessBuilder("claude", "--model", model("summarize"), "--output-format", "json",
                         "--system-prompt", SUMMARIZE_SYSTEM_PROMPT,
                         "--json-schema", SUMMARIZE_JSON_SCHEMA,
-                        "--no-session-persistence", "--bare", "-p", "Summarize this article:")
+                        "--no-session-persistence", "-p", "Summarize this article:")
                         .redirectErrorStream(true).start();
                 proc.getOutputStream().write(dataInput.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                 proc.getOutputStream().close();
@@ -318,13 +318,17 @@ public class DigestHelper implements Runnable {
                     var cliJson = GSON.fromJson(raw, JsonObject.class);
                     if (cliJson.has("total_cost_usd")) { totalCostUsd.add(cliJson.get("total_cost_usd").getAsDouble()); totalCalls.incrementAndGet(); }
                     if (cliJson.has("structured_output") && !cliJson.get("structured_output").isJsonNull()) {
-                        return ClaudeResult.ok(cliJson.get("structured_output").getAsJsonObject());
+                        var so = cliJson.get("structured_output").getAsJsonObject();
+                        if (so.has("articles") && so.getAsJsonArray("articles").size() > 0) {
+                            return ClaudeResult.ok(so.getAsJsonArray("articles").get(0).getAsJsonObject());
+                        }
+                        return ClaudeResult.ok(so);
                     }
                     String result = cliJson.has("result") ? cliJson.get("result").getAsString().trim() : "";
                     if (result.isEmpty()) return ClaudeResult.fail("no structured_output and empty result");
                     result = result.replaceAll("(?s)^```[a-z]*\\n?", "").replaceAll("(?s)\\n?```$", "").trim();
                     return ClaudeResult.ok(GSON.fromJson(result, JsonObject.class));
-                } catch (Exception e) { return ClaudeResult.fail("parse: " + e.getMessage()); }
+                } catch (Exception e) { throw new RuntimeException("parse: " + e.getMessage()); }
             })).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
         }
 
@@ -339,6 +343,7 @@ public class DigestHelper implements Runnable {
             return Multi.createFrom().iterable(articleInputs)
                     .onItem().transformToUni(entry ->
                         callForOneArticle(entry.getValue())
+                                .onFailure().retry().atMost(2)
                                 .onItem().invoke(result -> {
                                     if (result.failed()) {
                                         errors.add("    #" + entry.getKey() + ": " + result.error());
@@ -1341,6 +1346,12 @@ public class DigestHelper implements Runnable {
 
     static final Pattern READING_TIME = Pattern.compile("\\s*\\(\\d+\\s+minute\\s+read\\)\\s*$", Pattern.CASE_INSENSITIVE);
 
+    static JsonObject parseLenientJson(String raw) {
+        var reader = new com.google.gson.stream.JsonReader(new java.io.StringReader(raw));
+        reader.setLenient(true);
+        return GSON.fromJson(reader, JsonObject.class);
+    }
+
     static String sanitizeText(String s) {
         if (s == null || s.isEmpty()) return s;
         return Jsoup.clean(s, org.jsoup.safety.Safelist.none()).trim();
@@ -1556,7 +1567,12 @@ public class DigestHelper implements Runnable {
             String content = body.getAsJsonArray("choices").get(0).getAsJsonObject()
                     .getAsJsonObject("message").get("content").getAsString();
             if (jsonSchema != null) {
-                return GSON.fromJson(content, JsonObject.class);
+                try {
+                    return parseLenientJson(content);
+                } catch (Exception e) {
+                    System.err.println("  [JSON parse error] " + e.getMessage() + "\n  Raw content: " + content.substring(0, Math.min(500, content.length())));
+                    throw new RuntimeException("JSON parse: " + e.getMessage());
+                }
             }
             var wrapper = new JsonObject();
             wrapper.addProperty("result", content);
