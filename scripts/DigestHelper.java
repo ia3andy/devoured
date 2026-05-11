@@ -133,14 +133,17 @@ public class DigestHelper implements Runnable {
         final Map<String, String> models;
         final int batch;
         final int rpm;
+        final int rpdBudget;
+        final AtomicInteger rpdUsed = new AtomicInteger(0);
 
-        OpenAIProvider(String name, String endpoint, String token, Map<String, String> models, int batch, int rpm) {
+        OpenAIProvider(String name, String endpoint, String token, Map<String, String> models, int batch, int rpm, int rpd) {
             this.providerName = name;
             this.endpoint = endpoint;
             this.token = token;
             this.models = models;
             this.batch = batch;
             this.rpm = rpm;
+            this.rpdBudget = rpd;
             String rpmOverride = env("AI_RPM");
             activeRpm = rpmOverride != null ? Integer.parseInt(rpmOverride) : rpm;
         }
@@ -188,6 +191,11 @@ public class DigestHelper implements Runnable {
 
             return Multi.createFrom().iterable(batches)
                     .onItem().transformToUniAndConcatenate(batch -> {
+                        if (rpdBudget > 0 && rpdUsed.get() >= rpdBudget) {
+                            log(logWriter, "  Daily budget reached (" + rpdUsed.get() + "/" + rpdBudget + "), skipping remaining articles");
+                            return Uni.createFrom().nullItem();
+                        }
+                        rpdUsed.incrementAndGet();
                         var sb = new StringBuilder();
                         for (var entry : batch) {
                             sb.append("--- ARTICLE ---\nArticle id: ").append(entry.getKey()).append("\n");
@@ -219,12 +227,12 @@ public class DigestHelper implements Runnable {
                                     }
                                     log(logWriter, String.format("  [%d/%d] done", Math.min(aiMap.size(), total), total));
                                 })
-                                .onFailure().recoverWithItem(e -> {
+                                .onFailure().invoke(e -> {
                                     for (var entry : batch) errors.add("    #" + entry.getKey() + ": " + e.getMessage());
-                                    return null;
                                 });
                     })
                     .collect().asList()
+                    .onFailure().recoverWithItem(e -> List.of())
                     .map(ignored -> {
                         log(logWriter, "  Got " + aiMap.size() + "/" + total + " article summaries"
                                 + (!errors.isEmpty() ? ", " + errors.size() + " failed" : ""));
@@ -400,12 +408,12 @@ public class DigestHelper implements Runnable {
                     "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
                     env("GEMINI_API_KEY"),
                     Map.of("summarize", "gemini-2.5-flash", "description", "gemini-2.5-flash-lite", "clean-html", "gemini-2.5-flash-lite"),
-                    10, 5);
+                    6, 5, 14);
             case "github" -> new OpenAIProvider("github",
                     "https://models.github.ai/inference/chat/completions",
                     env("GITHUB_TOKEN"),
                     Map.of("summarize", "openai/gpt-4o", "description", "openai/gpt-4o-mini", "clean-html", "openai/gpt-4o-mini"),
-                    3, 10);
+                    3, 10, 0);
             default -> new ClaudeCliProvider();
         };
     }
@@ -677,6 +685,27 @@ public class DigestHelper implements Runnable {
                 }
             }
 
+            // Backfill missing summaries from recent posts (e.g. from previous budget-limited runs)
+            var store2 = new PostStore(dataFile);
+            store2.load();
+            for (var post : store2.all()) {
+                String d = jsonStr(post, "date");
+                boolean hasMissing = false;
+                for (var section : post.getAsJsonArray("sections")) {
+                    for (var article : section.getAsJsonObject().getAsJsonArray("articles")) {
+                        if (!article.getAsJsonObject().has("one-liner") || jsonStr(article.getAsJsonObject(), "one-liner").isEmpty()) {
+                            hasMissing = true;
+                            break;
+                        }
+                    }
+                    if (hasMissing) break;
+                }
+                if (hasMissing) {
+                    System.err.println("Backfilling missing summaries for " + d + "...");
+                    resummarize(dataFile, d, cacheDir);
+                }
+            }
+
             reportCost("generate");
             return 0;
         }
@@ -794,7 +823,7 @@ public class DigestHelper implements Runnable {
                             System.err.println("  [" + task.feedName() + "] Summarize failed: " + e.getMessage());
                             return null;
                         }))
-                    .merge(2)
+                    .merge(1)
                     .collect().asList()
                     .await().atMost(Duration.ofMinutes(15))
                     .stream().filter(s -> s != null).collect(Collectors.toList());
