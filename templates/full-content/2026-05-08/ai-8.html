@@ -1,0 +1,507 @@
+<h3>Featured projects</h3>
+<ul>
+ <li><a href="https://pytorch.org/projects/pytorch/"><img src="https://pytorch.org/wp-content/uploads/2026/05/PyTorch-Logo-2022_RGB_PyTorchLogo_Horiz_fullColor_RGB2-300x84.png" alt="PyTorch logo"> </a></li>
+</ul>
+<p>TL;DR:</p>
+<ul>
+ <li>Traditional RecSys inference explicitly replicates shared user embeddings/sequences for every candidate. <b>In-Kernel Broadcast Optimization</b> (IKBO) eliminates this overhead via a <b>kernel-model-system co-design</b> that fuses broadcast logic directly into user-candidate interaction kernels. By decreasing both the memory footprint and IO utilization, IKBO unlocks even higher throughput.</li>
+ <li>IKBO delivers up to a <b>2/3 reduction</b> in compute-intensive net latency, serving as the <b>scalability backbone</b> for the request-centric, inference-efficient framework that powers the<a href="https://engineering.fb.com/2026/03/31/ml-applications/meta-adaptive-ranking-model-bending-the-inference-scaling-curve-to-serve-llm-scale-models-for-ads/"> Meta Adaptive Ranking Model</a>.</li>
+ <li>Deployed end-to-end across Meta’s multi-stage recommendation funnel on both GPU and <a href="https://ai.meta.com/blog/next-generation-meta-training-inference-accelerator-AI-MTIA/">MTIA</a> (Meta Training and Inference Accelerator).</li>
+ <li>The IKBO Linear Compression kernel achieved a cumulative <b>~4×</b> speedup on H100 SXM5 after four stages of progressive co-design, culminating in warp-specialized fusion via<a href="https://github.com/facebookexperimental/triton/tree/tlx"> TLX</a>.</li>
+ <li>The IKBO co-design shifted the Flash Attention kernel from IO-bound to compute-bound (hitting <b>621 BF16 TFLOPs </b>on H100 SXM5). Coupled with <a href="https://github.com/facebookexperimental/triton/tree/tlx">TLX</a> warp-specialized optimization, this results in a <b>2.4x/6.4×</b> throughput gain over the non-co-designed CuTeDSL FA4 Hopper baseline (kernel only/kernel + broadcasting).</li>
+</ul>
+<p>In this post, we present In-Kernel Broadcast Optimization (IKBO), a kernel-model-system co-design approach that eliminates redundant user-embedding broadcast in recommendation model inference. In production RecSys, user embeddings are identical across all candidates for a given request, yet standard approaches require explicit replication, wasting memory bandwidth and compute that scale with candidate count. IKBO encodes a simple insight: broadcast is a data layout concern, not a computational necessity. Each IKBO kernel accepts user and candidate inputs at their natural, mismatched batch sizes and handles broadcast internally, so no replicated tensors ever materialize. We showcase the methodology through two kernel deep dives: Linear Compression and Flash Attention.</p>
+<p>Deployed across Meta’s RecSys inference stack—from early-stage to late-stage ranking models, spanning both GPU and MTIA (Meta Training and Inference Accelerator)—IKBO delivers up to a 2/3 reduction in compute-intensive net latency on co-designed models. It serves as the scalability backbone for the request-centric, inference-efficient framework underlying the <a href="https://engineering.fb.com/2026/03/31/ml-applications/meta-adaptive-ranking-model-bending-the-inference-scaling-curve-to-serve-llm-scale-models-for-ads/">Meta Adaptive Ranking Model</a> (serving LLM-scale models in production). On H100 SXM5, our IKBO Linear Compression kernel achieves ~4× speedup through four progressive co-design stages: matmul decomposition, memory alignment, broadcast fusion, and warp-specialized multi-stage fusion via <a href="https://github.com/facebookexperimental/triton/tree/tlx">TLX (Triton Low-Level Extensions)</a>. For Flash Attention, IKBO delivers a 2.4×/6.4× throughput compared to non-co-designed CuTeDSL FA4-Hopper (kernel only / kernel + broadcasting) with 621 BF16 TFLOPs. Unlike system-level broadcast or net-splitting that work around replication, IKBO eliminates it at the computational primitive layer, achieving dense interaction quality at near-independent cost.</p>
+<p>Code Repository: <a href="https://github.com/pytorch/FBGEMM/tree/main/fbgemm_gpu/experimental/ikbo">https://github.com/pytorch/FBGEMM/tree/main/fbgemm_gpu/experimental/ikbo</a></p>
+<p>† <em>Work done while at Meta</em></p>
+<h2>1. In-Kernel Broadcast Optimization: Eliminating Memory and Compute Redundancy</h2>
+<p>When a user opens their feed, the recommendation system must score hundreds to thousands of candidate items to decide what to show. The model’s inputs split into two categories: <b>user features</b> (e.g., browsing history, profile, context) that are identical for every candidate in a request, and <b>candidate features</b> (e.g., item ID, category, engagement statistics) that are unique to each item. Both pass through embedding lookups and subsequent processing to produce embedding representations. At various points in the model, <b>interaction layers</b> (e.g., linear projections, feature crosses, target attention) combine user and candidate embeddings. We call embeddings shared across all candidates in a request <b>Request-Only (RO)</b>, and per-candidate embeddings <b>Non-Request-Only (NRO)</b>.</p>
+<p><b>Fig. 1.</b> A very simplified RecSys inference data flow. Request-Only (RO) user embeddings must be broadcast (replicated) to match the Non-Request-Only (NRO) candidate batch dimension before interaction layers. IKBO eliminates this materialization by handling broadcast internally within each kernel.</p>
+<p>Interaction layers require tensors with matching batch dimensions. In a batch of 1,024 candidates served by ~15 users, RO embeddings must be <b>broadcast</b>, replicated ~70 times, to match the NRO batch size before any interaction (Fig. 1). As architectures have evolved from DLRM [1] and DCN [2] through sequential models like HSTU [3] and X’s Phoenix [4], they have steadily enriched user-candidate interaction. But richer interaction comes at a cost: user features must be broadcast across all candidates. For batch sizes of 10 – 10,000+ in inference, this replication overhead incurs significant computation and memory cost that scales linearly with candidate count.</p>
+<p><b>Broadcast is a data layout concern, not a computational necessity</b>. Viewing the model and inference system through this lens opens optimization at every layer: the inference runtime eliminates system-level broadcast, user-only model layers run at the smaller user batch size, and kernels that mix both are redesigned to handle broadcast internally—no replicated tensors ever materialize. Deployed across Meta’s RecSys inference stack, from early-stage to late-stage ranking models, spanning both GPU and MTIA, IKBO delivers up to 2/3 reduction in compute-intensive net latency on co-designed models.</p>
+<p>This post focuses on the kernel layer through two deep dives: Linear Compression and Flash Attention.</p>
+<h3>1.1. Kernel Optimization Type</h3>
+<p><b>Type I — Decomposable Operations</b>. Mathematical restructuring lets the Request-Only (RO) portion be computed independently at small batch size, combining with the Non-Request-Only (NRO) portion only at the end. This saves both memory bandwidth and compute.</p>
+<p><b>Type II — Memory-Only Optimization.</b> Handling RO-NRO broadcasting within the kernel avoids redundant data movement, pushing the kernel away from IO bound.</p>
+<h3>1.2. E2E System Design</h3>
+<p>Deploying IKBO touches three layers of the infra stack:</p>
+<ol>
+ <li><b>Kernels</b>: Custom GPU kernels that accept mismatched RO/NRO batch sizes and handle broadcast internally (Sections 2 and 3).</li>
+ <li><b>Compilation Specification</b>: The ML compiler needs per-operator dynamic shape ranges to select appropriately shaped kernels. With one batch size this is trivial; with two (user and candidate) or even more, reliably resolving which each operator uses—across production models where interactions obscure batch lineage—requires systematic automation.</li>
+ <li><b>Inference</b>: The runtime passes the candidate-to-user mapping into the model instead of materializing the broadcast.</li>
+</ol>
+<p>These kernels enter the model through one of two paths:</p>
+<ol>
+ <li>Direct adoption: Model authors integrate IKBO kernels directly into their model definitions. When candidate-to-user ratio &gt; 1 during training, the same kernels reduce training cost as well.</li>
+ <li>Inference-time transformation: A pass automatically swaps standard ops for IKBO equivalents at inference time — no model code changes required.</li>
+</ol>
+<p>The net effect: broadcast disappears from every stage of inference, with no architectural constraints on the model and no infrastructure changes beyond the inference runtime’s mapping interface.</p>
+<h3>1.3. Comparison with Other Approaches</h3>
+<p>Existing approaches work around broadcast rather than eliminating it.&nbsp;</p>
+<ol>
+ <li>System-level broadcast materializes the replicated tensor before GPU dispatch—simple but wasteful, with cost scaling linearly with candidate count.&nbsp;</li>
+ <li>Net-splitting (ROO) [5] partitions the model into RO and NRO sub-networks, reducing redundant work but constraining where user-candidate interactions can occur and still introduce extra cost at small RO batch sizes.</li>
+</ol>
+<p>Both preserve broadcast as a materialized tensor. IKBO eliminates it at the computational primitive layer: savings scale with the candidate-to-user ratio, any interaction pattern works without broadcast cost, and the full NRO batch dimension provides GPU occupancy within fused kernels.</p>
+<p>IKBO has been deployed on both GPU and MTIA accelerators. In this blog post, we focus on H100 GPU kernel design to illustrate the core optimization principles.</p>
+<h2>2. Kernel Deep Dive I: IKBO Linear Compression</h2>
+<p>Linear Compress Embedding (LCE) compresses input embeddings <code>(B, K, N)</code> via a learned projection <code>(M, K) @ (B, K, N) → (B, M, N)</code>, and is widely adopted in Meta RecSys models, e.g., Wukong [6]. We go through four progressive optimization stages.</p>
+<h3>2.1 Matmul Decomposition</h3>
+<p><b>Fig. 2.</b> LCE decomposition: baseline batched matmul (top-left), embedding separation and user deduplication along K (top-right), two independent GEMMs with broadcast-add on compressed output (bottom).</p>
+<p>The baseline LCE computes a single batched matmul across all B candidates. The input embeddings concatenate user and candidate parts along K — but user embeddings are identical across all candidates for the same user.</p>
+<p><b>Push broadcast past the matmul.</b> Since W is batch-independent, we decompose by linearity: separate user and candidate embedding blocks along K, deduplicate the repeated user embeddings, and compute two independent GEMMs at their natural batch sizes. Instead of replicating user embeddings before the matmul, we broadcast only the small compressed result. See Fig. 2. With a candidate-to-user ratio of ~70 (a representative setting), the user batch shrinks from <code>B=1024</code> to <code>B_user ≈ 15</code> — a <b>70x reduction</b> in user-side compute. The decomposition is implemented in standard PyTorch.</p>
+<p><b>Result.</b> 1.944 ms → 1.389 ms (<b>28.5% reduction</b>; benchmark setup in Appendix 1). Both the original batched GEMM (arithmetic intensity ~ 356 FLOPs/Byte, below H100’s ~495 FLOPs/Byte machine balance point; see Appendix 2 for derivations) and the two decomposed GEMMs are memory-bound, so the speedup is driven by memory cost reduction. Deduplication cuts memory cost more than half — as the user-side GEMM (B_user ≈ 15 vs. B = 1024) becomes negligible in cost.</p>
+<p>Note that the decomposition pushes broadcast past the matmul: instead of replicating full K-dimensional input embeddings before the GEMM, we broadcast only the small compressed result, which is far cheaper. In Section 2.3, we will further eliminate this remaining broadcast entirely via in-kernel broadcast fusion.</p>
+<p>The current bottleneck is L1/TEX pipeline utilization (84%) rather than DRAM utilization — a suspicious imbalance we will zoom into in the next section. Detailed profiling breakdown in Appendix 3.</p>
+<h3>2.2 Memory Layout Optimization</h3>
+<p>Detailed result analysis of the decomposed GEMM reveals an imbalance: L1/TEX sits at 84% of peak while DRAM reaches only 19%, indicating unnecessarily narrow memory loads. SASS confirms: every <code>cp.async</code> copies only 4 bytes instead of a single 128-bit load.</p>
+<pre><code>LDGSTS.E.LTC128B P0, [R203],&nbsp; &nbsp; &nbsp; [R38.64] &nbsp; &nbsp; &nbsp; // 4 bytes
+LDGSTS.E.LTC128B P1, [R203+0x4],&nbsp; [R38.64+0x4] &nbsp; // 4 bytes&nbsp; (×4 total, only 16B load in total)
+</code></pre>
+<p><code>cp.async</code> width is capped by the source pointer’s natural alignment. Matrix A is <code>(M, K)</code> row-major with stride <code>K × 2</code> bytes, so when K is not a multiple of 8, the stride breaks 128-bit alignment.</p>
+<p><b>Model-kernel co-design insights.</b> Memory alignment is a well-understood GPU optimization — but decomposition turns it into a model-kernel co-design challenge. <code>K</code> is formed by <code>torch.cat</code> of embedding tensors whose sizes depend on many model config factors. Decomposition makes it very hard to manually engineer these factors so that decomposed embeddings remain perfect multiples. A systematic solution is needed.</p>
+<p><b>Solution.</b> Pad each decomposed K to the next multiple of 8 by appending zeros to the concat list. We prove this is mathematically equivalent in both forward and backward passes (see Proof 1 below), and with the ML compiler’s memory planner, reduces to a cheap constant copy.</p>
+<p><b>Proof 1.</b> Zero-padding K preserves exact numerical equivalence in both forward and backward passes.</p>
+<p><b>Result.</b> 1.389 ms → 0.798 ms (<b>42.5% reduction</b>). Padding enables CUTLASS to select a TMA-based kernel, bypassing L1/TEX entirely (sectors 351M → 0) and cutting GEMM latency from 0.984 ms to 0.400 ms. With the GEMM resolved, the unfused broadcast and add (0.398 ms) now accounts for half the total latency — to be addressed in the next section. Detailed result analysis in Appendix 5.</p>
+<h3>2.3 Candidate GEMM In-Kernel Broadcast Fusion</h3>
+<p>The unfused broadcast and add are memory-bound: write the candidate GEMM result to HBM, read it back alongside the user result, add, and write again. We eliminate this by fusing the broadcast into the candidate GEMM epilogue (Fig. 3). After each tile’s accumulation, the epilogue looks up the user index, loads the pre-computed user result, adds it in registers, and writes the final sum — the intermediate tensor is never materialized. We implement this as a Triton kernel: a standard batched GEMM with a custom post-accumulation epilogue block.</p>
+<p><b>Fig. 3.</b> In-kernel broadcast fusion: the GEMM epilogue loads the pre-computed user result via index lookup and adds it in-register.</p>
+<p><b>Result.</b> 0.798 ms → 0.580 ms (<b>27.4% reduction</b>). Fusion eliminates 0.87 GB of intermediate DRAM traffic, contributing to the latency win. However, occupancy is just 6.25% (1 warp per scheduler), leaving every stall fully exposed. Beyond 42% of cycles waiting on global loads, 20% are spent waiting on WGMMA — stalls that cannot be hidden by the epilogue, and without persistence there is no next-tile load to overlap with. This is a challenging tradeoff: large tiles and deep pipelines are needed to keep tensor cores fed, but they consume most of the shared memory budget, leaving little room to hide latency through occupancy. Detailed result analysis in Appendix 6.</p>
+<h3>2.4 Warp-Specialized Multi-Stage Fusion with TLX</h3>
+<p><a href="https://github.com/facebookexperimental/triton/tree/tlx"><b>TLX (Triton Low-level Language Extensions)</b></a> exposes Hopper’s warp specialization, TMA, mbarriers, and named barriers while preserving Triton’s Python DSL and autotuning infrastructure.</p>
+<p>Using TLX, we address the occupancy limitation from Section 2.3 with warp specialization — hiding latency through functional partitioning rather than additional warps.</p>
+<p>Sections 2.1 – 2.3 decomposed the original LCE into two independent computations: the user GEMM (Stage 1) and the candidate GEMM with fused broadcast-add epilogue (Stage 2). We first optimize latency hiding within Stage 2, the dominant bottleneck, then fuse both stages into a single persistent kernel.</p>
+<p><b>Intra-Stage Latency Overlap</b></p>
+<p>The candidate IKBO kernel is memory-bound — the design goal is to keep the memory pipeline continuously fed. Triton’s software pipelining (Section 2.3) already overlaps Loads with WGMMA, but the epilogue remains serialized — it blocks future Loads and exposes the WGMMA wait stalls. We resolve both by partitioning each CTA into specialized warp groups: a dedicated producer issues TMA loads continuously (Overlap #1, analogous to Triton’s software pipeline), while two consumers ping-pong tiles so one’s epilogue overlaps the other’s WGMMA (Overlap #2). With persistence, tiles flow continuously with no cross-tile gaps. See Fig. 4.</p>
+<p><b>Fig. 4.</b> Candidate IKBO kernel structure with two intra-stage latency overlaps and warp group role assignments.</p>
+<p><b>Multi-Stage Fusion</b></p>
+<p>We fuse user IKBO (Stage 1) and candidate IKBO (Stage 2) into a single mega-kernel to reduce wave quantization, eliminate kernel launch overhead, and improve L2 cache utilization. High candidate-to-user ratios amplify wave quantization in Stage 1. Since the candidate GEMM is independent of user results until its epilogue, we schedule both stages concurrently.</p>
+<p>This concurrent scheduling unlocks two additional cross-stage overlaps, bringing the total overlaps to four. See Fig. 5.</p>
+<p><b>Fig. 5.</b> Concurrent stage scheduling: SMs without user tiles enter Stage 2 immediately, overlapping with Stage 1’s partial wave. All four latency overlaps after multi-stage fusion, showing intra-stage (#1, #2) and cross-stage (#3, #4) overlap opportunities. SM 0-49, 50-131 are example numbers.</p>
+<p><b>Warp Group Specialization &amp; Synchronization Setup</b></p>
+<p>To realize all four overlaps, each CTA is partitioned into one producer and two consumer warp groups. Critically, both stages share the same circular buffer and <code>mbarrier</code> infrastructure — no pipeline drain or barrier reinitialization occurs at the stage boundary. The last user K-block and the first candidate K-block coexist in different buffer slots simultaneously. See Fig. 6.</p>
+<p><b>Fig. 6.</b> Per-CTA warp group setup and the three synchronization mechanisms.</p>
+<p><b>Bidirectional Stage-Alternating Tile Scheduling</b></p>
+<p>When neither stage’s tile count divides evenly by the SM count, naive unidirectional dispatch causes workload imbalance. We reverse tile assignment direction between stages: Stage 1 starts at <code>pid</code>, Stage 2 at <code>NUM_SM - 1 - pid</code>. See Fig. 7.</p>
+<p><b>Fig. 7.</b> Unidirectional (left) vs. bidirectional stage-alternating dispatch (right), balancing per-SM workload across partial waves.</p>
+<p><b>Tile-Granularity Cross-CTA Synchronization</b></p>
+<p>User and candidate tiles may execute on different CTAs, requiring cross-CTA synchronization — but a device-wide barrier would serialize all work and destroy the overlap. We synchronize at per-tile granularity using a three-step release-acquire protocol:&nbsp;</p>
+<ol>
+ <li>A single thread per warp group spins on the tile flag with <code>ld.relaxed</code>, minimizing memory traffic</li>
+ <li>Once set, a single <code>ld.acquire</code> establishes the happens-before edge</li>
+ <li>A named barrier broadcasts readiness to all 128 threads in the warp group</li>
+</ol>
+<p>This avoids expensive fences during polling and lets candidate CTAs on different user tiles proceed fully independently. Details in Appendix 7.</p>
+<p><b>Results</b></p>
+<p>With all optimizations combined, latency improves from 0.580 ms to 0.482 ms (<b>16.9% reduction</b>). The clear intra-warp <a href="https://github.com/triton-lang/triton/tree/main/third_party/proton/tutorials/intra_kernel">Proton tracer</a> timeline confirms all four overlaps are realized in practice.</p>
+<p><b>Fig. 8.</b> Proton profiler timeline for two CTAs, with all four overlaps color-coded. The memory pipeline remains continuously fed.</p>
+<p>The primary gain comes from Overlap #2: ping-ponging consumers hide WGMMA and epilogue stalls on every tile — directly addressing the dominant wasted cycles from Section 2.3. Overlap #1 (Load↔WGMMA) carries forward from Triton’s existing software pipelining. Overlaps #3 and #4 hide idle time at the user-to-candidate stage transition. See Fig. 8.</p>
+<p>NCU confirms: occupancy rises from 6.25% to 18.75% (3 warp groups vs. 1), DRAM throughput from 39% to 52%, and L2 — the bottleneck — from 74% to 84% of peak. This is not occupancy alone: the aggressive latency hiding across all four overlaps keeps the memory pipeline saturated, which is what pushes L2 past 80%. Detailed NCU metrics in Appendix 8.</p>
+<p>We benchmark across batch sizes and candidate-to-user ratios, with the default (batch=1024, ratio=70) settings. See Fig. 9.</p>
+<p><b>Fig. 9.</b> Cumulative IKBO speedup across batch sizes (left, ratio=70) and candidate-to-user ratios (right, batch=1024).</p>
+<p>The IKBO fusion delivers robust gains across scenarios: ~4x speedup across batch sizes (left) and candidate-to-user ratios (right). Even at low candidate-to-user ratios, the kernel still achieves meaningful speedup.</p>
+<h2>3. Kernel Deep Dive II: IKBO Flash Attention</h2>
+<p>As recommendation models scale to capture richer user sequential behavior, <b>sequential architectures </b>– including <b>attention</b> – have emerged as a critical compute bottleneck, accounting for approximately <b>40% of inference latency </b>at 1K sequence lengths. This motivates our focus on IKBO-aware Flash Attention, co-designed with RecSys’s unique batching semantics.</p>
+<p>Inspired by Transformers and Set Transformers [7, 8], two fundamental user history interaction modules have been widely adopted in RecSys:&nbsp;</p>
+<ul>
+ <li><b>Target attention</b> (analogous to cross-attention) captures the relationship between the prediction candidate and the user’s historical interactions.</li>
+ <li><b>Self-attention</b> models sequential dependencies within the user history itself</li>
+</ul>
+<p>Since user history is a RO feature while the target operates on a distinct candidate (non-RO) batch dimension, this architectural asymmetry presents an opportunity for IKBO to improve model scalability and computational efficiency. Target attention will be our main focus for optimization, while with minor co-design, self attention could also be fused into IKBO target attention in Section. 3.3. As our model is encoder-driven, full attention is applied without causal masking.</p>
+<p>The ultimate optimized target attention version leveraging e2e co-design achieves <b>2.4×/6.4×</b> the throughput of non-co-designed CuTeDSL FA4-Hopper (attn kernel only / attn kernel + broadcasting cost), reducing latency by <b>0.320ms / 1.232ms</b> respectively (Table. 2).</p>
+<h3>3.1 IKBO flash attention solves the IO bound issues under RecSys boundary conditions</h3>
+<p><b>Fig. 10</b>: Traditional SDPA with candidate-user broadcasting (left) vs. fused IKBO target attention (right).&nbsp;</p>
+<p>IKBO fuses K/V broadcasting into the attention kernel, maintaining mathematical equivalence via a candidate-user mapping tensor from the inference runtime that handles non-uniform candidate-to-user ratios. Fig. 10 contrasts the two approaches: the traditional SDPA path broadcasts K and V to the full candidate batch size before attention, while the IKBO path eliminates this materialization entirely — each candidate indexes into its user’s K/V on the fly.</p>
+<p><b>Shifting IO-Bound to Compute-Bound by IKBO co-design</b></p>
+<p>In RecSys boundary conditions, target attention uses a relatively small number of candidate embeddings to represent the candidate attributes compared to the user’s browsing history. Roofline analysis of standard attention reveals an arithmetic intensity of ~60 FLOPs/Byte – well below the H100 (SXM5 HBM2e version) peak of ~495 FLOPs/Byte (Appendix 2)—making even standard flash attention heavily IO-bound. IKBO addresses this by amortizing K/V memory accesses across multiple candidates sharing the same user context, improving arithmetic intensity from ~60 FLOPs/Byte to ~833 FLOPs/Byte (at B_candidate : B_user = 70:1) and shifting the kernel firmly into compute-bound territory.</p>
+<p>To maximize this benefit, our implementation reorders the threadblock launch grid so that batch_size_candidate comes before num_heads. This ensures threadblocks processing different candidates — but sharing the same user K/V — are scheduled concurrently, improving L2 cache reuse.</p>
+<table>
+ <tbody>
+  <tr>
+   <td>Grid dimension</td>
+   <td>Flash attention (SDPA)</td>
+   <td>IKBO target attention</td>
+  </tr>
+  <tr>
+   <td>x</td>
+   <td>num_q_seq_block</td>
+   <td>num_q_seq_block</td>
+  </tr>
+  <tr>
+   <td>y</td>
+   <td>num_heads</td>
+   <td>batch_size_candidate</td>
+  </tr>
+  <tr>
+   <td>z</td>
+   <td>batch_size_candidate</td>
+   <td>num_heads</td>
+  </tr>
+ </tbody>
+</table>
+<p><b>Table 1</b>: Launch grid configuration comparison. SDPA prioritizes GQA optimization by placing num_heads in grid.y. IKBO swaps head and candidate dimensions, placing batch_size_candidate in grid.y to enable efficient K/V sharing across candidates.</p>
+<p>Table 2 compares our IKBO Triton implementation (FA2 logic + IKBO) against state-of-the-art Flash Attention implementations on Hopper (without IKBO co-design). Throughput and IO are measured on attention only; the broadcasting latency for Key and Value is even larger than the attention cost itself.</p>
+<table>
+ <tbody>
+  <tr>
+   <td></td>
+   <td>Throughput (TFLOPs/s)</td>
+   <td>IO (GB/s)</td>
+   <td>Latency (ms)</td>
+  </tr>
+  <tr>
+   <td>Triton IKBO FA2</td>
+   <td>425</td>
+   <td>487</td>
+   <td>0.321 (broadcast fused)</td>
+  </tr>
+  <tr>
+   <td>TLX FA3</td>
+   <td>245</td>
+   <td>2152</td>
+   <td>0.561 + 0.912 (broadcast K&amp;V)</td>
+  </tr>
+  <tr>
+   <td>CuTeDSL FA4 Hopper</td>
+   <td>250</td>
+   <td>2193</td>
+   <td>0.550 + 0.912 (broadcast K&amp;V)</td>
+  </tr>
+  <tr>
+   <td>TLX IKBO FA3 persistence generalized</td>
+   <td>594</td>
+   <td>681</td>
+   <td>0.230 (broadcast fused)</td>
+  </tr>
+ </tbody>
+</table>
+<p><b>Table 2</b>: Attention kernel comparison under RecSys boundary conditions (B_candidate = 2048, B_u = 32, uniform candidate-to-user ratio). Without co-design, even cutting-edge Hopper implementations remain IO-bound.</p>
+<h3>3.2 Adopting Modern Kernel Techniques (FA3, FA4) with IKBO on TLX</h3>
+<p>With IKBO shifting the kernel from IO-bound to compute-bound, the natural next step was to adopt the state-of-the-art compute optimizations from Flash Attention 3 (FA3 [10]) and Flash Attention 4 (FA4 [11]) on Hopper – specifically warp specialization and pipelining. However, our boundary conditions on the number of query embeddings (q_seq = 32 or 64) make it difficult to directly adopt FA3’s ping-pong or cooperative warp specialization.</p>
+<p>Warp specialization on Hopper requires asynchronous WGMMA instructions, which impose a minimum BLOCK_M ≥ 64. Two consumer warp groups are also necessary to minimize bubbles between them. To satisfy these constraints, we customized the kernel to launch both B_candidate = i and B_candidate = i + 1 within a single threadblock, sharing the same B_user. In the discussion below, we assume all users rank an even number of candidates with q_seq = 64; odd-candidate handling follows afterward.</p>
+<p><b>Performance improvement for IKBO FA3 kernel</b></p>
+<p>Starting from FA3’s recipe — intra-warp pipelining, warpgroup specialization, and ping-pong scheduling — the initial TLX IKBO FA3 kernel performed similarly to the FA2 baseline (Fig. 12, blue vs. red, Appendix 11), with on-par throughput.</p>
+<p>To diagnose the bottleneck, we visualized intra-warp pipelining using the <a href="https://github.com/triton-lang/triton/tree/main/third_party/proton/tutorials/intra_kernel">Proton tracer</a> with GPU cycles as the latency unit (Fig. 10). Table 3 summarizes the key bottlenecks before and after persistence, measured in GPU cycles via the Proton tracer.</p>
+<p><b>Fig. 11</b>: Proton-based intra-warp profiling of the TLX IKBO FA3 kernel. Representative warps from each warp group are shown: warp 0 (producer), warp 4 (consumer 1), and warp 8 (consumer 2). The softmax_PV_overlap and pure softmax regions are marked separately to identify the tensor core bubbles. (A) Before persistence zoomed in view of B (B) Before persistence with 2 waves (C) After persistence with 2 waves</p>
+<table>
+ <tbody>
+  <tr>
+   <td>Bottlenecks</td>
+   <td>Before</td>
+   <td>After</td>
+   <td>Key change</td>
+  </tr>
+  <tr>
+   <td><b>Tensor Core Bubbles</b> (1st QKT per wave, Blue)</td>
+   <td>~1,300 cycles (400 cycles from warp scheduler switching)</td>
+   <td>~1,300 cycles</td>
+   <td>Unchanged</td>
+  </tr>
+  <tr>
+   <td><b>Tensor Core Bubbles</b> (last PV per wave, Blue)</td>
+   <td>~2,000 cycles</td>
+   <td>~300 cycles</td>
+   <td>Async TMA store + reciprocal overlap with last PV</td>
+  </tr>
+  <tr>
+   <td><b>Cross-CTA Stalls</b> (Orange)</td>
+   <td>~14,000 cycles</td>
+   <td>Eliminated</td>
+   <td>Persistence removes CTA re-launch entirely</td>
+  </tr>
+  <tr>
+   <td><b>Init Buffers &amp; Barriers </b>(Green)</td>
+   <td>~1,600 cycles/wave</td>
+   <td>~1,600 cycles (1st wave only)</td>
+   <td>Persistence shared buffer and barrier amortized across waves&nbsp;</td>
+  </tr>
+  <tr>
+   <td><b>Wait 1st Q/K Load</b> (Dark purple)</td>
+   <td>2,100~4,000 cycles/wave (length varies depending on HBM bandwidth contention)</td>
+   <td>～2,000 cycles (1st wave only)</td>
+   <td>Cross-wave pipelining; producer prefetches ~3K cycles ahead</td>
+  </tr>
+ </tbody>
+</table>
+<p><b>Table 3</b>: Key bottlenecks before and after persistence + optimizations.</p>
+<p>Key takeaway: cross-CTA stalls are the dominant bottleneck — not tensor core utilization – at these small query sequence lengths. Persistence is a must for this improvement. After persistence, the profiling results and its latency changes are presented in Fig. 11C and Table. 3.</p>
+<p><b>HBM2e-Specific Optimizations</b></p>
+<p>We further tuned the persistent kernel for the H100 SXM5’s HBM2e bandwidth constraints, trading shared memory capacity for reduced load/store blocking. (Table 4).</p>
+<table>
+ <tbody>
+  <tr>
+   <td>Customized optimization/fix</td>
+   <td>Benefit</td>
+  </tr>
+  <tr>
+   <td><b>Decoupled SMEM buffer of O from Q/V with pipelined TMA async store</b></td>
+   <td>Decoupled O from Q/V SMEM sharing enable TMA async stores could overlap with next-wave compute, shortening store blocking time from <b>1,300</b> to <b>400</b> cycles/wave</td>
+  </tr>
+  <tr>
+   <td><b>Separate Q₀ and Q₁ buffers&nbsp;</b></td>
+   <td>Reduces per-Q loading time, allowing one consumer group starts earlier— beneficial when wave count greatly exceeds K/V sequence iterations (common in RecSys)</td>
+  </tr>
+  <tr>
+   <td><b>Instruction Cache Misses fix</b></td>
+   <td>Merges the peeled-out last-iteration code path back into the main loop, eliminating icache thrashing caused by excessive warp-specialized instructions (Appendix 12)</td>
+  </tr>
+ </tbody>
+</table>
+<p><b>Table 4:</b> Customized optimizations for the HBM2e H100 SXM5. These still fit within the available SMEM budget under RecSys boundary conditions (Appendix 10).</p>
+<p>We also implemented persistent V2, which iterates from the end of the K sequence to the front (matching FA3/FA4-Hopper’s approach) to simplify masking logic. Both persistent variants apply the Table 4 optimizations. As shown in Fig. 12, at low sequence lengths (512–4,096) the TLX FA3 persistent kernel outperforms all other candidates; beyond 8K the two persistent variants converge.</p>
+<p><b>Fig. 12</b>: IKBO implementation throughput vs. sequence length (B_candidate = 2,048; B_candidate : B_user = 64; num_head = 2; d_head = 128). Practical RecSys sequence lengths are under 4K [3]; longer lengths are included for comparison with LLM use cases. The generalized version handles non-even candidates per user with 50% odd-candidates per user probability</p>
+<p><b>Generalizing IKBO FA3 for ranking Arbitrary Candidate Batch Sizes</b></p>
+<p>Our IKBO FA3 kernel co-processes two candidate batches per CTA to meet WGMMA’s BLOCK_M ≥ 64 requirement. When a user has an odd number of candidates, one consumer warpgroup has no pairing partner. We handle this with idling logic (Fig. 13, left; Algorithm 1):</p>
+<ul>
+ <li>The idle warpgroup drains K/V buffers via mbarrier signaling to prevent producer deadlock.</li>
+ <li>The active warpgroup disables ping-pong synchronization (its partner no longer arrives at the named barriers).</li>
+</ul>
+<p>At a ~70 : 1 candidate-to-user ratio, the idle path triggers less than 0.7% of the time with negligible overhead (Fig. 12, IKBO TLX FA3 generalized). This approach generalizes to q_seq_len = 32, where four candidate batches are bundled per CTA using analogous idling and masking logic.</p>
+<p><b>Fig. 13</b>: CTA assignment for generalized target attention (left) and self + target attention fusion (right). Each CTA assigns two consumer warp groups sharing the same user K/V. When the candidate count is odd, the 2nd consumer idles and drains barriers.</p>
+<p><b>Algorithm 1: </b>IKBO Attention Forward Pass with Odd Candidate Handling</p>
+<h3>3.3 Self + Target Attention Fusion via Model Co-Design</h3>
+<p>The previous sections focused on optimizing target (cross) attention. A natural question arises: can we fold self-attention into the same kernel?</p>
+<p>The key insight is that both attention types share the same key-value source — the user sequence. The only difference is the query: self-attention queries come from the user side, while target-attention queries come from the candidate side. By sharing K/V projections between the two, we enable direct horizontal kernel fusion within a single launch. Fig. 13 (right) illustrates the fused CTA layout: the first CTAs handle self-attention query blocks, while the remaining CTAs handle target-attention candidate pairs — all reading from the same pipelined K/V stream.</p>
+<p>Similar co-design ideas have been explored in XAI Phoenix, an open-source recommendation system from X [4].</p>
+<p>We prototyped a fused kernel to quantify the fusion benefit, excluding K/V projection savings (Fig. 13, right):</p>
+<ul>
+ <li>seq_len = 512:&nbsp; &nbsp; 6.6% improvement (514 vs. 482 TFLOPs/s)</li>
+ <li>seq_len = 1,024:&nbsp; 4.1% improvement (581 vs. 558 TFLOPs/s)</li>
+ <li>seq_len = 2,048:&nbsp; 0.3% improvement (612 vs. 610 TFLOPs/s) — self-attention saturates the SMs</li>
+</ul>
+<p>The gains at short sequences stem from kernel fusion benefits: reduced launch overhead, shared buffer allocation savings, cross-kernel pipelining opportunities, and wave quantization mitigation — the same inefficiencies that megakernel techniques [12] target in LLM inference. In production, the shared K/V projections provide additional savings on linear projection cost, analogous to KV cache reuse.</p>
+<h2>4. Summary of Benchmarks and Results</h2>
+<p>We summarize the kernel-level benchmarks presented in this post alongside end-to-end deployment outcomes. All kernel benchmarks below are on H100 SXM5 (see details in Appendix 1).</p>
+<ul>
+ <li><b>Linear Compression (Section 2).</b> Four progressive co-design stages — matmul decomposition, memory alignment, broadcast fusion, and warp-specialized multi-stage fusion via TLX — yield a cumulative ~4× speedup (1.944 ms → 0.482 ms) at representative settings. Gains remain robust across batch sizes and candidate-to-user ratios (Fig. 9).</li>
+ <li><b>Flash Attention (Section 3).</b> IKBO shifts target attention from IO-bound (~60 FLOPs/Byte) to compute-bound (~833 FLOPs/Byte), achieving 2.4×/6.4× the throughput of non-co-designed CuTeDSL FA4-Hopper (kernel only / kernel + broadcasting) with 621 BF16 TFLOPs.</li>
+ <li><b>End-to-end deployment.</b> IKBO has been deployed broadly across Meta’s RecSys inference stack — from early-stage to late-stage ranking models, on both GPU and MTIA accelerators — delivering up to 2/3 reduction in compute-intensive net latency on co-designed models. IKBO has been validated across candidate-to-user broadcast ratios spanning from ~10,000 : 1 down to ~10 : 1, confirming both numerical stability and scalability across workloads.</li>
+</ul>
+<h2>5. Conclusion and Future Directions</h2>
+<p>IKBO demonstrates that broadcast — long treated as an unavoidable cost of user-candidate interaction — can be eliminated at the computational primitive layer through kernel-model-system co-design. By encoding broadcast semantics directly into kernels, no replicated tensors ever materialize, and savings scale naturally with the candidate-to-user ratio.</p>
+<p>While the kernel implementations presented in this work target NVIDIA Hopper via Triton and TLX, the core idea — replacing materialized broadcasts with index-driven in-kernel lookups — is hardware-vendor independent. Adapting the IKBO kernels to CuTeDSL (for advanced NVIDIA backend support) and completing the AMD CK support are natural next steps.</p>
+<p>Beyond the two-level user-candidate hierarchy presented here, some RecSys scenarios involve deeper hierarchies — for example, user → ads vendor → ads item, where each user sees multiple vendors and each vendor offers multiple items. This introduces two nested broadcast relationships with independent, non-uniform ratios. IKBO can handle this elegantly, and applying it to multi-level workloads is a natural direction for further reducing materialization overhead in production RecSys architectures.</p>
+<h2>Acknowledgements</h2>
+<p>We are grateful to <a>Hongtao Yu</a>, <a>Yuanwei (Kevin) Fang</a>, <a>Daohang Shi</a>, <a>Yueming Hao</a>, <a>Srivatsan Ramesh</a> and <a>Manman Ren</a> for their strong internal support of the Triton and TLX foundation, the powerful Triton profiling toolings, and for promptly resolving Triton-related issues throughout this work.</p>
+<p>Thanks <a>Chris Gottbrath</a> for his insightful feedback, which significantly improved the clarity of this post. We also greatly appreciate his help in facilitating a smooth review process.</p>
+<p>Thanks <a>Santanu Kolay</a>, <a>Sandeep Pandey</a>, <a>Matt Steiner</a>, <a>GP Musumeci</a>, <a>Ashwin Kumar</a>, <a>Ian Barber</a>, <a>Aparna Ramani</a>, <a>CQ Tang</a> for leadership support.</p>
+<h2>References</h2>
+<p>[1] Naumov, M., et al. “Deep Learning Recommendation Model for Personalization and Recommendation Systems,” arXiv:1906.00091, 2019.</p>
+<p>[2] Wang, R., et al. “Deep &amp; Cross Network for Ad Click Predictions,” ADKDD, 2017.</p>
+<p>[3] Zhai, J., et al. “Actions Speak Louder than Words: Trillion-Parameter Sequential Transducers for Generative Recommendations,” ICML, 2024.</p>
+<p>[4] xAI. “Phoenix: Recommendation System,” GitHub, 2026. https://github.com/xai-org/x-algorithm</p>
+<p>[5] Guo, L., et al. “Request-Only Optimization for Recommendation Systems,” arXiv:2508.05640, 2025.</p>
+<p>[6] Zhang, B., et al. “Wukong: Towards a Scaling Law for Large-Scale Recommendation,” ICML, 2024.</p>
+<p>[7] Vaswani, A., et al. “Attention Is All You Need,” NeurIPS, 2017.</p>
+<p>[8] Lee, J., et al. “Set Transformer: A Framework for Attention-based Permutation-Invariant Input,” ICML, 2019.</p>
+<p>[9] Dao, T. “FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning,” ICLR, 2024.</p>
+<p>[10] Shah, J., et al. “FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision,” NeurIPS, 2024.</p>
+<p>[11] Zadouri, T., et al. “FlashAttention-4: Algorithm and Kernel Pipelining Co-Design for Asymmetric Hardware Scaling,” arXiv:2603.05451, 2026.</p>
+<p>[12] Spector, B., et al. “Look Ma, No Bubbles! Designing a Low-Latency Megakernel for Llama-1B,” Hazy Research Blog, 2025. https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles</p>
+<h2>Appendix</h2>
+<h3>Appendix 1. Benchmark Setup</h3>
+<p>All experiments are conducted on a single NVIDIA H100 SXM5 GPU (700 W TDP, 96 GB HBM2e) with the following software stack:</p>
+<ul>
+ <li>CUDA: 12.4</li>
+ <li>PyTorch: 2.11.0a0+fb (internal build)</li>
+ <li>Triton: facebookexperimental/triton@<code>4059e79bf</code> (<a href="https://github.com/facebookexperimental/triton/pull/831">#831</a>)</li>
+</ul>
+<h3>Appendix 2. Arithmetic Intensity Analysis</h3>
+<p><b>2.1 Machine Balance Point of H100 SXM5 (700 W TDP, 96 GB HBM2E)</b></p>
+<p><b>2.2 Arithmetic Intensity of the Baseline LCE</b></p>
+<p>For a batched matmul <code>(M, K) @ (B, K, N) → (B, M, N)</code> in FP16, with B=1024, M=433, K=2044, N=256:</p>
+<h3>Appendix 3. Detailed Result Analysis for Section 2.1</h3>
+<p><i>Setup:</i> H100 SXM5 (Appendix 1), PyTorch eager mode (no kernel fusion), inference. Shapes from a representative configuration.</p>
+<table>
+ <tbody>
+  <tr>
+   <td><b>Version</b></td>
+   <td><b>Total&nbsp;</b>
+    <p><b>(ms)</b></p></td>
+   <td><b>Kernels</b></td>
+   <td><b>Latency</b>
+    <p><b>(ms)</b></p></td>
+   <td><b>DRAM</b>
+    <p><b>(GB)</b></p></td>
+   <td><b>L1/TEX Sectors</b>
+    <p><b>(M)</b></p></td>
+   <td><b>Compute</b>
+    <p><b>(GFLOPs)*</b></p></td>
+   <td><b>Bottleneck</b>
+    <p><b>†</b></p></td>
+  </tr>
+  <tr>
+   <td>Baseline</td>
+   <td>1.944</td>
+   <td>1 CUTLASS GEMM</td>
+   <td>1.944</td>
+   <td>1.31</td>
+   <td>798</td>
+   <td>460</td>
+   <td>L1/TEX (89%)&nbsp;</td>
+  </tr>
+  <tr>
+   <td>Decomposition</td>
+   <td>1.389</td>
+   <td>2 CUTLASS GEMM (user + candidate matmul)</td>
+   <td>0.984</td>
+   <td>0.68</td>
+   <td>351</td>
+   <td>200</td>
+   <td>L1/TEX (84%)</td>
+  </tr>
+  <tr>
+   <td>1 ATen Gather + 1 ATen add</td>
+   <td>0.405</td>
+   <td>0.87</td>
+   <td>36</td>
+   <td>0.11</td>
+   <td>DRAM (92%)</td>
+  </tr>
+ </tbody>
+</table>
+<p>*Total FLOPs executed, not throughput.<br>
+  †Bottleneck identified via NCU Speed of Light analysis; methodology in Appendix 4.</p>
+<p>Deduplication eliminates &gt;98% of user-side work (batch 1024 → ~15), cutting L1/TEX sectors from 798M to 351M and GEMM latency from 1.944 ms to 0.984 ms. The post-GEMM broadcast and addition costs 0.405 ms (DRAM-bound), yielding a net saving of 0.555 ms.</p>
+<p><b>Precision note.</b> The baseline accumulates all K products in a single FP32/TF32 reduction. Decomposition accumulates K_user and K_cand separately, then sums the partial results in BF16/FP16. Training uses the same decomposition, so numerics match end-to-end. For exact inference parity, a fused kernel (Section 2.4) can perform the final summation in FP32.</p>
+<h3>Appendix 4. Bottleneck Analysis Methodology</h3>
+<p>For a closer look after roofline analysis, we use NCU’s Speed of Light analysis to identify hardware subsystem bottlenecks. The bottleneck is the subsystem with the highest utilization relative to its peak sustained throughput. For the analysis in Section 2.1, we monitor three metrics:</p>
+<p><b>Compute</b> is the peak SM pipeline utilization, reported directly by NCU (<code>Compute (SM) Throughput</code>). It measures how busy the most active execution pipeline (tensor cores for GEMMs) is relative to its peak instruction rate.</p>
+<p><b>L1/TEX</b> utilization is derived from the total sectors the L1/TEX unit must process as below, where num_L1_tex_sectors is <code>l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum</code> and <code>_st.sum</code> counter, is SM_active_cycles <code>sm__cycles_active.avg</code> counter, num_SM is 132 and num_sustained_peak_sectors_per_sm_per_cycle is 2.0 on H100.</p>
+<p><b>DRAM</b> utilization is derived from total HBM bytes transferred as below, where dram_bytes_read_and_write is the dram__bytes_read.sum and <code>dram__bytes_write.sum</code> counter. peak_bandwidth is 2TB/s on the testing GPU server.</p>
+<h3>Appendix 5. Detailed Result Analysis for Section 2.2</h3>
+<p><b>Result.</b> 1.389 ms → 0.798 ms (<b>42.5% reduction</b>).</p>
+<table>
+ <tbody>
+  <tr>
+   <td><b>Version</b></td>
+   <td><b>Total Latency</b>
+    <p><b>(ms)</b></p></td>
+   <td><b>Kernels</b></td>
+   <td><b>Latency</b>
+    <p><b>(ms)</b></p></td>
+   <td><b>DRAM Traffic</b>
+    <p><b>(GB)</b></p></td>
+   <td><b>Compute</b>
+    <p><b>(GFLOPs)</b></p>
+    <p><b>*not speed</b></p></td>
+   <td><b>L1/TEX Sectors</b>
+    <p><b>(M)</b></p></td>
+   <td><b>Bottleneck</b>
+    <p><b>†</b></p></td>
+  </tr>
+  <tr>
+   <td>Decomposition 
+    <p>(unpadded)</p></td>
+   <td>1.386</td>
+   <td>2 CUTLASS GEMM – user &amp; candidate matmul</td>
+   <td>0.984</td>
+   <td>0.68</td>
+   <td>200</td>
+   <td>351</td>
+   <td>L1/TEX (84%)</td>
+  </tr>
+  <tr>
+   <td>1 ATen Gather – broadcast 
+    <p>1 ATen Elementwise – add</p></td>
+   <td>0.402</td>
+   <td>0.87</td>
+   <td>0.11</td>
+   <td>36</td>
+   <td>DRAM (92%)</td>
+  </tr>
+  <tr>
+   <td>Decomposition 
+    <p>(padded K)</p></td>
+   <td><b>0.798</b></td>
+   <td>2 CUTLASS GEMM – user &amp; candidate matmul</td>
+   <td><b>0.400</b></td>
+   <td>0.69</td>
+   <td>200</td>
+   <td><b>0</b></td>
+   <td><b>Balanced</b></td>
+  </tr>
+  <tr>
+   <td>1 ATen Gather – broadcast 
+    <p>1 ATen Elementwise – add</p></td>
+   <td>0.398</td>
+   <td>0.87</td>
+   <td>0.11</td>
+   <td>36</td>
+   <td>DRAM (92%)</td>
+  </tr>
+ </tbody>
+</table>
+<p>Two factors behind the large speedup.</p>
+<ul>
+ <li><b>TMA.</b> With aligned matrices, CUTLASS selects a TMA-based kernel, bypassing L1/TEX entirely (sectors → 0). The unpadded kernel also penalized matrix <code>B</code> unnecessarily: it applied 4-byte loads to <i>both</i> matrices, even though <code>B</code> (with aligned <code>N</code>) could have used 128-bit loads.</li>
+ <li><b>Bank conflicts.</b> The unpadded kernel also uses sm80 MMA path whose swizzle pattern doesn’t protect against 4-byte cp.async writes, causing many shared memory bank conflicts. The padded kernel doesn’t have this issue.</li>
+</ul>
+<h3>Appendix 6. Detailed Result Analysis for Section 2.3</h3>
+<p><b>Result. </b>Latency: 0.798 ms → 0.580 ms (<b>27.4% reduction</b>).</p>
+<table>
+ <tbody>
+  <tr>
+   <td>Version</td>
+   <td>Total Latency 
+    <p>(ms)</p></td>
+   <td>Kernels</td>
+   <td>Latency 
+    <p>(ms)</p></td>
+   <td>DRAM Traffic 
+    <p>(GB)</p></td>
+  </tr>
+  <tr>
+   <td>Decomposition 
+    <p>(padded K)</p></td>
+   <td>0.798</td>
+   <td>2 CUTLASS GEMM – user &amp; candidate matmul</td>
+   <td>0.400</td>
+   <td>0.68</td>
+  </tr>
+  <tr>
+   <td>1 ATen Gather – broadcast 
+    <p>1 ATen Elementwise – add</p></td>
+   <td>0.398</td>
+   <td>0.87</td>
+  </tr>
+  <tr>
+   <td>iKBO Fusion</td>
+   <td>0.580</td>
+   <td>user GEMM &amp; candidate iKBO kernel</td>
+   <td>0.580</td>
+   <td>0.68</td>
+  </tr>
+ </tbody>
+</table>
+<p>The 0.87 GB of intermediate DRAM traffic is eliminated as expected. NCU profiling reveals further opportunity: occupancy is just 6.25% with 1 warp per scheduler, and PC sampling shows only 23% of cycles are productive:</p>
+<table>
+ <tbody>
+  <tr>
+   <td><b>Stall Reason</b></td>
+   <td><b>Percentage</b></td>
+   <td><b>What it mainly refers in the kernel</b></td>
+  </tr>
+  <tr>
+   <td>Stall long scoreboard</td>
+   <td>41.8%</td>
+   <td>Global memory loads</td>
+  </tr>
+  <tr>
+   <td>Selected (executing)</td>
+   <td>23.1%</td>
+   <td>Productive work (good) – instructions actually issued</td>
+  </tr>
+  <tr>
+   <td>Stall wait</td>
+   <td>20.1%</td>
+   <td>Wait WGMMA</td>
+  </tr>
+  <tr>
+   <td>Stall barrier</td>
+   <td>5.7%</td>
+   <td><code>bar.sync</code> between software-pipeline stages</td>
+  </tr>
+ </tbody>
+</table>
+<p>With 1 warp per scheduler, every stall is fully exposed: there is no other warp to switch to. Increasing occupancy by reducing pipeline depth would sacrifice K-loop latency hiding. This is a challenging situation for this kernel:</p>

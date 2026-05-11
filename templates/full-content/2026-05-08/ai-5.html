@@ -1,0 +1,135 @@
+<h2>TL;DR</h2>
+<ul>
+ <li><strong><code>/goal</code></strong> shipped in <strong>Codex CLI v0.128.0</strong> on <strong>April 30, 2026</strong> as a named headline feature.</li>
+ <li>It introduces <strong>persisted goals</strong>: a goal state that survives terminal restarts, laptop sleeps, and multi-hour pauses without re-prompting.</li>
+ <li><strong>Runtime continuation</strong> means Codex injects a developer message on resume rather than waiting for you to type anything.</li>
+ <li>I ran a real session on a TypeScript monorepo. Wall time: about <strong>6h 44min</strong>. Actual model compute: about <strong>41 minutes</strong>. Final status: <code>TASK_COMPLETE</code>.</li>
+ <li>The session burned roughly <strong>6.8M cumulative input tokens</strong> at a ~94% cache hit rate. Auto-context-compaction fired once, configurable via <code>model_auto_compact_token_limit</code>.</li>
+</ul>
+<hr>
+<p>I did not plan to run Codex overnight. I started a session at 9:19 PM Berlin time on April 30, watched one turn run for 57 seconds, then closed the laptop and went to bed. When I came back five and a half hours later, <code>/goal</code> was already running again. It had picked up exactly where it left off. I had not re-prompted anything.</p>
+<p>That is the thing about <code>/goal</code> that does not come through in a changelog entry. It is not just a new command. It is a different contract between you and the agent.</p>
+<h2>What Shipped on April 30</h2>
+<p>Codex CLI <code>v0.128.0</code> (tagged <code>rust-v0.128.0</code>) dropped on April 30, 2026. The headline from the release notes: “Added persisted /goal workflows with app-server APIs, model tools, runtime continuation, and TUI controls for create, pause, resume, and clear.”</p>
+<p>That one sentence packs a lot in, so let me pull it apart.</p>
+<p><strong>Persisted goals</strong> are the core idea. Previous Codex sessions were ephemeral. Close the terminal, lose the thread. <code>/goal</code> stores the active goal in app-server state, so it outlives the process.</p>
+<p><strong>App-server APIs</strong> is the plumbing behind that persistence. Codex now talks to a local server layer that tracks goal state.</p>
+<p><strong>Model tools</strong> means the model itself gets tools for interacting with the goal lifecycle. It can signal completion, request continuation, and inspect goal state as part of its reasoning.</p>
+<p><strong>Runtime continuation</strong> is the behavior I saw that night. When you resume (or when Codex detects the session is alive again), it injects a developer message prompting the model to continue working. You do not have to type anything.</p>
+<p><strong>TUI controls</strong> rounds out the surface area. The terminal UI gets explicit create, pause, resume, and clear actions for goal management. You can pause a running goal intentionally, not just by closing the lid.</p>
+<p>The rest of <code>v0.128.0</code> is worth a quick mention. Scrollback reflow now works on terminal resize instead of the text getting mangled. A new <code>codex update</code> command handles CLI self-updates. The composer shows plan-mode nudges when a task seems like a good candidate for planning. TUI keymaps are now configurable. Permission profiles are expanded. The <code>--full-auto</code> flag is deprecated in favor of explicit approval profiles. The desktop app also got polish improvements the same week, though the focus of this post is the CLI. Plan mode itself landed earlier, in v0.122.0 on April 20, 2026. <code>/goal</code> builds on top of that foundation.</p>
+<h2>What /goal Actually Does</h2>
+<p>The basic mechanic is straightforward. You type <code>/goal</code> followed by your prompt. Codex stores the goal and starts working. If the session is interrupted (network hiccup, closed laptop, deliberate pause), the goal persists. When the session comes back, Codex resumes automatically via runtime continuation.</p>
+<p>The model signals completion with <code>TASK_COMPLETE</code> or the <code>task_complete</code> tool. Until that happens, the goal stays active.</p>
+<p>What actually makes this different from a long-running <code>--continue</code> session is the persistence layer. Before <code>/goal</code>, a closed terminal meant a dead session. You could approximate continuity by carefully managing context files and re-injecting prompts, which is basically what the Ralph Wiggum Loop does in a scrappier way. <code>/goal</code> makes continuity a first-class feature.</p>
+<p>A few config knobs matter here. In <code>~/.codex/config.toml</code>, the <code>model_auto_compact_token_limit</code> key sets the threshold for automatic context compaction. The <code>[features]</code> block is where feature flags live. The <code>model_reasoning_effort</code> key sets reasoning effort for the session. If you want hands-off autonomous runs, you will also need <code>approval_policy</code> and <code>sandbox_mode</code> configured correctly. I will get to that.</p>
+<p>The TUI also changes. You get visible goal state. You can pause a running goal intentionally without killing the process. Resume picks it back up with runtime continuation.</p>
+<h2>A Real Six-Hour Run</h2>
+<p>Here is what a real session actually looked like.</p>
+<p>The project was a TypeScript monorepo I am working on. A voice interview system with several end-to-end scenarios that needed to work correctly under a set of defined conditions.</p>
+<p>I run Codex with <code>approval_policy = "never"</code> and <code>sandbox_mode = "danger-full-access"</code> for autonomous <code>/goal</code> sessions. These two settings are the precondition for hands-off long runs: the model does not stop to ask permission, and it has full filesystem access to do its work. This is only sane in a trusted project directory with clean git state going in.</p>
+<p>The <code>/goal</code> prompt was around 600 words. I wrote it using a structured approach: XML-style blocks organizing the goal, an explicit reading list of ten or more files the model should consult first, working rules (check git status before edits, prefer <code>rg</code> over grep, use <code>apply_patch</code>), a <code>done_when</code> contract spelling out four concrete success criteria, and explicit anti-pattern fences. One of those fences: “do not add string-matching patches to pass one transcript.” If you have worked on voice systems, you know why that fence needs to exist.</p>
+<p>Writing a prompt like that is itself a task. If you want to see how I approach prompt design for this kind of work, <a>The Interview Method</a> covers the workflow.</p>
+<p>Model: <code>gpt-5.5</code>. Reasoning effort: <code>high</code>.</p>
+<p>Session timeline:</p>
+<ul>
+ <li><strong>9:19 PM</strong> - <code>/goal</code> submitted.</li>
+ <li><strong>9:20 PM</strong> - First turn running. I watched it for 57 seconds, then interrupted (<code>turn_aborted</code>).</li>
+ <li><strong>5.5 hours</strong> - I closed the laptop. No re-prompting.</li>
+ <li><strong>~2:50 AM</strong> - When I came back, <code>/goal</code> had already injected a developer message (“Continue working toward the active thread goal”) and was running. Autonomous.</li>
+ <li><strong>Context compaction</strong> fired once, at approximately 6.7M cumulative input tokens.</li>
+ <li><strong>Cumulative tokens</strong>: ~6.8M input, ~10K output, ~2.6K reasoning tokens. Cache hit rate: ~94%.</li>
+ <li><strong>Wall time</strong>: 6h 44min. Actual model compute: ~41 minutes across turns.</li>
+ <li><strong>Final status</strong>: <code>TASK_COMPLETE</code>. All four target end-to-end voice scenarios passed verification.</li>
+</ul>
+<p>Manual transcript review found no prompt loops, no liveness spirals, no premature closes. The model worked through the scenarios methodically and called it done when the criteria were met.</p>
+<p>One real-world ceiling worth noting. A TTS first-byte timing field I wanted captured could not be measured, because the upstream library does not emit the relevant runtime event. The model documented this honestly. Explicit nulls in the artifact, with a note explaining why the field was missing. It did not paper over the gap. <code>/goal</code> can give you an autonomous run, but it cannot bypass what the external environment actually exposes.</p>
+<p>The ~94% cache hit rate is the number that makes the economics work. 6.8M input tokens sounds alarming until you realize that the actual incremental cost at that cache rate is a fraction of the nominal number.</p>
+<h2>/goal vs the Ralph Wiggum Loop</h2>
+<p>I wrote about <a>the Ralph Wiggum Loop</a> a while back. Geoffrey Huntley coined it, and his original post is still the canonical reference: the technique is essentially <code>while :; do cat PROMPT.md | claude-code; done</code> with git history as memory. It solves the same core problem <code>/goal</code> solves: how do you keep an AI agent working on something longer than a single context window?</p>
+<p>The approaches are different in character.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Dimension</th>
+   <th>Ralph Wiggum Loop</th>
+   <th><code>/goal</code></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Setup</td>
+   <td>Shell script or plugin, external orchestration</td>
+   <td>Built into Codex CLI</td>
+  </tr>
+  <tr>
+   <td>State persistence</td>
+   <td>Git history, files on disk</td>
+   <td>App-server APIs, native goal state</td>
+  </tr>
+  <tr>
+   <td>Resume behavior</td>
+   <td>Manual re-invocation</td>
+   <td>Automatic runtime continuation</td>
+  </tr>
+  <tr>
+   <td>Context management</td>
+   <td>Fresh context per iteration (by design)</td>
+   <td>Compaction within session</td>
+  </tr>
+  <tr>
+   <td>Reasoning continuity</td>
+   <td>Stateless between iterations</td>
+   <td>Continuous within session</td>
+  </tr>
+  <tr>
+   <td>Model</td>
+   <td>Claude Code</td>
+   <td>Codex with <code>gpt-5.5</code></td>
+  </tr>
+  <tr>
+   <td>Good for</td>
+   <td>Tasks that benefit from fresh eyes each pass</td>
+   <td>Long-horizon tasks with accumulating context</td>
+  </tr>
+ </tbody>
+</table>
+<p>The Ralph Wiggum Loop is genuinely useful. The stateless-by-design property is sometimes an advantage: each iteration approaches the problem without carrying forward incorrect intermediate conclusions. If the model gets confused, the next iteration starts clean.</p>
+<p><code>/goal</code> bets on continuity instead. The model builds up a picture of the codebase across turns and does not have to re-read everything from scratch on each pass. For tasks where reasoning accumulates (debugging a subtle interaction, navigating a complex state machine), continuity wins. For tasks that are naturally iterative and convergent (adding tests, fixing lint), Ralph’s fresh-context model often works just as well.</p>
+<p>Neither is the right default. They are tools for different shapes of problem.</p>
+<h2>When /goal Is the Wrong Choice</h2>
+<p>A few situations where I would not reach for <code>/goal</code>.</p>
+<p><strong>Undefined success criteria.</strong> The <code>done_when</code> contract is not optional. If you cannot write four concrete success criteria before you start, the model has no way to know when it is done. It will either declare <code>TASK_COMPLETE</code> prematurely or loop indefinitely. Write the contract first.</p>
+<p><strong>Exploratory work.</strong> Early-stage “figure out what this codebase is doing” work benefits from human-in-the-loop. You learn things as the model surfaces them. <code>/goal</code> is for execution, not exploration.</p>
+<p><strong>Security-critical paths.</strong> I run with <code>approval_policy = "never"</code> and <code>sandbox_mode = "danger-full-access"</code>. That setup is only appropriate in project directories I trust completely. Authentication systems, payment flows, anything touching sensitive data: keep approval in the loop.</p>
+<p><strong>Unclear external dependencies.</strong> If your task depends on an external system you are not sure about, find out first. The TTS timing field I mentioned above is the mild version. The more expensive version is a six-hour run that hits a wall at hour five because the external API does not support what you assumed it would.</p>
+<p><strong>Short tasks.</strong> <code>/goal</code> has overhead. A task you can finish in ten minutes of interactive Codex is not improved by wrapping it in a persisted goal. The complexity is not worth it below some threshold. My rough heuristic: if the task would not comfortably span two or more separate sessions in the old model, it probably does not need <code>/goal</code>.</p>
+<h2>The Mindset Shift</h2>
+<blockquote>
+ <p><strong>Old</strong>: Autonomous AI runs are sessions you monitor, ready to intervene when things go sideways. <strong>New</strong>: Autonomous AI runs are contracts you write upfront, then get out of the way.</p>
+</blockquote>
+<p>The shift is from supervisor to architect. The quality of the <code>/goal</code> session is determined almost entirely before the first turn runs. The prompt quality, the success criteria, the anti-pattern fences, the reading list. Once it starts, your job is mostly done. If you wrote the contract well, the model executes. If you did not, no amount of monitoring will save it.</p>
+<p>That is a different skill than interactive prompting. It is closer to writing a spec than having a conversation.</p>
+<hr>
+<h2>Conclusion</h2>
+<p><code>/goal</code> is the most significant thing Codex has shipped since plan mode. The persistence layer and runtime continuation are what make it different from a long <code>--continue</code> session in practice. Six hours and forty-four minutes of wall time with forty-one minutes of actual compute is only possible because the model kept its context, the cache held, and the goal survived a five-hour gap without me touching anything.</p>
+<p>The economics work out because of cache hit rates. The quality works out because of upfront prompt discipline. Neither of those things is automatic.</p>
+<p>This is the first post in a two-part series. The companion post covers the workflow side: how I prep specs and prompts before they reach <code>/goal</code>. <strong><a>From SPEC.md to /goal: My Codex + GPT-5.5 Workflow</a></strong>.</p>
+<hr>
+<h2>Sources</h2>
+<ul>
+ <li><a href="https://github.com/openai/codex/releases/tag/rust-v0.128.0">Codex v0.128.0 release notes</a></li>
+ <li><a href="https://developers.openai.com/codex/changelog">Codex changelog</a></li>
+ <li><a href="https://developers.openai.com/codex/cli/features">Codex CLI features reference</a></li>
+ <li><a href="https://ghuntley.com/ralph/">Geoffrey Huntley: Ralph Wiggum, the goat</a></li>
+</ul>
+<h4>Yannik Zuehlke</h4>
+<p>Consultant, Architect &amp; Developer</p>
+<p>Software architect and cloud engineer with 15+ years of experience. I write about what works in practice.</p>
+<h2>Related Posts</h2>
+<h3><a>From SPEC.md to /goal: My Codex + GPT-5.5 Workflow</a></h3>
+<p>Two models, one pipeline. How I use Claude for SPEC.md, GPT-5.5 to refine, and Codex /goal to ship long-running work.</p>
+<h3><a>My Thoughts on Claude Opus 4.7</a></h3>
+<p>Anthropic's Opus 4.7 landed with big benchmark wins, a new tokenizer, and a split reception. Here are the facts, the community pushback, and how I'm using it.</p>
+<h3><a>How I Built My First iOS App with AI</a></h3>
+<p>I shipped a native SwiftUI app to the App Store with zero prior iOS experience. Here's every tool and workflow that made it possible.</p>
