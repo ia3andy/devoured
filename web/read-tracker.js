@@ -270,38 +270,107 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  if (!articlePage) {
+  function findFirstUnreadCard() {
     var cards = document.querySelectorAll('.card.post[data-post-date]');
     var nextRead = localStorage.getItem('digest-next-read') || 'oldest';
     var start = nextRead === 'newest' ? 0 : cards.length - 1;
     var end = nextRead === 'newest' ? cards.length : -1;
     var step = nextRead === 'newest' ? 1 : -1;
-    var swipeCta = document.getElementById('swipe-home-btn');
-    var foundUnread = false;
     for (var i = start; i !== end; i += step) {
-      if (!isPostRead(cards[i].dataset.postDate)) {
-        foundUnread = true;
-        var postLink = cards[i].querySelector('.post-title a');
-        if (postLink) {
-          var prefetch = document.createElement('link');
-          prefetch.rel = 'prefetch';
-          prefetch.href = postLink.href;
+      if (!isPostRead(cards[i].dataset.postDate)) return cards[i];
+    }
+    return null;
+  }
+
+  function updateHomeCta() {
+    var cta = document.getElementById('digest-home-cta');
+    if (!cta) return;
+    var cards = document.querySelectorAll('.card.post[data-post-date]');
+    var readCount = 0;
+    for (var j = 0; j < cards.length; j++) { if (isPostRead(cards[j].dataset.postDate)) readCount++; }
+    var card = findFirstUnreadCard();
+    if (!card) { cta.style.display = 'none'; return; }
+    var label = 'Next read for you';
+    if (readCount > 0) label += ' · ' + readCount + ' days digested';
+    cta.querySelector('.digest-cta-label').textContent = label;
+    var link = card.querySelector('.post-title a');
+    var isDesktop = window.matchMedia('(min-width: 769px)').matches;
+    cta.querySelector('.digest-cta-title').textContent = link ? link.textContent.trim() : '';
+    var btn = cta.querySelector('.digest-cta-btn');
+    btn.href = isDesktop ? (link ? link.href : card.dataset.swipeUrl) : card.dataset.swipeUrl;
+    cta.querySelector('.digest-cta-btn-text').textContent = isDesktop ? 'Read' : 'Swipe mode';
+    cta.style.display = '';
+  }
+
+  if (!articlePage) {
+    var cta = document.getElementById('digest-home-cta');
+    var startFrom = cta ? cta.querySelector('.digest-cta-start-from') : null;
+
+    if (localStorage.getItem(READ_KEY) === null && startFrom) {
+      var cards = document.querySelectorAll('.card.post[data-post-date]');
+      var placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = 'Choose a start date...';
+      placeholder.disabled = true;
+      placeholder.selected = true;
+      startFrom.appendChild(placeholder);
+      for (var i = 0; i < cards.length; i++) {
+        var date = cards[i].dataset.postDate;
+        var title = cards[i].querySelector('.post-title a');
+        var d = new Date(date + 'T00:00:00');
+        var opt = document.createElement('option');
+        opt.value = date;
+        opt.textContent = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + (title ? ' — ' + title.textContent.trim() : '');
+        startFrom.appendChild(opt);
+      }
+      if (cta) {
+        cta.querySelector('.digest-cta-label').textContent = 'Welcome to Devoured!';
+        cta.querySelector('.digest-cta-title').textContent = 'Catch up from any day. Pick one below and we\'ll mark older digests as read.';
+        cta.querySelector('.digest-cta-btn-text').textContent = 'Read from scratch';
+        cta.querySelector('.digest-cta-btn').href = cards.length > 0 ? cards[cards.length - 1].querySelector('.post-title a')?.href : '#';
+        startFrom.style.display = '';
+        cta.style.display = '';
+      }
+      startFrom.addEventListener('change', function() {
+        if (this.value) {
+          markAllRead(this.value);
+          startFrom.style.display = 'none';
+          updateHomeCta();
         }
-        var swipeUrl = cards[i].dataset.swipeUrl;
-        if (swipeCta && swipeUrl) {
-          var swipeLink = swipeCta.querySelector('.swipe-cta-btn');
-          if (swipeLink) {
-            swipeLink.href = swipeUrl;
-          }
-          var swipePrefetch = document.createElement('link');
-          swipePrefetch.rel = 'prefetch';
-          swipePrefetch.href = swipeUrl;
-          document.head.appendChild(swipePrefetch);
+      });
+    } else {
+      updateHomeCta();
+    }
+  }
+
+  if (articlePage) {
+    var postCta = articlePage.querySelector('.digest-cta-post');
+    if (postCta) {
+      function updatePostCta() {
+        var date = articlePage.dataset.postDate;
+        if (isPostRead(date)) { postCta.style.display = 'none'; return; }
+        var articles = articlePage.querySelectorAll('.digest-article[data-article-id]:not([data-priority="5"])');
+        var firstUnread = null;
+        for (var i = 0; i < articles.length; i++) {
+          if (!isArticleRead(date, articles[i].dataset.articleId)) { firstUnread = articles[i]; break; }
         }
-        break;
+        if (!firstUnread) { postCta.style.display = 'none'; return; }
+        postCta.querySelector('.digest-cta-title').textContent = firstUnread.dataset.oneliner || '';
+        if (window.matchMedia('(min-width: 769px)').matches) {
+          postCta.querySelector('.digest-cta-btn').href = '#' + firstUnread.id;
+          postCta.querySelector('.digest-cta-btn-text').textContent = 'Start reading';
+        }
+        postCta.style.display = '';
+      }
+      var digestContainer = document.querySelector('.digest-articles');
+      if (digestContainer && digestContainer.dataset.ready !== undefined) {
+        updatePostCta();
+      } else if (digestContainer) {
+        new MutationObserver(function(_, obs) {
+          if (digestContainer.dataset.ready !== undefined) { obs.disconnect(); updatePostCta(); }
+        }).observe(digestContainer, { attributes: true, attributeFilter: ['data-ready'] });
       }
     }
-    if (!foundUnread && swipeCta) swipeCta.style.display = 'none';
   }
 
   document.addEventListener('digest-mark-article-read', function(e) {
