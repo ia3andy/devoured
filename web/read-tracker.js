@@ -294,8 +294,14 @@ document.addEventListener('DOMContentLoaded', () => {
     if (readCount > 0) label += ' · ' + readCount + ' days digested';
     cta.querySelector('.digest-cta-label').textContent = label;
     var link = card.querySelector('.post-title a');
+    var desc = card.querySelector('.post-content p');
+    var dateEl = cta.querySelector('.digest-cta-date');
     var isDesktop = window.matchMedia('(min-width: 769px)').matches;
-    cta.querySelector('.digest-cta-title').textContent = link ? link.textContent.trim() : '';
+    if (dateEl) {
+      var d = new Date(card.dataset.postDate + 'T00:00:00');
+      dateEl.textContent = d.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
+    }
+    cta.querySelector('.digest-cta-title').textContent = desc ? desc.textContent.trim() : (link ? link.textContent.trim() : '');
     var btn = cta.querySelector('.digest-cta-btn');
     btn.href = isDesktop ? (link ? link.href : card.dataset.swipeUrl) : card.dataset.swipeUrl;
     cta.querySelector('.digest-cta-btn-text').textContent = isDesktop ? 'Read' : 'Swipe mode';
