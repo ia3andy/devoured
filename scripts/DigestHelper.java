@@ -216,6 +216,7 @@ public class DigestHelper implements Runnable {
                                                         var skipData = new JsonObject();
                                                         skipData.addProperty("one-liner", "Skipped (ad/sponsored)");
                                                         skipData.addProperty("skip", true);
+                                                        skipData.addProperty("rating", 1);
                                                         skipData.add("tags", new JsonArray());
                                                         aiMap.put(entry.getKey(), skipData);
                                                     } else {
@@ -360,6 +361,7 @@ public class DigestHelper implements Runnable {
                                         var skipData = new JsonObject();
                                         skipData.addProperty("one-liner", "Skipped (ad/sponsored)");
                                         skipData.addProperty("skip", true);
+                                        skipData.addProperty("rating", 1);
                                         skipData.add("tags", new JsonArray());
                                         aiMap.put(entry.getKey(), skipData);
                                     } else {
@@ -501,10 +503,9 @@ public class DigestHelper implements Runnable {
         @Parameters(index = "0", description = "Data JSON file") String dataFile;
         @Parameters(index = "1", description = "Post date") String date;
         @Parameters(index = "2", description = "Cache directory") String cacheDir;
-        @Parameters(index = "3", description = "Feeds file") String feedsFile;
         public Integer call() throws Exception {
             costContext = date;
-            writeContent(dataFile, date, cacheDir, feedsFile);
+            writeContent(dataFile, date, cacheDir);
             reportCost("write-content");
             return 0;
         }
@@ -514,10 +515,9 @@ public class DigestHelper implements Runnable {
     static class CleanAllCmd implements Callable<Integer> {
         @Parameters(index = "0", description = "Data JSON file") String dataFile;
         @Parameters(index = "1", description = "Cache directory") String cacheDir;
-        @Parameters(index = "2", description = "Feeds file") String feedsFile;
         public Integer call() throws Exception {
             costContext = "all";
-            cleanAll(dataFile, cacheDir, feedsFile);
+            cleanAll(dataFile, cacheDir);
             reportCost("clean-all");
             return 0;
         }
@@ -910,7 +910,7 @@ public class DigestHelper implements Runnable {
 
             // Post-processing
             System.err.println("  Writing article content files...");
-            writeContent(dataFile, targetDate, cacheDir, feedsFile);
+            writeContent(dataFile, targetDate, cacheDir);
 
             System.err.println("  Syncing new tags...");
             syncTags(dataFile, feedsFile);
@@ -1520,16 +1520,22 @@ public class DigestHelper implements Runnable {
             "to build custom solutions integrated into their specific workflows, rather than selling standardized products.\"\n\n" +
             "Field guide per article:\n" +
             "- id: echo back the article id from the input\n" +
-            "- tags: 1-3 lowercase hyphenated tags describing the core technical topic, not the article's tone or domain. " +
-            "Good tags help a developer filter by technology or practice: ai, java, security, frontend, devops, crypto, startup, design, infrastructure, llm, agents, opensource, software-engineering, database, kubernetes, api, cloud, performance, testing, rust, python, web, mobile. " +
-            "Avoid vague/niche tags that only one article would ever use (e.g. philosophy, comics, psychology, nasa, genomics). " +
-            "Use singular forms.\n" +
+            "- tags: 2-4 lowercase hyphenated tags. First 1-2 MUST be primary tags from this fixed list: " +
+            "ai, llm, agents, security, devops, infrastructure, frontend, backend, design, startup, crypto, opensource, cloud, database, mobile, web, performance, data, hardware, enterprise, fintech, research, policy, career. " +
+            "Then 1-2 secondary tags for the specific technology, language, or framework (e.g. rust, kubernetes, react, python, postgresql). " +
+            "Secondary tags should be reusable across articles, not one-off terms.\n" +
             "- one-liner: 1 SHORT sentence (max 25 words) narrative hook with the most surprising or consequential specific detail. This is a headline, not a summary.\n" +
             "- what: 1-2 lines naming specific people, products, numbers, and facts\n" +
             "- why: an editorial insight about what this reveals or where things are heading. Use empty string if self-evident.\n" +
             "- takeaway: a concrete, specific next step a developer could act on today. Use empty string if none (this is the default for most articles).\n" +
             "- deep-summary: single string with markdown list using * prefix, 5-15 items of readable analysis (only for important/technical articles, use empty string for most)\n" +
             "- decoder: single string with markdown list using * prefix, each item: * **Term**: short definition. Only for domain-specific jargon a developer would not know. Use empty string for most articles.\n" +
+            "- rating: integer 1-5. " +
+            "5 = must-know (~2-3/day max): major releases of widely-used tech, landmark AI models, critical security vulnerabilities. " +
+            "4 = worth knowing: engineering deep-dives, notable tool/feature releases, practical case studies, useful open-source projects. " +
+            "3 = interesting context: AI updates from smaller players, industry moves, funding rounds, opinion pieces. " +
+            "2 = background: minor product updates, career/management advice, design opinion, non-technical business news. " +
+            "1 = not relevant: crypto trading/DeFi, consumer hardware rumors, entertainment, non-tech content.\n" +
             "- source: clean publisher name derived from the article URL (e.g., \"Bloomberg\", \"TechCrunch\", \"Ars Technica\", \"GitHub\"). Capitalize properly. For personal blogs use the author name if known, otherwise the domain.\n" +
             "- skip: true for ads/sponsored/job postings, false otherwise\n" +
             "No filler, no generic phrases, no corporate speak, no \"this highlights the importance of\" style padding.";
@@ -1544,9 +1550,10 @@ public class DigestHelper implements Runnable {
             "takeaway":{"type":"string"},\
             "deep-summary":{"type":"string"},\
             "decoder":{"type":"string"},\
+            "rating":{"type":"integer"},\
             "source":{"type":"string"},\
             "skip":{"type":"boolean"}\
-            },"required":["id","tags","one-liner","what","why","takeaway","deep-summary","decoder","source","skip"],\
+            },"required":["id","tags","one-liner","what","why","takeaway","deep-summary","decoder","rating","source","skip"],\
             "additionalProperties":false}""";
 
     static final String SUMMARIZE_JSON_SCHEMA = """
@@ -1723,6 +1730,10 @@ public class DigestHelper implements Runnable {
         String decoder = ai != null ? markdownList(sanitizeMarkdown(jsonStr(ai, "decoder"))) : "";
         if (!decoder.isEmpty()) article.addProperty("decoder", decoder);
 
+        if (ai != null && ai.has("rating")) {
+            article.addProperty("rating", Math.max(1, Math.min(5, ai.get("rating").getAsInt())));
+        }
+
         return article;
     }
 
@@ -1749,6 +1760,9 @@ public class DigestHelper implements Runnable {
         if (!deepSummary.isEmpty()) article.addProperty("deep-summary", deepSummary);
         String decoder = markdownList(sanitizeMarkdown(jsonStr(ai, "decoder")));
         if (!decoder.isEmpty()) article.addProperty("decoder", decoder);
+        if (ai.has("rating")) {
+            article.addProperty("rating", Math.max(1, Math.min(5, ai.get("rating").getAsInt())));
+        }
     }
 
     static void summarize(String enrichedFile, String feedName) throws Exception {
@@ -1893,42 +1907,23 @@ public class DigestHelper implements Runnable {
         return "Daily developer news digest";
     }
 
-    static Map<String, Integer> parseTagPriorities(String feedsFile) throws IOException {
-        var priorities = new LinkedHashMap<String, Integer>();
-        boolean inTagPriorities = false;
+    static Set<String> parseKnownTags(String feedsFile) throws IOException {
+        var tags = new LinkedHashSet<String>();
+        boolean inSection = false;
         for (String line : Files.readAllLines(Path.of(feedsFile))) {
-            if (line.matches("tag-priorities:.*")) { inTagPriorities = true; continue; }
-            if (inTagPriorities) {
+            if (line.matches("known-tags:.*")) { inSection = true; continue; }
+            if (inSection) {
                 if (!line.startsWith("  ")) break;
-                var m = Pattern.compile("\\s+(\\S+):\\s*(\\d+)").matcher(line);
-                if (m.matches()) priorities.put(m.group(1), Integer.parseInt(m.group(2)));
+                var m = Pattern.compile("\\s+-\\s+(\\S+)").matcher(line);
+                if (m.matches()) tags.add(m.group(1));
             }
         }
-        return priorities;
+        return tags;
     }
 
-    static int parseUnsortedPriority(String feedsFile) throws IOException {
-        for (String line : Files.readAllLines(Path.of(feedsFile))) {
-            var m = Pattern.compile("unsorted-priority:\\s*(\\d+)").matcher(line);
-            if (m.matches()) return Integer.parseInt(m.group(1));
-        }
-        return 4;
-    }
+    record ArticleInfo(String id, String link, List<String> tags, int rating) {}
 
-    static int computePriority(List<String> tags, Map<String, Integer> tagPriorities, int unsortedPriority) {
-        if (tags.isEmpty()) return unsortedPriority;
-        int primary = tagPriorities.getOrDefault(tags.get(0).toLowerCase(), 0);
-        if (primary != 0) return primary;
-        for (int i = 1; i < tags.size(); i++) {
-            int p = tagPriorities.getOrDefault(tags.get(i).toLowerCase(), 0);
-            if (p != 0) return p;
-        }
-        return unsortedPriority;
-    }
-
-    record ArticleInfo(String id, String link, List<String> tags, int priority) {}
-
-    static List<ArticleInfo> parseArticles(JsonObject post, Map<String, Integer> tagPriorities, int unsortedPriority) {
+    static List<ArticleInfo> parseArticles(JsonObject post) {
         var articles = new ArrayList<ArticleInfo>();
         var sections = post.getAsJsonArray("sections");
         if (sections == null) return articles;
@@ -1939,11 +1934,12 @@ public class DigestHelper implements Runnable {
                 var obj = a.getAsJsonObject();
                 String id = jsonStr(obj, "id");
                 String link = jsonStr(obj, "link");
+                int rating = obj.has("rating") ? obj.get("rating").getAsInt() : 3;
                 var tags = new ArrayList<String>();
                 if (obj.has("tags") && obj.get("tags").isJsonArray()) {
                     for (var t : obj.getAsJsonArray("tags")) tags.add(t.getAsString());
                 }
-                articles.add(new ArticleInfo(id, link.isEmpty() ? null : link, tags, computePriority(tags, tagPriorities, unsortedPriority)));
+                articles.add(new ArticleInfo(id, link.isEmpty() ? null : link, tags, rating));
             }
         }
         return articles;
@@ -1979,20 +1975,18 @@ public class DigestHelper implements Runnable {
         return tags;
     }
 
-    static void writeContent(String dataFile, String date, String cacheDir, String feedsFile) throws Exception {
+    static void writeContent(String dataFile, String date, String cacheDir) throws Exception {
         var store = new PostStore(dataFile);
         store.load();
         var post = store.findByDate(date);
         if (post == null) { System.err.println("  No post found for " + date); return; }
 
-        var tagPriorities = parseTagPriorities(feedsFile);
-        int unsortedPriority = parseUnsortedPriority(feedsFile);
-        var articles = parseArticles(post, tagPriorities, unsortedPriority);
+        var articles = parseArticles(post);
         Path contentDir = Path.of("templates/full-content/" + date);
         Files.createDirectories(contentDir);
 
         var eligible = articles.stream()
-                .filter(a -> a.priority() <= 3 && a.link() != null)
+                .filter(a -> a.rating() >= 3 && a.link() != null)
                 .toList();
 
         record CleanJob(ArticleInfo article, Path cachePath, JsonObject data, String html) {}
@@ -2055,10 +2049,10 @@ public class DigestHelper implements Runnable {
         store.save();
         System.err.println("  Wrote " + written + " HTML files to " + contentDir);
         int skipped = articles.size() - eligible.size();
-        System.err.println("  Skipped " + skipped + " articles (priority >= 4)");
+        System.err.println("  Skipped " + skipped + " articles (rating < 3)");
     }
 
-    static void cleanAll(String dataFile, String cacheDir, String feedsFile) throws Exception {
+    static void cleanAll(String dataFile, String cacheDir) throws Exception {
         var store = new PostStore(dataFile);
         store.load();
         var posts = store.all();
@@ -2067,7 +2061,7 @@ public class DigestHelper implements Runnable {
         for (var post : posts) {
             String date = jsonStr(post, "date");
             System.err.println("\n=== " + date + " ===");
-            writeContent(dataFile, date, cacheDir, feedsFile);
+            writeContent(dataFile, date, cacheDir);
         }
         System.err.println("\nDone processing all posts.");
     }
@@ -2119,16 +2113,16 @@ public class DigestHelper implements Runnable {
         System.err.println("  Refreshed " + refreshed + " / " + urls.size() + " cache entries with contentHtml");
     }
 
-    static String canonicalizeTag(String tag, Map<String, Integer> existing) {
-        if (existing.containsKey(tag)) return tag;
+    static String canonicalizeTag(String tag, Set<String> existing) {
+        if (existing.contains(tag)) return tag;
         String stripped = tag.replace("-", "");
-        for (String known : existing.keySet()) {
+        for (String known : existing) {
             if (known.replace("-", "").equals(stripped)) return known;
         }
         String singularized = tag.endsWith("s") ? tag.substring(0, tag.length() - 1) : tag + "s";
-        if (existing.containsKey(singularized)) return singularized;
+        if (existing.contains(singularized)) return singularized;
         String singularizedStripped = singularized.replace("-", "");
-        for (String known : existing.keySet()) {
+        for (String known : existing) {
             if (known.replace("-", "").equals(singularizedStripped)) return known;
         }
         return tag;
@@ -2137,7 +2131,7 @@ public class DigestHelper implements Runnable {
     static void syncTags(String dataFile, String feedsFile) throws IOException {
         var store = new PostStore(dataFile);
         store.load();
-        var existing = parseTagPriorities(feedsFile);
+        var existing = parseKnownTags(feedsFile);
         var tagCounts = new TreeMap<String, Integer>();
         var renames = new LinkedHashMap<String, String>();
 
@@ -2183,7 +2177,7 @@ public class DigestHelper implements Runnable {
         var newTags = new ArrayList<String>();
         var skippedTags = new ArrayList<String>();
         for (var e : tagCounts.entrySet()) {
-            if (existing.containsKey(e.getKey())) continue;
+            if (existing.contains(e.getKey())) continue;
             if (e.getValue() >= 2) {
                 newTags.add(e.getKey());
             } else {
@@ -2194,28 +2188,64 @@ public class DigestHelper implements Runnable {
             System.err.println("  Skipped " + skippedTags.size() + " rare tag(s) (< 2 articles): " + String.join(", ", skippedTags));
         }
 
-        if (newTags.isEmpty()) {
-            System.err.println("  No new tags found.");
-            return;
-        }
-
-        var feedLines = new ArrayList<>(Files.readAllLines(Path.of(feedsFile)));
-        int insertAt = feedLines.size();
-        for (int i = feedLines.size() - 1; i >= 0; i--) {
-            String line = feedLines.get(i);
-            if (line.matches("\\s+\\S+:\\s*\\d+")) {
-                insertAt = i + 1;
-                break;
+        if (!newTags.isEmpty()) {
+            var feedLines = new ArrayList<>(Files.readAllLines(Path.of(feedsFile)));
+            int insertAt = feedLines.size();
+            for (int i = feedLines.size() - 1; i >= 0; i--) {
+                String line = feedLines.get(i);
+                if (line.matches("\\s+-\\s+\\S+")) {
+                    insertAt = i + 1;
+                    break;
+                }
             }
+
+            for (String tag : newTags) {
+                feedLines.add(insertAt, "  - " + tag);
+                insertAt++;
+            }
+
+            Files.writeString(Path.of(feedsFile), String.join("\n", feedLines) + "\n");
+            System.err.println("  Added " + newTags.size() + " new tag(s): " + String.join(", ", newTags));
+        } else {
+            System.err.println("  No new tags found.");
         }
 
-        for (String tag : newTags) {
-            feedLines.add(insertAt, "  " + tag + ": 0");
-            insertAt++;
+        pruneRareTags(feedsFile, tagCounts);
+    }
+
+    static void pruneRareTags(String feedsFile, Map<String, Integer> tagCounts) throws IOException {
+        var feedLines = new ArrayList<>(Files.readAllLines(Path.of(feedsFile)));
+        var pruned = new ArrayList<String>();
+        boolean inKnownTags = false;
+        var kept = new ArrayList<String>();
+
+        for (var line : feedLines) {
+            if (line.trim().equals("known-tags:")) {
+                inKnownTags = true;
+                kept.add(line);
+                continue;
+            }
+            if (inKnownTags) {
+                var m = java.util.regex.Pattern.compile("^  - (\\S+)").matcher(line);
+                if (m.matches()) {
+                    String tag = m.group(1);
+                    int count = tagCounts.getOrDefault(tag, 0);
+                    if (count < 2) {
+                        pruned.add(tag);
+                        continue;
+                    }
+                }
+                if (!line.startsWith("  ") && !line.isEmpty()) {
+                    inKnownTags = false;
+                }
+            }
+            kept.add(line);
         }
 
-        Files.writeString(Path.of(feedsFile), String.join("\n", feedLines) + "\n");
-        System.err.println("  Added " + newTags.size() + " new tag(s): " + String.join(", ", newTags));
+        if (!pruned.isEmpty()) {
+            Files.writeString(Path.of(feedsFile), String.join("\n", kept) + "\n");
+            System.err.println("  Pruned " + pruned.size() + " rare tag(s) (< 2 articles): " + String.join(", ", pruned));
+        }
     }
 
     // --- Resummarize: re-run AI on existing posts ---

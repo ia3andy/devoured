@@ -1,301 +1,139 @@
 ---
 title: Settings
-description: Customize your digest tag priorities
+description: Customize your digest relevance and tag filters
 layout: main
 ---
 
-<script>
-window.DEFAULT_TAG_PRIORITIES={cdi:feeds.get('tag-priorities').raw};
-window.UNSORTED_PRIORITY={cdi:feeds.get('unsorted-priority').raw};
-</script>
-
 <article class="article-page">
   <section class="page-content">
-    <section class="wrap-content">
-      <h1>Tag Priorities</h1>
-      <p class="text-sm text-gray-500 dark:text-gray-400 mb-4 text-center">
-        Drag tags between buckets to change priority. Drag within a bucket to reorder.
-      </p>
-      <div id="unsorted-priority-setting" class="mb-6"></div>
-      <div id="priority-settings" class="priority-settings"></div>
+    <section class="wrap-content settings-page">
+
+      <h1>Settings</h1>
+
+      <div class="settings-section">
+        <h2 class="settings-section-title">Relevance Threshold</h2>
+        <p class="settings-section-desc">Articles rated below this threshold are collapsed into "Other News" quick links.</p>
+        <div class="settings-stars" id="settings-stars"></div>
+        <p class="settings-star-desc" id="settings-star-desc"></p>
+      </div>
+
+      <div class="settings-section">
+        <h2 class="settings-section-title">Hidden Tags</h2>
+        <p class="settings-section-desc">Articles with a hidden tag are removed from the digest entirely. Click a tag to toggle.</p>
+        <div class="settings-tag-grid" id="settings-tags"></div>
+      </div>
+
+      <div class="settings-actions">
+        <button class="settings-reset-btn" id="settings-reset">Reset to defaults</button>
+      </div>
+
     </section>
   </section>
 </article>
 
 <script>
 (function() {
+  var KNOWN_TAGS = {cdi:feeds.get('primary-tags').raw};
   var LEVELS = [
-    { value: 1, label: 'Top', icon: '🔥', hint: 'Expanded with full summary' },
-    { value: 2, label: 'High', icon: '⬆', hint: 'Collapsed, click to expand' },
-    { value: 3, label: 'Normal', icon: '━', hint: 'One-line link in "Other news"' },
-    { value: 4, label: 'Compact', icon: '⬇', hint: 'One-line link in "Other news"' },
-    { value: 5, label: 'Hidden', icon: '🚫' },
-    { value: 0, label: 'Unsorted', icon: '📥', hint: 'New tags, rendered per setting above' }
+    { value: 5, label: 'Only the best', approx: '~5 articles/day' },
+    { value: 4, label: 'Recommended', approx: '~15 articles/day' },
+    { value: 3, label: 'More coverage', approx: '~30 articles/day' },
+    { value: 2, label: 'Most articles', approx: '~45 articles/day' },
+    { value: 1, label: 'Everything', approx: 'all articles' }
   ];
+  var DEFAULT_THRESHOLD = 4;
 
-  var defaults = window.DEFAULT_TAG_PRIORITIES || {};
-  var overrides = JSON.parse(localStorage.getItem('digest-tag-priorities') || '{}');
-  var savedOrder = JSON.parse(localStorage.getItem('digest-tag-order') || '[]');
-  var current = Object.assign({}, defaults, overrides);
-  var unsortedPri = window.UNSORTED_PRIORITY || 4;
+  var threshold = parseInt(localStorage.getItem('digest-rating-threshold') || String(DEFAULT_THRESHOLD));
+  var hiddenTags = JSON.parse(localStorage.getItem('digest-hidden-tags') || '[]');
 
-  var root = document.getElementById('priority-settings');
-  if (!root) return;
+  var starsEl = document.getElementById('settings-stars');
+  var descEl = document.getElementById('settings-star-desc');
+  var tagsEl = document.getElementById('settings-tags');
 
-  // --- Unsorted priority selector ---
-
-  var unsortedRoot = document.getElementById('unsorted-priority-setting');
-  if (unsortedRoot) {
-    var row = document.createElement('div');
-    row.className = 'priority-tag-row';
-
-    var label = document.createElement('span');
-    label.className = 'text-sm text-gray-600 dark:text-gray-400';
-    label.textContent = 'Unsorted tags render as:';
-    row.appendChild(label);
-
-    var levels = document.createElement('div');
-    levels.className = 'priority-levels';
-
-    var storedUnsorted = localStorage.getItem('digest-unsorted-priority');
-    var activeUnsorted = storedUnsorted !== null ? parseInt(storedUnsorted) : unsortedPri;
-
-    var renderLevels = LEVELS.filter(function(l) { return l.value >= 1 && l.value <= 5; });
-    for (var li = 0; li < renderLevels.length; li++) {
-      var level = renderLevels[li];
+  function renderStars() {
+    starsEl.textContent = '';
+    for (var i = 0; i < LEVELS.length; i++) {
+      var lev = LEVELS[i];
       var btn = document.createElement('button');
-      btn.className = 'priority-level-btn';
-      btn.textContent = level.label;
-      btn.dataset.level = level.value;
-      if (level.value === activeUnsorted) btn.classList.add('is-active');
-      btn.addEventListener('click', (function(lv) {
+      btn.className = 'settings-star-btn';
+      if (lev.value === threshold) btn.classList.add('is-active');
+      btn.dataset.value = lev.value;
+
+      var stars = '';
+      for (var s = 0; s < lev.value; s++) stars += '★';
+      for (var s = lev.value; s < 5; s++) stars += '☆';
+
+      var starsSpan = document.createElement('span');
+      starsSpan.className = 'settings-star-icons';
+      starsSpan.textContent = stars;
+      btn.appendChild(starsSpan);
+
+      var label = document.createElement('span');
+      label.className = 'settings-star-label';
+      label.textContent = lev.label;
+      btn.appendChild(label);
+
+      btn.addEventListener('click', (function(val) {
         return function() {
-          for (var b of levels.querySelectorAll('.priority-level-btn')) b.classList.remove('is-active');
-          this.classList.add('is-active');
-          localStorage.setItem('digest-unsorted-priority', lv);
+          threshold = val;
+          localStorage.setItem('digest-rating-threshold', String(val));
+          renderStars();
         };
-      })(level.value));
-      levels.appendChild(btn);
+      })(lev.value));
+
+      starsEl.appendChild(btn);
     }
-
-    row.appendChild(levels);
-    unsortedRoot.appendChild(row);
+    updateDesc();
   }
 
-  // --- Buckets ---
-
-  var allTags = Object.keys(defaults).filter(function(t) { return t !== 'unsorted-priority'; });
-  var orderedTags = savedOrder.filter(function(t) { return allTags.indexOf(t) !== -1; });
-  for (var i = 0; i < allTags.length; i++) {
-    if (orderedTags.indexOf(allTags[i]) === -1) orderedTags.push(allTags[i]);
-  }
-
-  var buckets = {};
-
-  for (var idx = 0; idx < LEVELS.length; idx++) {
-    var lev = LEVELS[idx];
-    var bucket = document.createElement('div');
-    bucket.className = 'priority-bucket';
-    bucket.dataset.level = lev.value;
-
-    var header = document.createElement('div');
-    header.className = 'priority-bucket-header';
-    var headerLabel = document.createElement('span');
-    headerLabel.textContent = lev.icon + ' ' + lev.label;
-    header.appendChild(headerLabel);
-    if (lev.hint) {
-      var hintEl = document.createElement('span');
-      hintEl.className = 'priority-bucket-hint';
-      hintEl.textContent = lev.hint;
-      header.appendChild(hintEl);
-    }
-    bucket.appendChild(header);
-
-    var dropzone = document.createElement('div');
-    dropzone.className = 'priority-bucket-tags';
-    dropzone.dataset.level = lev.value;
-    bucket.appendChild(dropzone);
-
-    root.appendChild(bucket);
-    buckets[lev.value] = dropzone;
-  }
-
-  function createGripSvg() {
-    var ns = 'http://www.w3.org/2000/svg';
-    var svg = document.createElementNS(ns, 'svg');
-    svg.setAttribute('width', '14');
-    svg.setAttribute('height', '14');
-    svg.setAttribute('viewBox', '0 0 24 24');
-    svg.setAttribute('fill', 'none');
-    svg.setAttribute('stroke', 'currentColor');
-    svg.setAttribute('stroke-width', '2');
-    svg.setAttribute('stroke-linecap', 'round');
-    svg.setAttribute('stroke-linejoin', 'round');
-    var coords = [[9,5],[15,5],[9,12],[15,12],[9,19],[15,19]];
-    for (var ci = 0; ci < coords.length; ci++) {
-      var c = document.createElementNS(ns, 'circle');
-      c.setAttribute('cx', coords[ci][0]);
-      c.setAttribute('cy', coords[ci][1]);
-      c.setAttribute('r', '1');
-      svg.appendChild(c);
-    }
-    return svg;
-  }
-
-  function createTagChip(tag) {
-    var chip = document.createElement('div');
-    chip.className = 'priority-tag-chip';
-    chip.dataset.tag = tag;
-    chip.setAttribute('touch-action', 'none');
-
-    var grip = document.createElement('span');
-    grip.className = 'priority-tag-grip';
-    grip.appendChild(createGripSvg());
-    chip.appendChild(grip);
-
-    var lbl = document.createElement('span');
-    lbl.className = 'priority-tag-label';
-    lbl.textContent = tag;
-    chip.appendChild(lbl);
-
-    return chip;
-  }
-
-  for (var ti = 0; ti < orderedTags.length; ti++) {
-    var tag = orderedTags[ti];
-    var priority = current[tag] !== undefined ? current[tag] : unsortedPri;
-    if (buckets[priority]) buckets[priority].appendChild(createTagChip(tag));
-  }
-
-  // --- Drag and drop (pointer events for mouse + touch) ---
-
-  var dragEl = null, ghost = null, placeholder = null;
-  var startX = 0, startY = 0, offsetX = 0, offsetY = 0;
-  var isDragging = false;
-
-  function findInsertBefore(zone, y) {
-    var chips = zone.querySelectorAll('.priority-tag-chip');
-    for (var i = 0; i < chips.length; i++) {
-      if (chips[i] === dragEl || chips[i] === ghost) continue;
-      var rect = chips[i].getBoundingClientRect();
-      if (y < rect.top + rect.height / 2) return chips[i];
-    }
-    return null;
-  }
-
-  function getDropTarget(x, y) {
-    var els = document.elementsFromPoint(x, y);
-    for (var i = 0; i < els.length; i++) {
-      if (els[i].classList.contains('priority-bucket-tags')) return { zone: els[i], before: findInsertBefore(els[i], y) };
-      var chip = els[i].closest('.priority-tag-chip');
-      if (chip && chip !== dragEl && chip !== ghost) {
-        var zone = chip.closest('.priority-bucket-tags');
-        var rect = chip.getBoundingClientRect();
-        return { zone: zone, before: y < rect.top + rect.height / 2 ? chip : chip.nextElementSibling };
+  function updateDesc() {
+    for (var i = 0; i < LEVELS.length; i++) {
+      if (LEVELS[i].value === threshold) {
+        descEl.textContent = LEVELS[i].approx;
+        return;
       }
     }
-    return null;
   }
 
-  root.addEventListener('pointerdown', function(e) {
-    var chip = e.target.closest('.priority-tag-chip');
-    if (!chip || !root.contains(chip)) return;
-    e.preventDefault();
-    chip.setPointerCapture(e.pointerId);
-    dragEl = chip;
-    var rect = chip.getBoundingClientRect();
-    startX = e.clientX; startY = e.clientY;
-    offsetX = rect.width / 2; offsetY = rect.height / 2;
-    isDragging = false;
-  });
-
-  document.addEventListener('pointermove', function(e) {
-    if (!dragEl) return;
-    e.preventDefault();
-    if (!isDragging && Math.abs(e.clientX - startX) + Math.abs(e.clientY - startY) < 8) return;
-
-    if (!isDragging) {
-      isDragging = true;
-      ghost = dragEl.cloneNode(true);
-      ghost.className = 'priority-tag-chip priority-tag-ghost';
-      ghost.style.width = dragEl.getBoundingClientRect().width + 'px';
-      document.body.appendChild(ghost);
-      placeholder = document.createElement('div');
-      placeholder.className = 'priority-tag-placeholder';
-      placeholder.style.height = dragEl.getBoundingClientRect().height + 'px';
-      dragEl.parentNode.insertBefore(placeholder, dragEl);
-      dragEl.style.display = 'none';
-    }
-
-    ghost.style.left = (e.clientX - offsetX) + 'px';
-    ghost.style.top = (e.clientY - offsetY) + 'px';
-
-    dragEl.releasePointerCapture(e.pointerId);
-    var target = getDropTarget(e.clientX, e.clientY);
-    dragEl.setPointerCapture(e.pointerId);
-
-    for (var k in buckets) buckets[k].classList.remove('priority-bucket-hover');
-    if (target) {
-      target.zone.classList.add('priority-bucket-hover');
-      if (placeholder.parentNode !== target.zone || placeholder.nextElementSibling !== target.before) {
-        target.zone.insertBefore(placeholder, target.before);
-      }
-    }
-  });
-
-  function endDrag(e) {
-    if (!dragEl) return;
-    if (isDragging) {
-      dragEl.releasePointerCapture(e.pointerId);
-      if (placeholder && placeholder.parentNode) placeholder.parentNode.insertBefore(dragEl, placeholder);
-      dragEl.style.display = '';
-      if (ghost) ghost.remove();
-      if (placeholder) placeholder.remove();
-      for (var k in buckets) buckets[k].classList.remove('priority-bucket-hover');
-      saveState();
-    }
-    ghost = null; placeholder = null; dragEl = null; isDragging = false;
-  }
-
-  document.addEventListener('pointerup', endDrag);
-  document.addEventListener('pointercancel', endDrag);
-
-  function saveState() {
-    var newOverrides = {};
-    var order = [];
-    for (var li = 0; li < LEVELS.length; li++) {
-      var zone = buckets[LEVELS[li].value];
-      var chips = zone.querySelectorAll('.priority-tag-chip');
-      for (var ci = 0; ci < chips.length; ci++) {
-        var t = chips[ci].dataset.tag;
-        order.push(t);
-        if (LEVELS[li].value !== (defaults[t] !== undefined ? defaults[t] : 0)) {
-          newOverrides[t] = LEVELS[li].value;
+  function renderTags() {
+    tagsEl.textContent = '';
+    var sorted = KNOWN_TAGS.slice().sort();
+    for (var i = 0; i < sorted.length; i++) {
+      var tag = sorted[i];
+      var chip = document.createElement('button');
+      chip.className = 'settings-tag-chip';
+      if (hiddenTags.indexOf(tag) !== -1) chip.classList.add('is-hidden');
+      chip.textContent = tag;
+      chip.dataset.tag = tag;
+      chip.addEventListener('click', function() {
+        var t = this.dataset.tag;
+        var idx = hiddenTags.indexOf(t);
+        if (idx === -1) {
+          hiddenTags.push(t);
+          this.classList.add('is-hidden');
+        } else {
+          hiddenTags.splice(idx, 1);
+          this.classList.remove('is-hidden');
         }
-      }
+        localStorage.setItem('digest-hidden-tags', JSON.stringify(hiddenTags));
+      });
+      tagsEl.appendChild(chip);
     }
-    localStorage.setItem('digest-tag-priorities', JSON.stringify(newOverrides));
-    localStorage.setItem('digest-tag-order', JSON.stringify(order));
   }
 
-  var resetBtn = document.createElement('button');
-  resetBtn.className = 'priority-reset-btn';
-  resetBtn.textContent = 'Reset to defaults';
-  resetBtn.addEventListener('click', function() {
+  document.getElementById('settings-reset').addEventListener('click', function() {
+    localStorage.removeItem('digest-rating-threshold');
+    localStorage.removeItem('digest-hidden-tags');
     localStorage.removeItem('digest-tag-priorities');
     localStorage.removeItem('digest-tag-order');
     localStorage.removeItem('digest-unsorted-priority');
-    for (var k in buckets) buckets[k].replaceChildren();
-    var defaultOrder = Object.keys(defaults).filter(function(t) { return t !== 'unsorted-priority'; });
-    for (var di = 0; di < defaultOrder.length; di++) {
-      var p = defaults[defaultOrder[di]] !== undefined ? defaults[defaultOrder[di]] : 0;
-      if (buckets[p]) buckets[p].appendChild(createTagChip(defaultOrder[di]));
-    }
-    var uBtns = unsortedRoot.querySelectorAll('.priority-level-btn');
-    for (var bi = 0; bi < uBtns.length; bi++) {
-      uBtns[bi].classList.toggle('is-active', parseInt(uBtns[bi].dataset.level) === unsortedPri);
-    }
+    threshold = DEFAULT_THRESHOLD;
+    hiddenTags = [];
+    renderStars();
+    renderTags();
   });
-  root.appendChild(resetBtn);
+
+  renderStars();
+  renderTags();
 })();
 </script>

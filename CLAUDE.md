@@ -77,10 +77,10 @@ Commands:
 - `tldr-articles <url>` - scrape TLDR newsletter, output XML to stdout
 - `enrich <input.json> <output.json> <cacheDir>` - fetch article content, cache locally
 - `summarize <enriched.json> <feedName>` - AI summaries, output section JSON to stdout
-- `write-content <dataFile> <date> <cacheDir> <feeds.yml>` - write post content from data
+- `write-content <dataFile> <date> <cacheDir>` - write post content from data
 - `resummarize <dataFile> <date> <cacheDir>` - re-summarize a post (supports stop/resume)
 - `resummarize-all <dataFile> <cacheDir>` - re-summarize all posts
-- `clean-all <dataFile> <cacheDir> <feeds.yml>` - clean all posts
+- `clean-all <dataFile> <cacheDir>` - clean all posts
 - `refresh-html <dataFile> <date> <cacheDir>` - refresh cached HTML
 - `sync-tags <dataFile> <feeds.yml>` - synchronize tags
 - `sync-swipe <dataFile> <outputFile>` - sync swipe data
