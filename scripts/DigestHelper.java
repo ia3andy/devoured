@@ -400,7 +400,7 @@ public class DigestHelper implements Runnable {
                     "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
                     env("GEMINI_API_KEY"),
                     Map.of("summarize", "gemini-2.5-flash", "description", "gemini-2.5-flash-lite", "clean-html", "gemini-2.5-flash-lite"),
-                    20, 5);
+                    10, 5);
             case "github" -> new OpenAIProvider("github",
                     "https://models.github.ai/inference/chat/completions",
                     env("GITHUB_TOKEN"),
@@ -1519,7 +1519,7 @@ public class DigestHelper implements Runnable {
             var usr = new JsonObject(); usr.addProperty("role", "user"); usr.addProperty("content", userMessage);
             messages.add(sys); messages.add(usr);
             payload.add("messages", messages);
-            payload.addProperty("max_tokens", 8192);
+            payload.addProperty("max_tokens", 32768);
 
             if (jsonSchema != null) {
                 var rf = new JsonObject();
