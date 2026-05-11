@@ -1483,8 +1483,11 @@ public class DigestHelper implements Runnable {
             "to build custom solutions integrated into their specific workflows, rather than selling standardized products.\"\n\n" +
             "Field guide per article:\n" +
             "- id: echo back the article id from the input\n" +
-            "- tags: 1-4 lowercase single-word or hyphenated (ai, java, security, frontend, devops, crypto, startup, design, infrastructure, llm, agents, opensource, software-engineering, etc.). Use singular forms.\n" +
-            "- one-liner: 1 sentence narrative hook with the most surprising or consequential specific detail\n" +
+            "- tags: 1-3 lowercase hyphenated tags describing the core technical topic, not the article's tone or domain. " +
+            "Good tags help a developer filter by technology or practice: ai, java, security, frontend, devops, crypto, startup, design, infrastructure, llm, agents, opensource, software-engineering, database, kubernetes, api, cloud, performance, testing, rust, python, web, mobile. " +
+            "Avoid vague/niche tags that only one article would ever use (e.g. philosophy, comics, psychology, nasa, genomics). " +
+            "Use singular forms.\n" +
+            "- one-liner: 1 SHORT sentence (max 25 words) narrative hook with the most surprising or consequential specific detail. This is a headline, not a summary.\n" +
             "- what: 1-2 lines naming specific people, products, numbers, and facts\n" +
             "- why: an editorial insight about what this reveals or where things are heading. Use empty string if self-evident.\n" +
             "- takeaway: a concrete, specific next step a developer could act on today. Use empty string if none (this is the default for most articles).\n" +
@@ -2065,16 +2068,15 @@ public class DigestHelper implements Runnable {
         var store = new PostStore(dataFile);
         store.load();
         var existing = parseTagPriorities(feedsFile);
-        var allTags = new TreeSet<String>();
+        var tagCounts = new TreeMap<String, Integer>();
         var renames = new LinkedHashMap<String, String>();
-        boolean modified = false;
 
         for (var post : store.all()) {
             for (String rawTag : collectArticleTags(post)) {
                 String tag = rawTag.toLowerCase().replaceAll("[^a-z0-9-]", "");
                 if (!tag.isEmpty() && !tag.equals("default")) {
                     String canonical = canonicalizeTag(tag, existing);
-                    allTags.add(canonical);
+                    tagCounts.merge(canonical, 1, Integer::sum);
                     if (!canonical.equals(tag)) renames.put(tag, canonical);
                 }
             }
@@ -2082,6 +2084,7 @@ public class DigestHelper implements Runnable {
 
         if (!renames.isEmpty()) {
             System.err.println("  Normalizing tag variants: " + renames);
+            boolean modified = false;
             for (var post : store.all()) {
                 var sections = post.getAsJsonArray("sections");
                 if (sections == null) continue;
@@ -2108,8 +2111,17 @@ public class DigestHelper implements Runnable {
         }
 
         var newTags = new ArrayList<String>();
-        for (String tag : allTags) {
-            if (!existing.containsKey(tag)) newTags.add(tag);
+        var skippedTags = new ArrayList<String>();
+        for (var e : tagCounts.entrySet()) {
+            if (existing.containsKey(e.getKey())) continue;
+            if (e.getValue() >= 2) {
+                newTags.add(e.getKey());
+            } else {
+                skippedTags.add(e.getKey());
+            }
+        }
+        if (!skippedTags.isEmpty()) {
+            System.err.println("  Skipped " + skippedTags.size() + " rare tag(s) (< 2 articles): " + String.join(", ", skippedTags));
         }
 
         if (newTags.isEmpty()) {
