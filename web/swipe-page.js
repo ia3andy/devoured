@@ -8,24 +8,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // --- Priority filtering ---
 
-  var defaults = window.DEFAULT_TAG_PRIORITIES || {};
-  var overrides = JSON.parse(localStorage.getItem('digest-tag-priorities') || '{}');
-  var priorities = Object.assign({}, defaults, overrides);
-  var storedUnsorted = localStorage.getItem('digest-unsorted-priority');
-  var unsortedPri = window.UNSORTED_PRIORITY || 4;
-  var defaultPriority = storedUnsorted !== null ? parseInt(storedUnsorted) : unsortedPri;
+  var threshold = parseInt(localStorage.getItem('digest-rating-threshold') || '4');
+  var hiddenTags = JSON.parse(localStorage.getItem('digest-hidden-tags') || '[]');
 
-  function resolvePriority(tags) {
-    for (var i = 0; i < tags.length; i++) {
-      var p = priorities[tags[i]];
-      if (p !== undefined && p !== 0) return p;
-    }
-    return defaultPriority;
+  function resolveDisplayPriority(rating, tags) {
+    if (tags.some(function(t) { return hiddenTags.indexOf(t) !== -1; })) return 5;
+    if (rating >= threshold + 1) return 1;
+    if (rating >= threshold)     return 2;
+    if (rating >= threshold - 1) return 3;
+    if (rating >= threshold - 2) return 4;
+    return 5;
   }
 
   var PLACEHOLDER_SUFFIX = 'article-placeholder.svg';
   var FALLBACK_BG_COUNT = 15;
-  var BULLETS_PER_FRAME = 7;
+  var BULLET_ITEM_HEIGHT = 48;
+  var BULLET_CHROME_HEIGHT = 180;
+  var BULLETS_PER_FRAME = Math.max(3, Math.floor((window.innerHeight - BULLET_CHROME_HEIGHT) / BULLET_ITEM_HEIGHT));
 
   function fallbackBg(id) {
     var hash = 0;
@@ -55,17 +54,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
   var frames = Array.from(track.querySelectorAll('.swipe-frame:not(.swipe-frame-completion)'));
   var completionFrame = track.querySelector('.swipe-frame-completion');
-  var grouped = { high: [], medium: [], other: [], hidden: [] };
+  var grouped = { high: [], other: [], hidden: [] };
 
   for (var i = 0; i < frames.length; i++) {
     var frame = frames[i];
     var tags = (frame.dataset.tags || '').split(',').map(function(t) { return t.trim(); }).filter(Boolean);
-    var priority = resolvePriority(tags);
+    var rating = parseInt(frame.dataset.rating || '3');
+    var priority = resolveDisplayPriority(rating, tags);
     frame.dataset.priority = priority;
 
     if (priority === 5) grouped.hidden.push(frame);
     else if (priority <= 2) grouped.high.push(frame);
-    else if (priority === 3) grouped.medium.push(frame);
     else grouped.other.push(frame);
 
     frame.dataset.layerCount = frame.querySelector('.swipe-layers').children.length;
@@ -92,7 +91,7 @@ document.addEventListener('DOMContentLoaded', () => {
     frame.insertBefore(bg, frame.firstChild);
   }
 
-  var regularFrames = grouped.high.concat(grouped.medium);
+  var regularFrames = grouped.high;
   for (var i = 0; i < regularFrames.length; i++) cloneFrameBg(regularFrames[i]);
 
   // --- Dot indicators ---
@@ -190,7 +189,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // --- Remove all frames, reinsert in priority order ---
 
   for (var i = 0; i < frames.length; i++) frames[i].remove();
-  var visibleFrames = grouped.high.concat(grouped.medium).concat(bulletFrames);
+  var visibleFrames = grouped.high.concat(bulletFrames);
   for (var i = 0; i < visibleFrames.length; i++) track.insertBefore(visibleFrames[i], completionFrame);
   var totalArticles = visibleFrames.length;
 

@@ -39,6 +39,7 @@ import picocli.CommandLine.*;
         DigestHelper.DedupCmd.class,
         DigestHelper.TestFetchCmd.class,
         DigestHelper.SyncSwipeCmd.class,
+        DigestHelper.AddRatingCmd.class,
 }, mixinStandardHelpOptions = true)
 public class DigestHelper implements Runnable {
 
@@ -627,6 +628,21 @@ public class DigestHelper implements Runnable {
         System.out.println(GSON.toJson(data));
     }
 
+    @Command(name = "add-rating", description = "Add AI rating (1-5 stars) to articles missing one")
+    static class AddRatingCmd implements Callable<Integer> {
+        @Parameters(index = "0", description = "Data file path") String dataFile;
+        @Parameters(index = "1", description = "Date (YYYY-MM-DD) or 'all'") String dateArg;
+        @Option(names = "--project-dir", description = "Project directory for .env", defaultValue = ".") String projectDir;
+
+        @Override
+        public Integer call() throws Exception {
+            loadEnv(Path.of(projectDir));
+            addRating(dataFile, dateArg);
+            reportCost("add-rating");
+            return 0;
+        }
+    }
+
     @Command(name = "generate", description = "Generate digest posts (full pipeline)", mixinStandardHelpOptions = true)
     static class GenerateCmd implements Callable<Integer> {
         @Option(names = "--date", description = "Single date (YYYY-MM-DD). Default: backfill from last post to yesterday")
@@ -703,6 +719,27 @@ public class DigestHelper implements Runnable {
                 if (hasMissing) {
                     System.err.println("Backfilling missing summaries for " + d + "...");
                     resummarize(dataFile, d, cacheDir);
+                }
+            }
+
+            // Backfill missing ratings
+            var store3 = new PostStore(dataFile);
+            store3.load();
+            for (var post : store3.all()) {
+                String d = jsonStr(post, "date");
+                boolean hasMissing = false;
+                for (var section : post.getAsJsonArray("sections")) {
+                    for (var article : section.getAsJsonObject().getAsJsonArray("articles")) {
+                        if (!article.getAsJsonObject().has("rating")) {
+                            hasMissing = true;
+                            break;
+                        }
+                    }
+                    if (hasMissing) break;
+                }
+                if (hasMissing) {
+                    System.err.println("Backfilling missing ratings for " + d + "...");
+                    addRating(dataFile, d);
                 }
             }
 
@@ -1515,6 +1552,39 @@ public class DigestHelper implements Runnable {
     static final String SUMMARIZE_JSON_SCHEMA = """
             {"type":"object","properties":{\
             "articles":{"type":"array","items":""" + ARTICLE_SCHEMA + """
+            }},"required":["articles"],"additionalProperties":false}""";
+
+    static final String RATING_SYSTEM_PROMPT =
+            "You rate developer news articles for a daily digest aimed at software developers.\n" +
+            "Rate each article 1-5 stars based on how relevant and valuable it is to a working developer who wants to stay informed.\n" +
+            "What matters is whether a developer learns something or needs to act, not the dollar figure or company prestige.\n\n" +
+            "5 stars: Must-know, reserved for ~2-3 articles per day at most. " +
+            "Major version release of widely-used tech (TypeScript 7, Kubernetes 1.36, Java 26). " +
+            "Landmark AI model from a top lab that changes what's possible (GPT-5.5, not incremental updates). " +
+            "Critical security vulnerability affecting many developers. " +
+            "NOT: engineering blog posts, case studies, new tools, sub-features of a larger release, or business news.\n" +
+            "4 stars: Worth knowing. Engineering deep-dives you'd learn from, notable tool/feature releases, " +
+            "practical case studies, useful open-source projects, developer workflow changes. " +
+            "This is where most good technical content belongs.\n" +
+            "3 stars: Interesting context. AI model updates from smaller players, industry moves, " +
+            "funding rounds, company strategy, investment news, opinion pieces. " +
+            "Most AI and tech business news belongs here regardless of dollar amount.\n" +
+            "2 stars: Background. Minor product updates, career/management advice, design opinion, " +
+            "non-technical business news about tech companies.\n" +
+            "1 star: Not relevant. Crypto trading/DeFi, consumer hardware rumors, entertainment, " +
+            "non-tech content, biology, legal news, social media app updates.\n\n" +
+            "Return the rating for each article by id.";
+
+    static final String RATING_ARTICLE_SCHEMA = """
+            {"type":"object","properties":{\
+            "id":{"type":"string"},\
+            "rating":{"type":"integer"}\
+            },"required":["id","rating"],\
+            "additionalProperties":false}""";
+
+    static final String RATING_JSON_SCHEMA = """
+            {"type":"object","properties":{\
+            "articles":{"type":"array","items":""" + RATING_ARTICLE_SCHEMA + """
             }},"required":["articles"],"additionalProperties":false}""";
 
     static final AtomicLong nextAllowedCall = new AtomicLong(0);
@@ -2385,6 +2455,137 @@ public class DigestHelper implements Runnable {
                 summary += ", " + ai().formatCostSummary().trim();
             }
             log(log, summary);
+        }
+    }
+
+    static void addRating(String dataFile, String dateArg) throws Exception {
+        var store = new PostStore(dataFile);
+        store.load();
+
+        List<JsonObject> posts;
+        if ("all".equals(dateArg)) {
+            posts = store.all();
+        } else {
+            var post = store.findByDate(dateArg);
+            if (post == null) { System.err.println("Post not found: " + dateArg); return; }
+            posts = List.of(post);
+        }
+
+        try (var log = openLog("add-rating")) {
+            log.println("\n=== add-rating " + java.time.LocalDateTime.now().format(
+                    java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")) + " ===");
+
+            var provider = ai();
+            int batchSize = (provider instanceof OpenAIProvider op) ? op.batchSize() : 25;
+            boolean budgetExhausted = false;
+            int totalRated = 0;
+            for (var post : posts) {
+                if (budgetExhausted) break;
+                String date = jsonStr(post, "date");
+                var sections = post.getAsJsonArray("sections");
+                if (sections == null) continue;
+
+                var pending = new ArrayList<JsonObject>();
+                for (var sec : sections) {
+                    for (var art : sec.getAsJsonObject().getAsJsonArray("articles")) {
+                        var obj = art.getAsJsonObject();
+                        if (obj.has("rating")) continue;
+                        if ("Skipped (ad/sponsored)".equals(jsonStr(obj, "one-liner"))) {
+                            obj.addProperty("rating", 1);
+                            totalRated++;
+                            continue;
+                        }
+                        pending.add(obj);
+                    }
+                }
+
+                if (pending.isEmpty()) {
+                    log(log, date + ": all articles already rated, skipping");
+                    continue;
+                }
+                log(log, date + ": " + pending.size() + " articles to rate");
+
+                for (int i = 0; i < pending.size(); i += batchSize) {
+                    var batch = pending.subList(i, Math.min(i + batchSize, pending.size()));
+                    var sb = new StringBuilder();
+                    for (var obj : batch) {
+                        sb.append("---\nid: ").append(jsonStr(obj, "id")).append("\n");
+                        sb.append("title: ").append(jsonStr(obj, "title")).append("\n");
+                        String oneLiner = jsonStr(obj, "one-liner");
+                        if (!oneLiner.isEmpty()) sb.append("one-liner: ").append(oneLiner).append("\n");
+                    }
+
+                    log(log, "  Batch " + (i / batchSize + 1) + ": " + batch.size() + " articles");
+
+                    if (provider instanceof OpenAIProvider op && op.rpdBudget > 0 && op.rpdUsed.get() >= op.rpdBudget) {
+                        log(log, "  Daily budget reached, skipping remaining");
+                        budgetExhausted = true;
+                        break;
+                    }
+
+                    JsonObject result;
+                    try {
+                    if (provider instanceof OpenAIProvider op) {
+                        op.rpdUsed.incrementAndGet();
+                        result = acquireRateSlot(op.rpm)
+                                .chain(() -> callOpenAIAPI(op.endpoint, op.token, op.model("description"),
+                                        RATING_SYSTEM_PROMPT, sb.toString(), RATING_JSON_SCHEMA))
+                                .await().atMost(Duration.ofSeconds(120));
+                    } else {
+                        var proc = new ProcessBuilder("claude", "--model", provider.model("description"),
+                                "--output-format", "json", "--system-prompt", RATING_SYSTEM_PROMPT,
+                                "--json-schema", RATING_JSON_SCHEMA,
+                                "--no-session-persistence", "-p", "Rate these articles:")
+                                .redirectErrorStream(false).start();
+                        proc.getOutputStream().write(sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        proc.getOutputStream().close();
+                        String raw = new String(proc.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).trim();
+                        proc.waitFor(AI_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS);
+                        if (proc.exitValue() != 0 || raw.isEmpty()) { result = null; }
+                        else {
+                            var json = GSON.fromJson(raw, JsonObject.class);
+                            if (json.has("total_cost_usd")) {
+                                totalCostUsd.add(json.get("total_cost_usd").getAsDouble());
+                                totalCalls.incrementAndGet();
+                            }
+                            if (json.has("structured_output") && json.get("structured_output").isJsonObject()) {
+                                result = json.getAsJsonObject("structured_output");
+                            } else {
+                                result = parseLenientJson(json.get("result").getAsString().trim());
+                            }
+                        }
+                    }
+
+                    if (result != null && result.has("articles")) {
+                        var ratings = result.getAsJsonArray("articles");
+                        var ratingMap = new java.util.HashMap<String, Integer>();
+                        for (var r : ratings) {
+                            var ro = r.getAsJsonObject();
+                            ratingMap.put(jsonStr(ro, "id"), ro.get("rating").getAsInt());
+                        }
+                        for (var obj : batch) {
+                            String id = jsonStr(obj, "id");
+                            if (ratingMap.containsKey(id)) {
+                                int rating = Math.max(1, Math.min(5, ratingMap.get(id)));
+                                obj.addProperty("rating", rating);
+                                totalRated++;
+                            } else {
+                                log(log, "    WARNING: no rating returned for " + id);
+                            }
+                        }
+                    } else {
+                        log(log, "    ERROR: no result from AI for batch");
+                    }
+                    } catch (Exception e) {
+                        log(log, "    ERROR: " + e.getMessage());
+                    }
+                }
+
+                store.save();
+                log(log, date + ": done");
+            }
+
+            log(log, "Total rated: " + totalRated + " articles, " + ai().formatCostSummary().trim());
         }
     }
 

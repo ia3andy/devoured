@@ -3,22 +3,28 @@ document.addEventListener('DOMContentLoaded', () => {
   const container = document.querySelector('.digest-articles');
   if (!container) return;
 
-  const defaults = window.DEFAULT_TAG_PRIORITIES || {};
-  const overrides = JSON.parse(localStorage.getItem('digest-tag-priorities') || '{}');
-  const priorities = { ...defaults, ...overrides };
-  const storedUnsorted = localStorage.getItem('digest-unsorted-priority');
-  const unsortedPri = window.UNSORTED_PRIORITY || 4;
-  const defaultPriority = storedUnsorted !== null ? parseInt(storedUnsorted) : unsortedPri;
+  // --- Migrate old localStorage format ---
+  const oldPri = localStorage.getItem('digest-tag-priorities');
+  if (oldPri) {
+    try {
+      const old = JSON.parse(oldPri);
+      const hidden = Object.keys(old).filter(t => old[t] === 5);
+      if (hidden.length > 0) localStorage.setItem('digest-hidden-tags', JSON.stringify(hidden));
+    } catch (_) {}
+    localStorage.removeItem('digest-tag-priorities');
+    localStorage.removeItem('digest-unsorted-priority');
+  }
 
-  function resolvePriority(tags) {
-    if (tags.length === 0) return defaultPriority;
-    const primary = priorities[tags[0]];
-    if (primary !== undefined && primary !== 0) return primary;
-    for (let i = 1; i < tags.length; i++) {
-      const p = priorities[tags[i]];
-      if (p !== undefined && p !== 0) return p;
-    }
-    return defaultPriority;
+  const threshold = parseInt(localStorage.getItem('digest-rating-threshold') || '4');
+  const hiddenTags = JSON.parse(localStorage.getItem('digest-hidden-tags') || '[]');
+
+  function resolveDisplayPriority(rating, tags) {
+    if (tags.some(t => hiddenTags.includes(t))) return 5;
+    if (rating >= threshold + 1) return 1;
+    if (rating >= threshold)     return 2;
+    if (rating >= threshold - 1) return 3;
+    if (rating >= threshold - 2) return 4;
+    return 5;
   }
 
   const articles = Array.from(container.querySelectorAll('.digest-article'));
@@ -26,7 +32,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   for (const el of articles) {
     const tags = (el.dataset.tags || '').split(',').map(t => t.trim()).filter(Boolean);
-    const priority = resolvePriority(tags);
+    const rating = parseInt(el.dataset.rating || '3');
+    const priority = resolveDisplayPriority(rating, tags);
     el.dataset.priority = priority;
     grouped[priority] = grouped[priority] || [];
     grouped[priority].push(el);
