@@ -1,0 +1,108 @@
+<h2>Introduction</h2>
+<p>Ensuring the reliability of Apache Flink deployments in Grab is crucial for the availability of our business-critical, real-time applications. While all applications are tested in a staging environment before getting promoted to the production environment, there is still a class of issues that can only surface when deploying in the production environment, e.g.:</p>
+<ul>
+ <li>The new version of the application is unable to cope with the volume or the nature of production traffic.</li>
+ <li>The new version of the application is unable to resume from a production checkpoint or savepoint taken by the previous version of the application.</li>
+ <li>Certain environment-specific dependencies or configurations are malfunctioning or misconfigured.</li>
+</ul>
+<p>When an application faces such issues upon deployment in production, our in-house deployment system automatically rolls it back after 10 minutes of observation, leading to a downtime of the application for about the same duration.</p>
+<p>In this article, we will describe how Grab’s data streaming team (Coban) has enriched the traditional deployment pipeline for Flink applications with a <strong>Shadow Testing stage</strong> that eliminates this downtime during deployment failures, enhancing the availability of our Flink applications during this critical moment of their lifecycle.</p>
+<p><strong>Shadow Testing</strong> is a testing technique whereby a new version of an application (<em>Shadow</em>) is deployed in parallel with the current version of the application (<em>Main</em>), but without impacting it. It involves replicating production data to the new version of the application and comparing its behavior with the current version of the application to identify potential issues and regressions.</p>
+<h2>Architecture overview</h2>
+<p>We integrated Shadow Testing directly into the production environment, alongside the Main application (1). The Shadow application is deployed next to it via the same deployment process (2). An environment variable <code>isShadow=true</code> as well as a distinct <code>jobID</code> are injected for runtime differentiation, enabling the Shadow application to produce its results to distinct, isolated sinks that do not interfere with those of the Main application (3).</p>
+<h2>Deployment flow</h2>
+<p>Shadow Testing is embedded within our normal Flink deployment pipeline to make it a seamless experience for the users of our platform.</p>
+<p>The deployment flow is as follows.</p>
+<ol>
+ <li>A user triggers a deployment of their Flink application in Grab’s in-house deployment tool. At this step, they decide whether they want to enable Shadow Testing for this particular deployment.</li>
+ <li>The deployment pipeline validates the input parameters provided by the user.</li>
+ <li>If the user has not opted for Shadow Testing, the deployment flow directly jumps to step 8 and deploys the latest version to the Main application. However, if the user has enabled Shadow Testing, the deployment flow first goes through the Shadow Testing stages described in steps 4 to 7.</li>
+ <li>The Shadow Kubernetes manifest is baked with its set of distinctive parameters: 
+  <ul>
+   <li>The application name is prefixed with <em>shadow-</em> which propagates to all the Kubernetes objects that are part of the Shadow application</li>
+   <li>An environment variable <code>isShadow</code> is injected and set to <em>true</em>. It instructs the Shadow application to produce its results to the shadow sinks.</li>
+   <li>A distinct Job ID is attributed</li>
+   <li>The target Kubernetes namespace is overridden with a <em>shadow</em> namespace</li>
+  </ul></li>
+ <li>The Shadow application is deployed into the <em>shadow</em> Kubernetes namespace.</li>
+ <li>The Shadow application runs for a configured period of 1 hour by default to reach a steady state. The status of the job manager is monitored to determine the success of the Shadow Testing. If the Shadow application is stable, the Shadow Testing is considered successful.</li>
+ <li>The user is prompted to continue with the deployment of the Main application.</li>
+ <li>The Kubernetes manifest of the Main application is baked with its standard parameters and the environment variable <code>isShadow</code> is set to <em>false</em>.</li>
+ <li>The Main application is deployed in its standard Kubernetes namespace.</li>
+ <li>After 10 minutes of observation, the deployment pipeline determines if the Main application is healthy by querying the status of its job manager. If it is healthy, the Main application is considered successfully deployed. Otherwise, the deployment pipeline automatically triggers a rollback to the previous version.</li>
+</ol>
+<p>During the deployment, the user can leverage our standard observability stack to monitor the behavior of the Shadow application. For example, in the case of an Apache Kafka sink, they can compare the number of messages produced by the Main and Shadow applications.</p>
+<p>Besides, our standard Datadog dashboard that comes with each application can conveniently be toggled to view the metrics of the respective Shadow application.</p>
+<h2>Connector implementation</h2>
+<p>Our standard sink and source connectors, provided by our platform, ensure the absence of interference with the Main application during Shadow Testing. For example, Kafka source connectors use distinct consumer group IDs, while the various sink connectors direct the data to dedicated shadow sinks.</p>
+<p>The Flink application evaluates the <code>isShadow</code> environment variable to set up the connectors at runtime.</p>
+<pre><code>if (isShadow)\{
+    // Shadow Testing operation
+}
+else \{
+    // Normal operation
+}
+</code></pre>
+<p>The following table shows how some typical connectors are dynamically configured if <code>isShadow=true</code>:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Type</th>
+   <th>Connector</th>
+   <th>Dynamic configuration</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Source</td>
+   <td>Kafka</td>
+   <td>The consumer group ID for the Shadow application is suffixed with <em>-shadow</em>. This is crucial so as to consume a full copy of the data stream without interfering with the Main application. <br>
+     Main application: <code>consumerGroup = &lt;application_name&gt;</code> <br>
+     Shadow application: <code>consumerGroup = &lt;application_name&gt;-shadow</code></td>
+  </tr>
+  <tr>
+   <td>Source</td>
+   <td>Change Data Capture</td>
+   <td>The Server ID range of <a href="https://debezium.io/">Debezium</a> is shifted to the next non-overlapping range of the same size. This enables the Shadow application to get a full copy of the database binlog stream without interfering with the Main application. Note that the misleading <em>Server ID</em> naming is because Debezium acts as a pseudo-replica of the database server. <br>
+     Main application: <code>serverId = 1001-2000</code> <br>
+     Shadow application: <code>serverId = 2001 - 3000</code></td>
+  </tr>
+  <tr>
+   <td>Sink</td>
+   <td>Kafka</td>
+   <td>The cluster endpoint is replaced with that of a Kafka cluster dedicated to Shadow Testing, set up with <em>auto.create.topics.enable=true</em> and 8h retention. <br>
+     Main application: <code>brokers = &lt;flink-kafka&gt;:9092</code> <br>
+     Shadow application: <code>brokers = &lt;flink-kafka-shadow&gt;:9092</code></td>
+  </tr>
+  <tr>
+   <td>Sink</td>
+   <td>S3</td>
+   <td>The S3 bucket name is replaced with that of a bucket dedicated to Shadow Testing, set up with a 7-day retention lifecycle policy.<br>
+     Main application: <code>s3://&lt;flink-s3&gt;/&lt;application_name&gt;</code> <br>
+     Shadow application: <code>s3://&lt;flink-s3-shadow&gt;/&lt;application_name&gt;</code></td>
+  </tr>
+  <tr>
+   <td>Sink</td>
+   <td>Metrics</td>
+   <td>The StatsD prefix configuration is overridden. A <em>shadow.</em> prefix is added. <br>
+     Main application: <code>flink.&lt;application_name&gt;.&lt;metric_name&gt;</code><br>
+     Shadow application: <code>shadow.flink.&lt;application_name&gt;.&lt;metric_name&gt;</code></td>
+  </tr>
+  <tr>
+   <td>Sink</td>
+   <td>Logs</td>
+   <td>The <em>Shadow</em> Kubernetes manifest prefixes the Shadow application name with <em>shadow-</em>. The resulting name becomes available as a field in Kibana, enabling discriminated filtering. This tweak is done at the Kubernetes manifest level, not at the Flink application level.<br>
+     Main application: <code>app_name = &lt;application_name&gt;</code> <br>
+     Shadow application: <code>app_name = shadow-&lt;application_name&gt;</code></td>
+  </tr>
+ </tbody>
+</table>
+<h2>Conclusion</h2>
+<p>Our Shadow Testing framework represents a meaningful step forward in enhancing the reliability of our Flink applications during deployment. By leveraging and enriching the existing components of our platform, we have created a robust system that enables our users to confidently increase their Deployment Frequency and reduce their Change Failure Rate.</p>
+<h2>What’s next</h2>
+<p>To drive wider adoption, we intend to support more source and sink connectors. By expanding the range of supported connectors, we could empower teams to leverage Shadow Testing across a broader spectrum of applications.</p>
+<p>For connectors that are less frequently used, we consider implementing a no-op approach combined with metrics collection to expose a minimal set of actionable data points.</p>
+<p>We will remain focused on making Shadow Testing accessible, scalable, and adaptable to various applications. Stay tuned as we continue to push the boundaries of innovation and deliver solutions that enhance reliability and efficiency across our systems.</p>
+<h2>Join us</h2>
+<p>Grab is Southeast Asia’s leading superapp, serving over 900 cities across eight countries (Cambodia, Indonesia, Malaysia, Myanmar, the Philippines, Singapore, Thailand, and Vietnam). Through a single platform, millions of users access mobility, delivery, and digital financial services, including ride-hailing, food delivery, payments, lending, and digital banking via GXS Bank and GXBank. Founded in 2012, Grab’s mission is to drive Southeast Asia forward by creating economic empowerment for everyone while delivering sustainable financial performance and positive social impact.</p>
+<p>Powered by technology and driven by heart, our mission is to drive Southeast Asia forward by creating economic empowerment for everyone. If this mission speaks to you, <a href="https://grb.to/gebios">join our team today</a>!</p>
