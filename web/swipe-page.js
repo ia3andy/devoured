@@ -22,7 +22,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   var PLACEHOLDER_SUFFIX = 'article-placeholder.svg';
   var FALLBACK_BG_COUNT = 15;
-  var BULLET_CHROME_HEIGHT = 180;
+  var BULLET_CHROME_HEIGHT = 170;
   var BULLET_BUDGET = window.innerHeight - BULLET_CHROME_HEIGHT;
 
   function chunkBullets(items, budget) {
@@ -30,7 +30,7 @@ document.addEventListener('DOMContentLoaded', () => {
     var used = 0;
     var start = 0;
     for (var i = 0; i < items.length; i++) {
-      var h = items[i].dataset.priority === '4' ? 44 : 72;
+      var h = items[i].dataset.priority === '4' ? 84 : 104;
       if (used + h > budget && i > start) {
         chunks.push(items.slice(start, i));
         start = i;
@@ -39,6 +39,10 @@ document.addEventListener('DOMContentLoaded', () => {
       used += h;
     }
     if (start < items.length) chunks.push(items.slice(start));
+    if (chunks.length > 1 && chunks[chunks.length - 1].length <= 2) {
+      var last = chunks.pop();
+      chunks[chunks.length - 1] = chunks[chunks.length - 1].concat(last);
+    }
     return chunks;
   }
 
@@ -135,6 +139,11 @@ document.addEventListener('DOMContentLoaded', () => {
     var bf = document.createElement('div');
     bf.className = 'swipe-frame swipe-frame-bullets';
 
+    var bgDiv = document.createElement('div');
+    bgDiv.className = 'swipe-frame-bg';
+    bgDiv.style.backgroundImage = 'url(/images/swipe-bg/' + ((ci % FALLBACK_BG_COUNT) + 1) + '.jpg)';
+    bf.appendChild(bgDiv);
+
     var layers = document.createElement('div');
     layers.className = 'swipe-layers';
 
@@ -144,11 +153,19 @@ document.addEventListener('DOMContentLoaded', () => {
     var inner = document.createElement('div');
     inner.className = 'swipe-bullets-inner';
 
+    var titleRow = document.createElement('div');
+    titleRow.className = 'swipe-bullets-header';
     var title = document.createElement('h3');
     title.className = 'swipe-bullets-title';
-    var bulletPage = ci + 1;
-    title.textContent = bulletPageTotal > 1 ? 'Other News (' + bulletPage + '/' + bulletPageTotal + ')' : 'Other News';
-    inner.appendChild(title);
+    title.textContent = 'Other News';
+    titleRow.appendChild(title);
+    if (bulletPageTotal > 1) {
+      var pageIndicator = document.createElement('span');
+      pageIndicator.className = 'swipe-bullets-page';
+      pageIndicator.textContent = (ci + 1) + ' / ' + bulletPageTotal;
+      titleRow.appendChild(pageIndicator);
+    }
+    inner.appendChild(titleRow);
 
     var list = document.createElement('div');
     list.className = 'swipe-bullets-list';
@@ -192,7 +209,32 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     inner.appendChild(list);
+
     bulletLayer.appendChild(inner);
+
+    if (ci === bulletChunks.length - 1) {
+      var arrow = document.createElement('div');
+      arrow.className = 'swipe-bullets-arrow';
+      var ns = 'http://www.w3.org/2000/svg';
+      var svg = document.createElementNS(ns, 'svg');
+      svg.setAttribute('width', '24');
+      svg.setAttribute('height', '24');
+      svg.setAttribute('viewBox', '0 0 24 24');
+      svg.setAttribute('fill', 'none');
+      svg.setAttribute('stroke', 'currentColor');
+      svg.setAttribute('stroke-width', '2');
+      svg.setAttribute('stroke-linecap', 'round');
+      svg.setAttribute('stroke-linejoin', 'round');
+      var path = document.createElementNS(ns, 'path');
+      path.setAttribute('d', 'm6 9 6 6 6-6');
+      svg.appendChild(path);
+      arrow.appendChild(svg);
+      arrow.addEventListener('click', function(e) {
+        e.stopPropagation();
+        completionFrame.scrollIntoView({ behavior: 'smooth' });
+      });
+      bulletLayer.appendChild(arrow);
+    }
     layers.appendChild(bulletLayer);
     bf.appendChild(layers);
 
@@ -283,6 +325,31 @@ document.addEventListener('DOMContentLoaded', () => {
   var completionStats = root.querySelector('.swipe-completion-stats');
   if (progressText) progressText.textContent = '1 / ' + totalArticles;
   if (completionStats) completionStats.textContent = totalArticles + ' articles';
+
+  // --- Completion: next unread or all caught up ---
+
+  var nextRead = localStorage.getItem('digest-next-read') || 'oldest';
+  var nextData = nextRead === 'newest'
+    ? { url: root.dataset.prevSwipe, date: root.dataset.prevDate, oneliner: root.dataset.prevOneliner }
+    : { url: root.dataset.nextSwipe, date: root.dataset.nextDate, oneliner: root.dataset.nextOneliner };
+
+  var completionNext = root.querySelector('.swipe-completion-next');
+  var completionCaughtUp = root.querySelector('.swipe-completion-caught-up');
+
+  if (nextData.url) {
+    completionNext.href = nextData.url;
+    if (nextData.date) {
+      var d = new Date(nextData.date + 'T00:00:00');
+      completionNext.querySelector('.swipe-completion-next-date').textContent =
+        d.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
+    }
+    var descEl = completionNext.querySelector('.swipe-completion-next-desc');
+    if (descEl && nextData.oneliner) descEl.textContent = nextData.oneliner;
+    completionNext.style.display = '';
+  } else {
+    completionCaughtUp.textContent = 'All caught up! Come back tomorrow for more.';
+    completionCaughtUp.style.display = '';
+  }
 
   // --- Scroll buttons ---
 
@@ -462,4 +529,23 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     }
   });
+
+  // --- Swipe down on completion frame to go to next digest ---
+
+  if (nextData.url) {
+    var touchStartY = 0;
+    var navigating = false;
+
+    completionFrame.addEventListener('touchstart', function(e) {
+      touchStartY = e.touches[0].clientY;
+    }, { passive: true });
+
+    completionFrame.addEventListener('touchend', function(e) {
+      if (navigating) return;
+      if (touchStartY - e.changedTouches[0].clientY > 60) {
+        navigating = true;
+        window.location.href = nextData.url;
+      }
+    });
+  }
 });

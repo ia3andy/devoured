@@ -4,12 +4,25 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 
+import io.quarkiverse.roq.frontmatter.runtime.model.DocumentPage;
 import io.quarkus.qute.TemplateExtension;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 
 @TemplateExtension
 public class TemplateExtensions {
+
+    static DocumentPage relatedPost(DocumentPage swipePage) {
+        var posts = swipePage.site().collections().get("digest-posts");
+        if (posts == null)
+            return null;
+        var date = swipePage.date();
+        for (var p : posts) {
+            if (p.date().equals(date))
+                return p;
+        }
+        return null;
+    }
 
     static String join(JsonArray array, String separator) {
         var sb = new StringBuilder();
