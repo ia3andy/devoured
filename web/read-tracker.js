@@ -270,14 +270,15 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  function findFirstUnreadCard() {
-    var cards = document.querySelectorAll('.card.post[data-post-date]');
+  function findFirstUnread() {
+    var stubs = document.querySelectorAll('.post-stub[data-post-date]');
+    var items = stubs.length > 0 ? stubs : document.querySelectorAll('.card.post[data-post-date]');
     var nextRead = localStorage.getItem('digest-next-read') || 'oldest';
-    var start = nextRead === 'newest' ? 0 : cards.length - 1;
-    var end = nextRead === 'newest' ? cards.length : -1;
+    var start = nextRead === 'newest' ? 0 : items.length - 1;
+    var end = nextRead === 'newest' ? items.length : -1;
     var step = nextRead === 'newest' ? 1 : -1;
     for (var i = start; i !== end; i += step) {
-      if (!isPostRead(cards[i].dataset.postDate)) return cards[i];
+      if (!isPostRead(items[i].dataset.postDate)) return items[i];
     }
     return null;
   }
@@ -285,26 +286,38 @@ document.addEventListener('DOMContentLoaded', () => {
   function updateHomeCta() {
     var cta = document.getElementById('digest-home-cta');
     if (!cta) return;
-    var cards = document.querySelectorAll('.card.post[data-post-date]');
     var allDates = (cta.dataset.allDates || '').split(',').filter(Boolean);
     var readCount = 0;
     for (var j = 0; j < allDates.length; j++) { if (isPostRead(allDates[j])) readCount++; }
-    var card = findFirstUnreadCard();
-    if (!card) { cta.style.display = 'none'; return; }
+    var item = findFirstUnread();
+    if (!item) {
+      cta.querySelector('.digest-cta-label').textContent = 'All caught up! · ' + readCount + ' days digested';
+      cta.querySelector('.digest-cta-date').textContent = '';
+      cta.querySelector('.digest-cta-title').textContent = 'You\'ve devoured every digest. Come back tomorrow for more.';
+      var btn = cta.querySelector('.digest-cta-btn');
+      btn.style.display = 'none';
+      cta.style.display = '';
+      return;
+    }
     var label = 'Next read for you';
     if (readCount > 0) label += ' · ' + readCount + ' days digested';
     cta.querySelector('.digest-cta-label').textContent = label;
-    var link = card.querySelector('.post-title a');
-    var desc = card.querySelector('.post-content p');
     var dateEl = cta.querySelector('.digest-cta-date');
     var isDesktop = window.matchMedia('(min-width: 769px)').matches;
     if (dateEl) {
-      var d = new Date(card.dataset.postDate + 'T00:00:00');
+      var d = new Date(item.dataset.postDate + 'T00:00:00');
       dateEl.textContent = d.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
     }
-    cta.querySelector('.digest-cta-title').textContent = desc ? desc.textContent.trim() : (link ? link.textContent.trim() : '');
+    var link = item.querySelector('.post-title a');
+    var desc = item.querySelector('.post-content p');
+    var title = link ? link.textContent.trim() : (item.dataset.title || '');
+    var description = desc ? desc.textContent.trim() : (item.dataset.desc || title);
+    var postUrl = link ? link.href : (item.dataset.url || '');
+    var swipeUrl = item.dataset.swipeUrl || '';
+    cta.querySelector('.digest-cta-title').textContent = description;
     var btn = cta.querySelector('.digest-cta-btn');
-    btn.href = isDesktop ? (link ? link.href : card.dataset.swipeUrl) : card.dataset.swipeUrl;
+    btn.style.display = '';
+    btn.href = isDesktop ? (postUrl || swipeUrl) : swipeUrl;
     cta.querySelector('.digest-cta-btn-text').textContent = isDesktop ? 'Read' : 'Swipe mode';
     cta.style.display = '';
   }

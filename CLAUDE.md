@@ -4,13 +4,11 @@ A daily developer news digest site built with [Roq](https://iamroq.dev), a stati
 
 ## Dev Server
 
-```bash
-roq start
-```
+Use the Quarkus Agent MCP `quarkus_start` tool to start the dev server. This is a Roq/Quarkus project, so all Quarkus MCP tools apply (`quarkus_start`, `quarkus_stop`, `quarkus_status`, `quarkus_logs`, etc.).
 
-Starts live-reload dev server on http://localhost:8080. Content and template changes are auto-detected. Press `s` to force a soft restart if needed.
+Content and template changes trigger hot reload automatically. The default port is 8080 but use a unique port per worktree (check `quarkus_list` first).
 
-Other commands: `roq generate` (build to `target/roq/`), `roq serve` (preview built site), `roq update` (update deps to latest), `roq add plugin:name` (add a plugin).
+CLI equivalents (for reference, prefer MCP tools): `roq start`, `roq generate` (build to `target/roq/`), `roq serve` (preview built site), `roq update` (update deps to latest), `roq add plugin:name` (add a plugin).
 
 ## Project Structure
 
