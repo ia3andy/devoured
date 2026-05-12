@@ -85,7 +85,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     frame.dataset.layerCount = frame.querySelector('.swipe-layers').children.length;
 
-    var bgEls = frame.querySelectorAll('.swipe-card-bg, .swipe-layer-bg');
+    var bgEls = frame.querySelectorAll('.swipe-frame-bg, .swipe-card-bg, .swipe-layer-bg');
     for (var j = 0; j < bgEls.length; j++) {
       var bgStyle = bgEls[j].style.backgroundImage;
       if (bgStyle && bgStyle.indexOf(PLACEHOLDER_SUFFIX) !== -1) {
@@ -93,22 +93,6 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     }
   }
-
-  // --- Fixed background: clone card bg to frame level ---
-
-  function cloneFrameBg(frame) {
-    var existing = frame.querySelector(':scope > .swipe-frame-bg');
-    if (existing) existing.remove();
-    var cardBg = frame.querySelector('.swipe-card-bg');
-    if (!cardBg) return;
-    var bg = document.createElement('div');
-    bg.className = 'swipe-frame-bg';
-    bg.style.backgroundImage = cardBg.style.backgroundImage;
-    frame.insertBefore(bg, frame.firstChild);
-  }
-
-  var regularFrames = grouped.high;
-  for (var i = 0; i < regularFrames.length; i++) cloneFrameBg(regularFrames[i]);
 
   // --- Dot indicators ---
 
@@ -122,12 +106,14 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function initDotScroll(layersEl, dotsEl) {
+    var frame = layersEl.closest('.swipe-frame');
     layersEl.addEventListener('scroll', function() {
       var idx = Math.round(layersEl.scrollLeft / layersEl.clientWidth);
       var allDots = dotsEl.querySelectorAll('.swipe-dot');
       for (var k = 0; k < allDots.length; k++) {
         allDots[k].classList.toggle('is-active', k === idx);
       }
+      if (frame) frame.classList.toggle('is-inner-layer', idx > 0);
     });
   }
 
@@ -251,8 +237,6 @@ document.addEventListener('DOMContentLoaded', () => {
       var prevLayers = bfLayers.querySelectorAll('.swipe-layer:not(.swipe-layer-bullets)');
       var prevStash = stash[prevId].querySelector('.swipe-layers');
       for (var k = 0; k < prevLayers.length; k++) prevStash.appendChild(prevLayers[k]);
-      var prevBg = bulletFrame.querySelector(':scope > .swipe-frame-bg');
-      if (prevBg) prevBg.remove();
     }
 
     var stashedFrame = stash[articleId];
@@ -261,7 +245,14 @@ document.addEventListener('DOMContentLoaded', () => {
     var layersToMove = Array.from(articleLayersEl.children);
     for (var k = 0; k < layersToMove.length; k++) bfLayers.appendChild(layersToMove[k]);
 
-    cloneFrameBg(bulletFrame);
+    var bg = bulletFrame.querySelector(':scope > .swipe-frame-bg');
+    if (!bg) {
+      bg = document.createElement('div');
+      bg.className = 'swipe-frame-bg';
+      bulletFrame.insertBefore(bg, bulletFrame.firstChild);
+    }
+    var cardBg = stashedFrame.querySelector('.swipe-card-bg');
+    bg.style.backgroundImage = cardBg ? cardBg.style.backgroundImage : stashedFrame.querySelector('.swipe-frame-bg').style.backgroundImage;
 
     var layerCount = parseInt(stashedFrame.dataset.layerCount || '1');
     buildDots(bfDots, 1 + layerCount, 1);
