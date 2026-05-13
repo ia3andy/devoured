@@ -1,3 +1,5 @@
+import DigestStorage from './digest-localstorage.js';
+
 document.addEventListener('DOMContentLoaded', () => {
 
   var root = document.querySelector('.swipe-page-root');
@@ -8,8 +10,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // --- Priority filtering ---
 
-  var threshold = parseInt(localStorage.getItem('digest-rating-threshold') || '4');
-  var hiddenTags = JSON.parse(localStorage.getItem('digest-hidden-tags') || '[]');
+  var threshold = DigestStorage.getRatingThreshold();
+  var hiddenTags = DigestStorage.getHiddenTags();
 
   function resolveDisplayPriority(rating, tags) {
     if (tags.some(function(t) { return hiddenTags.indexOf(t) !== -1; })) return 5;
@@ -328,7 +330,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // --- Completion: next unread or all caught up ---
 
-  var nextRead = localStorage.getItem('digest-next-read') || 'oldest';
+  var nextRead = DigestStorage.getNextRead();
   var nextData = nextRead === 'newest'
     ? { url: root.dataset.prevSwipe, date: root.dataset.prevDate, oneliner: root.dataset.prevOneliner }
     : { url: root.dataset.nextSwipe, date: root.dataset.nextDate, oneliner: root.dataset.nextOneliner };

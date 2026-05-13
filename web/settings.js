@@ -1,3 +1,5 @@
+import DigestStorage from './digest-localstorage.js';
+
 document.addEventListener('DOMContentLoaded', function() {
   var starsEl = document.getElementById('settings-stars');
   if (!starsEl) return;
@@ -12,8 +14,8 @@ document.addEventListener('DOMContentLoaded', function() {
   ];
   var DEFAULT_THRESHOLD = 4;
 
-  var threshold = parseInt(localStorage.getItem('digest-rating-threshold') || String(DEFAULT_THRESHOLD));
-  var hiddenTags = JSON.parse(localStorage.getItem('digest-hidden-tags') || '[]');
+  var threshold = DigestStorage.getRatingThreshold();
+  var hiddenTags = DigestStorage.getHiddenTags();
   var descEl = document.getElementById('settings-star-desc');
   var tagsEl = document.getElementById('settings-tags');
 
@@ -43,7 +45,7 @@ document.addEventListener('DOMContentLoaded', function() {
       btn.addEventListener('click', (function(val) {
         return function() {
           threshold = val;
-          localStorage.setItem('digest-rating-threshold', String(val));
+          DigestStorage.setRatingThreshold(val);
           renderStars();
         };
       })(lev.value));
@@ -78,7 +80,7 @@ document.addEventListener('DOMContentLoaded', function() {
           hiddenTags.splice(idx, 1);
           this.classList.remove('is-hidden');
         }
-        localStorage.setItem('digest-hidden-tags', JSON.stringify(hiddenTags));
+        DigestStorage.setHiddenTags(hiddenTags);
       });
       tagsEl.appendChild(chip);
     }
@@ -86,7 +88,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
   // Reading Order
   var orderEl = document.getElementById('settings-order');
-  var nextRead = localStorage.getItem('digest-next-read') || 'oldest';
+  var nextRead = DigestStorage.getNextRead();
   var ORDER_OPTIONS = [
     { value: 'oldest', label: 'Oldest first' },
     { value: 'newest', label: 'Newest first' }
@@ -103,7 +105,7 @@ document.addEventListener('DOMContentLoaded', function() {
       btn.addEventListener('click', (function(val) {
         return function() {
           nextRead = val;
-          localStorage.setItem('digest-next-read', val);
+          DigestStorage.setNextRead(val);
           renderOrder();
         };
       })(opt.value));
@@ -160,12 +162,7 @@ document.addEventListener('DOMContentLoaded', function() {
   }
 
   document.getElementById('settings-reset').addEventListener('click', function() {
-    localStorage.removeItem('digest-rating-threshold');
-    localStorage.removeItem('digest-hidden-tags');
-    localStorage.removeItem('digest-tag-priorities');
-    localStorage.removeItem('digest-tag-order');
-    localStorage.removeItem('digest-unsorted-priority');
-    localStorage.removeItem('digest-next-read');
+    DigestStorage.resetAll();
     threshold = DEFAULT_THRESHOLD;
     hiddenTags = [];
     nextRead = 'oldest';

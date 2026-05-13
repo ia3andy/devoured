@@ -1,22 +1,23 @@
+import DigestStorage from './digest-localstorage.js';
+
 document.addEventListener('DOMContentLoaded', () => {
 
   const container = document.querySelector('.digest-articles');
   if (!container) return;
 
   // --- Migrate old localStorage format ---
-  const oldPri = localStorage.getItem('digest-tag-priorities');
+  const oldPri = DigestStorage.getLegacyTagPriorities();
   if (oldPri) {
     try {
       const old = JSON.parse(oldPri);
       const hidden = Object.keys(old).filter(t => old[t] === 5);
-      if (hidden.length > 0) localStorage.setItem('digest-hidden-tags', JSON.stringify(hidden));
+      if (hidden.length > 0) DigestStorage.setHiddenTags(hidden);
     } catch (_) {}
-    localStorage.removeItem('digest-tag-priorities');
-    localStorage.removeItem('digest-unsorted-priority');
+    DigestStorage.removeLegacy();
   }
 
-  const threshold = parseInt(localStorage.getItem('digest-rating-threshold') || '4');
-  const hiddenTags = JSON.parse(localStorage.getItem('digest-hidden-tags') || '[]');
+  const threshold = DigestStorage.getRatingThreshold();
+  const hiddenTags = DigestStorage.getHiddenTags();
 
   function resolveDisplayPriority(rating, tags) {
     if (tags.some(t => hiddenTags.includes(t))) return 5;
