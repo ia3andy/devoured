@@ -44,7 +44,7 @@ import picocli.CommandLine.*;
 public class DigestHelper implements Runnable {
 
     static final int CONTENT_MIN_LENGTH = 500;
-    static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
 
     static class PostStore {
         final Path dataFile;
