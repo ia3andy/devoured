@@ -1,3 +1,5 @@
+import DigestStorage from './digest-localstorage.js';
+
 document.addEventListener('DOMContentLoaded', () => {
 
   const READ_KEY = 'digest-read-posts';
@@ -101,6 +103,44 @@ document.addEventListener('DOMContentLoaded', () => {
   // Per-article scroll tracking on detail pages
   const articlePage = document.querySelector('.article-page[data-post-date]');
   const activeObservers = [];
+  let focusArticleId = null;
+
+  function initFocusMode() {
+    if (!articlePage) return;
+    const articleId = new URLSearchParams(window.location.search).get('a');
+    if (!articleId) return;
+    const target = articlePage.querySelector('.digest-article[data-article-id="' + articleId + '"]');
+    if (!target) return;
+
+    focusArticleId = articleId;
+    articlePage.classList.add('is-article-focus');
+    target.classList.add('is-focused');
+    for (const d of target.querySelectorAll('details:not(.digest-description)')) d.open = true;
+
+    const cleanUrl = window.location.pathname;
+    const pageTitle = articlePage.querySelector('.page-header h1, .page-header .post-title')?.textContent?.trim() || document.title;
+    const closeBtn = document.createElement('a');
+    closeBtn.className = 'digest-focus-close';
+    closeBtn.href = cleanUrl;
+    closeBtn.textContent = 'Back to ' + pageTitle;
+    closeBtn.addEventListener('click', (e) => { e.preventDefault(); exitFocusMode(); history.back(); });
+    articlePage.querySelector('.wrap-content')?.prepend(closeBtn);
+
+    history.replaceState(null, '', cleanUrl);
+    history.pushState({ focusArticle: articleId }, '', cleanUrl + '?a=' + articleId);
+  }
+
+  function exitFocusMode() {
+    if (!focusArticleId) return;
+    articlePage.querySelector('.digest-article.is-focused')?.classList.remove('is-focused');
+    focusArticleId = null;
+    articlePage.classList.remove('is-article-focus');
+    articlePage.querySelector('.digest-focus-close')?.remove();
+    setupArticleObservers();
+    updateReadUI();
+  }
+
+  window.addEventListener('popstate', () => { if (focusArticleId) exitFocusMode(); });
 
   function setupArticleObservers() {
     for (const obs of activeObservers) obs.disconnect();
@@ -248,24 +288,27 @@ document.addEventListener('DOMContentLoaded', () => {
       const swipeRoot = document.querySelector('.swipe-page-root');
       const basePath = swipeRoot ? swipeRoot.dataset.backUrl : window.location.pathname;
       const base = window.location.origin + basePath;
-      shareUrl(btn.title, base + '#' + btn.dataset.shareArticle);
+      shareUrl(btn.title, base + '?a=' + btn.dataset.shareArticle);
     } else {
-      shareUrl(document.title, window.location.href.split('#')[0]);
+      shareUrl(document.title, window.location.href.split('?')[0].split('#')[0]);
     }
   });
 
   if (articlePage) {
-    const digestContainer = document.querySelector('.digest-articles');
-    if (digestContainer) {
-      if (digestContainer.dataset.ready !== undefined) {
-        setupArticleObservers();
-      } else {
-        new MutationObserver((mutations, obs) => {
-          if (digestContainer.dataset.ready !== undefined) {
-            obs.disconnect();
-            setupArticleObservers();
-          }
-        }).observe(digestContainer, { attributes: true, attributeFilter: ['data-ready'] });
+    initFocusMode();
+    if (!focusArticleId) {
+      const digestContainer = document.querySelector('.digest-articles');
+      if (digestContainer) {
+        if (digestContainer.dataset.ready !== undefined) {
+          setupArticleObservers();
+        } else {
+          new MutationObserver((mutations, obs) => {
+            if (digestContainer.dataset.ready !== undefined) {
+              obs.disconnect();
+              setupArticleObservers();
+            }
+          }).observe(digestContainer, { attributes: true, attributeFilter: ['data-ready'] });
+        }
       }
     }
   }
@@ -273,7 +316,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function findFirstUnread() {
     var stubs = document.querySelectorAll('.post-stub[data-post-date]');
     var items = stubs.length > 0 ? stubs : document.querySelectorAll('.card.post[data-post-date]');
-    var nextRead = localStorage.getItem('digest-next-read') || 'oldest';
+    var nextRead = DigestStorage.getNextRead();
     var start = nextRead === 'newest' ? 0 : items.length - 1;
     var end = nextRead === 'newest' ? items.length : -1;
     var step = nextRead === 'newest' ? 1 : -1;
@@ -363,7 +406,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  if (articlePage) {
+  if (articlePage && !focusArticleId) {
     var postCta = articlePage.querySelector('.digest-cta-post');
     if (postCta) {
       function updatePostCta() {
