@@ -121,7 +121,7 @@ public class DigestHelper implements Runnable {
         String model(String task);
         int batchSize();
         Uni<JsonObject> chatCompletion(String systemPrompt, String userMessage, String jsonSchema);
-        Uni<String> cleanHtml(String html);
+        Uni<String> cleanHtml(String articleId, String html);
         Uni<Map<Integer, JsonObject>> summarizeBatch(List<Map.Entry<Integer, String>> inputs, PrintWriter log);
         String formatCostLine(String context);
         String formatCostSummary();
@@ -166,8 +166,8 @@ public class DigestHelper implements Runnable {
             return callOpenAIAPI(endpoint, token, model("description"), "description", systemPrompt, userMessage, jsonSchema);
         }
 
-        public Uni<String> cleanHtml(String html) {
-            return callOpenAIAPI(endpoint, token, model("clean-html"), "clean",
+        public Uni<String> cleanHtml(String articleId, String html) {
+            return callOpenAIAPI(endpoint, token, model("clean-html"), "clean:" + articleId,
                     CLEAN_HTML_SYSTEM_PROMPT, "Clean this article HTML:\n" + html, null)
                     .map(result -> {
                         String content = jsonStr(result, "result");
@@ -281,7 +281,7 @@ public class DigestHelper implements Runnable {
             })).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
         }
 
-        public Uni<String> cleanHtml(String html) {
+        public Uni<String> cleanHtml(String articleId, String html) {
             return Uni.createFrom().item(Unchecked.supplier(() -> {
                 var proc = new ProcessBuilder("claude", "--model", model("clean-html"), "--output-format", "json",
                         "--system-prompt", CLEAN_HTML_SYSTEM_PROMPT,
@@ -2043,7 +2043,7 @@ public class DigestHelper implements Runnable {
                 Multi.createFrom().iterable(jobs)
                         .onItem().transformToUniAndConcatenate(job -> {
                             System.err.println("    [clean] " + job.article().id());
-                            return ai().cleanHtml(job.html())
+                            return ai().cleanHtml(job.article().id(), job.html())
                                     .onItem().invoke(cleaned -> {
                                         if (cleaned != null && !cleaned.isEmpty()) {
                                             job.data().addProperty("cleanedHtml", cleaned);
