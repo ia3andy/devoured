@@ -163,11 +163,11 @@ public class DigestHelper implements Runnable {
         }
 
         public Uni<JsonObject> chatCompletion(String systemPrompt, String userMessage, String jsonSchema) {
-            return callOpenAIAPI(endpoint, token, model("description"), systemPrompt, userMessage, jsonSchema);
+            return callOpenAIAPI(endpoint, token, model("description"), "description", systemPrompt, userMessage, jsonSchema);
         }
 
         public Uni<String> cleanHtml(String html) {
-            return callOpenAIAPI(endpoint, token, model("clean-html"),
+            return callOpenAIAPI(endpoint, token, model("clean-html"), "clean",
                     CLEAN_HTML_SYSTEM_PROMPT, "Clean this article HTML:\n" + html, null)
                     .map(result -> {
                         String content = jsonStr(result, "result");
@@ -202,7 +202,7 @@ public class DigestHelper implements Runnable {
                             sb.append("--- ARTICLE ---\nArticle id: ").append(entry.getKey()).append("\n");
                             sb.append(entry.getValue()).append("\n");
                         }
-                        return callOpenAIAPI(endpoint, token, model, SUMMARIZE_SYSTEM_PROMPT,
+                        return callOpenAIAPI(endpoint, token, model, "summarize", SUMMARIZE_SYSTEM_PROMPT,
                                 "Summarize these articles:\n" + sb, SUMMARIZE_JSON_SCHEMA)
                                 .onItem().invoke(result -> {
                                     var articles = result.getAsJsonArray("articles");
@@ -1629,12 +1629,12 @@ public class DigestHelper implements Runnable {
         }
     }
 
-    static Uni<JsonObject> callOpenAIAPI(String endpoint, String token, String model,
+    static Uni<JsonObject> callOpenAIAPI(String endpoint, String token, String model, String context,
                                           String systemPrompt, String userMessage, String jsonSchema) {
-        return callOpenAIAPI(endpoint, token, model, systemPrompt, userMessage, jsonSchema, 0);
+        return callOpenAIAPI(endpoint, token, model, context, systemPrompt, userMessage, jsonSchema, 0);
     }
 
-    static Uni<JsonObject> callOpenAIAPI(String endpoint, String token, String model,
+    static Uni<JsonObject> callOpenAIAPI(String endpoint, String token, String model, String context,
                                           String systemPrompt, String userMessage, String jsonSchema, int attempt) {
         return acquireRateSlot(activeRpm).chain(() -> Uni.createFrom().item(Unchecked.supplier(() -> {
             if (token == null || token.isEmpty()) throw new IllegalStateException("API token not set for " + endpoint);
@@ -1712,12 +1712,12 @@ public class DigestHelper implements Runnable {
                 return Uni.createFrom().failure(new RuntimeException("Daily API quota exhausted"));
             }
             if (attempt >= 30) return Uni.createFrom().failure(new RuntimeException("Rate limited after 30 retries"));
-            if (attempt == 0) System.err.println("  [429] body: " + rle.getMessage().substring(rle.getMessage().indexOf(": ") + 2, Math.min(rle.getMessage().length(), 300)));
-            System.err.printf("  [429] rate limited (retry in %ds, attempt %d/30)%n", rle.retryAfter.toSeconds(), attempt + 1);
+            if (attempt == 0) System.err.println("  [429 " + context + "] body: " + rle.getMessage().substring(rle.getMessage().indexOf(": ") + 2, Math.min(rle.getMessage().length(), 300)));
+            System.err.printf("  [429 %s] retry in %ds (attempt %d/30)%n", context, rle.retryAfter.toSeconds(), attempt + 1);
             nextAllowedCall.updateAndGet(prev -> Math.max(prev, System.currentTimeMillis() + rle.retryAfter.toMillis()));
             return Uni.createFrom().voidItem()
                     .onItem().delayIt().by(rle.retryAfter)
-                    .chain(() -> callOpenAIAPI(endpoint, token, model, systemPrompt, userMessage, jsonSchema, attempt + 1));
+                    .chain(() -> callOpenAIAPI(endpoint, token, model, context, systemPrompt, userMessage, jsonSchema, attempt + 1));
         });
     }
 
@@ -1931,7 +1931,7 @@ public class DigestHelper implements Runnable {
                 if (!desc.isEmpty()) return desc.replace("\"", "").replace("\\", "");
             }
         } catch (Exception e) {
-            System.err.println("  Failed to generate digest description: " + e.getMessage());
+            System.err.println("  Failed to generate digest description: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
         }
         return "Daily developer news digest";
     }
@@ -2594,7 +2594,7 @@ public class DigestHelper implements Runnable {
                     if (provider instanceof OpenAIProvider op) {
                         op.rpdUsed.incrementAndGet();
                         result = acquireRateSlot(op.rpm)
-                                .chain(() -> callOpenAIAPI(op.endpoint, op.token, op.model("description"),
+                                .chain(() -> callOpenAIAPI(op.endpoint, op.token, op.model("description"), "rating",
                                         RATING_SYSTEM_PROMPT, sb.toString(), RATING_JSON_SCHEMA))
                                 .await().atMost(Duration.ofSeconds(120));
                     } else {
