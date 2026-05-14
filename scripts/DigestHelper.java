@@ -1198,7 +1198,12 @@ public class DigestHelper implements Runnable {
             "<blockquote> for quotes, <pre><code> for code, <strong>/<em> for emphasis. " +
             "Remove redundant <br/> tags.\n" +
             "Keep the article words exactly as-is. Only change HTML tags.\n" +
-            "Output only the cleaned HTML. No markdown fences, no explanation.";
+            "Use semantic prose tags to improve readability: <p> for paragraphs, " +
+            "<h2>/<h3> for sections, <ul>/<ol> for lists, <blockquote> for quotes, " +
+            "<strong>/<em> for emphasis, <pre><code> for code blocks.\n" +
+            "If the content is NOT a readable article (e.g. mostly navigation, login/paywall wall, " +
+            "cookie consent, empty, or unintelligible fragments), output exactly: EMPTY\n" +
+            "Otherwise output only the cleaned HTML. No markdown fences, no explanation.";
 
     static boolean isJunkContent(String content) {
         if (content == null || content.length() < 200) return true;
@@ -2033,6 +2038,11 @@ public class DigestHelper implements Runnable {
             }
             html = jsonStr(data, "contentHtml");
             if (html.length() < 200 || isJunkContent(html)) continue;
+            if (html.length() > 30000) {
+                writePlaceholderFile(contentDir, a.id(), a.link());
+                System.err.println("    [skip] " + a.id() + " (" + html.length() + " chars, too large for AI cleaning)");
+                continue;
+            }
             jobs.add(new CleanJob(a, cachePath, data, html));
         }
 
@@ -2044,28 +2054,28 @@ public class DigestHelper implements Runnable {
                         .onItem().transformToUniAndConcatenate(job -> {
                             System.err.println("    [clean] " + job.article().id());
                             return ai().cleanHtml(job.article().id(), job.html())
+                                    .ifNoItem().after(Duration.ofSeconds(AI_TIMEOUT_SECONDS + 30)).fail()
                                     .onItem().invoke(cleaned -> {
-                                        if (cleaned != null && !cleaned.isEmpty()) {
+                                        if (cleaned != null && !cleaned.isBlank() && !cleaned.strip().equals("EMPTY")) {
                                             job.data().addProperty("cleanedHtml", cleaned);
                                             try { Files.writeString(job.cachePath(), GSON.toJson(job.data())); } catch (IOException e) { /* ignore */ }
                                             writeHtmlFile(contentDir, job.article().id(), cleaned);
                                             System.err.println("      -> done (" + cleaned.length() + " chars)");
                                         } else {
-                                            writeHtmlFile(contentDir, job.article().id(), job.html());
-                                            System.err.println("      -> cleaning failed, using raw HTML");
+                                            writePlaceholderFile(contentDir, job.article().id(), job.article().link());
+                                            System.err.println("      -> content not suitable for inline reading");
                                         }
                                     })
                                     .onFailure().recoverWithItem(e -> {
-                                        System.err.println("      -> AI cleaning failed: " + e.getMessage());
-                                        writeHtmlFile(contentDir, job.article().id(), job.html());
-                                        System.err.println("      -> cleaning failed, using raw HTML");
+                                        System.err.println("      -> AI cleaning failed: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+                                        writePlaceholderFile(contentDir, job.article().id(), job.article().link());
                                         return null;
                                     });
                         })
                         .collect().asList()
                         .await().atMost(Duration.ofMinutes(30));
             } catch (Exception e) {
-                System.err.println("  [warn] AI cleaning incomplete: " + e.getMessage());
+                System.err.println("  [warn] AI cleaning incomplete: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
                 complete = false;
             }
         }
@@ -2105,6 +2115,17 @@ public class DigestHelper implements Runnable {
     static void writeHtmlFile(Path dir, String id, String html) {
         try {
             html = Jsoup.clean(html, PROSE_SAFELIST);
+            html = html.replace("{", "\\{");
+            Files.writeString(dir.resolve(id + ".html"), html);
+        } catch (IOException e) {
+            System.err.println("      -> write error for " + id + ": " + e.getMessage());
+        }
+    }
+
+    static void writePlaceholderFile(Path dir, String id, String link) {
+        try {
+            String html = "<p>Full article content is not available for inline reading.</p>\n" +
+                    "<p><a href=\"" + link.replace("\"", "&quot;") + "\">Read the original article &rarr;</a></p>";
             html = html.replace("{", "\\{");
             Files.writeString(dir.resolve(id + ".html"), html);
         } catch (IOException e) {
