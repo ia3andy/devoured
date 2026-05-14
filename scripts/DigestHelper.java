@@ -1620,9 +1620,12 @@ public class DigestHelper implements Runnable {
 
     static class RateLimitException extends RuntimeException {
         final Duration retryAfter;
+        final boolean dailyQuota;
         RateLimitException(Duration retryAfter, String body) {
             super("429 rate limited (retry in " + retryAfter.toSeconds() + "s): " + body);
             this.retryAfter = retryAfter;
+            this.dailyQuota = body.contains("per day") || body.contains("daily")
+                    || body.contains("quota") || body.contains("GenerateContent");
         }
     }
 
@@ -1704,7 +1707,12 @@ public class DigestHelper implements Runnable {
         })).runSubscriptionOn(Infrastructure.getDefaultWorkerPool()))
         .onFailure(RateLimitException.class).recoverWithUni(t -> {
             var rle = (RateLimitException) t;
+            if (rle.dailyQuota) {
+                System.err.println("  [429] daily quota exhausted, stopping retries");
+                return Uni.createFrom().failure(new RuntimeException("Daily API quota exhausted"));
+            }
             if (attempt >= 30) return Uni.createFrom().failure(new RuntimeException("Rate limited after 30 retries"));
+            if (attempt == 0) System.err.println("  [429] body: " + rle.getMessage().substring(rle.getMessage().indexOf(": ") + 2, Math.min(rle.getMessage().length(), 300)));
             System.err.printf("  [429] rate limited (retry in %ds, attempt %d/30)%n", rle.retryAfter.toSeconds(), attempt + 1);
             nextAllowedCall.updateAndGet(prev -> Math.max(prev, System.currentTimeMillis() + rle.retryAfter.toMillis()));
             return Uni.createFrom().voidItem()
