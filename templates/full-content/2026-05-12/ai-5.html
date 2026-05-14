@@ -1,0 +1,259 @@
+<h1>Building Blocks for Foundation Model Training and Inference on AWS</h1>
+<p>For a long time, "scaling" in foundation models mostly meant one thing: spend more compute on pre-training and capabilities rise. That intuition was supported by empirical work such as <a href="https://arxiv.org/abs/2001.08361">Kaplan et al. (2020)</a>, which reported predictable power-law trends in loss as you scale <strong>model parameters</strong>, <strong>dataset size</strong>, and <strong>training compute</strong>. In practice, these trends justified sustained investment in large-scale accelerator capacity and the surrounding distributed infrastructure needed to keep it efficiently utilized. But the frontier has evolved—and scaling is no longer a single curve. NVIDIA's "from one to three scaling laws" framing usefully emphasizes that, beyond pre-training, performance increasingly scales through <strong>post-training</strong> (e.g., supervised fine-tuning (SFT) and reinforcement learning (RL)-based methods) and through <strong>test-time compute</strong> ("long thinking," search/verification, multi-sample strategies).</p><img src="https://cdn-uploads.huggingface.co/production/uploads/64d6b270c2eedf9af82baa23/X5ZiXBoPmJzcDhaiL_Zkf.jpeg" alt="3-Scaling-Laws-Chart-1280x720">
+<blockquote>
+ <p><strong>Figure:</strong> Adapted from <a href="https://blogs.nvidia.com/blog/ai-scaling-laws/">"AI's Three Scaling Laws, Explained"</a> (NVIDIA Blog).</p>
+</blockquote>
+<p>Taken together, these scaling regimes push the foundation-model lifecycle—pre-training, post-training, and inference—toward convergent infrastructure requirements: tightly coupled accelerator compute, a high-bandwidth low-latency network, and a distributed storage backend. They also raise the importance of orchestration for resource management, and of application- and hardware-level observability to maintain cluster health and diagnose performance pathologies at scale.</p>
+<p>Another key trend is the increasing reliance of the foundation-model lifecycle on an open-source software (OSS) ecosystem that spans model development frameworks, cluster resource management, and operational tooling. At the cluster layer, resource management is typically provided by systems such as <a href="https://slurm.schedmd.com/documentation.html">Slurm</a> and <a href="https://kubernetes.io/docs/">Kubernetes</a>. Model development and distributed training are commonly implemented in frameworks such as <a href="https://pytorch.org/">PyTorch</a> and <a href="https://jax.readthedocs.io/">JAX</a>. Monitoring and visualization—that is, observability—are often achieved using <a href="https://prometheus.io/docs/introduction/overview/">Prometheus</a> for metrics collection and <a href="https://grafana.com/docs/grafana/latest/">Grafana</a> for visualization and alerting, positioned as an operational layer atop infrastructure and resource management. Figure 1 illustrates this layered architecture, showing how hardware infrastructure supports resource orchestration, which in turn enables ML frameworks, with observability spanning across all layers.</p><img src="https://cdn-uploads.huggingface.co/production/uploads/64d6b270c2eedf9af82baa23/QSBYRirLS8pkgJK3rvqMF.png" alt="Building Blocks Intro">
+<p><em>Figure 1: The layered architecture of open-source software stacks for foundation model training and inference</em></p>
+<p>This post is intended for machine learning engineers and researchers involved in foundation model training and inference, with particular attention to workflows built atop OSS frameworks. It analyzes how AWS infrastructure—including multi-node accelerator compute, high-bandwidth low-latency networking, distributed shared storage, and associated managed services—interacts with common OSS stacks across the foundation model lifecycle. The primary goal is to provide a technical foundation for understanding systems bottlenecks and scaling characteristics spanning pre-training, post-training, and inference. This introductory post surfaces the overall system architecture, emphasizing the integration points between AWS infrastructure components and OSS tools that underpin large-scale distributed training and inference.</p>
+<h2>The AWS Building Blocks</h2>
+<p>The remainder of this series examines how this layered architecture is realized on AWS, progressing through infrastructure, resource orchestration, the ML software stack, and observability. The following sections preview each layer.</p>
+<h3>Infrastructure: Compute, Network, and Storage</h3>
+<p>As illustrated in Figure 1, infrastructure is anchored by three coupled building blocks—accelerated compute with large device memory, wide-bandwidth interconnect for collective communication, and scalable distributed storage for data and checkpoints.</p>
+<p>Accelerated compute forms the foundation of large-scale foundation model pre-training, post-training, and inference. AWS offers several generations of NVIDIA GPUs as part of its <a href="https://aws.amazon.com/ec2/instance-types/accelerated-computing/">Amazon EC2 accelerated computing instances</a>, including the Amazon EC2 P instance family. The <a href="https://aws.amazon.com/ec2/instance-types/p5/">P5 instance family</a> includes p5.48xlarge with eight <a href="https://www.nvidia.com/en-us/data-center/h100/">NVIDIA H100</a> GPUs, p5.4xlarge with a single H100 GPU for smaller-scale workloads, and p5e.48xlarge/p5en.48xlarge variants with <a href="https://www.nvidia.com/en-us/data-center/h200/">NVIDIA H200</a> GPUs. The <a href="https://aws.amazon.com/ec2/instance-types/p6/">P6 instance family</a> introduces <a href="https://www.nvidia.com/en-us/data-center/dgx-b200/">NVIDIA Blackwell B200</a> architecture with p6-b200.48xlarge and <a href="https://developer.nvidia.com/blog/inside-nvidia-blackwell-ultra-the-chip-powering-the-ai-factory-era/">Blackwell Ultra B300</a> with p6-b300.48xlarge. Across these generations, the dominant scaling axes are peak Tensor throughput, HBM capacity and bandwidth, and interconnect bandwidth (within and across nodes).</p>
+<p>As a first-order approximation, peak Tensor Core throughput—measured in floating point operations per second (FLOPS)—helps situate these accelerators on a common axis. The table below summarizes per-GPU peak throughput for dense BF16/FP16 and FP8 Tensor operations, along with HBM capacity and HBM bandwidth, using SXM/HGX-class specifications that align with NVSwitch/NVLink-based multi-GPU nodes.</p>
+<table>
+ <thead>
+  <tr>
+   <th>GPU (representative variant)</th>
+   <th>BF16/FP16 Tensor peak (dense)</th>
+   <th>FP8 Tensor peak (dense)</th>
+   <th>FP4 Tensor peak (dense)</th>
+   <th>HBM capacity</th>
+   <th>HBM bandwidth</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><a href="https://www.nvidia.com/en-us/data-center/h100/">H100 (SXM)</a></td>
+   <td>0.9895 PFLOPS</td>
+   <td>1.979 PFLOPS</td>
+   <td>—</td>
+   <td>80 GB HBM3</td>
+   <td>3.35 TB/s</td>
+  </tr>
+  <tr>
+   <td><a href="https://www.nvidia.com/en-us/data-center/h200/">H200 (SXM)</a></td>
+   <td>0.9895 PFLOPS</td>
+   <td>1.979 PFLOPS</td>
+   <td>—</td>
+   <td>141 GB HBM3e</td>
+   <td>4.8 TB/s</td>
+  </tr>
+  <tr>
+   <td><a href="https://www.nvidia.com/en-us/data-center/dgx-b200/">B200 (HGX, per GPU)</a></td>
+   <td>2.25 PFLOPS</td>
+   <td>4.5 PFLOPS</td>
+   <td>9 PFLOPS</td>
+   <td>180 GB HBM3e</td>
+   <td>8 TB/s</td>
+  </tr>
+  <tr>
+   <td><a href="https://www.nvidia.com/en-us/data-center/dgx-b300/">B300 (HGX, per GPU)</a></td>
+   <td>2.25 PFLOPS</td>
+   <td>4.5 PFLOPS</td>
+   <td>13.5 PFLOPS</td>
+   <td>288 GB HBM3e</td>
+   <td>8 TB/s</td>
+  </tr>
+ </tbody>
+</table>
+<p><em>Note: NVIDIA product tables often report Tensor throughput "with sparsity"; this table reports dense throughput. Where applicable, dense throughput is taken as half of sparse throughput, following NVIDIA's guidance for HGX-class platforms (<a href="https://www.nvidia.com/en-us/data-center/hgx/">NVIDIA</a>). DGX figures are system-level; the B200 HBM capacity and bandwidth values are expressed per GPU by dividing DGX totals by eight (<a href="https://www.nvidia.com/en-us/data-center/dgx-b200/">NVIDIA</a>).</em></p>
+<p>As models scale, step time is often dominated by collective communication and memory movement rather than raw compute throughput, motivating explicit scale-up and scale-out bandwidth accounting. For the multi-GPU instances, GPU communication spans two regimes. <strong>Internal scale-up (NVLink/NVSwitch)</strong> provides high-bandwidth, low-latency GPU-to-GPU connectivity within a node, enabling collectives such as all-reduce and all-gather to execute without traversing the host networking stack. <strong>External scale-out (EFA)</strong> provides OS-bypass networking across nodes, which AWS uses as a building block for <a href="https://aws.amazon.com/ec2/ultraclusters/">Amazon EC2 UltraClusters</a> where communication-heavy collectives span thousands of instances. The following table summarizes key specifications across these instance types:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Instance Type</th>
+   <th>GPU</th>
+   <th>GPUs</th>
+   <th>GPU Memory</th>
+   <th>NVLink</th>
+   <th>NVLink BW (aggregate)</th>
+   <th>EFA</th>
+   <th>EFA BW (aggregate)</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><a href="https://aws.amazon.com/ec2/instance-types/p5/">p5.4xlarge</a></td>
+   <td>H100</td>
+   <td>1</td>
+   <td>80 GB HBM3</td>
+   <td>—</td>
+   <td>—</td>
+   <td>v2</td>
+   <td>12.5 GB/s</td>
+  </tr>
+  <tr>
+   <td><a href="https://aws.amazon.com/ec2/instance-types/p5/">p5.48xlarge</a></td>
+   <td>H100</td>
+   <td>8</td>
+   <td>640 GB HBM3</td>
+   <td>4th</td>
+   <td>7.2 TB/s</td>
+   <td>v2</td>
+   <td>400 GB/s</td>
+  </tr>
+  <tr>
+   <td><a href="https://aws.amazon.com/ec2/instance-types/p5/">p5e.48xlarge</a></td>
+   <td>H200</td>
+   <td>8</td>
+   <td>1,128 GB HBM3e</td>
+   <td>4th</td>
+   <td>7.2 TB/s</td>
+   <td>v2</td>
+   <td>400 GB/s</td>
+  </tr>
+  <tr>
+   <td><a href="https://aws.amazon.com/ec2/instance-types/p5/">p5en.48xlarge</a></td>
+   <td>H200</td>
+   <td>8</td>
+   <td>1,128 GB HBM3e</td>
+   <td>4th</td>
+   <td>7.2 TB/s</td>
+   <td>v3</td>
+   <td>400 GB/s</td>
+  </tr>
+  <tr>
+   <td><a href="https://aws.amazon.com/ec2/instance-types/p6/">p6-b200.48xlarge</a></td>
+   <td>B200</td>
+   <td>8</td>
+   <td>1,440 GB HBM3e</td>
+   <td>5th</td>
+   <td>14.4 TB/s</td>
+   <td>v4</td>
+   <td>400 GB/s</td>
+  </tr>
+  <tr>
+   <td><a href="https://aws.amazon.com/ec2/instance-types/p6/">p6-b300.48xlarge</a></td>
+   <td>B300</td>
+   <td>8</td>
+   <td>2,100 GB HBM3e</td>
+   <td>5th</td>
+   <td>14.4 TB/s</td>
+   <td>v4</td>
+   <td>800 GB/s</td>
+  </tr>
+ </tbody>
+</table>
+<p><em>Note: EFA bandwidth is converted from Gbps to GB/s (÷8) for consistency with other bandwidth metrics; see the <a href="https://docs.aws.amazon.com/ec2/latest/instancetypes/ac.html#ac_network">EC2 accelerated computing networking specifications</a>. NVLink and EFA bandwidth figures are shown as aggregate per-instance values rather than per-link values; see the <a href="https://aws.amazon.com/ec2/instance-types/p5/">P5 instance family page</a> and the <a href="https://aws.amazon.com/ec2/instance-types/p6/">P6 instance family page</a> for the corresponding intra-node interconnect and networking characteristics.</em></p>
+<p>Elastic Fabric Adapter (EFA) is a network interface for Amazon EC2 that provides OS-bypass remote direct memory access (RDMA) capability using the <a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa.html">Scalable Reliable Datagram (SRD)</a> protocol. By enabling applications to communicate directly with the network device through the Libfabric API—bypassing the operating system kernel—EFA reduces latency and improves throughput for collective operations in distributed training.</p>
+<p>Multiple generations of EFA are available on different instance families. Amazon EC2 P5 and P5e instances are equipped with EFA version 2 (EFAv2). <a href="https://aws.amazon.com/blogs/aws/new-amazon-ec2-p5en-instances-with-nvidia-h200-tensor-core-gpus-and-efav3-networking/">EFA version 3 (EFAv3), provided on P5en instances, reduces packet latency by approximately 35% compared to EFAv2</a>. <a href="https://aws.amazon.com/blogs/machine-learning/aws-ai-infrastructure-with-nvidia-blackwell-two-powerful-compute-solutions-for-the-next-frontier-of-ai/">EFA version 4 (EFAv4), available on P6 instances, delivers an additional 18% improvement in collective communication performance relative to EFAv3</a>.</p>
+<p>At scale, both distributed training (streaming corpora and writing multi-terabyte checkpoints) and large-scale inference (staging weights and managing KV cache growth) motivate a tiered storage hierarchy—local NVMe SSD for hot data, Lustre for shared high-throughput access, and <a href="https://aws.amazon.com/s3/">Amazon S3</a> for durable persistence.</p>
+<p>In this series' primary multi-GPU instances, local NVMe is provided as <strong>instance store (ephemeral)</strong> with <strong>30.72 TB raw capacity (8 × 3.84 TB NVMe SSD)</strong>; see the <a href="https://docs.aws.amazon.com/ec2/latest/instancetypes/ac.html#ac_instance-store">EC2 accelerated-computing instance store specifications</a>.</p>
+<p><a href="https://www.lustre.org/about/">Lustre</a> is an open-source, POSIX compliant distributed file system widely used in high-performance computing (HPC) to provide a shared namespace with high aggregate throughput across many clients. <a href="https://aws.amazon.com/fsx/lustre/">Amazon FSx for Lustre</a> provides Lustre as a fully managed service and exposes it as a parallel file system capable of terabytes per second of throughput, millions of IOPS, and sub-millisecond latencies. Data Repository Associations enable integration with <a href="https://aws.amazon.com/s3/">Amazon S3</a>, supporting lazy loading of training datasets and automatic checkpoint export for durability.</p>
+<p>At cluster scale, these instances are deployed in <a href="https://aws.amazon.com/ec2/ultraclusters/">Amazon EC2 UltraClusters</a>, which provision thousands of accelerated instances as a single, tightly placed cluster within an Availability Zone and interconnect them using a petabit-scale nonblocking network.</p><img src="https://cdn-uploads.huggingface.co/production/uploads/64d6b270c2eedf9af82baa23/iMu8fYvHpDiGrquj6d-6m.jpeg" alt="ec2-ultraclusters-gen2">
+<blockquote>
+ <p><strong>Figure:</strong> 2nd-generation Amazon EC2 UltraClusters (example P5 UltraCluster).</p>
+</blockquote>
+<p>For workloads with high per-step communication intensity (e.g., expert parallelism in MoE models where all-to-all token dispatch spans many GPUs), the size of the NVLink domain can become a first-order constraint. As an extension of the internal scale-up axis, increasing the NVLink domain reduces how often performance-critical communication must leave the NVLink fabric.</p>
+<p><a href="https://aws.amazon.com/ec2/ultraservers/">Amazon EC2 UltraServers</a> extend the NVLink domain beyond a single EC2 instance by connecting multiple component instances through a dedicated accelerator interconnect. AWS reports that <a href="https://aws.amazon.com/about-aws/whats-new/2025/07/amazon-p6e-gb200-ultraservers-gpu-performance-ec2/">P6e-GB200 UltraServers</a> are built on the <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">NVIDIA GB200 NVL72</a> platform and expose up to 72 Blackwell GPUs and 13.4 TB of aggregate HBM3e within one NVLink domain. At larger scales, EFA remains the cross-node fabric for multi-UltraServer jobs, but increasing the intra-domain GPU count can reduce how often performance-critical communication must leave the NVLink fabric.</p>
+<p>These systems are built from NVIDIA Grace–Blackwell superchips, which couple Grace CPU memory and Blackwell GPU HBM via cache-coherent <a href="https://developer.nvidia.com/blog/nvidia-grace-hopper-superchip-architecture-in-depth/">NVLink-C2C</a>, enabling direct access across CPU- and GPU-attached memory without explicit host–device copies. In practice, this can extend the effective memory available to GPU workloads (e.g., by placing colder model state or KV cache in CPU-attached memory) while avoiding PCIe-scale copy overheads, albeit with higher latency and lower bandwidth than local HBM.</p>
+<p>The component instance type for P6e-GB200 UltraServers is <a href="https://aws.amazon.com/ec2/instance-types/p6/"><code>p6e-gb200.36xlarge</code></a>, which provides four GPUs and Elastic Fabric Adapter (EFA) v4 networking. The tables below summarize the per-instance and composed UltraServer configurations.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Instance Type</th>
+   <th>GPU</th>
+   <th>GPUs</th>
+   <th>GPU Memory</th>
+   <th>Memory BW</th>
+   <th>NVLink</th>
+   <th>NVLink BW</th>
+   <th>EFA</th>
+   <th>EFA BW</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><a href="https://aws.amazon.com/ec2/instance-types/p6/">p6e-gb200.36xlarge</a></td>
+   <td><a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">GB200 NVL72</a></td>
+   <td>4</td>
+   <td><a href="https://aws.amazon.com/blogs/aws/new-amazon-ec2-p6e-gb200-ultraservers-powered-by-nvidia-grace-blackwell-gpus-for-the-highest-ai-performance/">740 GB HBM3e</a></td>
+   <td>—</td>
+   <td>—</td>
+   <td>—</td>
+   <td>v4</td>
+   <td><a href="https://aws.amazon.com/blogs/aws/new-amazon-ec2-p6e-gb200-ultraservers-powered-by-nvidia-grace-blackwell-gpus-for-the-highest-ai-performance/">200 GB/s</a></td>
+  </tr>
+ </tbody>
+</table>
+<p><em>Note: The <code>p6e-gb200.36xlarge</code> EFA bandwidth is converted from the published aggregate EFA networking (4 × 400 Gbps) to GB/s (÷8); see the <a href="https://docs.aws.amazon.com/ec2/latest/instancetypes/ac.html#ac_network">EC2 accelerated computing networking specifications</a>.</em></p>
+<table>
+ <thead>
+  <tr>
+   <th>UltraServer</th>
+   <th>Component instance type</th>
+   <th>GPUs (NVLink domain)</th>
+   <th>HBM3e (aggregate)</th>
+   <th>EFA</th>
+   <th>EFA BW</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>u-p6e-gb200x36</td>
+   <td><a href="https://aws.amazon.com/ec2/instance-types/p6/">p6e-gb200.36xlarge</a></td>
+   <td>36</td>
+   <td>6.7 TB</td>
+   <td>v4</td>
+   <td>1,800 GB/s</td>
+  </tr>
+  <tr>
+   <td>u-p6e-gb200x72</td>
+   <td><a href="https://aws.amazon.com/ec2/instance-types/p6/">p6e-gb200.36xlarge</a></td>
+   <td>72</td>
+   <td>13.4 TB</td>
+   <td>v4</td>
+   <td>3,600 GB/s</td>
+  </tr>
+ </tbody>
+</table>
+<p><em>Note: UltraServer EFA bandwidth is converted from terabits per second (Tbps), as reported by AWS, to GB/s (÷8); see the <a href="https://aws.amazon.com/blogs/aws/new-amazon-ec2-p6e-gb200-ultraservers-powered-by-nvidia-grace-blackwell-gpus-for-the-highest-ai-performance/">P6e-GB200 UltraServers announcement</a> and the <a href="https://aws.amazon.com/ec2/instance-types/p6/">P6 instance family page</a>.</em></p>
+<h3>Resource Orchestration: Slurm and Kubernetes</h3>
+<p>When training spans hundreds or thousands of accelerators, manual resource management becomes intractable. For example, a training job requiring 512 GPUs must co-schedule 64 eight-GPU nodes (P-instances) simultaneously, and release resources atomically upon completion or failure. Both <a href="https://slurm.schedmd.com/">Slurm</a> and <a href="https://kubernetes.io/">Kubernetes</a> address this challenge through a control-plane architecture: a centralized scheduler maintains cluster state and makes allocation decisions, while worker nodes execute assigned workloads.</p><img src="https://cdn-uploads.huggingface.co/production/uploads/64d6b270c2eedf9af82baa23/rYM10isubva2wx3jIVeZm.png" alt="slurm-k8s-highlevel-arch">
+<p><em>Figure 2: High-level architecture of Slurm-based and Kubernetes-based resource orchestration on AWS</em></p>
+<p><a href="https://slurm.schedmd.com/">Slurm</a> (Simple Linux Utility for Resource Management) is the dominant workload manager in high-performance computing, built on a modular plugin architecture that allows the scheduling algorithm, topology model, resource types, and accounting backend to be configured independently. Its scheduling model organizes resources into partitions (logical groupings of nodes), accepts job submissions via <code>sbatch</code>, and launches parallel tasks via <code>srun</code> with synchronized startup across allocated nodes. Critically for distributed training, Slurm schedules at the job level—allocating entire multi-node jobs atomically before any task launches. A <a href="https://slurm.schedmd.com/sched_config.html">backfill scheduler</a> starts lower-priority jobs in idle slots without delaying higher-priority ones, while a <a href="https://slurm.schedmd.com/priority_multifactor.html">multi-factor priority</a> system weighs fair-share usage, job age, and QOS tiers to order the queue across tenants. Slurm also supports <a href="https://slurm.schedmd.com/topology.html">topology-aware placement</a> through plugins that model network switch hierarchies—on AWS, encoding the EFA fabric topology to co-locate jobs on nodes with minimal switch hops—and native <a href="https://slurm.schedmd.com/gres.html">GPU scheduling</a> through its Generic Resource (GRES) interface, which tracks GPU types and enforces device affinity.</p>
+<p>AWS provides multiple deployment options for Slurm-based orchestration. <a href="https://github.com/aws/aws-parallelcluster">AWS ParallelCluster</a> is an open-source cluster management tool that automates the deployment of Slurm clusters on EC2, handling head node provisioning, compute fleet scaling, and integration with shared storage. <a href="https://aws.amazon.com/pcs/">AWS Parallel Computing Service (PCS)</a> offers an alternative that provides the managed control plane. For distributed training workloads specifically, <a href="https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-hyperpod.html">Amazon SageMaker HyperPod</a> supports Slurm mode with additional capabilities tailored to large-scale training, such as <a href="https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-hyperpod-resiliency-slurm-cluster-health-check.html">continuous node health monitoring</a> and <a href="https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-hyperpod-resiliency-slurm-auto-resume.html">job auto-resume functionality</a>.</p>
+<p><a href="https://kubernetes.io/">Kubernetes</a> takes a declarative, API-driven approach: users specify desired state through resource manifests, and controllers reconcile actual state to match. While Kubernetes excels at model deployment, its native scheduling model exposes several gaps for tightly coupled distributed training. Kubernetes schedules at the pod level; without job-level atomicity, a multi-node training job can partially start—some ranks running while others remain Pending—wasting GPUs or causing deadlocks. Vanilla Kubernetes also lacks batch queue semantics with priority-based backfill, built-in awareness of network fabric topology (NVLink domains, EFA interconnects) for placement of communication-heavy collectives.</p>
+<p>Several Kubernetes-native projects address these gaps at different layers. <a href="https://kueue.sigs.k8s.io/">Kueue</a> operates as an admission controller atop the default scheduler, managing job-level gang admission, multi-tenant quotas with hierarchical fair sharing, and priority-based preemption—while delegating pod placement to the underlying scheduler. <a href="https://volcano.sh/">Volcano</a> and <a href="https://github.com/NVIDIA/KAI-Scheduler">NVIDIA KAI Scheduler</a> take a different approach, replacing or augmenting the default scheduler to integrate gang scheduling directly with topology-aware pod placement—Volcano as a general-purpose batch scheduler, KAI Scheduler with deep NVLink/NVSwitch awareness for GPU-optimized placement. These layers are complementary: Kueue can manage admission and quota policy while passing admitted jobs to a topology-aware scheduler for placement.</p>
+<p>For Kubernetes-based orchestration on AWS, <a href="https://aws.amazon.com/eks/">Amazon Elastic Kubernetes Service (EKS)</a> provides managed Kubernetes with GPU scheduling via the <a href="https://github.com/NVIDIA/k8s-device-plugin">NVIDIA device plugin</a>. Amazon SageMaker HyperPod also supports <a href="https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-hyperpod-eks.html">EKS mode</a>, combining Kubernetes orchestration with HyperPod's training-specific capabilities. HyperPod EKS extends EKS with features designed for foundation model training at scale. <a href="https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-hyperpod-eks-operate-console-ui-governance-policies.html">Task governance</a> provides compute allocation and policy enforcement across teams, integrating managed <a href="https://kueue.sigs.k8s.io/">Kueue</a> for admission control and <a href="https://karpenter.sh/">Karpenter</a> for just-in-time node provisioning. <a href="https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-eks-checkpointless.html">Checkpointless training</a> addresses the recovery latency inherent in traditional checkpoint-based fault tolerance. Rather than periodically serializing model state to shared storage, checkpointless training maintains continuous peer-to-peer state replication across GPUs. When a failure occurs, surviving nodes reconstruct the lost state through EFA-based communication rather than reading multi-terabyte checkpoints from FSx for Lustre or S3. <a href="https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-eks-elastic-training.html">Elastic training</a> enables jobs to automatically scale based on resource availability. When additional accelerators become available (e.g., from completed jobs or newly provisioned capacity), elastic jobs can expand to utilize them; when higher-priority workloads require resources, jobs can contract while maintaining training progress.</p>
+<h3>ML Software Stack</h3>
+<p>Distributed training and inference involve multiple software layers that must be correctly configured and coordinated. A useful model treats the runtime stack as five layers, ordered from hardware-adjacent components (which must function correctly for anything to run) to framework-level abstractions (which determine programmer productivity and model throughput): hardware enablement, accelerator runtime and math libraries, communication substrate, ML frameworks, and distributed training/inference frameworks.</p><img src="https://cdn-uploads.huggingface.co/production/uploads/64d6b270c2eedf9af82baa23/nglvcX4bzuE_vxavN-2ZU.png" alt="demystify-ml-software-stack">
+<p><em>Figure 3: The ML software stack for distributed training and inference on EC2 instances</em></p>
+<h4>Hardware enablement: kernel drivers</h4>
+<p>At the foundation, Linux kernel drivers provide direct hardware access. The NVIDIA GPU driver exposes compute capabilities and supports <a href="https://docs.nvidia.com/cuda/gpudirect-rdma/index.html">GPUDirect RDMA</a> for direct data transfers between GPUs and network adapters. The <a href="https://github.com/NVIDIA/gdrcopy">GDRCopy</a> driver (<code>gdrdrv</code>) enables low-latency CPU-initiated copies to and from GPU memory, used by NCCL for small-message transfers. The <a href="https://github.com/amzn/amzn-drivers">EFA driver</a> provides OS-bypass networking through the <a href="https://github.com/ofiwg/libfabric">libfabric</a> API, and the <a href="https://www.lustre.org/">Lustre client</a> driver enables POSIX access to FSx for Lustre parallel file systems.</p>
+<h4>Accelerator runtime, compilers, and kernel libraries</h4>
+<p>The <a href="https://developer.nvidia.com/cuda-toolkit">CUDA</a> platform provides the programming model and runtime for GPU compute. Applications compiled against CUDA can launch kernels on NVIDIA GPUs, manage device memory, and coordinate execution across multiple devices. The current release is CUDA Toolkit 13.x, with support for Blackwell architecture (compute capability 10.x).</p>
+<p>Modern training and inference performance is increasingly driven by specialized optimization libraries and custom kernels, not just general-purpose vendor primitives. Kernels like <a href="https://github.com/Dao-AILab/flash-attention">FlashAttention</a> fuse attention into a single memory-efficient pass, cutting HBM traffic and improving throughput. Many teams also write shape- and precision-specialized fused kernels (e.g., layernorm/residual/activation, quantized GEMMs, MoE dispatch, KV-cache ops) tuned to their exact models. This is enabled by programmable toolchains such as <a href="https://triton-lang.org/">Triton</a> (Python GPU kernel compiler) and NVIDIA's <a href="https://github.com/NVIDIA/cutlass/blob/1d9e1f6d7a1e820a884765cf3dcfda05c95f39d1/media/docs/cpp/cute/00_quickstart.md">CuTe</a> (tensor layout and warp-level DSL), with libraries like <a href="https://github.com/NVIDIA/cutlass">CUTLASS</a> providing highly optimized GEMM and fusion building blocks. In practice, this kernel and compiler layer often determines end-to-end performance as much as the ML framework.</p>
+<h4>Communication substrate: NCCL and transport plugins</h4>
+<p>Multi-GPU training depends on efficient collective communication. <a href="https://developer.nvidia.com/nccl">NVIDIA Collective Communications Library (NCCL)</a> implements collective operations—all-reduce, all-gather, reduce-scatter, all-to-all, broadcast, and point-to-point send/receive—with topology-aware algorithms that exploit NVLink for intra-node communication and network transports for inter-node traffic. NCCL dynamically detects the communication topology and selects ring or tree algorithms depending on message size and available bandwidth. While data-parallel and tensor-parallel strategies rely primarily on all-reduce and all-gather, Mixture-of-Experts (MoE) models with expert parallelism depend on all-to-all collectives to route tokens between GPUs: a dispatch all-to-all sends each token to the GPU hosting its assigned expert, and a combine all-to-all returns expert outputs to the originating GPUs (<a href="https://developer.nvidia.com/blog/accelerating-large-scale-mixture-of-experts-training-in-pytorch/">NVIDIA Developer Blog</a>). Because every GPU exchanges data with every other GPU in the expert-parallel group, all-to-all communication volume scales with the number of experts and can become a dominant bottleneck at high expert-parallelism degrees.</p>
+<p>On AWS, NCCL's inter-node communication is enabled through the <a href="https://github.com/aws/aws-ofi-nccl">aws-ofi-nccl</a> plugin, which maps NCCL's transport APIs to <a href="https://github.com/ofiwg/libfabric">libfabric</a> interfaces. This allows NCCL to leverage EFA's OS-bypass and Scalable Reliable Datagram (SRD) protocol without application changes.</p>
+<p>For inference workloads, collective operations do not capture all communication patterns. Disaggregated inference architectures—which separate prefill and decode phases onto distinct GPU pools—require efficient point-to-point data movement, particularly for transferring KV cache state between instances. <a href="https://github.com/ai-dynamo/nixl">NVIDIA Inference Xfer Library (NIXL)</a> addresses this requirement by providing a unified API for point-to-point transfers across memory tiers (HBM, DRAM, NVMe, distributed storage) and interconnects (NVLink, InfiniBand, Ethernet). NIXL integrates with inference frameworks such as NVIDIA Dynamo and supports backends including UCX and GPUDirect Storage.</p>
+<h4>ML frameworks: PyTorch</h4>
+<p>The two dominant frameworks for foundation model development are <a href="https://pytorch.org/">PyTorch</a> and <a href="https://jax.readthedocs.io/">JAX</a>. JAX takes an SPMD (Single Program Multiple Data) approach through XLA, where the same program executes across devices with automatic data distribution and collective lowering. This blog focuses on PyTorch, which sees broader adoption in the open-source ecosystem and forms the basis for the distributed training and inference frameworks discussed below.</p>
+<p>PyTorch provides tensor computation with GPU acceleration, automatic differentiation, and a flexible eager-execution model. For distributed workloads, PyTorch's <code>torch.distributed</code> module provides the core primitives: process groups for collective communication, and distributed data-parallel abstractions including <a href="https://docs.pytorch.org/docs/stable/nn.html#torch.nn.parallel.DistributedDataParallel">Distributed Data Parallel (DDP)</a> and <a href="https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html">Fully Sharded Data Parallel (FSDP2)</a>. DDP replicates models across GPUs and synchronizes gradients via all-reduce, while FSDP2 shards parameters, gradients, and optimizer states across workers using techniques from the ZeRO algorithm, enabling training of models that exceed single-GPU memory capacity.</p>
+<h4>Distributed training and inference frameworks</h4>
+<p>The top layer comprises frameworks that build on PyTorch to provide higher-level abstractions for distributed training and inference at scale. For training, three categories of frameworks address different points in the complexity-performance tradeoff. Below are few examples</p>
+<p><a href="https://huggingface.co/docs/transformers/">Hugging Face Transformers</a> provides the <code>Trainer</code> class with built-in support for distributed training via <a href="https://huggingface.co/docs/accelerate/">Accelerate</a>, which abstracts over DDP, FSDP, and DeepSpeed. This path prioritizes ease of use and broad model compatibility, making it suitable for fine-tuning and moderate-scale training where configuration simplicity matters more than maximum throughput.</p>
+<p><a href="https://developer.nvidia.com/megatron-core">NVIDIA Megatron Core</a> targets maximum efficiency at scale, implementing 3D parallelism (tensor, pipeline, and expert parallelism) with optimizations including FP8 mixed precision via Transformer Engine. The <a href="https://docs.nvidia.com/nemo-framework/user-guide/latest/">NeMo Framework</a> builds on Megatron Core to provide end-to-end workflows for pre-training and fine-tuning.</p>
+<p>For reinforcement learning from human feedback (RLHF) and related post-training methods, <a href="https://github.com/volcengine/verl">veRL</a> (Volcano Engine Reinforcement Learning) provides a flexible framework that implements algorithms including PPO, GRPO, and REINFORCE++. veRL's HybridFlow architecture allows mixing training backends (FSDP2, Megatron) with inference engines (vLLM, SGLang) in the same job, avoiding weight synchronization overhead by sharing model weights in memory between actor and rollout components.</p>
+<p>For inference serving, <a href="https://github.com/vllm-project/vllm">vLLM</a> implements PagedAttention, managing the KV cache as paged virtual memory to reduce fragmentation and enable higher batch sizes. <a href="https://github.com/sgl-project/sglang">SGLang</a> extends this with RadixAttention for automatic prefix reuse across requests, a zero-overhead batch scheduler that overlaps CPU scheduling with GPU computation, and a cache-aware load balancer that routes requests based on predicted cache hit rates. Both frameworks support tensor parallelism for serving models that exceed single-GPU memory, and both integrate with <a href="https://developer.nvidia.com/blog/introducing-nvidia-dynamo-a-low-latency-distributed-inference-framework-for-scaling-reasoning-ai-models/">NVIDIA Dynamo</a> for disaggregated serving architectures that separate prefill and decode phases.</p>
+<h3>Observability</h3>
+<p>Observability is a prerequisite for debugging and operating distributed training systems at scale. When a training job stalls or throughput degrades, practitioners need visibility into whether the cause is hardware failure, network congestion, storage bottlenecks, or application-level inefficiency. At the infrastructure scale discussed in this series—thousands of GPUs, petabits of interconnect bandwidth, and terabytes of checkpoint data—the challenge shifts from simple monitoring to systematic telemetry collection, storage, and analysis. Observability spans three telemetry categories: infrastructure metrics (GPU, network, storage), workload metrics (training throughput, queue latency), and alerting for proactive fault detection.</p>
+<h4>Core Stack: Prometheus and Grafana</h4>
+<p>The de facto standard for observability in Kubernetes and HPC environments combines <a href="https://prometheus.io/docs/introduction/overview/">Prometheus</a> for metrics collection with <a href="https://grafana.com/docs/grafana/latest/">Grafana</a> for visualization and alerting. Prometheus operates on a pull-based model, periodically scraping HTTP endpoints exposed by metric exporters. Collected metrics are stored in a time-series database (TSDB) and queried via PromQL, a flexible query language for aggregation, filtering, and alerting rule evaluation. Grafana consumes Prometheus as a data source, rendering dashboards and triggering alerts based on PromQL expressions.</p>
+<p>For production deployments, <a href="https://docs.aws.amazon.com/prometheus/latest/userguide/what-is-Amazon-Managed-Service-Prometheus.html">Amazon Managed Service for Prometheus (AMP)</a> provides a fully managed, Prometheus-compatible time-series database that scales to ingest millions of samples per second without requiring operators to manage storage, replication, or high availability. <a href="https://docs.aws.amazon.com/grafana/latest/userguide/what-is-Amazon-Managed-Service-Grafana.html">Amazon Managed Grafana (AMG)</a> offers a managed Grafana workspace with native integration to AMP and AWS authentication via IAM Identity Center. Together, these services eliminate operational overhead while preserving compatibility with existing Prometheus exporters and Grafana dashboards.</p>
+<h4>GPU, Network, and Application Telemetry</h4>
+<p><a href="https://github.com/NVIDIA/dcgm-exporter">DCGM-Exporter</a> exposes NVIDIA GPU metrics in Prometheus format, including utilization, memory usage, power, temperature, and hardware health indicators such as ECC errors and XID events. For training workloads, SM activity (<code>DCGM_FI_PROF_SM_ACTIVE</code>) often provides a more accurate measure of compute efficiency than basic utilization metrics.</p>
+<p>EFA exposes driver-level statistics (bytes, packets, retransmits, timeouts) that help diagnose collective operation bottlenecks in distributed training. The <a href="https://github.com/aws/aws-ofi-nccl">aws-ofi-nccl</a> plugin bridges NCCL to the libfabric interface, and operators can combine EFA counters with NCCL diagnostics (<code>NCCL_DEBUG=INFO</code>) to isolate network-layer issues.</p>
+<p><a href="https://aws.amazon.com/fsx/lustre/">Amazon FSx for Lustre</a> exposes client-side metrics including throughput and metadata latency, while application-level metrics (step time, tokens per second, loss values for training; TTFT, inter-token latency for inference) can be exported via Prometheus client libraries.</p>
+<h4>GPU Health Monitoring and Alerting</h4>
+<p>Proactive fault detection prevents hardware issues from propagating into extended training interruptions. A typical workflow monitors DCGM health metrics and triggers alerts when error counts exceed thresholds. ECC single-bit errors (SBE) may be tolerable in small numbers, but accelerating SBE rates often precede double-bit errors (DBE) or other failures. XID 63 (row remap failure), XID 64 (GPU fallen off bus), and XID 94/95 (contained/uncontained errors) typically warrant immediate node replacement.</p>
+<p>The <a href="https://grafana.com/grafana/dashboards/21645-gpu-health-cluster/">GPU Health - Cluster dashboard</a> (Grafana dashboard ID 21645) provides a reference visualization for common GPU error patterns. The dashboard aggregates ECC errors, XID events, thermal violations, and row remapping status across all cluster nodes, enabling operators to identify failing hardware before it impacts training jobs.</p><img src="https://cdn-uploads.huggingface.co/production/uploads/64d6b270c2eedf9af82baa23/CNoV_SbvTriVgMgg85ekz.png" alt="gpu-health">
+<p><em>Figure 4: GPU Health - Cluster dashboard showing GPU error patterns and instance reporting</em></p>
+<h2>Conclusion</h2>
+<p>The shift from a single pre-training scaling law to three complementary regimes—pre-training, post-training, and test-time compute—has not fragmented infrastructure requirements; it has reinforced them. All three regimes demand tightly coupled accelerator compute, high-bandwidth low-latency networking, and scalable distributed storage, differing mainly in workload profile and resource scheduling patterns.</p>
+<p>This post surfaced the four-layer architecture that addresses those requirements on AWS: infrastructure building blocks (EC2 P-instances, EFA networking, and tiered storage), resource orchestration (Slurm and Kubernetes with SageMaker HyperPod), the ML software stack (from kernel drivers and CUDA through NCCL to PyTorch), and observability (Prometheus, Grafana, and GPU health monitoring). Each layer constrains and enables the layers above it—a misconfigured driver or saturated network link can bottleneck an otherwise well-tuned training run just as effectively as a suboptimal parallelism strategy.</p>
+<p>Understanding these integration points is the foundation for diagnosing performance bottlenecks and making informed scaling decisions across the foundation model lifecycle.</p>

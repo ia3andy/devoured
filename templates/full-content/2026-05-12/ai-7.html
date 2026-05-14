@@ -1,0 +1,268 @@
+Let me output the cleaned HTML directly: 
+<h1>AutoTTS</h1>
+<p><strong>LLMs Improving LLMs: Agentic Discovery for Test-Time Scaling</strong></p>
+<p>Tong Zheng, Haolin Liu, Chengsong Huang, Huiwen Bao, Sheng Zhang, Rui Liu, Runpeng Dai, Ruibo Chen, Chenxi Liu, Tianyi Xiong, Xidong Wu, Hongming Zhang, Heng Huang <em>UMD · UVA · WUSTL · UNC · Google · Meta</em></p>
+<p><a href="https://zhengkid.github.io/AutoTTS-web/">Project page</a></p>
+<p>AutoTTS reframes TTS strategy design from <strong>hand-crafting heuristics</strong> to <strong>environment-driven automatic search</strong>: humans only construct an <strong>offline replay environment</strong> (states, actions, feedback, objectives), and a <strong>coding agent</strong> iteratively proposes and refines <strong>code-defined controllers</strong> within it — <strong>code edits, no gradient updates</strong>. <strong>Cheap: 0 LLM calls, fully replay.</strong></p>
+<p><strong>Quick links:</strong> Install · Reproduction · Citation</p>
+<h2>Highlighted results</h2>
+<ul>
+ <li>~<strong>69.5% tokens saved</strong> vs SC@64 at β ≈ 0.5; held-out average accuracy matches SC@64 across four backbone scales.</li>
+ <li><strong>$39.9</strong> estimated monetary cost for one full discovery run.</li>
+ <li><strong>160 minutes</strong> wall-clock for the same run.</li>
+ <li><strong>0</strong> LLM calls during discovery evaluation (replays cached segments only).</li>
+</ul>
+<p>The discovered controller is the <strong>Confidence Momentum Controller (CMC)</strong>, characterized by trend-based stopping, coupled width–depth control, alignment-aware depth allocation, and conservative branch abandonment.</p>
+<h2>Problem setup</h2>
+<p>We treat adaptive test-time inference as allocating a finite budget over branches in fixed-length intervals.</p>
+<p><strong>State</strong> at step <code>t</code>:</p>
+<pre><code>s_t = (q, m_t, I_t, ℓ_t, Ω_t)</code></pre>
+<p><code>q</code>: question; <code>m_t</code>: number of instantiated branches; <code>I_t</code>: active branch set; <code>ℓ_t</code>: depth vector; <code>Ω_t</code>: revealed probe triples.</p>
+<p><strong>Admissible actions</strong> <code>A(s_t)</code>:</p>
+<ul>
+ <li><code>BRANCH</code> — open a new branch through the first interval.</li>
+ <li><code>CONTINUE(i)</code> — advance branch <code>i</code> by one interval.</li>
+ <li><code>PROBE(i)</code> — reveal <code>ω_\{i,ℓ}</code> without advancing depth.</li>
+ <li><code>PRUNE(i)</code> — deactivate branch <code>i</code>; depths and past probes stay recorded.</li>
+ <li><code>ANSWER</code> — terminate and apply the controller's terminal aggregator.</li>
+</ul>
+<p><strong>Cost</strong> in interval units:</p>
+<pre><code>Cost(s_t) = Σ_i ℓ_\{t,i} + κ_probe · |Ω_t|        (often κ_probe = 0)</code></pre>
+<p><strong>Objective.</strong> A code-defined policy <code>π(· | s, β)</code> is parameterized by a scalar meta-parameter <code>β</code> that deterministically schedules every internal hyper-parameter. Over tasks <code>(q, y) ~ 𝒟</code>:</p>
+<pre><code>max_\{π, β}  E_\{q,y}[ 1\{ŷ_\{π,β}(q) = y}  −  γ · C_\{π,β}(q) ]</code></pre>
+<p>The <strong>outer loop</strong> searches over implementations of <code>π</code>. Each candidate is replay-evaluated on offline caches; traces and scaling curves enter the next round's history.</p>
+<h2>Environment construction (run once per (model, benchmark))</h2>
+<p>The MDP above is instantiated as a concrete replay environment <strong>before</strong> the discovery loop starts:</p>
+<ol>
+ <li><strong>Specify the interface.</strong> Fix <code>s_t</code>, <code>A(s_t)</code>, <code>Cost(s_t)</code>, and the accuracy–cost objective.</li>
+ <li><strong>Offline trajectory collection.</strong> For each query, draw <code>N</code> parallel independent reasoning traces from the backbone (full strings first), then partition each trace into fixed-length segments of <code>Δ</code> tokens and enumerate branch prefixes <code>z_\{i,k}</code> with probe responses <code>ω_\{i,k}</code>.</li>
+ <li><strong>Materialize the replay store.</strong> Every environment transition consults the archived table; e.g. <code>PROBE(i)</code> retrieves the cached <code>ω_\{i,k}</code> without any new decoding.</li>
+ <li><strong>Hand off to discovery.</strong> Candidate controllers are simulated exclusively through <code>observe</code>/<code>step</code>. Asymptotic evaluation cost is dominated by table replay.</li>
+</ol>
+<p>Steps 1–3 run once. Iterative coding-agent discovery starts only after the replay store is <strong>frozen</strong>.</p>
+<p>In this repository:</p>
+<ul>
+ <li><code>efficient_reasoning_controller/workspace/code_base/environment/</code> — search-set replay store.</li>
+ <li><code>efficient_reasoning_controller/test_environment/</code> — held-out replay store; never exposed to the proposer.</li>
+</ul>
+<h2>Discovery: β parameterization &amp; trace feedback</h2>
+<ul>
+ <li><strong>β parameterization.</strong> Each candidate controller exports a single scalar <code>β</code> plus a deterministic, monotonic map from <code>β</code> to every internal knob. Outer search collapses to sweeping <code>β</code>, eliminating brittle thresholds tuned only to the search set.</li>
+ <li><strong>History augmentation with execution traces.</strong> Alongside each round's β-sweep we archive both empirical scaling curves <em>and</em> the full action-by-action trajectories reconstructed during replay. Traces give the explorer fine-grained behavioral evidence to localize defects before rewriting code.</li>
+</ul>
+<h2>Main results</h2>
+<p>AutoTTS is optimized on AIME24 replay constructions and evaluated on held-out AIME25 / HMMT25 benchmarks across four Qwen3 backbone scales. The project page reports the following trends:</p>
+<ul>
+ <li><strong>Better accuracy–token trade-offs.</strong> Discovered controllers typically shift the empirical Pareto frontier beyond handcrafted baselines such as SC@64, ASC, ESC, and Parallel-Probe.</li>
+ <li><strong>Held-out generalization.</strong> Policies discovered on AIME24 transfer to held-out benchmarks, outperforming every handcrafted baseline on average accuracy for three of four backbone scales and remaining competitive on Qwen3-8B.</li>
+ <li><strong>β = 0.5 operating point.</strong> Cuts aggregate token usage by roughly <strong>69.5%</strong> compared with SC@64 while matching mean held-out accuracy across models.</li>
+ <li><strong>β = 1.0 operating point.</strong> Pushes peak accuracy beyond all handcrafted baselines in five of the eight tabulated comparison cells on the project page.</li>
+</ul>
+<p>Sweeping <code>β</code> traces accuracy–token scaling curves: larger <code>β</code> generally moves toward higher-budget, accuracy-first behavior, while smaller <code>β</code> favors cheaper inference.</p>
+<h3>Evolution of the discovery process</h3>
+<p>The round-level trajectory (e.g., <code>t1 -&gt; t5</code>) shows a consistent move toward better objective values over the search process:</p>
+<ul>
+ <li>On the search benchmark, later rounds improve accuracy while keeping token growth controlled, indicating progressively better policy structure rather than random fluctuation.</li>
+ <li>On held-out benchmarks, the same trajectory remains competitive and often improves, suggesting that the discovered control logic transfers beyond the optimization split.</li>
+ <li>The trajectory reflects <strong>objective-seeking code evolution without gradient updates</strong>: the agent edits explicit controller programs, receives replay-based accuracy/cost feedback, and iteratively shifts behavior toward better empirical trade-offs.</li>
+</ul>
+<p>This is a key point of AutoTTS: optimization is achieved through iterative program search in a fixed replay environment, not through backpropagation or parameter fine-tuning of the backbone model.</p>
+<h2>Discovered controller: CMC</h2>
+<p>The discovered controller is named the <strong>Confidence Momentum Controller (CMC)</strong>. Its main mechanisms are:</p>
+<ul>
+ <li><strong>Trend-based stopping.</strong> CMC maintains an exponential moving average of pool confidence and stops only when the confidence level is high and the trend is non-negative. This avoids stopping on transient confidence spikes.</li>
+ <li><strong>Coupled width–depth control.</strong> Widening and deepening are linked through the EMA delta: strong confidence gains suppress new branch spawning, while stagnation or regression triggers widening.</li>
+ <li><strong>Alignment-aware depth allocation.</strong> Branches whose latest answer matches the pool winner receive extra probe steps, concentrating compute on the emerging consensus while still advancing active branches.</li>
+ <li><strong>Conservative branch abandonment.</strong> A branch is abandoned only after persistently deviating for multiple rounds, and at least two active branches are preserved.</li>
+</ul>
+<p>These mechanisms are implemented as code-defined controller logic and evaluated through the same replay environment as the handcrafted baselines.</p>
+<p><strong>Show full <code>OptimalController</code> source (CMC)</strong></p>
+<pre><code>class OptimalController(LLMDesignedMethod):
+    """Confidence Momentum Controller (CMC)."""
+    NAME = "optimal_controller"
+    _MAX_BRANCH   = 64
+    _MAX_OUTER    = 500
+    def _schedule(self, beta: float) -&gt; dict:
+        b = max(0.0, min(1.0, float(beta)))
+        n_init           = max(2, round(2  + 6  * b))
+        max_branch_use   = min(self._MAX_BRANCH, round(4 + 60 * b))
+        warm_up          = max(2, round(2  + 8  * b))
+        abandon_patience = max(3, round(3  + 9  * b))
+        T_ema            = max(2, round(2  + 6  * b))
+        ema_alpha        = 0.70 - 0.40 * b
+        conf_thresh      = 0.85 + 0.12 * b
+        delta_slack      = 0.04 - 0.03 * b
+        burst_aligned    = max(1, round(1 + 2 * b))
+        widen_burst      = max(1, round(1 + 3 * b))
+        trend_thresh     = 0.04 - 0.03 * b
+        min_complete     = max(2, round(2 + 3 * b))
+        return \{
+            "n_init":           n_init,
+            "max_branch_use":   max_branch_use,
+            "warm_up":          warm_up,
+            "abandon_patience": abandon_patience,
+            "T_ema":            T_ema,
+            "ema_alpha":        round(ema_alpha, 4),
+            "conf_thresh":      round(conf_thresh, 4),
+            "delta_slack":      round(delta_slack, 4),
+            "burst_aligned":    burst_aligned,
+            "widen_burst":      widen_burst,
+            "trend_thresh":     round(trend_thresh, 4),
+            "min_complete":     min_complete,
+        }</code></pre>
+<p>The same source also lives in <code>efficient_reasoning_controller/workspace/code_base/method.py</code>.</p>
+<h2>Repository structure</h2>
+<pre><code>AutoTTS/
+└── efficient_reasoning_controller/
+    ├── eval/
+    ├── logs/search_history/
+    ├── workspace/
+    │   ├── code_base/
+    │   │   ├── data_loader.py
+    │   │   ├── method.py
+    │   │   ├── method.template.py
+    │   │   ├── eval.py
+    │   │   ├── evaluator.py
+    │   │   ├── controller_api.py
+    │   │   ├── trace_schema.py
+    │   │   ├── environment/
+    │   │   └── history/
+    │   └── controller_search/
+    │       ├── run_workflow.sh
+    │       ├── workflow_propose_critic.py
+    │       ├── claude_proposer.py
+    │       ├── codex_proposer.py
+    │       └── prompts/
+    └── test_environment/</code></pre>
+<h2>Install</h2>
+<p>Depending on how you reproduce results:</p>
+<ul>
+ <li><strong>Evaluate our controllers only</strong> — create the Conda environment and install <code>numpy</code>, <code>pandas</code>, <code>tqdm</code>. No Node.js, Claude CLI, or API keys are required for replay evaluation.</li>
+ <li><strong>Run discovery yourself</strong> — complete all subsections: Conda, Claude environment setup, and API environment setup.</li>
+</ul>
+<h3>Conda environment</h3>
+<pre><code>conda create -n autotts python=3.12 -y
+conda activate autotts</code></pre>
+<h3>Claude environment setup</h3>
+<pre><code>curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+
+source ~/.bashrc
+
+nvm install 21
+
+npm install -g @anthropic-ai/claude-code
+
+pip install claude-agent-sdk==0.1.58
+
+pip install numpy pandas tqdm</code></pre>
+<h3>API environment setup</h3>
+<pre><code>cat &gt;&gt; ~/.bashrc &lt;&lt;'EOF'
+export OPENROUTER_API_KEY="your_openrouter_api_key"
+
+export ANTHROPIC_BASE_URL="https://openrouter.ai/api"
+export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY"
+export ANTHROPIC_API_KEY=""
+
+export ANTHROPIC_DEFAULT_SONNET_MODEL="anthropic/claude-sonnet-4.6"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="anthropic/claude-opus-4.6"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="anthropic/claude-haiku-4.5"
+export CLAUDE_CODE_SUBAGENT_MODEL="anthropic/claude-opus-4.6"
+export CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK=1
+EOF
+
+source ~/.bashrc</code></pre>
+<h2>Reproduction</h2>
+<p>There are <strong>two supported workflows</strong>:</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th><strong>Goal</strong></th>
+   <th><strong>Needs API / Claude tooling?</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Way A</strong></td>
+   <td>Evaluate <strong>released or archived</strong> TTS controller programs (<code>method.py</code>) on our replay splits</td>
+   <td>No — replay-only</td>
+  </tr>
+  <tr>
+   <td><strong>Way B</strong></td>
+   <td><strong>Run controller discovery yourself</strong> (multi-round propose → critic → eval)</td>
+   <td>Yes — follow full Install</td>
+  </tr>
+ </tbody>
+</table>
+<p>Complete Install before Way B. Way A only requires the Conda setup and <code>numpy</code> / <code>pandas</code> / <code>tqdm</code>.</p>
+<h3>Way A — Evaluate our programs (<code>eval/</code>)</h3>
+<p>Use this when you want tables and traces on the bundled replay data <strong>without</strong> launching search.</p>
+<ol>
+ <li><strong>Controller code.</strong> The repo ships a working <code>efficient_reasoning_controller/eval/method.py</code>. To evaluate a <strong>specific snapshot</strong> from our search logs, copy it over that file, e.g. from <code>logs/search_history/&lt;run&gt;/code_base/method.py</code>.</li>
+ <li><strong>Configure sweeps.</strong> Edit models, datasets, and method lists at the top of <code>eval/eval.py</code>.</li>
+ <li><strong>Run evaluation</strong> from the repository root:</li>
+</ol>
+<pre><code>cd efficient_reasoning_controller
+python eval/eval.py</code></pre>
+<ol>
+ <li><strong>Outputs</strong> land under <strong><code>eval/test_results/</code></strong>, e.g. <code>eval/test_results/matrix_results_&lt;MODEL&gt;/</code> with <code>&lt;DATASET&gt;_raw_new_api.csv</code> and <code>&lt;DATASET&gt;_trace_new_api.jsonl</code>.</li>
+</ol>
+<p>Discovery evaluation inside the research codebase uses the same logic under <code>workspace/code_base/eval.py</code>; it writes to <code>code_base/training_results/</code> instead. Use <strong><code>eval/</code></strong> for the standalone "evaluate what we ship" layout.</p>
+<h3>Way B — Run discovery yourself (<code>workspace/</code>)</h3>
+<p>Use this to reproduce or extend the <strong>automated search loop</strong> (costs LLM calls; evaluation steps remain replay-only).</p>
+<ol>
+ <li><strong>Environment.</strong> Finish Install (Conda + nvm/Node + <code>claude-agent-sdk</code> + API exports). Authenticate the Claude Code CLI (<code>claude login</code>) as needed.</li>
+ <li><strong>Set up History</strong>: Download History from huggingface:</li>
+</ol>
+<pre><code>huggingface-cli download AutoTTS/history --local-dir ./history
+cp -r ./history efficient_reasoning_controller/workspace/code_base/</code></pre>
+<ol>
+ <li><strong>Launch the workflow:</strong></li>
+</ol>
+<pre><code>cd efficient_reasoning_controller/workspace
+bash controller_search/run_workflow.sh</code></pre>
+<ol>
+ <li><strong>Optional tuning</strong> via environment variables:</li>
+</ol>
+<pre><code>export WORKFLOW_PROPOSER_BACKEND=claude
+export WORKFLOW_ROUNDS=5
+export WORKFLOW_EVAL_CMD="python code_base/eval.py"
+export WORKFLOW_RESUME=1</code></pre>
+<p>Each round writes a snapshot under:</p>
+<pre><code>code_base/history/rNNNN_&lt;timestamp&gt;_&lt;uid&gt;/
+├── method.py
+└── proposal_results/</code></pre>
+<p><code>code_base/method.py</code> is reset from <code>code_base/method.template.py</code> at the start of every round; each candidate must be self-contained in <code>method.py</code>.</p>
+<p><strong>Evaluation during search.</strong> <code>WORKFLOW_EVAL_CMD</code> defaults to <code>python code_base/eval.py</code>; matrices appear under <code>code_base/training_results/</code>:</p>
+<pre><code>code_base/training_results/
+└── matrix_results_&lt;MODEL&gt;/
+    ├── &lt;DATASET&gt;_raw_new_api.csv
+    └── &lt;DATASET&gt;_trace_new_api.jsonl</code></pre>
+<p><strong>After discovery.</strong> Copy any round's <code>method.py</code> into <code>eval/method.py</code> and follow <strong>Way A</strong> for a standalone rerun under <code>eval/test_results/</code>.</p>
+<h2>Built-in baselines</h2>
+<p><code>code_base/method.py</code> ships:</p>
+<ul>
+ <li><code>ASCMethod</code> — adaptive self-consistency with Beta-confidence early stopping.</li>
+ <li><code>ESCMethod</code> — early stopping by sliding-window answer consistency.</li>
+ <li><code>Parallel_Probe</code> — parallel chains with warm-up, off-track pruning, and stable-majority termination.</li>
+ <li><code>OptimalController</code> — the target class rewritten by the search workflow (e.g. CMC).</li>
+</ul>
+<p>Pre-computed seed baseline results are stored under:</p>
+<pre><code>efficient_reasoning_controller/workspace/code_base/history/seed_algorithms/</code></pre>
+<h2>Citation</h2>
+<pre><code>@article\{zheng2026autotts,
+  title  = \{LLMs Improving LLMs: Agentic Discovery for Test-Time Scaling},
+  author = \{Zheng, Tong and Liu, Haolin and Huang, Chengsong and Bao, Huiwen and
+            Zhang, Sheng and Liu, Rui and Dai, Runpeng and Chen, Ruibo and
+            Liu, Chenxi and Xiong, Tianyi and Wu, Xidong and Zhang, Hongming and
+            Huang, Heng},
+  journal=\{arXiv preprint arXiv:2605.08083},
+  year    = \{2026}
+}
+
+@article\{zheng2026parallel,
+  title=\{Parallel-Probe: Towards Efficient Parallel Thinking via 2D Probing},
+  author=\{Zheng, Tong and Huang, Chengsong and Dai, Runpeng and He, Yun and Liu, Rui and Ni, Xin and Bao, Huiwen and Wang, Kaishen and Zhu, Hongtu and Huang, Jiaxin and others},
+  journal=\{arXiv preprint arXiv:2602.03845},
+  year=\{2026}
+}</code></pre>

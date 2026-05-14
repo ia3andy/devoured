@@ -1,0 +1,68 @@
+<p>I've been a fan of security tokens for a decade now and have accrued quite a collection. This redundancy isn't a bad thing, as security tokens are easily misplaced and the only way to recover from a lost token is using a second token that is also registered with the service you're trying to access. I use security tokens whenever I can! SSH authentication, universal two-factor (U2F) authentication, passwordless local login, sudo command elevation, and git commit signing are all things I use security tokens for every day. When I take my laptop traveling, there also travels a yubikey. However, it took me an oddly long time to realize that I'm a relic of a bygone era. Laptops and smartphones all have built-in security tokens these days! I've been carrying around yubikeys when an even better one is built right into my macbook. This post is about how I use security tokens, and how I configured my laptop's secure element to replace my yubikey collection.</p>
+<h2>The security token promise</h2>
+<p>Security tokens like yubikeys (or <a href="https://solokeys.com/">SoloKeys</a> and <a href="https://www.nitrokey.com/">Nitrokeys</a> if you want FOSS firmware) have a private/public keypair baked into them. Their promise is that while the public key is easily retrieved, the private key can <em>never</em> leave the device. The only thing you can do is send packets of data to the device to be signed in-place by the private key, and this operation is gated behind some physical user interaction like pressing a touch-sensitive button when it flashes. Fancier security tokens add a biometric flourish with a built-in fingerprint reader, but the real value is stopping attackers from making progress with purely remote access. If an attacker remotely accesses your computer, they still can't get your security token to sign random things without you doing something in the real world! Much better than your full SSH private/public keypair sitting in some files in the <code>~/.ssh</code> directory.</p>
+<p>There are drawbacks to this. Users can become conditioned to press the security token whenever it flashes, which could easily be a malicious request. If you're in the middle of repeatedly pressing the security token for a series of signing operations, do you really notice when it flashes an extra time? So companies like Apple and Microsoft have their own authenticator apps running on your smartphone that attach every access request to a random numeric code that has to be typed in. However, this is a fairly tedious and removes a lot of the usability benefit of security tokens vs. time-based one-time passwords (<a href="https://en.wikipedia.org/wiki/Time-based_one-time_password">TOTP</a>) as implemented by the authy or google authenticator apps.</p>
+<p>Another drawback of security tokens is that if you lose one, its private key is gone for good. There's no way to back it up! So when you buy a security token, you really commit to buying at least two security tokens unless you want to risk locking yourself out of your various accounts. There is one alternative: maybe the only thing the cryptocurrency industry has contributed to the wider world is a moderately user-friendly method of backing up &amp; restoring private keys by converting them into human-readable word list (see <a href="https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki">BIP 39</a>) that can be written down. Of course this has produced some very innovative phishing attacks to convince users to write down that list of words in the wrong place, but that's the game you play if you allow private keys to leave a secure enclave. Still, if you're really paranoid about losing all of your security tokens you can use BIP 39 word lists as a method of last resort for regaining access to your systems.</p>
+<h2>How I use security tokens</h2>
+<p>I started off using my security tokens for SSH. If you just run <code>ssh-keygen</code>, it'll output a pair of files - one of which includes your full private key! But it's possible to have your private key live on a security token. I accomplished this by following the FIDO/U2F instructions <a href="https://developers.yubico.com/SSH/Securing_SSH_with_FIDO2.html">here</a>, which boil down to installing <a href="https://github.com/yubico/libfido2">libfido2</a> then running <code>ssh-keygen -t ed25519-sk</code> while your security token is plugged in. This again generates a pair of files, but this time the "private key" file is only a handle to the private key that actually lives on the security token. Thus I feel confident pasting that private key file here for all to see!</p>
+<pre><code>-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAASgAAABpzay1zc2
+gtZWQyNTUxOUBvcGVuc3NoLmNvbQAAACD9zOiJ55uYy6qviTz+RiSspJpLrau+pN3o6MZX
+A+eFKwAAAARzc2g6AAAA+EZ0QmdGdEJnAAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY2
+9tAAAAIP3M6Innm5jLqq+JPP5GJKykmkutq76k3ejoxlcD54UrAAAABHNzaDoBAAAAgBNm
+0IZwRiRE+zjuIvj6JjAUW1gYHiewTNA90UV2igEeJ80p7OdCumpNXaok232zclR2gDZaK3
+AZOU8OOKeD3bklnL9WmyoeZi58wdKb9C4lSfH+7Hs5thbu5Jgg6i6Aha3qjPtXCSGJiH/i
+RCI4Th7n72GEaSrW0leTAHk1MyDZAAAAAAAAABZhaGVsd2VyQGFoLW1iYWlyLmxvY2FsAQ
+ID
+-----END OPENSSH PRIVATE KEY-----
+</code></pre>
+<p>Running <code>ssh-keygen -t ed25519-sk</code> again with the same security token should generate the same private/public key files on any computer you have it plugged in to, so your SSH access capabilities travel with the security token instead being tied to a specific file on a specific computer.</p>
+<p>Probably 90% of the time I press my security token it's for git. Every git forge I know of implements SSH authentication for push &amp; pull operations, and you can upload the <code>id_ed25519_sk.pub</code> file generated above so it accepts your security token keypair. Git also supports SSH keys for commit signing; you can read how to set this up <a href="https://docs.github.com/en/authentication/managing-commit-signature-verification/telling-git-about-your-signing-key#telling-git-about-your-ssh-key">here</a> and then run <code>git config --global commit.gpgsign true</code> to automatically sign every commit. You'll also need to upload your public key again so your git forge recognizes your commits as being signed by you (this is usually a separate field from the SSH authentication one).</p>
+<p>Note that using security tokens to sign commits can be a bit annoying. While rebasing a long series of commits, you'll have to re-sign every single one! This is what made me stop using the fingerprint reader yubikey, because the fingerprint read failure rate was just way too high to successfully sign dozens of commits in a row. Maybe there's a way to configure this behavior, since in jujutsu (which is basically a "rebasey/amendy" wrapper of git) there is a way to <a href="https://lobste.rs/s/ha3xyn/git_stage_over_git_add#c_qvr6p7">only sign commits on push</a>.</p>
+<p>Finally, I use my security tokens for passwordless local login &amp; sudo elevation on Linux systems, as a <a href="https://wiki.archlinux.org/title/YubiKey#Linux_user_authentication_with_PAM">Pluggable Authentication Module (PAM)</a>.</p>
+<h2>Just using my laptop</h2>
+<p>Having a security token constantly hanging out of my laptop's USB-C port is a bit precarious. It sits out there like a little lever waiting to destroy the port (and itself) if dropped or bumped the wrong way. However, when things generally just work you tend not to think about how to replace them, so it took me an entire half-decade to consider that maybe I don't need that security token at all! My laptop has one built in! Can I just use it instead?</p>
+<p>I tried following Arian van Putten's <a href="https://gist.github.com/arianvp/5f59f1783e3eaf1a2d4cd8e952bb4acf">excellent instructions</a> on my 2020 m1 macbook air:</p>
+<pre><code>sc_auth create-ctk-identity -l ssh -k p-256-ne -t bio
+ssh-keygen -w /usr/lib/ssh-keychain.dylib -K -N ""
+</code></pre>
+<p>This created <code>id_ecdsa_sk_rk</code> private/public keypair files which I moved into my <code>~/.ssh</code> directory. Again I can safely paste the private key file here for all to see:</p>
+<pre><code>-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAfwAAACJzay1lY2
+RzYS1zaGEyLW5pc3RwMjU2QG9wZW5zc2guY29tAAAACG5pc3RwMjU2AAAAQQRsRRHZyIOq
+ac/qUAnXdXorIzleIMa4zL9WOEm7XS6EpugiQoD2equ5ZzcrkELHZ0uP05ZbHOuegEC+wT
+tzkuO3AAAABHNzaDoAAACw4XQCeeF0AnkAAAAic2stZWNkc2Etc2hhMi1uaXN0cDI1NkBv
+cGVuc3NoLmNvbQAAAAhuaXN0cDI1NgAAAEEEbEUR2ciDqmnP6lAJ13V6KyM5XiDGuMy/Vj
+hJu10uhKboIkKA9nqruWc3K5BCx2dLj9OWWxzrnoBAvsE7c5LjtwAAAARzc2g6IQAAABTp
+WyIrRBYp86ZnfGCWxVVSwAvHJwAAAAAAAAAEc3NoOgECAwQ=
+-----END OPENSSH PRIVATE KEY-----
+</code></pre>
+<p>After running <code>ssh-copy-id -i ~/.ssh/id_ecdsa_sk_rk.pub &lt;server nickname&gt;</code> to add the public key as an authorized key on one of my homelab boxes, I added the following into my <code>~/.ssh/config</code> file:</p>
+<pre><code>Host *
+  IdentityFile ~/.ssh/id_ecdsa_sk_rk
+  SecurityKeyProvider=/usr/lib/ssh-keychain.dylib
+</code></pre>
+<p>I was then able to run <code>ssh &lt;server nickname&gt;</code> and be automatically prompted with a thumbprint request from macOS before logging in smoothly! Amazing!</p>
+<p>But can I use it for git? After setting <code>git config --global user.signingKey /Users/ahelwer/.ssh/id_ecdsa_sk_rk</code> and updating the <code>.ssh/allowed_signers</code> file, unfortunately it doesn't work - git can't sign the commit, and produces an error like:</p>
+<pre><code>error: Signing file /var/folders/l5/5wqvq2l10p96wtdtfr6lvrvw0000gn/T//.git_signing_buffer_tmpc4uQgO
+Confirm user presence for key ECDSA-SK SHA256:oQDA2SNYb2MoSQcxJVSmWyAeAWPqMp7rxliBRfi87as
+Couldn't sign message: device not found?
+Signing /var/folders/l5/5wqvq2l10p96wtdtfr6lvrvw0000gn/T//.git_signing_buffer_tmpc4uQgO failed: device not found?
+
+fatal: failed to write commit object
+</code></pre>
+<p>The fix is to use ssh-agent instead of pointing directly to files in the <code>~/.ssh</code> directory. Following instructions from the ever-helpful <a href="https://gist.github.com/arianvp/5f59f1783e3eaf1a2d4cd8e952bb4acf">tutorial from above</a>, we run this command to make the keypair known to ssh-agent:</p>
+<pre><code>ssh-add -K -S /usr/lib/ssh-keychain.dylib
+</code></pre>
+<p>Then, instead of pointing to a filepath for <code>user.signingKey</code>, point directly to a key in your <code>~/.gitconfig</code> as in:</p>
+<pre><code>[user]
+	name = Andrew Helwer
+	signingKey = "key::sk-ecdsa-sha2-nistp256@openssh.com AAAAInNrLWVjZHNhLXNoYTItbmlzdHAyNTZAb3BlbnNzaC5jb20AAAAIbmlzdHAyNTYAAABBBGxFEdnIg6ppz+pQCdd1eisjOV4gxrjMv1Y4SbtdLoSm6CJCgPZ6q7lnNyuQQsdnS4/Tllsc656AQL7BO3OS47cAAAAEc3NoOg== ssh:"
+</code></pre>
+<p>which is the contents of <code>~/.ssh/id_ecdsa_sk_rk.pub</code> prefixed with <code>key::</code>. After that, I am pleased to proclaim that this very file you are reading was signed &amp; pushed to my gitlab pages site using the key from my macbook's secure element!</p>
+<p>I also ran a quick experiment on my corp-issued Windows laptop:</p>
+<pre><code>winget install Microsoft.OpenSSH.preview
+ssh-keygen -t ecdsa-sk
+</code></pre>
+<p>This again generated a pair of private/public key files, and anytime I SSH'd somewhere it went through the standard Windows Hello login flow accepting facial recognition, fingerprint, or my PIN.</p>
+<p>I unfortunately do not have access to a Linux laptop with a secure element gated behind a similar real-world user presence check, so can't demonstrate anything there. If you're able to try it out, please let me know!</p>
