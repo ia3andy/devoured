@@ -891,12 +891,13 @@ public class DigestHelper implements Runnable {
             String titleDate = parsedDate.format(
                     java.time.format.DateTimeFormatter.ofPattern("MMMM dd, yyyy", java.util.Locale.US));
 
-            // Build and save post
+            // Build and save post (as draft until content is complete)
             var post = new JsonObject();
             post.addProperty("title", "Devoured - " + titleDate);
             post.addProperty("description", digestDesc);
             post.addProperty("layout", "digest-post");
             post.addProperty("date", targetDate);
+            post.addProperty("draft", true);
             post.addProperty("tags", "digest");
             post.addProperty("author", "ia3andy");
             if (!postImage.isEmpty()) post.addProperty("image", postImage);
@@ -906,17 +907,26 @@ public class DigestHelper implements Runnable {
             post.add("sections", sectionsArray);
 
             store.addPost(post);
-            System.err.println("  Added post for " + targetDate + " with " + sections.size() + " sections");
-
-            // Post-processing
-            System.err.println("  Writing article content files...");
-            writeContent(dataFile, targetDate, cacheDir);
+            System.err.println("  Added post for " + targetDate + " with " + sections.size() + " sections (draft)");
 
             System.err.println("  Syncing new tags...");
             syncTags(dataFile, feedsFile);
 
             System.err.println("  Syncing swipe data...");
             syncSwipe(dataFile, swipeFile);
+
+            System.err.println("  Writing article content files...");
+            boolean contentComplete = writeContent(dataFile, targetDate, cacheDir);
+
+            store.load();
+            var published = store.findByDate(targetDate);
+            if (published != null && contentComplete) {
+                published.remove("draft");
+                store.save();
+                System.err.println("  Post published for " + targetDate);
+            } else if (published != null) {
+                System.err.println("  Post kept as draft for " + targetDate + " (content incomplete, re-run to finish)");
+            }
 
         } finally {
             // Clean up temp directory
@@ -1618,6 +1628,11 @@ public class DigestHelper implements Runnable {
 
     static Uni<JsonObject> callOpenAIAPI(String endpoint, String token, String model,
                                           String systemPrompt, String userMessage, String jsonSchema) {
+        return callOpenAIAPI(endpoint, token, model, systemPrompt, userMessage, jsonSchema, 0);
+    }
+
+    static Uni<JsonObject> callOpenAIAPI(String endpoint, String token, String model,
+                                          String systemPrompt, String userMessage, String jsonSchema, int attempt) {
         return acquireRateSlot(activeRpm).chain(() -> Uni.createFrom().item(Unchecked.supplier(() -> {
             if (token == null || token.isEmpty()) throw new IllegalStateException("API token not set for " + endpoint);
 
@@ -1687,9 +1702,15 @@ public class DigestHelper implements Runnable {
             wrapper.addProperty("result", content);
             return wrapper;
         })).runSubscriptionOn(Infrastructure.getDefaultWorkerPool()))
-        .onFailure(RateLimitException.class).invoke(t ->
-                System.err.printf("  [429] rate limited (retry in %ds)%n", ((RateLimitException) t).retryAfter.toSeconds()))
-        .onFailure(RateLimitException.class).retry().withBackOff(Duration.ofSeconds(15), Duration.ofSeconds(90)).atMost(10);
+        .onFailure(RateLimitException.class).recoverWithUni(t -> {
+            var rle = (RateLimitException) t;
+            if (attempt >= 30) return Uni.createFrom().failure(new RuntimeException("Rate limited after 30 retries"));
+            System.err.printf("  [429] rate limited (retry in %ds, attempt %d/30)%n", rle.retryAfter.toSeconds(), attempt + 1);
+            nextAllowedCall.updateAndGet(prev -> Math.max(prev, System.currentTimeMillis() + rle.retryAfter.toMillis()));
+            return Uni.createFrom().voidItem()
+                    .onItem().delayIt().by(rle.retryAfter)
+                    .chain(() -> callOpenAIAPI(endpoint, token, model, systemPrompt, userMessage, jsonSchema, attempt + 1));
+        });
     }
 
     static JsonObject buildArticleJson(String id, String title, String link, String image, String desc, JsonObject ai) {
@@ -1975,7 +1996,7 @@ public class DigestHelper implements Runnable {
         return tags;
     }
 
-    static void writeContent(String dataFile, String date, String cacheDir) throws Exception {
+    static boolean writeContent(String dataFile, String date, String cacheDir) throws Exception {
         var store = new PostStore(dataFile);
         store.load();
         var post = store.findByDate(date);
@@ -2007,32 +2028,38 @@ public class DigestHelper implements Runnable {
             jobs.add(new CleanJob(a, cachePath, data, html));
         }
 
+        boolean complete = true;
         if (!jobs.isEmpty()) {
-            System.err.println("  AI-cleaning " + jobs.size() + " articles...");
-            Multi.createFrom().iterable(jobs)
-                    .onItem().transformToUniAndConcatenate(job -> {
-                        System.err.println("    [clean] " + job.article().id());
-                        return ai().cleanHtml(job.html())
-                                .onItem().invoke(cleaned -> {
-                                    if (cleaned != null && !cleaned.isEmpty()) {
-                                        job.data().addProperty("cleanedHtml", cleaned);
-                                        try { Files.writeString(job.cachePath(), GSON.toJson(job.data())); } catch (IOException e) { /* ignore */ }
-                                        writeHtmlFile(contentDir, job.article().id(), cleaned);
-                                        System.err.println("      -> done (" + cleaned.length() + " chars)");
-                                    } else {
+            System.err.println("  AI-cleaning " + jobs.size() + " articles (" + ai().name() + " / " + ai().model("clean-html") + ")...");
+            try {
+                Multi.createFrom().iterable(jobs)
+                        .onItem().transformToUniAndConcatenate(job -> {
+                            System.err.println("    [clean] " + job.article().id());
+                            return ai().cleanHtml(job.html())
+                                    .onItem().invoke(cleaned -> {
+                                        if (cleaned != null && !cleaned.isEmpty()) {
+                                            job.data().addProperty("cleanedHtml", cleaned);
+                                            try { Files.writeString(job.cachePath(), GSON.toJson(job.data())); } catch (IOException e) { /* ignore */ }
+                                            writeHtmlFile(contentDir, job.article().id(), cleaned);
+                                            System.err.println("      -> done (" + cleaned.length() + " chars)");
+                                        } else {
+                                            writeHtmlFile(contentDir, job.article().id(), job.html());
+                                            System.err.println("      -> cleaning failed, using raw HTML");
+                                        }
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        System.err.println("      -> AI cleaning failed: " + e.getMessage());
                                         writeHtmlFile(contentDir, job.article().id(), job.html());
                                         System.err.println("      -> cleaning failed, using raw HTML");
-                                    }
-                                })
-                                .onFailure().recoverWithItem(e -> {
-                                    System.err.println("      -> AI cleaning failed: " + e.getMessage());
-                                    writeHtmlFile(contentDir, job.article().id(), job.html());
-                                    System.err.println("      -> cleaning failed, using raw HTML");
-                                    return null;
-                                });
-                    })
-                    .collect().asList()
-                    .await().atMost(Duration.ofMinutes(10));
+                                        return null;
+                                    });
+                        })
+                        .collect().asList()
+                        .await().atMost(Duration.ofMinutes(30));
+            } catch (Exception e) {
+                System.err.println("  [warn] AI cleaning incomplete: " + e.getMessage());
+                complete = false;
+            }
         }
 
         int written = 0;
@@ -2050,6 +2077,7 @@ public class DigestHelper implements Runnable {
         System.err.println("  Wrote " + written + " HTML files to " + contentDir);
         int skipped = articles.size() - eligible.size();
         System.err.println("  Skipped " + skipped + " articles (rating < 3)");
+        return complete;
     }
 
     static void cleanAll(String dataFile, String cacheDir) throws Exception {
