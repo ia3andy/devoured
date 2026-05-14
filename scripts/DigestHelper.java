@@ -2000,7 +2000,7 @@ public class DigestHelper implements Runnable {
         var store = new PostStore(dataFile);
         store.load();
         var post = store.findByDate(date);
-        if (post == null) { System.err.println("  No post found for " + date); return; }
+        if (post == null) { System.err.println("  No post found for " + date); return true; }
 
         var articles = parseArticles(post);
         Path contentDir = Path.of("templates/full-content/" + date);
