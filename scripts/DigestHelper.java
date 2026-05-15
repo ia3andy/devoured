@@ -1193,16 +1193,18 @@ public class DigestHelper implements Runnable {
             "share/like buttons, related articles, cookie notices, footer boilerplate, " +
             "promotional blocks, \"Read more\" links, social media widgets, empty paragraphs, " +
             "stock tickers, market data, subscriber counts, donation/paywall prompts, " +
-            "newsletter signup forms, image captions/credits, breadcrumbs, sidebars.\n" +
-            "IMPROVE structure: <h2>/<h3> for headings, <ul>/<ol>/<li> for lists, " +
-            "<blockquote> for quotes, <pre><code> for code, <strong>/<em> for emphasis. " +
-            "Remove redundant <br/> tags.\n" +
-            "Keep the article words exactly as-is. Only change HTML tags.\n" +
-            "Use semantic prose tags to improve readability: <p> for paragraphs, " +
-            "<h2>/<h3> for sections, <ul>/<ol> for lists, <blockquote> for quotes, " +
-            "<strong>/<em> for emphasis, <pre><code> for code blocks.\n" +
-            "If the content is NOT a readable article (e.g. mostly navigation, login/paywall wall, " +
-            "cookie consent, empty, or unintelligible fragments), output exactly: EMPTY\n" +
+            "newsletter signup forms, image captions/credits, breadcrumbs, sidebars, " +
+            "thread unroller instructions, \"Keep Current\" prompts, notification signup blocks, " +
+            "pricing/CTA sections, product feature lists from landing pages.\n" +
+            "Use semantic prose tags for readability: <p> for paragraphs, " +
+            "<h2>/<h3> for section headings, <ul>/<ol>/<li> for lists, " +
+            "<blockquote> for quotes, <pre><code> for code blocks, " +
+            "<strong>/<em> for emphasis. Remove redundant <br/> tags.\n" +
+            "Keep the article words exactly as-is. Only change HTML tags.\n\n" +
+            "Output EMPTY (just that word) if the content is NOT a readable article or blog post. " +
+            "Examples: product landing pages, app store listings, tool homepages, " +
+            "login/paywall walls, cookie consent pages, social media embeds without article text, " +
+            "thread unroller wrapper pages, mostly navigation with little prose.\n" +
             "Otherwise output only the cleaned HTML. No markdown fences, no explanation.";
 
     static boolean isJunkContent(String content) {
