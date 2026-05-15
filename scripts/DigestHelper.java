@@ -1180,8 +1180,27 @@ public class DigestHelper implements Runnable {
             "unusual activity", "captcha", "verify you are human",
             "request could not be satisfied", "403 error", "access denied",
             "just a moment", "checking your browser", "ray id",
-            "please turn javascript on", "we care about your privacy"
+            "please turn javascript on", "we care about your privacy",
+            "javascript is disabled", "please enable javascript",
+            "switch to a supported browser", "we've detected that javascript"
     );
+
+    static boolean isJunkHtml(String html) {
+        if (html == null || html.length() < 200) return true;
+        if (isJunkContent(Jsoup.clean(html, org.jsoup.safety.Safelist.none()))) return true;
+        String text = Jsoup.clean(html, org.jsoup.safety.Safelist.none()).trim();
+        return text.length() < 300;
+    }
+
+    static boolean isUsableCleanedHtml(String html) {
+        if (html == null || html.isBlank()) return false;
+        String stripped = html.strip();
+        if (stripped.equals("EMPTY")) return false;
+        if (stripped.startsWith("This is not an article")) return false;
+        if (stripped.startsWith("This HTML contains no article")) return false;
+        if (stripped.toLowerCase().startsWith("<h1>javascript is not available")) return false;
+        return true;
+    }
 
     static final String CLEAN_HTML_SYSTEM_PROMPT =
             "You extract article body from raw HTML. " +
@@ -2035,11 +2054,21 @@ public class DigestHelper implements Runnable {
             if (data.has("skipped") && data.get("skipped").getAsBoolean()) continue;
             String html = jsonStr(data, "cleanedHtml");
             if (!html.isEmpty()) {
-                writeHtmlFile(contentDir, a.id(), html);
+                if (isUsableCleanedHtml(html)) {
+                    writeHtmlFile(contentDir, a.id(), html);
+                } else {
+                    writePlaceholderFile(contentDir, a.id(), a.link());
+                    System.err.println("    [skip] " + a.id() + " (cached cleanedHtml is not usable)");
+                }
                 continue;
             }
             html = jsonStr(data, "contentHtml");
             if (html.length() < 200 || isJunkContent(html)) continue;
+            if (isJunkHtml(html)) {
+                writePlaceholderFile(contentDir, a.id(), a.link());
+                System.err.println("    [skip] " + a.id() + " (junk HTML detected)");
+                continue;
+            }
             if (html.length() > 30000) {
                 writePlaceholderFile(contentDir, a.id(), a.link());
                 System.err.println("    [skip] " + a.id() + " (" + html.length() + " chars, too large for AI cleaning)");
@@ -2058,7 +2087,7 @@ public class DigestHelper implements Runnable {
                             return ai().cleanHtml(job.article().id(), job.html())
                                     .ifNoItem().after(Duration.ofSeconds(AI_TIMEOUT_SECONDS + 30)).fail()
                                     .onItem().invoke(cleaned -> {
-                                        if (cleaned != null && !cleaned.isBlank() && !cleaned.strip().equals("EMPTY")) {
+                                        if (isUsableCleanedHtml(cleaned)) {
                                             job.data().addProperty("cleanedHtml", cleaned);
                                             try { Files.writeString(job.cachePath(), GSON.toJson(job.data())); } catch (IOException e) { /* ignore */ }
                                             writeHtmlFile(contentDir, job.article().id(), cleaned);
