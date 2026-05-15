@@ -1,0 +1,46 @@
+<h1>Can Kafka Queues Make Consumers Faster? Part 2: Head-Of-Line Blocking</h1>
+<p>Go slow to go fast.</p>
+<p>A few weeks ago, I published my findings about the new Apache Kafka feature: Queues.</p>
+<p>Check the post if you haven’t already!</p>
+<p>I kept receiving the same feedback:</p>
+<ul>
+ <li>
+  <p>Obviously, with all the additional overhead that comes with Queues, it won’t be faster than a consumer with a much simpler standard consumer group (it wasn’t <em>obvious</em> to me 🤷).</p></li>
+ <li>
+  <p>Queues will likely perform much better when messages are processed with some delay, e.g., due to external IO. This is because Queues can essentially avoid hitting the Head-Of-Line Blocking problem.</p></li>
+</ul>
+<h3>Head-Of-Line Blocking?</h3>
+<p>Apache Kafka and similar systems use partitions as the smallest unit of parallelism. A topic with 4 partitions can be processed by up to 4 instances in the same consumer group (unless you add more groups reading the same topic, or start adding asynchronous message processing, which adds a lot of complexity very quickly).</p>
+<p>And because only one instance processes a partition at a time, any delay in processing stalls the entire partition. For example, imagine a pipeline that needs to call an external API for enrichment for <em>about half of the</em> records. If that API is briefly unavailable, the pipeline can’t process <em>any</em> messages, even the ones that don’t need to be enriched.</p>
+<p>Queues should solve this: a share group (new primitive) can have more active instances than partitions. My previous benchmark showed that this doesn’t really provide any advantage when message processing doesn’t have delays (so data is processed as fast as possible). So, let’s add some delays?</p>
+<h3>The Benchmark</h3>
+<p>The benchmark setup was identical to the one in the previous post.</p>
+<p>The only difference: both standard and share group consumers had a configurable delay, modelling some kind of IO.</p>
+<p>I wanted to see how delays affect throughput and whether share groups can keep scaling as new instances are added.</p>
+<h3>Results</h3>
+<p>I tried a few different delays:</p>
+<ul>
+ <li>
+  <p><strong>200ms</strong>. Each instance could process records at a <strong>5 rec/s rate</strong>.</p></li>
+ <li>
+  <p><strong>20ms</strong>. Each instance could process records at a <strong>50 rec/s rate</strong>.</p></li>
+ <li>
+  <p><strong>5ms</strong>. Each instance could process records at a ~<strong>196 rec/s rate</strong>.</p></li>
+ <li>
+  <p><strong>1ms</strong>. Each instance could process records at a ~<strong>925 rec/s rate</strong>.</p></li>
+</ul>
+<p>The last two rates show that, at lower latencies, batch processing impact (Kafka consumer polls data in batches) becomes apparent.</p>
+<p>But what’s more important: the numbers looked exactly the same for the standard and the share consumer at 4 instances. I couldn’t scale out the standard consumer (the test topic only had 4 partitions). But the share consumer can be scaled out!</p>
+<p>So I tried 8, 16 and 32 instances. <strong>And all of them showed a linear increase in the total processing rate!</strong> <strong>Individual instances performed at the same rate, and there was no overhead as the number of instances grew</strong>. This will likely hit a bottleneck at some point, but this test shows that it’s very easy to achieve <strong>at least an 8x increase in throughput</strong>!</p>
+<figure>
+ <img src="https://substackcdn.com/image/fetch/$s_!GOsA!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fab20e549-a9fc-44a7-abf6-de08fbba8baa_1194x734.png" alt="">
+</figure>
+<h3>Summary</h3>
+<p>Kafka Queues is a great building block for things like job queuing, but it can also be used for scaling consumers! As long as consumers perform some form of head-of-line blocking, share groups can be used to scale processing beyond the number of partitions.</p>
+<p>The biggest downside is <strong>losing ordering guarantees</strong>. Because several instances can consume data from the same partition, the ordering is no longer guaranteed. This can be a deal-breaker for many systems, so make sure to confirm if ordering is important before switching to share groups!</p>
+<hr>
+<h3>Other Posts</h3>
+<p>I recently wrote <a href="https://streamacademy.io/tutorial/flink-postgres-cdc-replication/">Apache Flink: Postgres to Postgres Replication with Flink CDC</a>, which you may find interesting.</p>
+<hr>
+<h3>Advanced Apache Flink</h3>
+<p><a href="https://streamacademy.io/course/advanced-apache-flink/">Advanced Apache Flink</a> is an on-demand course focused on Flink internals, production deployment best practices, and advanced patterns.</p>
