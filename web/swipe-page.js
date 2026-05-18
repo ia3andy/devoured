@@ -493,7 +493,7 @@ document.addEventListener('DOMContentLoaded', () => {
           clearTimeout(readTimer);
           clearTimeout(stampTimer);
           var activeFrame = entry.target;
-          readTimer = setTimeout(function() { markFrameAndPreviousRead(activeFrame, false); }, 3000);
+          readTimer = setTimeout(function() { markFrameAndPreviousRead(activeFrame, false); }, 1500);
           stampTimer = setTimeout(function() { addStamp(activeFrame); }, 15000);
         }
       }
