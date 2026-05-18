@@ -447,6 +447,37 @@ document.addEventListener('DOMContentLoaded', () => {
     return current;
   }
 
+  function addStamp(frame) {
+    if (frame.querySelector('.swipe-read-stamp') || frame.classList.contains('swipe-frame-bullets')) return;
+    var stamp = document.createElement('div');
+    stamp.className = 'swipe-read-stamp';
+    stamp.textContent = 'DEVOURED';
+    stamp.style.setProperty('--stamp-angle', (Math.random() * 16 - 8).toFixed(1) + 'deg');
+    stamp.style.setProperty('--stamp-mx', (Math.random() * 100).toFixed(0) + '%');
+    stamp.style.setProperty('--stamp-my', (Math.random() * 100).toFixed(0) + '%');
+    frame.appendChild(stamp);
+  }
+
+  function markFrameRead(frame) {
+    if (frame.classList.contains('is-swipe-read')) return;
+    frame.classList.add('is-swipe-read');
+    var aids = getFrameArticleIds(frame);
+    for (var k = 0; k < aids.length; k++) {
+      document.dispatchEvent(new CustomEvent('digest-mark-article-read', { detail: { date: postDate, articleId: aids[k] } }));
+    }
+  }
+
+  function markFrameAndPreviousRead(frame, stampCurrent) {
+    var idx = visibleFrames.indexOf(frame);
+    if (idx < 0) return;
+    for (var j = 0; j < idx; j++) { markFrameRead(visibleFrames[j]); addStamp(visibleFrames[j]); }
+    markFrameRead(frame);
+    if (stampCurrent !== false) addStamp(frame);
+  }
+
+  var readTimer = null;
+  var stampTimer = null;
+
   var obs = new IntersectionObserver(function(entries) {
     for (var i = 0; i < entries.length; i++) {
       var entry = entries[i];
@@ -459,13 +490,15 @@ document.addEventListener('DOMContentLoaded', () => {
           var n = visIdx + 1;
           if (progressText) progressText.textContent = n + ' / ' + totalArticles;
           if (progressFill) progressFill.style.width = (n / totalArticles * 100) + '%';
+          clearTimeout(readTimer);
+          clearTimeout(stampTimer);
+          var activeFrame = entry.target;
+          readTimer = setTimeout(function() { markFrameAndPreviousRead(activeFrame, false); }, 3000);
+          stampTimer = setTimeout(function() { addStamp(activeFrame); }, 15000);
         }
       }
       if (!entry.isIntersecting && entry.boundingClientRect.top < 0) {
-        var aids = getFrameArticleIds(entry.target);
-        for (var k = 0; k < aids.length; k++) {
-          document.dispatchEvent(new CustomEvent('digest-mark-article-read', { detail: { date: postDate, articleId: aids[k] } }));
-        }
+        markFrameAndPreviousRead(entry.target);
       }
     }
   }, { root: track, threshold: [0, 0.5] });
@@ -475,7 +508,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   var resumeIdx = 0;
   for (var i = 0; i < visibleFrames.length; i++) {
-    if (!isFrameRead(visibleFrames[i])) { resumeIdx = i; break; }
+    if (isFrameRead(visibleFrames[i])) {
+      markFrameRead(visibleFrames[i]);
+      addStamp(visibleFrames[i]);
+    } else {
+      resumeIdx = i;
+      break;
+    }
   }
 
   if (resumeIdx > 0) {
