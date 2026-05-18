@@ -332,8 +332,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   var nextRead = DigestStorage.getNextRead();
   var nextData = nextRead === 'newest'
-    ? { url: root.dataset.prevSwipe, date: root.dataset.prevDate, oneliner: root.dataset.prevOneliner }
-    : { url: root.dataset.nextSwipe, date: root.dataset.nextDate, oneliner: root.dataset.nextOneliner };
+    ? { url: root.dataset.nextSwipe, date: root.dataset.nextDate, oneliner: root.dataset.nextOneliner }
+    : { url: root.dataset.prevSwipe, date: root.dataset.prevDate, oneliner: root.dataset.prevOneliner };
 
   var completionNext = root.querySelector('.swipe-completion-next');
   var completionCaughtUp = root.querySelector('.swipe-completion-caught-up');
