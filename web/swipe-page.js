@@ -417,6 +417,27 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // --- Read tracking ---
 
+  function getFrameArticleIds(frame) {
+    if (frame.classList.contains('swipe-frame-bullets')) {
+      return Array.from(frame.querySelectorAll('.swipe-bullet-item[data-article-id]'))
+        .map(function(el) { return el.dataset.articleId; });
+    }
+    var aid = frame.dataset.articleId || frame.dataset.activeArticle;
+    return aid ? [aid] : [];
+  }
+
+  function isFrameRead(frame) {
+    var aids = getFrameArticleIds(frame);
+    if (aids.length === 0) return false;
+    for (var k = 0; k < aids.length; k++) {
+      var evt = new CustomEvent('digest-is-article-read',
+        { detail: { date: postDate, articleId: aids[k], result: false } });
+      document.dispatchEvent(evt);
+      if (!evt.detail.result) return false;
+    }
+    return true;
+  }
+
   function getCurrentFrame() {
     var allFrames = track.querySelectorAll('.swipe-frame');
     var current = allFrames[0];
@@ -441,9 +462,9 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       }
       if (!entry.isIntersecting && entry.boundingClientRect.top < 0) {
-        var aid = entry.target.dataset.articleId || entry.target.dataset.activeArticle;
-        if (aid) {
-          document.dispatchEvent(new CustomEvent('digest-mark-article-read', { detail: { date: postDate, articleId: aid } }));
+        var aids = getFrameArticleIds(entry.target);
+        for (var k = 0; k < aids.length; k++) {
+          document.dispatchEvent(new CustomEvent('digest-mark-article-read', { detail: { date: postDate, articleId: aids[k] } }));
         }
       }
     }
@@ -452,16 +473,16 @@ document.addEventListener('DOMContentLoaded', () => {
   var allTrackFrames = track.querySelectorAll('.swipe-frame');
   for (var i = 0; i < allTrackFrames.length; i++) obs.observe(allTrackFrames[i]);
 
+  var resumeIdx = 0;
   for (var i = 0; i < visibleFrames.length; i++) {
-    if (visibleFrames[i].classList.contains('swipe-frame-bullets')) continue;
-    var evt = new CustomEvent('digest-is-article-read', {
-      detail: { date: postDate, articleId: visibleFrames[i].dataset.articleId, result: false }
-    });
-    document.dispatchEvent(evt);
-    if (!evt.detail.result) {
-      if (i > 0) visibleFrames[i].scrollIntoView();
-      break;
-    }
+    if (!isFrameRead(visibleFrames[i])) { resumeIdx = i; break; }
+  }
+
+  if (resumeIdx > 0) {
+    var resumeFrame = visibleFrames[resumeIdx];
+    root.addEventListener('swipe-ready', function() {
+      resumeFrame.scrollIntoView();
+    }, { once: true });
   }
 
   // --- Share button ---
@@ -486,16 +507,22 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // --- Hide loading indicator once first background is ready ---
   var loader = root.querySelector('.swipe-loading');
+  function onSwipeReady() {
+    root.dispatchEvent(new CustomEvent('swipe-ready'));
+  }
   if (loader) {
     var firstBg = root.querySelector('.swipe-frame-bg');
     var bgUrl = firstBg && firstBg.style.backgroundImage.replace(/^url\(["']?|["']?\)$/g, '');
     if (bgUrl) {
       var img = new Image();
-      img.onload = img.onerror = function() { loader.remove(); };
+      img.onload = img.onerror = function() { loader.remove(); onSwipeReady(); };
       img.src = bgUrl;
     } else {
       loader.remove();
+      onSwipeReady();
     }
+  } else {
+    onSwipeReady();
   }
 
   // --- Keyboard navigation ---
