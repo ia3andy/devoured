@@ -812,9 +812,13 @@ public class DigestHelper implements Runnable {
                         Files.writeString(xmlFile, xml);
 
                         futures.add(executor.submit(() -> {
-                            System.err.println("  [" + task.feed().name() + "] Enriching...");
-                            enrich(xmlFile.toString(), enrichedFile, cacheDir);
-                            System.err.println("  [" + task.feed().name() + "] Enriched.");
+                            try {
+                                System.err.println("  [" + task.feed().name() + "] Enriching...");
+                                enrich(xmlFile.toString(), enrichedFile, cacheDir);
+                                System.err.println("  [" + task.feed().name() + "] Enriched.");
+                            } catch (Exception e) {
+                                throw new RuntimeException(e);
+                            }
                         }));
                     } catch (Exception e) {
                         System.err.println("  [" + task.feed().name() + "] Scrape failed: " + e.getMessage());
@@ -1453,7 +1457,7 @@ public class DigestHelper implements Runnable {
 
     static JsonObject parseLenientJson(String raw) {
         var reader = new com.google.gson.stream.JsonReader(new java.io.StringReader(raw));
-        reader.setLenient(true);
+        reader.setStrictness(com.google.gson.Strictness.LENIENT);
         return GSON.fromJson(reader, JsonObject.class);
     }
 
