@@ -800,26 +800,21 @@ public class DigestHelper implements Runnable {
             try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
                 for (int i = 0; i < feedTasks.size(); i++) {
                     var task = feedTasks.get(i);
-                    int idx = i;
                     if (i > 0) Thread.sleep(2000);
-                    String enrichedFile = tempDir.resolve("enriched-" + idx + "-" + task.feed().name() + ".json").toString();
+                    String enrichedFile = tempDir.resolve("enriched-" + i + "-" + task.feed().name() + ".json").toString();
                     enrichedFiles.add(enrichedFile);
                     feedNames.add(task.feed().name());
 
                     try {
                         System.err.println("  [" + task.feed().name() + "] Scraping...");
                         String xml = truncateArticles(tldrArticlesToString(task.dailyUrl()), maxArticles);
-                        Path xmlFile = tempDir.resolve("feed-" + idx + ".xml");
+                        Path xmlFile = tempDir.resolve("feed-" + i + ".xml");
                         Files.writeString(xmlFile, xml);
 
                         futures.add(executor.submit(() -> {
-                            try {
-                                System.err.println("  [" + task.feed().name() + "] Enriching...");
-                                enrich(xmlFile.toString(), enrichedFile, cacheDir);
-                                System.err.println("  [" + task.feed().name() + "] Enriched.");
-                            } catch (Exception e) {
-                                System.err.println("  [" + task.feed().name() + "] Enrich failed: " + e.getMessage());
-                            }
+                            System.err.println("  [" + task.feed().name() + "] Enriching...");
+                            enrich(xmlFile.toString(), enrichedFile, cacheDir);
+                            System.err.println("  [" + task.feed().name() + "] Enriched.");
                         }));
                     } catch (Exception e) {
                         System.err.println("  [" + task.feed().name() + "] Scrape failed: " + e.getMessage());
@@ -829,7 +824,10 @@ public class DigestHelper implements Runnable {
                 System.err.println("  Waiting for " + futures.size() + " feeds to enrich...");
                 int failed = 0;
                 for (var f : futures) {
-                    try { f.get(); } catch (Exception e) { failed++; }
+                    try { f.get(); } catch (Exception e) {
+                        System.err.println("  Enrich failed: " + e.getMessage());
+                        failed++;
+                    }
                 }
                 if (failed > 0) System.err.println("  Warning: " + failed + " feed(s) failed enrichment");
             }
