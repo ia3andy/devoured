@@ -790,7 +790,7 @@ public class DigestHelper implements Runnable {
             return;
         }
 
-        // Phase 1: scrape + enrich all feeds in parallel
+        // Phase 1: scrape feeds with 2s pacing, then enrich in parallel
         Path tempDir = Files.createTempDirectory("digest-");
         try {
             var enrichedFiles = new ArrayList<String>();
@@ -801,24 +801,29 @@ public class DigestHelper implements Runnable {
                 for (int i = 0; i < feedTasks.size(); i++) {
                     var task = feedTasks.get(i);
                     int idx = i;
+                    if (i > 0) Thread.sleep(2000);
                     String enrichedFile = tempDir.resolve("enriched-" + idx + "-" + task.feed().name() + ".json").toString();
                     enrichedFiles.add(enrichedFile);
                     feedNames.add(task.feed().name());
 
-                    futures.add(executor.submit(() -> {
-                        try {
-                            System.err.println("  [" + task.feed().name() + "] Scraping...");
-                            String xml = truncateArticles(tldrArticlesToString(task.dailyUrl()), maxArticles);
-                            Path xmlFile = tempDir.resolve("feed-" + idx + ".xml");
-                            Files.writeString(xmlFile, xml);
+                    try {
+                        System.err.println("  [" + task.feed().name() + "] Scraping...");
+                        String xml = truncateArticles(tldrArticlesToString(task.dailyUrl()), maxArticles);
+                        Path xmlFile = tempDir.resolve("feed-" + idx + ".xml");
+                        Files.writeString(xmlFile, xml);
 
-                            System.err.println("  [" + task.feed().name() + "] Enriching...");
-                            enrich(xmlFile.toString(), enrichedFile, cacheDir);
-                            System.err.println("  [" + task.feed().name() + "] Enriched.");
-                        } catch (Exception e) {
-                            System.err.println("  [" + task.feed().name() + "] Failed: " + e.getMessage());
-                        }
-                    }));
+                        futures.add(executor.submit(() -> {
+                            try {
+                                System.err.println("  [" + task.feed().name() + "] Enriching...");
+                                enrich(xmlFile.toString(), enrichedFile, cacheDir);
+                                System.err.println("  [" + task.feed().name() + "] Enriched.");
+                            } catch (Exception e) {
+                                System.err.println("  [" + task.feed().name() + "] Enrich failed: " + e.getMessage());
+                            }
+                        }));
+                    } catch (Exception e) {
+                        System.err.println("  [" + task.feed().name() + "] Scrape failed: " + e.getMessage());
+                    }
                 }
 
                 System.err.println("  Waiting for " + futures.size() + " feeds to enrich...");
