@@ -695,6 +695,7 @@ public class DigestHelper implements Runnable {
                 store.load();
                 String lastDate = null;
                 for (var post : store.all()) {
+                    if (post.has("draft") && post.get("draft").getAsBoolean()) continue;
                     String d = jsonStr(post, "date");
                     if (lastDate == null || d.compareTo(lastDate) > 0) lastDate = d;
                 }
@@ -778,18 +779,32 @@ public class DigestHelper implements Runnable {
                              String cacheDir, String swipeFile, List<Feed> feeds, int maxArticles) throws Exception {
         var store = new PostStore(dataFile);
         store.load();
-        if (store.findByDate(targetDate) != null) {
+        var existingPost = store.findByDate(targetDate);
+        boolean isDraft = existingPost != null && existingPost.has("draft") && existingPost.get("draft").getAsBoolean();
+        if (existingPost != null && !isDraft) {
             System.err.println("Post for " + targetDate + " already exists, skipping.");
             return;
+        }
+        var existingSections = new HashSet<String>();
+        if (isDraft && existingPost.has("sections")) {
+            for (var s : existingPost.getAsJsonArray("sections"))
+                existingSections.add(jsonStr(s.getAsJsonObject(), "name").toLowerCase());
+            System.err.println("Reprocessing draft for " + targetDate + " (existing sections: " + existingSections + ")");
         }
 
         System.err.println("Generating digest for " + targetDate + "...");
         costContext = targetDate;
 
         // Phase 1: discover + scrape (paced) + enrich (parallel)
+        var feedsToProcess = feeds.stream()
+                .filter(f -> !existingSections.contains(f.name().toLowerCase()))
+                .toList();
+        if (feedsToProcess.isEmpty() && isDraft) {
+            System.err.println("  All feeds already processed, skipping to content generation.");
+        }
         Path tempDir = Files.createTempDirectory("digest-");
         try {
-            var scraped = Multi.createFrom().iterable(feeds)
+            var scraped = Multi.createFrom().iterable(feedsToProcess)
                 .onItem().transformToUniAndConcatenate(feed ->
                     findDailyFeed(feed, targetDate, cacheDir)
                         .onItem().delayIt().by(Duration.ofSeconds(2))
@@ -854,18 +869,24 @@ public class DigestHelper implements Runnable {
                     .collect().asList()
                     .await().atMost(Duration.ofMinutes(15));
 
-            if (sections.isEmpty()) {
+            // Merge new sections with existing draft sections
+            var allSections = new ArrayList<>(sections);
+            if (isDraft && existingPost.has("sections")) {
+                for (var s : existingPost.getAsJsonArray("sections")) allSections.add(s.getAsJsonObject());
+            }
+
+            if (allSections.isEmpty()) {
                 System.err.println("  Error: no output for " + targetDate);
                 return;
             }
 
             // Generate digest description
             System.err.println("  Generating digest summary...");
-            String digestDesc = generateDigestDescription(sections);
+            String digestDesc = generateDigestDescription(allSections);
 
             // Extract first image from sections
             String postImage = "";
-            for (var section : sections) {
+            for (var section : allSections) {
                 var articles = section.getAsJsonArray("articles");
                 if (articles == null) continue;
                 for (var a : articles) {
@@ -880,7 +901,8 @@ public class DigestHelper implements Runnable {
             String titleDate = parsedDate.format(
                     java.time.format.DateTimeFormatter.ofPattern("MMMM dd, yyyy", java.util.Locale.US));
 
-            // Build and save post (as draft until content is complete)
+            // Build and save post (replace draft or create new)
+            if (isDraft) { store.posts.remove(existingPost); }
             var post = new JsonObject();
             post.addProperty("title", "Devoured - " + titleDate);
             post.addProperty("description", digestDesc);
@@ -892,11 +914,11 @@ public class DigestHelper implements Runnable {
             if (!postImage.isEmpty()) post.addProperty("image", postImage);
 
             var sectionsArray = new JsonArray();
-            for (var s : sections) sectionsArray.add(s);
+            for (var s : allSections) sectionsArray.add(s);
             post.add("sections", sectionsArray);
 
             store.addPost(post);
-            System.err.println("  Added post for " + targetDate + " with " + sections.size() + " sections (draft)");
+            System.err.println("  Added post for " + targetDate + " with " + allSections.size() + " sections (draft)");
 
             System.err.println("  Syncing new tags...");
             syncTags(dataFile, feedsFile);
