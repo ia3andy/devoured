@@ -46,6 +46,20 @@ public class DigestHelper implements Runnable {
     static final int CONTENT_MIN_LENGTH = 500;
     static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
 
+    static void logStep(String label, String msg) {
+        System.err.println("  [" + label + "] " + msg);
+    }
+
+    @SuppressWarnings("unchecked")
+    static <T> java.util.function.Function<Throwable, T> logRecover(String label) {
+        return e -> { logStep(label, "Failed: " + e.getMessage()); return null; };
+    }
+
+    static <T> Uni<T> blocking(io.smallrye.mutiny.unchecked.UncheckedSupplier<T> supplier) {
+        return Uni.createFrom().item(Unchecked.supplier(supplier))
+            .runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+    }
+
     static class PostStore {
         final Path dataFile;
         JsonArray posts;
@@ -772,68 +786,39 @@ public class DigestHelper implements Runnable {
         System.err.println("Generating digest for " + targetDate + "...");
         costContext = targetDate;
 
-        // Find daily URLs for each feed
-        record FeedTask(Feed feed, String dailyUrl) {}
-        var feedTasks = new ArrayList<FeedTask>();
-        for (var feed : feeds) {
-            String dailyUrl = findDailyUrl(feed.url(), targetDate);
-            if (dailyUrl == null) {
-                System.err.println("  No daily page for " + feed.name() + " on " + targetDate);
-                continue;
-            }
-            System.err.println("  " + feed.name() + ": " + dailyUrl);
-            feedTasks.add(new FeedTask(feed, dailyUrl));
-        }
-
-        if (feedTasks.isEmpty()) {
-            System.err.println("  No feeds found for " + targetDate + ", skipping.");
-            return;
-        }
-
-        // Phase 1: scrape feeds with 2s pacing, then enrich in parallel
+        // Phase 1: discover + scrape (paced) + enrich (parallel)
         Path tempDir = Files.createTempDirectory("digest-");
         try {
-            var enrichedFiles = new ArrayList<String>();
-            var feedNames = new ArrayList<String>();
-            var futures = new ArrayList<java.util.concurrent.Future<?>>();
+            var scraped = Multi.createFrom().iterable(feeds)
+                .onItem().transformToUniAndConcatenate(feed ->
+                    findDailyFeed(feed, targetDate, cacheDir)
+                        .onItem().delayIt().by(Duration.ofSeconds(2))
+                        .onItem().invoke(t -> { if (t != null) logStep(feed.name(), t.dailyUrl()); })
+                        .onFailure().recoverWithItem(logRecover(feed.name()))
+                )
+                .select().where(Objects::nonNull)
+                .onItem().transformToUniAndConcatenate(task ->
+                    scrapeFeed(task, tempDir, maxArticles)
+                        .onItem().invoke(s -> logStep(s.feed().name(), "Scraped."))
+                        .onItem().delayIt().by(Duration.ofSeconds(2))
+                        .onFailure().recoverWithItem(logRecover(task.feed().name()))
+                )
+                .select().where(Objects::nonNull)
+                .onItem().transformToUniAndMerge(s ->
+                    enrichFeed(s, cacheDir)
+                        .onItem().invoke(r -> logStep(r.feed().name(), "Enriched."))
+                        .onFailure().recoverWithItem(logRecover(s.feed().name()))
+                )
+                .select().where(Objects::nonNull)
+                .collect().asList()
+                .await().atMost(Duration.ofMinutes(10));
 
-            try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
-                for (int i = 0; i < feedTasks.size(); i++) {
-                    var task = feedTasks.get(i);
-                    if (i > 0) Thread.sleep(2000);
-                    String enrichedFile = tempDir.resolve("enriched-" + i + "-" + task.feed().name() + ".json").toString();
-                    enrichedFiles.add(enrichedFile);
-                    feedNames.add(task.feed().name());
+            var enrichedFiles = scraped.stream().map(ScrapedFeed::enrichedFile).toList();
+            var feedNames = scraped.stream().map(s -> s.feed().name()).toList();
 
-                    try {
-                        System.err.println("  [" + task.feed().name() + "] Scraping...");
-                        String xml = truncateArticles(tldrArticlesToString(task.dailyUrl()), maxArticles);
-                        Path xmlFile = tempDir.resolve("feed-" + i + ".xml");
-                        Files.writeString(xmlFile, xml);
-
-                        futures.add(executor.submit(() -> {
-                            try {
-                                System.err.println("  [" + task.feed().name() + "] Enriching...");
-                                enrich(xmlFile.toString(), enrichedFile, cacheDir);
-                                System.err.println("  [" + task.feed().name() + "] Enriched.");
-                            } catch (Exception e) {
-                                throw new RuntimeException(e);
-                            }
-                        }));
-                    } catch (Exception e) {
-                        System.err.println("  [" + task.feed().name() + "] Scrape failed: " + e.getMessage());
-                    }
-                }
-
-                System.err.println("  Waiting for " + futures.size() + " feeds to enrich...");
-                int failed = 0;
-                for (var f : futures) {
-                    try { f.get(); } catch (Exception e) {
-                        System.err.println("  Enrich failed: " + e.getMessage());
-                        failed++;
-                    }
-                }
-                if (failed > 0) System.err.println("  Warning: " + failed + " feed(s) failed enrichment");
+            if (enrichedFiles.isEmpty()) {
+                System.err.println("  No feeds found for " + targetDate + ", skipping.");
+                return;
             }
 
             // Phase 2: deduplicate across all enriched files
@@ -849,28 +834,25 @@ public class DigestHelper implements Runnable {
             record SummarizeTask(String enrichedFile, String feedName) {}
             var summarizeTasks = new ArrayList<SummarizeTask>();
             for (int i = 0; i < validEnriched.size(); i++) {
-                String enrichedFile = validEnriched.get(i);
-                String feedName = feedNames.get(enrichedFiles.indexOf(enrichedFile));
-                summarizeTasks.add(new SummarizeTask(enrichedFile, feedName));
+                summarizeTasks.add(new SummarizeTask(validEnriched.get(i),
+                    feedNames.get(enrichedFiles.indexOf(validEnriched.get(i)))));
             }
 
-            System.err.println("  Waiting for " + summarizeTasks.size() + " feeds to summarize...");
+            System.err.println("  Summarizing " + summarizeTasks.size() + " feeds...");
             var sections = Multi.createFrom().iterable(summarizeTasks)
                     .onItem().transformToUni(task ->
-                        Uni.createFrom().item(Unchecked.supplier(() -> {
-                            System.err.println("  [" + task.feedName() + "] Summarizing...");
+                        blocking(() -> {
+                            logStep(task.feedName(), "Summarizing...");
                             var section = summarizeToJson(task.enrichedFile(), task.feedName());
-                            System.err.println("  [" + task.feedName() + "] Done.");
+                            logStep(task.feedName(), "Done.");
                             return section;
-                        })).runSubscriptionOn(Infrastructure.getDefaultWorkerPool())
-                        .onFailure().recoverWithItem(e -> {
-                            System.err.println("  [" + task.feedName() + "] Summarize failed: " + e.getMessage());
-                            return null;
-                        }))
+                        })
+                        .onFailure().recoverWithItem(logRecover(task.feedName()))
+                    )
                     .merge(1)
+                    .select().where(Objects::nonNull)
                     .collect().asList()
-                    .await().atMost(Duration.ofMinutes(15))
-                    .stream().filter(s -> s != null).collect(Collectors.toList());
+                    .await().atMost(Duration.ofMinutes(15));
 
             if (sections.isEmpty()) {
                 System.err.println("  Error: no output for " + targetDate);
@@ -961,7 +943,7 @@ public class DigestHelper implements Runnable {
                 String link = jsonStr(article, "link");
                 String normalized = normalizeUrl(link);
                 if (seen.contains(normalized)) {
-                    System.err.println("    [dedup] removing: " + jsonStr(article, "title"));
+                    logStep("dedup", "removing: " + jsonStr(article, "title"));
                     removed++;
                 } else {
                     seen.add(normalized);
@@ -1144,7 +1126,7 @@ public class DigestHelper implements Runnable {
             String url = item.selectFirst("guid").text();
             Path cachePath = Path.of(cacheDir, cacheKey(url) + ".json");
             if (Files.exists(cachePath)) {
-                System.err.println("    [cached] " + url);
+                logStep("cached", url);
                 cacheMap.put(url, GSON.fromJson(Files.readString(cachePath), JsonObject.class));
             } else {
                 uncachedUrls.add(url);
@@ -1152,7 +1134,7 @@ public class DigestHelper implements Runnable {
         }
 
         for (String url : uncachedUrls) {
-            System.err.println("    [jsoup] " + url);
+            logStep("jsoup", url);
             JsonObject data = fetchAndResolveImage(url);
             cacheAndStore(cacheMap, data, url, cacheDir);
         }
@@ -1257,7 +1239,7 @@ public class DigestHelper implements Runnable {
         if (jsonStr(data, "ogImage").isEmpty()) {
             String fbImage = fetchOgImageFromFacebook(url);
             if (!fbImage.isEmpty()) {
-                System.err.println("      [fb] found image");
+                logStep("fb", "found image");
                 data.addProperty("ogImage", fbImage);
             }
         }
@@ -1730,7 +1712,7 @@ public class DigestHelper implements Runnable {
                 try {
                     return parseLenientJson(content);
                 } catch (Exception e) {
-                    System.err.println("  [JSON parse error] " + e.getMessage() + "\n  Raw content: " + content.substring(0, Math.min(500, content.length())));
+                    logStep("JSON parse error", e.getMessage() + "\n  Raw content: " + content.substring(0, Math.min(500, content.length())));
                     throw new RuntimeException("JSON parse: " + e.getMessage());
                 }
             }
@@ -1741,11 +1723,11 @@ public class DigestHelper implements Runnable {
         .onFailure(RateLimitException.class).recoverWithUni(t -> {
             var rle = (RateLimitException) t;
             if (rle.dailyQuota) {
-                System.err.println("  [429] daily quota exhausted, stopping retries");
+                logStep("429", "daily quota exhausted, stopping retries");
                 return Uni.createFrom().failure(new RuntimeException("Daily API quota exhausted"));
             }
             if (attempt >= 30) return Uni.createFrom().failure(new RuntimeException("Rate limited after 30 retries"));
-            if (attempt == 0) System.err.println("  [429 " + context + "] body: " + rle.getMessage().substring(rle.getMessage().indexOf(": ") + 2, Math.min(rle.getMessage().length(), 300)));
+            if (attempt == 0) logStep("429 " + context, "body: " + rle.getMessage().substring(rle.getMessage().indexOf(": ") + 2, Math.min(rle.getMessage().length(), 300)));
             System.err.printf("  [429 %s] retry in %ds (attempt %d/30)%n", context, rle.retryAfter.toSeconds(), attempt + 1);
             nextAllowedCall.updateAndGet(prev -> Math.max(prev, System.currentTimeMillis() + rle.retryAfter.toMillis()));
             return Uni.createFrom().voidItem()
@@ -1934,22 +1916,55 @@ public class DigestHelper implements Runnable {
         return feeds;
     }
 
-    static String findDailyUrl(String rssUrl, String targetDate) {
-        try {
-            String rssContent = Jsoup.connect(rssUrl)
-                    .userAgent("Mozilla/5.0")
-                    .timeout(30000)
-                    .ignoreContentType(true)
-                    .execute().body();
+    record FeedTask(Feed feed, String dailyUrl) {}
+    record ScrapedFeed(Feed feed, String enrichedFile, Path xmlFile) {
+        static ScrapedFeed of(FeedTask task, Path tempDir, Path xmlFile) {
+            return new ScrapedFeed(task.feed(),
+                tempDir.resolve("enriched-" + task.feed().name() + ".json").toString(), xmlFile);
+        }
+    }
+
+    static Uni<FeedTask> findDailyFeed(Feed feed, String targetDate, String cacheDir) {
+        return blocking(() -> {
+            Path cacheFile = Path.of(cacheDir, "rss", feed.name() + "-" + targetDate + ".xml");
+            String rssContent;
+            if (Files.exists(cacheFile)) {
+                rssContent = Files.readString(cacheFile);
+            } else {
+                rssContent = Jsoup.connect(feed.url())
+                        .userAgent("Mozilla/5.0")
+                        .timeout(30000)
+                        .ignoreContentType(true)
+                        .execute().body();
+                if (rssContent != null && !rssContent.isEmpty()) {
+                    Files.createDirectories(cacheFile.getParent());
+                    Files.writeString(cacheFile, rssContent);
+                }
+            }
             if (rssContent == null || rssContent.isEmpty()) return null;
             for (String url : extractUrls(rssContent)) {
-                if (url.contains(targetDate)) return url;
+                if (url.contains(targetDate)) return new FeedTask(feed, url);
             }
             return null;
-        } catch (Exception e) {
-            System.err.println("  Failed to fetch RSS from " + rssUrl + ": " + e.getMessage());
-            return null;
-        }
+        })
+        .onFailure(e -> e.getMessage() != null && e.getMessage().contains("429"))
+            .retry().withBackOff(Duration.ofSeconds(5)).atMost(3);
+    }
+
+    static Uni<ScrapedFeed> scrapeFeed(FeedTask task, Path tempDir, int maxArticles) {
+        return blocking(() -> {
+            String xml = truncateArticles(tldrArticlesToString(task.dailyUrl()), maxArticles);
+            Path xmlFile = tempDir.resolve("feed-" + task.feed().name() + ".xml");
+            Files.writeString(xmlFile, xml);
+            return ScrapedFeed.of(task, tempDir, xmlFile);
+        });
+    }
+
+    static Uni<ScrapedFeed> enrichFeed(ScrapedFeed s, String cacheDir) {
+        return blocking(() -> {
+            enrich(s.xmlFile().toString(), s.enrichedFile(), cacheDir);
+            return s;
+        });
     }
 
     static String generateDigestDescription(List<JsonObject> sections) {
@@ -2065,7 +2080,7 @@ public class DigestHelper implements Runnable {
                     writeHtmlFile(contentDir, a.id(), html);
                 } else {
                     writePlaceholderFile(contentDir, a.id(), a.link());
-                    System.err.println("    [skip] " + a.id() + " (cached cleanedHtml is not usable)");
+                    logStep("skip", a.id() + " (cached cleanedHtml is not usable)");
                 }
                 continue;
             }
@@ -2073,12 +2088,12 @@ public class DigestHelper implements Runnable {
             if (html.length() < 200 || isJunkContent(html)) continue;
             if (isJunkHtml(html)) {
                 writePlaceholderFile(contentDir, a.id(), a.link());
-                System.err.println("    [skip] " + a.id() + " (junk HTML detected)");
+                logStep("skip", a.id() + " (junk HTML detected)");
                 continue;
             }
             if (html.length() > 30000) {
                 writePlaceholderFile(contentDir, a.id(), a.link());
-                System.err.println("    [skip] " + a.id() + " (" + html.length() + " chars, too large for AI cleaning)");
+                logStep("skip", a.id() + " (" + html.length() + " chars, too large for AI cleaning)");
                 continue;
             }
             jobs.add(new CleanJob(a, cachePath, data, html));
@@ -2090,7 +2105,7 @@ public class DigestHelper implements Runnable {
             try {
                 Multi.createFrom().iterable(jobs)
                         .onItem().transformToUniAndConcatenate(job -> {
-                            System.err.println("    [clean] " + job.article().id());
+                            logStep("clean", job.article().id());
                             return ai().cleanHtml(job.article().id(), job.html())
                                     .ifNoItem().after(Duration.ofSeconds(AI_TIMEOUT_SECONDS + 30)).fail()
                                     .onItem().invoke(cleaned -> {
@@ -2113,7 +2128,7 @@ public class DigestHelper implements Runnable {
                         .collect().asList()
                         .await().atMost(Duration.ofMinutes(30));
             } catch (Exception e) {
-                System.err.println("  [warn] AI cleaning incomplete: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+                logStep("warn", "AI cleaning incomplete: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
                 complete = false;
             }
         }
@@ -2189,7 +2204,7 @@ public class DigestHelper implements Runnable {
             if (data.has("skipped") && data.get("skipped").getAsBoolean()) continue;
             if (jsonStr(data, "contentHtml").length() > 100) continue;
 
-            System.err.println("    [jsoup] " + url);
+            logStep("jsoup", url);
             JsonObject fresh = fetchWithJsoup(url);
             String freshHtml = jsonStr(fresh, "contentHtml");
             if (freshHtml.length() > 200) {
