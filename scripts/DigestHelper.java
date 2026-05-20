@@ -1673,15 +1673,17 @@ public class DigestHelper implements Runnable {
                 Duration retryAfter = retryMatch.find()
                         ? Duration.ofMillis((long) (Double.parseDouble(retryMatch.group(1)) * 1000) + 1000)
                         : Duration.ofSeconds(20);
-                var h = response.headers();
-                String remainReq = h.firstValue("x-ratelimit-remaining-requests").orElse(h.firstValue("x-ratelimit-remaining").orElse("?"));
-                String limitReq = h.firstValue("x-ratelimit-limit-requests").orElse(h.firstValue("x-ratelimit-limit").orElse("?"));
-                String remainTokens = h.firstValue("x-ratelimit-remaining-tokens").orElse("?");
-                String limitTokens = h.firstValue("x-ratelimit-limit-tokens").orElse("?");
-                String reset = h.firstValue("x-ratelimit-reset-requests").orElse(h.firstValue("x-ratelimit-reset").orElse("?"));
-                boolean daily = "0".equals(remainReq) && retryAfter.toMinutes() > 10;
-                logStep("429 " + context, String.format("requests=%s/%s tokens=%s/%s reset=%s retryIn=%ds daily=%s",
-                        remainReq, limitReq, remainTokens, limitTokens, reset, retryAfter.toSeconds(), daily));
+                boolean daily = retryAfter.toMinutes() > 5;
+                if (attempt == 0) {
+                    logStep("429 " + context, (daily ? "DAILY QUOTA" : "RATE LIMITED") + " retryIn=" + retryAfter.toSeconds() + "s");
+                    logStep("429 " + context, "body: " + bodySnippet.replaceAll("\\s+", " ").trim());
+                    var headerLog = new StringBuilder();
+                    response.headers().map().forEach((k, v) -> {
+                        if (k.contains("rate") || k.contains("limit") || k.contains("quota") || k.contains("retry"))
+                            headerLog.append(k).append("=").append(v).append(" ");
+                    });
+                    if (headerLog.length() > 0) logStep("429 " + context, "headers: " + headerLog.toString().trim());
+                }
                 throw new RateLimitException(retryAfter, daily, bodySnippet);
             }
 
