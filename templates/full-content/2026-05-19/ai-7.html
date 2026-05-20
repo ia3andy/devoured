@@ -1,0 +1,259 @@
+<h1>HRM-Text: Efficient Pretraining Beyond Scaling</h1>
+<p><strong>🌟 Pretrain a foundation model from scratch with ~$1000. 🌠</strong></p>
+<p>HRM-Text is a 1B text generation model based on the HRM architecture, strengthened by task completion and latent space reasoning. It offers a full pretraining framework, making foundation model pretraining accessible with 130-600x less compute and 150-900x less data. It is built upon a hierarchical recurrent architecture, PrefixLM sequence packing, FlashAttention 3 kernels, PyTorch FSDP2 training, evaluation, and checkpoint conversion tooling.</p>
+<h2>Launch the Pretraining 🚀</h2>
+<h3>Required Resources</h3>
+<p>Choose a target size and prepare the corresponding GPU nodes.</p>
+<ul>
+ <li><strong>L, 0.6B parameters:</strong> 8 H100s, single node, about 50 hours (~$800).</li>
+ <li><strong>XL, 1B parameters:</strong> 16 H100s, two nodes, about 46 hours (~$1472).</li>
+</ul>
+<p><em>Price estimation based on $2/H100 hour.</em></p>
+<p>The following are benchmark results from the reference runs.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Size</th>
+   <th>GPUs</th>
+   <th>Time</th>
+   <th>GSM8k</th>
+   <th>MATH</th>
+   <th>DROP</th>
+   <th>MMLU</th>
+   <th>ARC-C</th>
+   <th>HellaSwag</th>
+   <th>Winogrande</th>
+   <th>BoolQ</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>L (0.6B)</strong></td>
+   <td>8</td>
+   <td>50 hrs</td>
+   <td>77.6%</td>
+   <td>51.2%</td>
+   <td>78.6%</td>
+   <td>56.6%</td>
+   <td>75.9%</td>
+   <td>52.7%</td>
+   <td>67.6%</td>
+   <td>85.0%</td>
+  </tr>
+  <tr>
+   <td><strong>XL (1B)</strong></td>
+   <td>16</td>
+   <td>46 hrs</td>
+   <td>84.7%</td>
+   <td>56.5%</td>
+   <td>82.3%</td>
+   <td>60.7%</td>
+   <td>81.9%</td>
+   <td>63.4%</td>
+   <td>72.4%</td>
+   <td>86.2%</td>
+  </tr>
+ </tbody>
+</table>
+<blockquote>
+ <p>Hopper-class GPUs are the expected training target because the attention path depends on FlashAttention 3.</p>
+</blockquote>
+<h3>1. Prepare Data</h3>
+<p>HRM-Text trains from sampled, tokenized data produced by the companion <code>data_io</code> pipeline. Use <code>data_io</code> to clean, tokenize, and stratified-sample the pretraining corpus, then point HRM-Text at the sampled output.</p>
+<p>Recommended setups:</p>
+<ol>
+ <li><strong>Single node:</strong> run the data pipeline and pretraining on the same node. After tokenization, stratified-sample into that node's shared memory at <code>/dev/shm/sampled</code>.</li>
+ <li><strong>Multi-node:</strong> keep <code>data_io</code> and the tokenized data on shared storage. Mount or expose that directory on every pretraining node, then run stratified sampling independently on each node. Sampling is fast and deterministic, so every node produces the same in-memory training data.</li>
+</ol>
+<p>Please first setup <code>data_io</code>, then run the pipeline. After tokenization, run stratified sampling on each training node.</p>
+<pre>cd &lt;DATA_IO_PATH&gt;
+python sample_tokenized.py epochs=4 output_path=/dev/shm/sampled &gt; show_analytics.md</pre>
+<p>HRM-Text uses 4 training epochs by default. If you change <code>epochs</code> in the training config, change the sampling command to match.</p>
+<h3>2. Start the Environment</h3>
+<p>Set up the same environment on every pretraining node.</p>
+<h4>Recommended: Docker</h4>
+<p>We recommend running through the published Docker image that contains the full environment. Make sure Docker can see your GPUs, for example through NVIDIA Container Toolkit.</p>
+<p>From the repo's directory:</p>
+<pre>docker run --gpus all --ipc=host --network=host -it \
+  -v "$PWD":/workspace \
+  sapientai/hrm-text:latest</pre>
+<p>For multi-node runs, mount the same shared workspace on every node. Keeping the code, tokenized data, and checkpoint directory at identical paths avoids version drift between ranks and makes FSDP2 checkpointing straightforward. A common layout is:</p>
+<pre><code>/shared/
+|-- HRM-Text/
+   |--- checkpoints/
+|-- data_io/
+</code></pre>
+<h4>Alternative: Install from Source</h4>
+<p>If you are not using Docker, first install PyTorch, CUDA, and FlashAttention 3. The tested versions are documented in <a><code>docker/Dockerfile</code></a>.</p>
+<p>Then install the Python dependencies:</p>
+<pre>pip install -r requirements.txt</pre>
+<h4>Check Distributed Communication</h4>
+<p>For multi-node runs, verify NCCL before starting a long job. At minimum, confirm that <code>torchrun</code> can initialize across the intended nodes. If your cluster provides <code>nccl-tests</code>, run both intra-node and inter-node bandwidth checks.</p>
+<h4>Set Up W&amp;B Tracking</h4>
+<p>HRM-Text logs training metrics to <a href="https://wandb.ai/">Weights &amp; Biases</a>. Log in before launching training:</p>
+<pre>wandb login</pre>
+<p>For headless runs, get an API key from <a href="https://wandb.ai/authorize">https://wandb.ai/authorize</a> and run:</p>
+<pre>wandb login &lt;API_KEY&gt;</pre>
+<h3>3. Launch Pretraining</h3>
+<p>For the <strong>L</strong>-size reference run on one 8xH100 node:</p>
+<pre>OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+torchrun --nproc_per_node=8 pretrain.py arch/size@arch=L lr=2.5e-4 global_batch_size=172032</pre>
+<p>For the <strong>XL</strong>-size reference run on two 8xH100 nodes, run this on each node:</p>
+<pre>OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+torchrun \
+  --nproc_per_node=8 \
+  --nnodes=2 \
+  --node_rank=&lt;NODE_RANK&gt; \
+  --master_addr=&lt;MASTER_ADDR&gt; \
+  --master_port=&lt;MASTER_PORT&gt; \
+  pretrain.py</pre>
+<p>Checkpoints are saved every epoch under <code>checkpoints/</code>. Remember for multi-node runs, each node only saves its own shard, so we recommend mounting a shared storage.</p>
+<h3>4. Evaluate</h3>
+<p>Evaluation loads the latest checkpoint epoch automatically when <code>ckpt_epoch</code> is not provided:</p>
+<pre>python -m evaluation.main ckpt_path="checkpoints/..."</pre>
+<p>To run a specified set of benchmarks, append <code>run_only=[MATH,DROP,ARC,MMLU]</code> to the command</p>
+<p>Evaluation typically needs one 80 GB GPU. If evaluation runs out of memory, lower the batch size by adding <code>generation_config.batch_size=16</code></p>
+<p>The evaluation scripts use Hugging Face <code>datasets</code>, so benchmark data is downloaded on demand.</p>
+<h3>5. Export to Transformers Format</h3>
+<pre>python -m conversion.convert_to_hf \
+  --ckpt_path "checkpoints/..." \
+  --out_dir "&lt;OUTPUT_PATH&gt;"</pre>
+<p>For evaluation and export, EMA weights are used by default when EMA is present in the checkpoint.</p>
+<h2>Status</h2>
+<ul>
+ <li>Training, checkpointing, and evaluation are implemented in this repository.</li>
+ <li>Transformers-format export is implemented in <a><code>conversion/convert_to_hf.py</code></a>.</li>
+ <li>Native Transformers model support is merged and scheduled for the next release.</li>
+ <li>Native vLLM support for HRM-Text checkpoints is in progress.</li>
+</ul>
+<h2>Training Overrides</h2>
+<p>The default pretraining config is <a><code>config/cfg_pretrain.yaml</code></a>:</p>
+<p>If <code>project_name</code>, <code>run_name</code>, or <code>checkpoint_path</code> are omitted, rank 0 derives them from the dataset path, architecture name, and a generated slug.</p>
+<p>Hydra overrides can be passed directly on the command line:</p>
+<pre># Train a vanilla Transformer architecture, size L
+torchrun --nproc_per_node=8 pretrain.py \
+  arch/net@arch=transformer \
+  arch/size@arch=L</pre>
+<h2>Model Configurations</h2>
+<p>Architectures live under <a><code>config/arch/net</code></a>:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Config</th>
+   <th>Model</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>hrm</code></td>
+   <td>HRM-Text</td>
+  </tr>
+  <tr>
+   <td><code>transformer</code></td>
+   <td>Standard Transformer wrapper</td>
+  </tr>
+  <tr>
+   <td><code>trm</code></td>
+   <td>Tiny Recursive Model baseline</td>
+  </tr>
+  <tr>
+   <td><code>trm_match_recurrence</code></td>
+   <td>TRM configured to match HRM recurrence with half parameters</td>
+  </tr>
+  <tr>
+   <td><code>rins</code></td>
+   <td>Recursive Inference Scaling (RINS) baseline</td>
+  </tr>
+  <tr>
+   <td><code>ut</code></td>
+   <td>Universal Transformer baseline</td>
+  </tr>
+ </tbody>
+</table>
+<p>Sizes live under <a><code>config/arch/size</code></a>:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Config</th>
+   <th>Layers</th>
+   <th>Hidden</th>
+   <th>Heads</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>B</code></td>
+   <td>12</td>
+   <td>1024</td>
+   <td>8</td>
+  </tr>
+  <tr>
+   <td><code>L</code></td>
+   <td>24</td>
+   <td>1280</td>
+   <td>10</td>
+  </tr>
+  <tr>
+   <td><code>XL</code></td>
+   <td>32</td>
+   <td>1536</td>
+   <td>12</td>
+  </tr>
+  <tr>
+   <td><code>XXL</code></td>
+   <td>72</td>
+   <td>1792</td>
+   <td>14</td>
+  </tr>
+  <tr>
+   <td><code>XXL_wide</code></td>
+   <td>32</td>
+   <td>2560</td>
+   <td>20</td>
+  </tr>
+ </tbody>
+</table>
+<p>For HRM and RINS, <code>half_layers: true</code> splits the configured layer count evenly between the H and L modules.</p>
+<h2>Repository Layout</h2>
+<pre><code>HRM-Text/
+|-- config/                       # Hydra configs for model, data, and training
+|-- conversion/convert_to_hf.py    # FSDP2 checkpoint -&gt; HF-style export
+|-- evaluation/                    # Evaluation engines, benchmark wrappers, configs
+|-- models/                        # HRM, recurrent baselines, Transformer blocks, LM head
+|-- docker/                        # Tested CUDA/PyTorch/FlashAttention environment
+|-- dataset_new.py                 # PrefixLM packed dataset loader
+|-- multipack_sampler.py           # Distributed multipack batch sampler
+|-- pretrain.py                    # FSDP2 pretraining entrypoint
+|-- simple_inference_engine.py     # Checkpoint loader and compiled generation engine
+`-- requirements.txt
+</code></pre>
+<h2>Technical Notes</h2>
+<ul>
+ <li><a><code>dataset_new.py</code></a> loads sampled <code>tokens.npy</code> and per-epoch index arrays, builds PrefixLM batches, masks instruction tokens by default, and emits FlashAttention sequence metadata.</li>
+ <li><a><code>multipack_sampler.py</code></a> implements distributed multipack batching with LPT allocation to improve token-slot utilization and balance quadratic attention work.</li>
+ <li><a><code>models/flash_attention_prefixlm_v2.py</code></a> implements the two-pass PrefixLM attention path: one bidirectional pass over the prefix region and one causal pass over the response region.</li>
+ <li><a><code>models/layers.py</code></a> contains RoPE, gated multi-head attention, SwiGLU MLPs, static KV cache helpers, and initialization utilities.</li>
+ <li><a><code>models/baselines/hrm_nocarry_bp_warmup.py</code></a> contains the main HRM-Text architecture.</li>
+ <li><a><code>models/lm_head.py</code></a> attaches scaled embeddings, the output head, cross-entropy loss, token accuracy, and sequence exact accuracy.</li>
+ <li><a><code>pretrain.py</code></a> handles FSDP2 wrapping, optimizer creation, LR schedule, W&amp;B logging, code/config snapshots, and distributed checkpointing.</li>
+</ul>
+<h2>Contributions</h2>
+<p>We welcome contributions that make HRM-Text faster, stronger, or easier to use.</p>
+<p>Please send data-pipeline changes to the companion <code>data_io</code> project. Send model, training, inference, evaluation, conversion, infrastructure, and documentation changes here.</p>
+<p>Recommended PR categories:</p>
+<ul>
+ <li><strong>Docs and tutorials:</strong> clarify setup, data prep, launch recipes, evaluation, or checkpoint conversion.</li>
+ <li><strong>Evaluation and inference:</strong> add benchmark wrappers, improve generation throughput, reduce VRAM, or improve result reporting.</li>
+ <li><strong>Training infrastructure:</strong> improve FSDP2 stability, efficiency, checkpointing, launch ergonomics, logging, or cluster portability.</li>
+ <li><strong>Model and optimizer changes:</strong> improve the architecture, recurrence schedule, initialization, attention path, optimizer, or training hyperparameters.</li>
+</ul>
+<p>For changes that alter pretraining behavior, we strongly recommend running pretraining at an appropriate scale and including downstream benchmark comparisons against the reference.</p>
+<p>For infrastructure changes intended to be behavior-preserving, include before/after speed, memory, or stability measurements and show that benchmark quality does not regress.</p>
+<p>For model-quality changes, we evaluate whether the change improves the Pareto frontier of training compute versus performance. Strict improvements and high-ROI changes are good candidates for defaults; valuable tradeoffs with higher cost or lower performance may belong in separate configs.</p>
+<h2>Paper</h2>
+<p>The full paper is available here:</p>
+<p><a href="https://sapientinc.github.io/HRM-Text/assets/HRM_Text.pdf">📄 View PDF</a></p>
+<h2>Citation</h2>
+<p>Citation information will be added with the accompanying paper.</p>
+<h2>License</h2>
+<p>Apache License 2.0</p>
