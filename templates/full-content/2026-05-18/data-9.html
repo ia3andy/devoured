@@ -1,0 +1,166 @@
+<h1>What Matters in Production RAG</h1>
+<p>Most of us build <a href="https://arxiv.org/abs/2005.11401">RAG</a> the same way: follow a tutorial that embeds a handful of PDFs, stores the vectors in a local <a href="https://docs.trychroma.com/">Chroma</a> instance, and chains everything together with <a href="https://python.langchain.com/docs/introduction/">LangChain</a> (if that's still a thing). The demo works. The answer looks reasonable. Then you take it to production and it falls apart in quiet, hard-to-diagnose ways.</p>
+<p>This article is about what comes after the demo. It covers the fundamentals of how RAG actually works under the hood, the engineering challenges of keeping an index fresh and correct over time, and how to build the observability layer that lets you answer "why did the system retrieve that?" when things go wrong. None of these topics are exotic. All of them are consistently underbuilt in practice.</p>
+<h2>RAG Basics</h2>
+<p>The core idea is simple: instead of asking an <a href="https://en.wikipedia.org/wiki/Large_language_model">LLM</a> to answer from memory, you retrieve relevant documents at query time and inject them into the prompt as context. The model's role shifts from "know everything" to "reason over what you are given." This architectural choice has made RAG the dominant pattern for grounding LLMs in specific, current, or proprietary knowledge.</p>
+<p>A RAG system has two distinct pipelines that run at different times.</p>
+<p>The indexing pipeline runs offline (or in the background). It ingests raw documents, splits them into chunks, converts each chunk into a dense vector embedding, and stores those vectors in a <a href="https://en.wikipedia.org/wiki/Vector_database">vector database</a> alongside metadata and the original text. This pipeline populates the knowledge base the retriever will search at query time.</p>
+<p>The query pipeline runs online, per user request. It takes the user's question, embeds it using the same model used during indexing, searches the vector database for the nearest chunks, assembles those chunks into a context window, and sends the whole thing to the LLM as a prompt.</p>
+<p>The math underlying the retrieval step is <a href="https://en.wikipedia.org/wiki/Cosine_similarity">cosine similarity</a>. Two vectors are considered close if the angle between them is small:</p>
+<p>similarity(q, d) = (q · d) / (‖q‖ · ‖d‖)</p>
+<p>Where q is the query embedding and d is a document chunk embedding. In practice, most vector databases use <a href="https://en.wikipedia.org/wiki/Nearest_neighbor_search#Approximate_nearest_neighbor">approximate nearest neighbor (ANN)</a> search rather than exact exhaustive search, because scanning billions of vectors at query time is prohibitively slow. <a href="https://arxiv.org/abs/1603.09320">HNSW (Hierarchical Navigable Small World)</a> is the dominant algorithm: it builds a layered proximity graph during indexing that allows retrieval in O(log n) time at the cost of a small, tunable recall loss.</p>
+<h3>Chunking</h3>
+<p>Chunking is where most RAG systems silently fail. The intuition is straightforward: chunks need to be small enough that retrieved text is specific and relevant, but large enough that they contain complete thoughts. In practice, getting this right requires understanding your document corpus.</p>
+<p>The naive approach is fixed-size chunking at some character or token count, say 512 tokens with a 128-token overlap. It is simple and fast. It is also routinely wrong. Fixed-size chunking cuts sentences in half, separates questions from their answers in FAQ documents, and splits code across function boundaries.</p>
+<p>The approaches that actually work in production:</p>
+<ul>
+ <li>Recursive splitting: split on paragraphs first, then sentences, then characters as a fallback. This preserves semantic structure far better than character counting.</li>
+ <li>Semantic chunking: embed consecutive sentences and insert chunk boundaries where cosine similarity between adjacent sentences drops below a threshold. This identifies genuine topic shifts rather than arbitrary position boundaries.</li>
+ <li>Structure-aware splitting: for code, split at function or class boundaries using <a href="https://docs.python.org/3/library/ast.html">AST parsing</a>. For legal documents, split at clause boundaries. For contracts, include the parent section heading with every child chunk.</li>
+</ul>
+<p>Always store metadata with each chunk: the source document ID, section heading, page number, creation timestamp, and a content hash. You will need all of these later, both for filtering and for keeping the index current.</p>
+<h3>Embedding Models and the Model-Lock Problem</h3>
+<p>The embedding model you choose during indexing is a 'long-term commitment' (sorry, could not come with a better working here). Every vector in your index was produced by that model. If you switch models, every vector is now incommensurable with the new query embeddings, and you must re-embed the entire corpus.</p>
+<p>Production-grade options as of mid-2026:</p>
+<ul>
+ <li><code>text-embedding-3-large</code> (OpenAI): 3072-dimensional, best general-purpose recall, but API-dependent</li>
+ <li><code>embed-v3</code> (Cohere): strong multilingual performance, supports truncation modes</li>
+ <li><code>bge-large-en-v1.5</code> (BAAI): open-source, deployable locally, competitive with the above for English</li>
+ <li><code>e5-mistral-7b-instruct</code>: instruction-tuned, excellent for asymmetric retrieval tasks</li>
+</ul>
+<h2>RAG Indexing Pipelines</h2>
+<p>Here is where most tutorials stop and most production problems begin. Your knowledge base is not static. Documents are updated, retracted, corrected, superseded, and deleted. If your indexing pipeline cannot handle these operations correctly, your RAG system will quietly serve stale, contradictory, or deleted information with full confidence.</p>
+<h3>Chunk Identity</h3>
+<p>A document that is split into 15 chunks produces 15 separate vectors, each stored with its own ID. When that document is updated, you cannot simply update a row as you would in a relational database. You need to:</p>
+<ol>
+ <li>Identify all 15 chunk IDs that belong to the old version of the document</li>
+ <li>Delete them from the vector store</li>
+ <li>Re-chunk the updated document (which may now produce 17 chunks)</li>
+ <li>Re-embed and insert the 17 new chunks</li>
+</ol>
+<p>This requires a mapping layer that vector databases do not provide natively. The standard approach is a document registry, a simple relational table (<a href="https://www.postgresql.org/">Postgres</a> works fine) that maps each <code>doc_id</code> to the list of chunk vector IDs currently in the index:</p>
+<pre><code>CREATE TABLE doc_chunk_registry (
+    doc_id          TEXT NOT NULL,
+    chunk_vector_id TEXT NOT NULL,
+    content_hash    TEXT NOT NULL,
+    version         INTEGER NOT NULL DEFAULT 1,
+    indexed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status          TEXT NOT NULL DEFAULT 'active',  -- 'active' | 'deleted' | 'superseded'
+    PRIMARY KEY (doc_id, chunk_vector_id)
+);</code></pre>
+<p>When a document update arrives, the flow is:</p>
+<pre><code>def reindex_document(doc_id: str, new_content: str, vector_store, registry_db):
+    # 1. Find existing chunk IDs
+    old_chunk_ids = registry_db.query(
+        """SELECT chunk_vector_id
+			FROM doc_chunk_registry
+			WHERE doc_id = %s AND status = 'active'""",
+        (doc_id,)
+    )
+
+    # 2. Delete old vectors
+    vector_store.delete(ids=[row["chunk_vector_id"] for row in old_chunk_ids])
+    registry_db.execute(
+        """UPDATE doc_chunk_registry
+		    SET status = 'superseded'
+		    WHERE doc_id = %s AND status = 'active'""",
+        (doc_id,)
+    )
+
+    # 3. Re-chunk and re-embed
+    new_chunks = splitter.split_text(new_content)
+    new_embeddings = embed(new_chunks)
+    new_ids = vector_store.upsert(new_embeddings, metadata=[...])
+
+    # 4. Register new chunks
+    for chunk_id in new_ids:
+        registry_db.execute(
+            """INSERT INTO doc_chunk_registry
+			        (doc_id, chunk_vector_id, content_hash, version)
+		            VALUES (%s, %s, %s, %s)""",
+            (doc_id, chunk_id, content_hash, next_version)
+        )</code></pre>
+<h3>Avoiding Unnecessary Re-Embedding</h3>
+<p>Re-embedding is expensive. A 100,000-document corpus with an average of 10 chunks per document means 1 million embedding API calls for a full rebuild. You want to re-embed only what changed.</p>
+<p>Content hashing is the first gate. When a document arrives, compute a hash of its content. If the hash matches what is in the registry, skip it entirely. Most "updates" in practice are metadata changes (a title change, a timestamp update) that do not affect the text content and therefore do not require re-embedding.</p>
+<pre><code>def should_reindex(doc_id: str, new_content: str, registry_db) -&gt; bool:
+    row = registry_db.query_one(
+        """SELECT content_hash
+		        FROM doc_chunk_registry
+		        WHERE doc_id = %s
+			        AND status = 'active' LIMIT 1""",
+        (doc_id,)
+    )
+    if row is None:
+        return True  # New document
+    new_hash = hashlib.sha256(new_content.encode()).hexdigest()
+    return new_hash != row["content_hash"]</code></pre>
+<p>For large documents, you can go further: hash at the chunk level, and re-embed only the chunks whose content changed. This is more complex to implement but pays off for long, mostly-stable documents like regulatory filings or technical manuals where only a few sections change per update cycle.</p>
+<h3>Index Versioning and No-Downtime Updates</h3>
+<p>The most underappreciated failure mode in RAG is the partial update. You start reindexing 10,000 documents, the pipeline crashes at document 6,000, and now your index is a flux: some documents are at version N, some at version N+1, and the seam between them is invisible to the retrieval layer.</p>
+<p>The safe pattern is alias-based deployment, borrowed directly from Elasticsearch operations:</p>
+<pre><code>rag_index_2026_05_14  (built overnight, fully validated)
+rag_index_current     (alias pointing to above)</code></pre>
+<p>You build the new index completely, validate it against a benchmark query set, then atomically swap the alias. The old index stays around for a configurable retention period in case rollback is needed. No query ever sees a partial index.</p>
+<p>For systems that cannot tolerate rebuild latency (the index is too large, or documents need to be available within seconds of ingestion), incremental upsert is the alternative. Upsert appends new vectors without touching existing ones. Manage concurrent visibility by including a <code>valid_from</code> timestamp (similar to Postgres MVCC) in metadata and filtering queries to only return chunks where <code>valid_from &lt;= NOW()</code>. This lets you stage new content before it becomes live.</p>
+<pre><code># Stage new chunks with a future valid_from
+vector_store.upsert(
+    vectors=new_embeddings,
+    metadata=[\{
+        "doc_id": doc_id,
+        "valid_from": (datetime.utcnow() + timedelta(minutes=5)).isoformat(),
+        "status": "active"
+    } for _ in new_embeddings]
+)
+
+# Query filter in retrieval
+results = vector_store.query(
+    query_vector=query_embedding,
+    filter=\{"valid_from": \{"$lte": datetime.utcnow().isoformat()}, "status": "active"}
+)</code></pre>
+<h3>Embedding Model Upgrades</h3>
+<p>When a better embedding model is released, every vector in your index is now wrong in a specific sense: it was produced by a different model, so its geometric position in the vector space is incommensurable with query embeddings from the new model. You cannot query with model B and retrieve vectors from model A.</p>
+<p>This means embedding model upgrades require full corpus re-embedding. In practice, the migration strategy is:</p>
+<ol>
+ <li>Build a shadow index with the new model running in parallel</li>
+ <li>Route a small percentage of queries to the shadow index and compare results</li>
+ <li>Gradually shift traffic using the alias pattern above</li>
+ <li>Keep the old index warm until you are confident in the new one</li>
+</ol>
+<p>The operational cost of this is why embedding model choice deserves more up-front thought than it typically gets. Treat it like a database schema migration: painful to undo, so choose carefully.</p>
+<p>A practical safeguard: store the embedding model name and version in every chunk's metadata. When querying, assert that the stored model matches the query model before returning results. This prevents the silent failure mode where model drift goes undetected.</p>
+<h2>Observability and Retrieval Tracing</h2>
+<p>Production RAG systems fail in ways that look like LLM problems but are actually retrieval problems. The answer is confidently wrong not because the model hallucinated, but because it faithfully reasoned over the wrong context. Without end-to-end tracing, you cannot distinguish these two failure modes.</p>
+<p>The standard observability stack for distributed systems (traces, metrics, logs via <a href="https://opentelemetry.io/docs/">OpenTelemetry</a>) applies here, but a RAG pipeline has primitives that <a href="https://opentelemetry.io/docs/">OTel's</a> generic span model does not capture natively. You need to instrument these explicitly.</p>
+<h3>The Span Architecture</h3>
+<p>A complete RAG request should produce a trace with these spans, nested in a single root span:</p>
+<pre><code>rag_request (root)
+  ├── embedding.query          (latency, model, input tokens)
+  ├── retrieval.vector_search  (latency, num_results, top_k, filter applied)
+  ├── retrieval.rerank         (latency, num_input, num_output, model)
+  ├── prompt.assembly          (latency, total_tokens, num_chunks_used)
+  └── llm.generate             (latency, model, input_tokens, output_tokens, stop_reason)</code></pre>
+<p>The <code>chunk_retrieved</code> events are what make a bad answer debuggable. When we investigate a support ticket about a wrong answer, we can open the trace, expand the retrieval span events, and immediately see which chunks scored highest and where they came from. "The system retrieved three chunks from the deprecated v1 policy document" is an actionable finding. "The system returned a bad answer" is not.</p>
+<h3>Logging the "Why"</h3>
+<p>A common question in production is not just "what was retrieved?" but "why did the system think this was relevant?" The similarity score alone does not answer this. A chunk with a score of 0.82 might be genuinely relevant, or it might be a false positive from an embedding space where the query and an unrelated chunk happen to land nearby.</p>
+<p>To address this, we can add a lightweight rationale step:</p>
+<p>After reranking, send the top-5 chunks and the query to the LLM with a short system prompt asking it to explain the relevance of each chunk before generating the final answer. The rationale is logged as a structured field on the trace. This is expensive if done per-request, but extremely valuable when run on a sampled basis (say, 1% of production traffic plus 100% of user-flagged responses).</p>
+<h3>Retrieval Quality vs Answer Quality</h3>
+<p>The highest-value observability investment is closing the feedback loop: connecting what was retrieved to how good the final answer was. This requires an evaluation signal.</p>
+<p>For many applications, you can compute answer quality automatically using a lightweight LLM-as-judge approach: after the main LLM generates an answer, send the answer, the retrieved context, and the original question to a smaller, cheaper model with a rubric asking it to score faithfulness (did the answer stay within what the context says?) and relevance (did the answer address the question?). Log these scores alongside the trace ID.</p>
+<p>This gives you a queryable dataset: "show me all requests where faithfulness score was below 0.7 in the last 7 days." Drilling into those traces, you will typically find one of three patterns:</p>
+<ul>
+ <li>Retrieved chunks are from the wrong document (index corruption or model drift)</li>
+ <li>Retrieved chunks are from the right document but the wrong section (chunking boundary problem)</li>
+ <li>Retrieved chunks are correct but the LLM ignored them (a generation problem, not a retrieval problem)</li>
+</ul>
+<p>Only traces with chunk-level attribution let you distinguish these cases. Without them, every bad answer looks the same from the outside.</p>
+<h3>Index Version Attribution in Traces</h3>
+<p>One failure mode that deserves special mention: your index was updated, retrieval behavior changed, and answer quality dropped. Without index version attribution in your traces, you cannot correlate the quality drop to the update.</p>
+<p>The fix is to include the index version (or the alias timestamp) in every retrieval span. When you investigate a spike in low-quality answers, you can immediately filter to traces where the index version is the new one, and compare them to traces from the old version.</p>
+<pre><code>span.set_attribute("retrieval.index_version", current_index_alias)
+span.set_attribute("retrieval.index_updated_at", index_metadata["updated_at"])</code></pre>
+<p>This sounds obvious in retrospect. Almost nobody does it until they spend a painful post-incident trying to figure out why answer quality degraded on a Tuesday afternoon.</p>
+<h2>Footnote</h2>
+<p>RAG combines offline indexing (chunk, embed, store) with online retrieval (embed query, search, inject context). Getting the demo right is easy; getting production right requires three things. First, an indexing pipeline with a document registry, content-hash-based change detection, correct delete semantics, and alias-based zero-downtime deployment.</p>
+<p>Second, a retrieval layer using hybrid search (vector + <a href="https://arpitbhayani.me/blogs/bm25">BM25</a>) and cross-encoder reranking to achieve meaningful accuracy. Third, an observability layer that records chunk-level attribution per request, tracks retrieval quality metrics over time, and links index versions to answer quality regressions. Without all three, a RAG system that works in staging will silently serve stale, wrong, or deleted information in production.</p>

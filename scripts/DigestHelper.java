@@ -830,7 +830,7 @@ public class DigestHelper implements Runnable {
                     .merge(1)
                     .select().where(Objects::nonNull)
                     .collect().asList()
-                    .await().atMost(Duration.ofMinutes(15));
+                    .await().atMost(Duration.ofMinutes(30));
 
             // Merge new sections with existing draft sections
             var allSections = new ArrayList<>(sections);

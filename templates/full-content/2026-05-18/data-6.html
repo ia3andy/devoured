@@ -1,0 +1,211 @@
+<h2>INTRO</h2>
+<p>Schema evolution is the part of data engineering that looks rudimentary until it isn't. A developer adds a column. Your analytics view doesn't know about it. If the new column contains PII, you've silently expanded your exposure surface. Either way, someone has to notice and fix it manually.</p>
+<p>The design: describe the access policy in plain language, encode it as a natural-language ontology, and use that ontology as the runtime policy applied column by column. Code produces what only code can easily produce - row counts, cardinality ratios, value samples. The LLM reads the ontology and applies it to those measurements. The ontology is the source of truth for both behavior and audit. Edit it in English; and the next rebuild adapts.</p>
+<h2>The ontology encodes the policy in plain English</h2>
+<p>Four steps:</p>
+<ol>
+ <li><strong>Write a prompt</strong>: describe the access policy in plain English</li>
+ <li><strong>Generate an ontology</strong>: pass the prompt to an LLM to encode the policy as structured rules</li>
+ <li><strong>Apply the policy at runtime</strong>: for each column, an LLM reads the ontology and decides based on the column's name, dtype, cardinality, and a sample of values</li>
+ <li><strong>Analytics-safe data</strong>: only columns that pass reach the output</li>
+</ol>
+<figure>
+ <img src="https://cdn.sanity.io/images/nsq559ov/production/9ba3c00e60a4d257848f02e069993bdfe379d5b2-1376x768.png?w=1500&amp;auto=format">
+</figure>
+<h3>Step 1 - prompt:</h3>
+<pre><code>I'm building a DuckDB analytics view over a fintech dataset. The schema evolves at any time — new columns can arrive without warning. I need an ontology that encodes the access policy as plain-English subject — predicate — object triples. No CamelCase, no identifier syntax — write it the way you'd write rules for a colleague who hasn't seen the codebase. Group claims under a shared subject with bullets when the subject repeats. Collapse parallel claims into a single list when the same predicate applies to several subjects. Keep the file short and scannable.
+
+The ontology will be applied two ways: a deterministic interpreter handles crisp cases (name patterns, dtypes, cardinality), and an LLM handles ambiguous cases by sampling values. Write rules that work for both readers.
+
+Keep it concise, essential rules only, no exhaustive type enumerations.
+
+Define:
+- The view's goal: expose analytics-safe columns, exclude PII and high-cardinality text unless the content is verifiably non-personal, adapt automatically on schema change
+- Which column classes pass and which are rejected
+- PII fragments — representative examples across name, contact, financial, and identity categories
+- A cardinality threshold of 3% (a text column is high-cardinality if more than 3 in 100 values are unique)
+- A runtime escalation rule: for high-cardinality text whose name doesn't match a PII fragment, inspect a sample of values; pass if values are identifiers, codes, or non-personal descriptions; reject if values contain personal information
+- That new columns are evaluated automatically by the same rules with no code change needed</code></pre>
+<p>The ontology it produced:</p>
+<pre><code>The view:
+- exposes analytics-safe columns
+- excludes PII columns
+- excludes high-cardinality text columns unless their values are verifiably non-personal
+- adapts automatically when the schema changes
+
+Columns that pass: numeric, boolean, date, low-cardinality text.
+Columns that are rejected: PII, high-cardinality text containing personal information.
+
+A column is PII if its name contains a fragment like:
+- name, full_name, first_name, last_name, username
+- email, email_address, phone, phone_number, mobile, address, city, zip, postal_code
+- card_number, iban, account_number, routing_number, cvv, pan
+- ssn, passport, national_id, tax_id, dob, date_of_birth, ip_address, device_id
+
+A text column is high-cardinality if more than 3% of its values are unique.
+
+For high-cardinality text columns whose name does not match a PII fragment:
+- inspect a sample of values
+- the column passes if its values are identifiers, codes, machine-generated strings, or non-personal descriptions
+- the column is rejected if its values contain personal information: names, contact details, financial identifiers, free-form text describing individuals, or anything resembling the PII categories above
+
+New columns:
+- are evaluated by the same rules
+- require no code change to be classified
+- inherit the policy of their column class</code></pre>
+<p>Two layers - what things <em>are</em> (taxonomy) and what to <em>do</em> with them (relationships). The taxonomy defines what makes a column PII, what name fragments flag it, what threshold marks text as high-cardinality. The relationships sit on top: what the view exposes, what it excludes, when to escalate to value inspection. Together, that's the ontology. Readable by a human auditor and by an LLM making runtime decisions.</p>
+<h2>The policy holds when the schema changes</h2>
+<p>I added the ontology to Claude Code, which already had the pipeline scripts in context, and asked it to write the view logic. The full setup is documented in the notebook.</p>
+<p>The code:</p>
+<pre><code>import json
+import anthropic
+
+client = anthropic.Anthropic(api_key=api_key.value)
+MODEL = "claude-sonnet-4-6"
+
+def llm_decide(name, dtype, cardinality, sample):
+    # Retry loop for model stability
+    for _ in range(3):
+        try:
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=200,
+                system=(
+                    f"You enforce this data access policy:\n\n\{ontology_text}\n\n"
+                    "Decide if a column is analytics-safe. Reply with JSON only, no markdown: "
+                    '\{"decision": "pass" or "reject", "reason": "&lt;one sentence&gt;"}'
+                ),
+                messages=[\{
+                    "role": "user",
+                    "content": (
+                        f"Column name: \{name}\n"
+                        f"Dtype: \{dtype}\n"
+                        f"Cardinality ratio: \{cardinality:.1%}\n"
+                        f"Sample values: \{sample}"
+                    ),
+                }],
+            )
+            out = json.loads(response.content[0].text)
+            
+            # Ensure the model sticks to the allowed ontology decisions
+            if out.get("decision") in ["pass", "reject"]:
+                return out["decision"], out["reason"]
+        except:
+            print(f"  Retrying \{name} due to invalid LLM output...")
+            continue
+
+    # Fail-closed posture for safety
+    return "reject", "classification_failed_after_retries"
+
+def build_safe_view(pipeline_name: str, raw_table: str, safe_view: str):
+    con = dlt.attach(pipeline_name).dataset().ibis()
+    tbl = con.table(raw_table)
+    total = tbl.count().execute()
+
+    safe_columns = []
+    for col_name, dtype in zip(tbl.schema().names, tbl.schema().types):
+        if col_name.startswith("_dlt_") or col_name == "_id":
+            continue
+        cardinality = tbl[col_name].nunique().execute() / total
+        sample = tbl.select(col_name).limit(20).execute()[col_name].tolist()
+        decision, reason = llm_decide(col_name, dtype, cardinality, sample)
+        marker = "✓ PASS  " if decision == "pass" else "✗ REJECT"
+        print(f"  \{marker}  \{col_name}  ← \{reason}")
+        if decision == "pass":
+            safe_columns.append(col_name)
+
+    con.create_view(safe_view, tbl.select(safe_columns), overwrite=True)
+    print(f"\nVIEW '\{safe_view}' created — \{len(safe_columns)} columns: \{', '.join(safe_columns)}")</code></pre>
+<p>Two runs: 5 columns first, then 5 more. The question was whether the policy would handle new columns without code changes - including the case where column names don't tell the full story.</p>
+<figure>
+ <img src="https://cdn.sanity.io/images/nsq559ov/production/c5f173034e6fa1fb595afbedc82ea0fbaaabf35f-1092x325.png?w=1500&amp;auto=format">
+</figure>
+<p>It held. Numeric columns passed, PII fragments were rejected. The case that shows why the LLM is doing the evaluation: <code>user_ref</code> clears the name-fragment check and shows 100% cardinality - it even sounds like it could reference a person. Pure cardinality-based rejection would discard it. The LLM sampled the values, saw UUIDs, and passed it as non-personal.</p>
+<h3>Run 1: pipeline loaded, view built from policy:</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Column</th>
+   <th>Result</th>
+   <th>Reason (as inferred)</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>id</td>
+   <td>✓ Pass</td>
+   <td>Numeric surrogate key with no personal information</td>
+  </tr>
+  <tr>
+   <td>transaction_volume_30d</td>
+   <td>✓ Pass</td>
+   <td>Numeric — transaction count aggregates with no PII characteristics</td>
+  </tr>
+  <tr>
+   <td>kyc_status</td>
+   <td>✓ Pass</td>
+   <td>Low-cardinality text — non-personal status values (expired, verified, failed, pending)</td>
+  </tr>
+  <tr>
+   <td>full_name</td>
+   <td>✗ Reject</td>
+   <td>PII — name fragment confirmed by sample values</td>
+  </tr>
+  <tr>
+   <td>email</td>
+   <td>✗ Reject</td>
+   <td>PII — email fragment, values are personal email addresses</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Run 2: same policy, 5 new columns:</h3>
+<p>Four resolved immediately from name and dtype. One required value inspection.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Column</th>
+   <th>Result</th>
+   <th>Reason (as inferred)</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>fraud_risk_score</td>
+   <td>✓ Pass</td>
+   <td>Numeric — machine-generated risk scores with no PII characteristics</td>
+  </tr>
+  <tr>
+   <td>outstanding_balance_usd</td>
+   <td>✓ Pass</td>
+   <td>Numeric — aggregate balance amounts, not a PII identifier</td>
+  </tr>
+  <tr>
+   <td>risk_tier</td>
+   <td>✓ Pass</td>
+   <td>Low-cardinality text — non-personal risk tier labels (low, medium, high, critical)</td>
+  </tr>
+  <tr>
+   <td>user_ref</td>
+   <td>✓ Pass</td>
+   <td>High-cardinality text — all sampled values are machine-generated UUIDs, non-personal</td>
+  </tr>
+  <tr>
+   <td>phone_number</td>
+   <td>✗ Reject</td>
+   <td>PII — phone fragment confirmed by sample values</td>
+  </tr>
+ </tbody>
+</table>
+<p><em>v1 columns unchanged → 3 pass, 2 rejected as before. Cumulative: 7 pass | 3 rejected.</em></p>
+<p><code>phone_number</code> caught by the fragment rule immediately.</p>
+<p><code>user_ref</code> went to the LLM: 100% cardinality, no PII keyword - values resolved it. No view code changes between runs.</p>
+<h2>What the ontology actually bought</h2>
+<p>The policy is the contract, not the column list. A SELECT allowlist tells you what's currently safe. An ontology tells you <em>why</em> it's safe. That distinction matters when the schema changes: the ontology stays valid, the allowlist goes stale.</p>
+<p>The code produces row counts, cardinality ratios, value samples - things code can produce easily. The LLM reads the natural-language ontology and applies it to those measurements per column. Neither is doing the other's job.</p>
+<p>Changing the policy is a one-line edit. Add <code>driver_license</code> to the PII fragment list. The next run catches it. This calls the LLM per column per rebuild. That's fine for view-build cadence - you're not running it per request, and it's batchable in production. The example runs with Claude Sonnet 4.6 via the Anthropic API - swap in any model that supports JSON output. Log the decisions and the reasons. The audit trail is in the model's output; persist it. Fix the sampling to be random rather than <code>limit(20)</code> if row order in your table is non-random.</p>
+<h2>The limits worth knowing</h2>
+<p>This works for what it claims to work for. It doesn't solve everything.</p>
+<p>Name-fragment matching catches PII by column name. A non-PII-looking name clears that check - value inspection covers the high-cardinality text case, but a numeric column encoding a sensitive inference (a risk score, a derived identifier) passes regardless: the ontology treats numeric as safe. The cardinality rule catches high-entropy strings, but a small-vocabulary column could still contain sensitive values. Cross-column re-identification isn't addressed at all.</p>
+<h2>When to use this</h2>
+<p>If your policy decomposes to pure pattern matches and counts - substring on names, dtype allowlist, a threshold - skip the LLM and run the same ontology through a small deterministic interpreter. We didn't, because high-cardinality text is the case where names lie and only inspecting the values resolves it. Pick the executor that matches your policy's edge.</p>
+<p>The ontology tells you what safety means. A column list tells you what's currently safe. One expires when the schema changes, the other doesn't. Because the policy is separate from the code, improving it doesn't touch the pipeline.</p>
