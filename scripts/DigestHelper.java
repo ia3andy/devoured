@@ -95,6 +95,7 @@ public class DigestHelper implements Runnable {
     static final AtomicLong totalPromptTokens = new AtomicLong();
     static final AtomicLong totalCompletionTokens = new AtomicLong();
     static String costContext = "";
+    static volatile boolean dailyQuotaExhausted = false;
 
     static final Map<String, String> envOverrides = new HashMap<>();
 
@@ -424,7 +425,7 @@ public class DigestHelper implements Runnable {
                     "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
                     env("GEMINI_API_KEY"),
                     Map.of("summarize", "gemini-2.5-flash", "description", "gemini-2.5-flash-lite", "clean-html", "gemini-2.5-flash-lite"),
-                    6, 5, 14);
+                    6, 2, 14);
             case "github" -> new OpenAIProvider("github",
                     "https://models.github.ai/inference/chat/completions",
                     env("GITHUB_TOKEN"),
@@ -1617,11 +1618,10 @@ public class DigestHelper implements Runnable {
     static class RateLimitException extends RuntimeException {
         final Duration retryAfter;
         final boolean dailyQuota;
-        RateLimitException(Duration retryAfter, String body) {
+        RateLimitException(Duration retryAfter, boolean dailyQuota, String body) {
             super("429 rate limited (retry in " + retryAfter.toSeconds() + "s): " + body);
             this.retryAfter = retryAfter;
-            this.dailyQuota = body.contains("per day") || body.contains("daily")
-                    || body.contains("quota") || body.contains("GenerateContent");
+            this.dailyQuota = dailyQuota;
         }
     }
 
@@ -1632,6 +1632,7 @@ public class DigestHelper implements Runnable {
 
     static Uni<JsonObject> callOpenAIAPI(String endpoint, String token, String model, String context,
                                           String systemPrompt, String userMessage, String jsonSchema, int attempt) {
+        if (dailyQuotaExhausted) return Uni.createFrom().failure(new RuntimeException("Daily API quota exhausted"));
         return acquireRateSlot(activeRpm).chain(() -> Uni.createFrom().item(Unchecked.supplier(() -> {
             if (token == null || token.isEmpty()) throw new IllegalStateException("API token not set for " + endpoint);
 
@@ -1667,11 +1668,21 @@ public class DigestHelper implements Runnable {
             var response = client.send(request, java.net.http.HttpResponse.BodyHandlers.ofString());
 
             if (response.statusCode() == 429) {
-                var retryMatch = Pattern.compile("retry in ([\\d.]+)s").matcher(response.body());
+                String bodySnippet = response.body().substring(0, Math.min(500, response.body().length()));
+                var retryMatch = Pattern.compile("retry in ([\\d.]+)s").matcher(bodySnippet);
                 Duration retryAfter = retryMatch.find()
                         ? Duration.ofMillis((long) (Double.parseDouble(retryMatch.group(1)) * 1000) + 1000)
                         : Duration.ofSeconds(20);
-                throw new RateLimitException(retryAfter, response.body().substring(0, Math.min(1000, response.body().length())));
+                var h = response.headers();
+                String remainReq = h.firstValue("x-ratelimit-remaining-requests").orElse(h.firstValue("x-ratelimit-remaining").orElse("?"));
+                String limitReq = h.firstValue("x-ratelimit-limit-requests").orElse(h.firstValue("x-ratelimit-limit").orElse("?"));
+                String remainTokens = h.firstValue("x-ratelimit-remaining-tokens").orElse("?");
+                String limitTokens = h.firstValue("x-ratelimit-limit-tokens").orElse("?");
+                String reset = h.firstValue("x-ratelimit-reset-requests").orElse(h.firstValue("x-ratelimit-reset").orElse("?"));
+                boolean daily = "0".equals(remainReq) && retryAfter.toMinutes() > 10;
+                logStep("429 " + context, String.format("requests=%s/%s tokens=%s/%s reset=%s retryIn=%ds daily=%s",
+                        remainReq, limitReq, remainTokens, limitTokens, reset, retryAfter.toSeconds(), daily));
+                throw new RateLimitException(retryAfter, daily, bodySnippet);
             }
 
             if (response.statusCode() != 200) {
@@ -1704,12 +1715,12 @@ public class DigestHelper implements Runnable {
         .onFailure(RateLimitException.class).recoverWithUni(t -> {
             var rle = (RateLimitException) t;
             if (rle.dailyQuota) {
+                dailyQuotaExhausted = true;
                 logStep("429", "daily quota exhausted, stopping retries");
                 return Uni.createFrom().failure(new RuntimeException("Daily API quota exhausted"));
             }
             if (attempt >= 30) return Uni.createFrom().failure(new RuntimeException("Rate limited after 30 retries"));
-            if (attempt == 0) logStep("429 " + context, "body: " + rle.getMessage().substring(rle.getMessage().indexOf(": ") + 2, Math.min(rle.getMessage().length(), 300)));
-            System.err.printf("  [429 %s] retry in %ds (attempt %d/30)%n", context, rle.retryAfter.toSeconds(), attempt + 1);
+            logStep("429 " + context, "retry in " + rle.retryAfter.toSeconds() + "s (attempt " + (attempt + 1) + "/30)");
             nextAllowedCall.updateAndGet(prev -> Math.max(prev, System.currentTimeMillis() + rle.retryAfter.toMillis()));
             return Uni.createFrom().voidItem()
                     .onItem().delayIt().by(rle.retryAfter)
