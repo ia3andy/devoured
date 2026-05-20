@@ -1603,8 +1603,10 @@ public class DigestHelper implements Runnable {
             }},"required":["articles"],"additionalProperties":false}""";
 
     // Gemini free tier quotas (2026-05):
-    //   Flash:      5 RPM, 250K TPM, 20 RPD
-    //   Flash Lite: 10 RPM, 250K TPM, 20 RPD
+    //   Flash:      5 RPM, 250K TPM, 20 RPD (rate, not hard cap)
+    //   Flash Lite: 10 RPM, 250K TPM, 20 RPD (rate, not hard cap)
+    // RPD is a pace limit (sliding window), not a daily counter.
+    // 429 with "limit: 20" = bursting too fast, not daily exhaustion.
     // Post-response delay: 60/rpm + 3s safety margin
     static int apiDelaySeconds = 15;
 
@@ -1653,11 +1655,14 @@ public class DigestHelper implements Runnable {
             if (response.statusCode() == 429) {
                 String bodySnippet = response.body().substring(0, Math.min(500, response.body().length())).replaceAll("\\s+", " ").trim();
                 var metricMatch = Pattern.compile("metric:\\s*([^,]+),\\s*limit:\\s*(\\d+)").matcher(bodySnippet);
-                String metric = metricMatch.find() ? metricMatch.group(1).trim() : "";
-                String limit = metricMatch.groupCount() >= 2 ? metricMatch.group(2) : "?";
-                logStep("quota", context + " RPD limit reached (limit=" + limit + " metric=" + metric + ")");
+                String metric = metricMatch.find() ? metricMatch.group(1).trim() : "unknown";
+                String limit = metricMatch.group(2) != null ? metricMatch.group(2) : "?";
+                var retryMatch = Pattern.compile("retry in ([\\d.]+)s").matcher(bodySnippet);
+                String retryIn = retryMatch.find() ? retryMatch.group(1) + "s" : "unknown";
+                logStep("429 " + context, "metric=" + metric + " limit=" + limit + " retryIn=" + retryIn);
+                logStep("429 " + context, "body: " + bodySnippet);
                 dailyQuotaExhausted = true;
-                throw new RuntimeException("Daily API quota exhausted (limit=" + limit + ")");
+                throw new RuntimeException("API quota exhausted (metric=" + metric + " limit=" + limit + ")");
             }
 
             if (response.statusCode() == 503) {
@@ -1670,8 +1675,9 @@ public class DigestHelper implements Runnable {
             }
 
             if (response.statusCode() != 200) {
-                throw new RuntimeException("API HTTP " + response.statusCode() + " from " + endpoint + ": " +
-                        response.body().substring(0, Math.min(500, response.body().length())));
+                String bodySnippet = response.body().substring(0, Math.min(500, response.body().length())).replaceAll("\\s+", " ").trim();
+                logStep("HTTP " + response.statusCode() + " " + context, bodySnippet);
+                throw new RuntimeException("API HTTP " + response.statusCode() + ": " + bodySnippet);
             }
 
             var body = GSON.fromJson(response.body(), JsonObject.class);

@@ -68,6 +68,8 @@ Markdown body content
 
 ## Digest Pipeline (scripts/DigestHelper.java)
 
+**Before running the generate command, always ask the user whether this is a test run (use `--max-articles 3`) or a real content generation (no limit).** Never assume.
+
 JBang script with Picocli subcommands. Run with `jbang scripts/DigestHelper.java <command>`.
 
 Commands:
