@@ -51,7 +51,7 @@ public class DigestHelper implements Runnable {
 
     @SuppressWarnings("unchecked")
     static <T> java.util.function.Function<Throwable, T> logRecover(String label) {
-        return e -> { logStep(label, "Failed: " + e.getMessage()); return null; };
+        return e -> { logStep(label, "Failed: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName())); return null; };
     }
 
     static <T> Uni<T> blocking(io.smallrye.mutiny.unchecked.UncheckedSupplier<T> supplier) {
@@ -425,7 +425,7 @@ public class DigestHelper implements Runnable {
                     "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
                     env("GEMINI_API_KEY"),
                     Map.of("summarize", "gemini-2.5-flash", "description", "gemini-2.5-flash-lite", "clean-html", "gemini-2.5-flash-lite"),
-                    6, 2, 14);
+                    6, 1, 14);
             case "github" -> new OpenAIProvider("github",
                     "https://models.github.ai/inference/chat/completions",
                     env("GITHUB_TOKEN"),
@@ -790,7 +790,7 @@ public class DigestHelper implements Runnable {
                 )
                 .select().where(Objects::nonNull)
                 .collect().asList()
-                .await().atMost(Duration.ofMinutes(10));
+                .await().atMost(Duration.ofMinutes(60));
 
             var enrichedFiles = scraped.stream().map(ScrapedFeed::enrichedFile).toList();
             var feedNames = scraped.stream().map(s -> s.feed().name()).toList();
@@ -831,7 +831,7 @@ public class DigestHelper implements Runnable {
                     .merge(1)
                     .select().where(Objects::nonNull)
                     .collect().asList()
-                    .await().atMost(Duration.ofMinutes(30));
+                    .await().atMost(Duration.ofMinutes(60));
 
             // Merge new sections with existing draft sections
             var allSections = new ArrayList<>(sections);
@@ -1829,7 +1829,7 @@ public class DigestHelper implements Runnable {
             articleInputs.add(Map.entry(i + 1, sb.toString()));
         }
 
-        var aiMap = ai().summarizeBatch(articleInputs, null).await().atMost(Duration.ofMinutes(10));
+        var aiMap = ai().summarizeBatch(articleInputs, null).await().atMost(Duration.ofMinutes(60));
         if (aiMap.isEmpty()) return null;
 
         var section = new JsonObject();
@@ -1966,7 +1966,7 @@ public class DigestHelper implements Runnable {
         String prompt = "Write a 1-2 sentence summary of the most important news for developers. Output ONLY the text, no quotes, no prefix.";
 
         try {
-            var result = ai().chatCompletion(prompt, sb.toString(), null).await().atMost(Duration.ofMinutes(3));
+            var result = ai().chatCompletion(prompt, sb.toString(), null).await().atMost(Duration.ofMinutes(10));
             if (result != null) {
                 String desc = jsonStr(result, "result");
                 if (!desc.isEmpty()) return desc.replace("\"", "").replace("\\", "");
@@ -2118,7 +2118,7 @@ public class DigestHelper implements Runnable {
                                     });
                         })
                         .collect().asList()
-                        .await().atMost(Duration.ofMinutes(30));
+                        .await().atMost(Duration.ofMinutes(60));
             } catch (Exception e) {
                 logStep("warn", "AI cleaning incomplete: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
                 complete = false;
@@ -2510,7 +2510,7 @@ public class DigestHelper implements Runnable {
             }
             log(log, "  Content sources: " + cachedCount + " cached, " + templateCount + " templates, " + noContentCount + " title+desc only");
 
-            var aiMap = ai().summarizeBatch(articleInputs, log).await().atMost(Duration.ofMinutes(30));
+            var aiMap = ai().summarizeBatch(articleInputs, log).await().atMost(Duration.ofMinutes(60));
 
             if (aiMap.isEmpty()) {
                 log(log, "  All AI calls failed. Restoring from backup.");
@@ -2651,7 +2651,7 @@ public class DigestHelper implements Runnable {
                         result = acquireRateSlot(op.rpm)
                                 .chain(() -> callOpenAIAPI(op.endpoint, op.token, op.model("description"), "rating",
                                         RATING_SYSTEM_PROMPT, sb.toString(), RATING_JSON_SCHEMA))
-                                .await().atMost(Duration.ofSeconds(120));
+                                .await().atMost(Duration.ofMinutes(10));
                     } else {
                         var proc = new ProcessBuilder("claude", "--model", provider.model("description"),
                                 "--output-format", "json", "--system-prompt", RATING_SYSTEM_PROMPT,
