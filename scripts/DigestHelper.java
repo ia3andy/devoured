@@ -159,8 +159,9 @@ public class DigestHelper implements Runnable {
             this.batch = batch;
             this.rpm = rpm;
             this.rpdBudget = rpd;
-            String rpmOverride = env("AI_RPM");
-            activeRpm = rpmOverride != null ? Integer.parseInt(rpmOverride) : rpm;
+            String delayOverride = env("AI_DELAY");
+            if (delayOverride != null) apiDelaySeconds = Integer.parseInt(delayOverride);
+            else apiDelaySeconds = 60 / Math.max(1, rpm) + 3;
         }
 
         public String name() { return providerName; }
@@ -425,7 +426,7 @@ public class DigestHelper implements Runnable {
                     "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
                     env("GEMINI_API_KEY"),
                     Map.of("summarize", "gemini-2.5-flash", "description", "gemini-2.5-flash-lite", "clean-html", "gemini-2.5-flash-lite"),
-                    6, 1, 14);
+                    6, 5, 18);
             case "github" -> new OpenAIProvider("github",
                     "https://models.github.ai/inference/chat/completions",
                     env("GITHUB_TOKEN"),
@@ -1601,29 +1602,11 @@ public class DigestHelper implements Runnable {
             "articles":{"type":"array","items":""" + RATING_ARTICLE_SCHEMA + """
             }},"required":["articles"],"additionalProperties":false}""";
 
-    static final AtomicLong nextAllowedCall = new AtomicLong(0);
-
-    static Uni<Void> acquireRateSlot(int rpm) {
-        if (rpm <= 0) return Uni.createFrom().voidItem();
-        long spacingMs = 60_000L / rpm;
-        long now = System.currentTimeMillis();
-        long slot = nextAllowedCall.getAndUpdate(prev -> Math.max(prev, now) + spacingMs);
-        long delayMs = Math.max(0, slot + spacingMs - now);
-        if (delayMs <= 0) return Uni.createFrom().voidItem();
-        return Uni.createFrom().voidItem().onItem().delayIt().by(Duration.ofMillis(delayMs));
-    }
-
-    static int activeRpm = 0;
-
-    static class RateLimitException extends RuntimeException {
-        final Duration retryAfter;
-        final boolean dailyQuota;
-        RateLimitException(Duration retryAfter, boolean dailyQuota, String body) {
-            super("429 rate limited (retry in " + retryAfter.toSeconds() + "s): " + body);
-            this.retryAfter = retryAfter;
-            this.dailyQuota = dailyQuota;
-        }
-    }
+    // Gemini free tier quotas (2026-05):
+    //   Flash:      5 RPM, 250K TPM, 20 RPD
+    //   Flash Lite: 10 RPM, 250K TPM, 20 RPD
+    // Post-response delay: 60/rpm + 3s safety margin
+    static int apiDelaySeconds = 15;
 
     static Uni<JsonObject> callOpenAIAPI(String endpoint, String token, String model, String context,
                                           String systemPrompt, String userMessage, String jsonSchema) {
@@ -1633,7 +1616,7 @@ public class DigestHelper implements Runnable {
     static Uni<JsonObject> callOpenAIAPI(String endpoint, String token, String model, String context,
                                           String systemPrompt, String userMessage, String jsonSchema, int attempt) {
         if (dailyQuotaExhausted) return Uni.createFrom().failure(new RuntimeException("Daily API quota exhausted"));
-        return acquireRateSlot(activeRpm).chain(() -> Uni.createFrom().item(Unchecked.supplier(() -> {
+        return Uni.createFrom().item(Unchecked.supplier(() -> {
             if (token == null || token.isEmpty()) throw new IllegalStateException("API token not set for " + endpoint);
 
             var payload = new JsonObject();
@@ -1668,28 +1651,27 @@ public class DigestHelper implements Runnable {
             var response = client.send(request, java.net.http.HttpResponse.BodyHandlers.ofString());
 
             if (response.statusCode() == 429) {
-                String bodySnippet = response.body().substring(0, Math.min(500, response.body().length()));
-                var retryMatch = Pattern.compile("retry in ([\\d.]+)s").matcher(bodySnippet);
-                Duration retryAfter = retryMatch.find()
-                        ? Duration.ofMillis((long) (Double.parseDouble(retryMatch.group(1)) * 1000) + 1000)
-                        : Duration.ofSeconds(20);
-                boolean daily = retryAfter.toMinutes() > 5;
-                if (attempt == 0) {
-                    logStep("429 " + context, (daily ? "DAILY QUOTA" : "RATE LIMITED") + " retryIn=" + retryAfter.toSeconds() + "s");
-                    logStep("429 " + context, "body: " + bodySnippet.replaceAll("\\s+", " ").trim());
-                    var headerLog = new StringBuilder();
-                    response.headers().map().forEach((k, v) -> {
-                        if (k.contains("rate") || k.contains("limit") || k.contains("quota") || k.contains("retry"))
-                            headerLog.append(k).append("=").append(v).append(" ");
-                    });
-                    if (headerLog.length() > 0) logStep("429 " + context, "headers: " + headerLog.toString().trim());
-                }
-                throw new RateLimitException(retryAfter, daily, bodySnippet);
+                String bodySnippet = response.body().substring(0, Math.min(500, response.body().length())).replaceAll("\\s+", " ").trim();
+                var metricMatch = Pattern.compile("metric:\\s*([^,]+),\\s*limit:\\s*(\\d+)").matcher(bodySnippet);
+                String metric = metricMatch.find() ? metricMatch.group(1).trim() : "";
+                String limit = metricMatch.groupCount() >= 2 ? metricMatch.group(2) : "?";
+                logStep("quota", context + " RPD limit reached (limit=" + limit + " metric=" + metric + ")");
+                dailyQuotaExhausted = true;
+                throw new RuntimeException("Daily API quota exhausted (limit=" + limit + ")");
+            }
+
+            if (response.statusCode() == 503) {
+                String msg = "model overloaded";
+                try {
+                    var err = GSON.fromJson(response.body(), JsonObject.class).getAsJsonObject("error");
+                    if (err != null) msg = err.get("message").getAsString();
+                } catch (Exception ignored) {}
+                throw new ModelOverloadedException(msg);
             }
 
             if (response.statusCode() != 200) {
                 throw new RuntimeException("API HTTP " + response.statusCode() + " from " + endpoint + ": " +
-                        response.body().substring(0, Math.min(1000, response.body().length())));
+                        response.body().substring(0, Math.min(500, response.body().length())));
             }
 
             var body = GSON.fromJson(response.body(), JsonObject.class);
@@ -1713,21 +1695,20 @@ public class DigestHelper implements Runnable {
             var wrapper = new JsonObject();
             wrapper.addProperty("result", content);
             return wrapper;
-        })).runSubscriptionOn(Infrastructure.getDefaultWorkerPool()))
-        .onFailure(RateLimitException.class).recoverWithUni(t -> {
-            var rle = (RateLimitException) t;
-            if (rle.dailyQuota) {
-                dailyQuotaExhausted = true;
-                logStep("429", "daily quota exhausted, stopping retries");
-                return Uni.createFrom().failure(new RuntimeException("Daily API quota exhausted"));
-            }
-            if (attempt >= 30) return Uni.createFrom().failure(new RuntimeException("Rate limited after 30 retries"));
-            logStep("429 " + context, "retry in " + rle.retryAfter.toSeconds() + "s (attempt " + (attempt + 1) + "/30)");
-            nextAllowedCall.updateAndGet(prev -> Math.max(prev, System.currentTimeMillis() + rle.retryAfter.toMillis()));
+        }))
+        .runSubscriptionOn(Infrastructure.getDefaultWorkerPool())
+        .onItem().delayIt().by(Duration.ofSeconds(apiDelaySeconds))
+        .onFailure(ModelOverloadedException.class).recoverWithUni(t -> {
+            if (attempt >= 5) return Uni.createFrom().failure(new RuntimeException("Model unavailable after 5 retries: " + t.getMessage()));
+            logStep("503 " + context, t.getMessage() + " (retry " + (attempt + 1) + "/5 in 30s)");
             return Uni.createFrom().voidItem()
-                    .onItem().delayIt().by(rle.retryAfter)
+                    .onItem().delayIt().by(Duration.ofSeconds(30))
                     .chain(() -> callOpenAIAPI(endpoint, token, model, context, systemPrompt, userMessage, jsonSchema, attempt + 1));
         });
+    }
+
+    static class ModelOverloadedException extends RuntimeException {
+        ModelOverloadedException(String message) { super(message); }
     }
 
     static JsonObject buildArticleJson(String id, String title, String link, String image, String desc, JsonObject ai) {
@@ -2648,9 +2629,8 @@ public class DigestHelper implements Runnable {
                     try {
                     if (provider instanceof OpenAIProvider op) {
                         op.rpdUsed.incrementAndGet();
-                        result = acquireRateSlot(op.rpm)
-                                .chain(() -> callOpenAIAPI(op.endpoint, op.token, op.model("description"), "rating",
-                                        RATING_SYSTEM_PROMPT, sb.toString(), RATING_JSON_SCHEMA))
+                        result = callOpenAIAPI(op.endpoint, op.token, op.model("description"), "rating",
+                                        RATING_SYSTEM_PROMPT, sb.toString(), RATING_JSON_SCHEMA)
                                 .await().atMost(Duration.ofMinutes(10));
                     } else {
                         var proc = new ProcessBuilder("claude", "--model", provider.model("description"),
