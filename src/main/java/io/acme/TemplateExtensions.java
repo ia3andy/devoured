@@ -33,6 +33,17 @@ public class TemplateExtensions {
         return sb.toString();
     }
 
+    static String stampStyle(String seed) {
+        int h = seed.hashCode();
+        h = h ^ (h >>> 16);
+        h = h * 0x45d9f3b;
+        h = h ^ (h >>> 16);
+        double angle = ((h & 0xFF) % 240) / 10.0 - 12.0;
+        int mx = ((h >>> 8) & 0xFF) % 100;
+        int my = ((h >>> 16) & 0xFF) % 100;
+        return "--stamp-angle:" + String.format(java.util.Locale.US, "%.1f", angle) + "deg;--stamp-mx:" + mx + "%;--stamp-my:" + my + "%";
+    }
+
     static List<JsonObject> articlesByRating(JsonObject postData) {
         var all = new ArrayList<JsonObject>();
         var sections = postData.getJsonArray("sections");

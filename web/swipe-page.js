@@ -450,7 +450,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function addStamp(frame) {
     if (frame.querySelector('.swipe-read-stamp') || frame.classList.contains('swipe-frame-bullets')) return;
     var stamp = document.createElement('div');
-    stamp.className = 'swipe-read-stamp';
+    stamp.className = 'devoured-stamp swipe-read-stamp';
     stamp.textContent = 'DEVOURED';
     stamp.style.setProperty('--stamp-angle', (Math.random() * 16 - 8).toFixed(1) + 'deg');
     stamp.style.setProperty('--stamp-mx', (Math.random() * 100).toFixed(0) + '%');

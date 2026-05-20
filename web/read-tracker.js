@@ -5,6 +5,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const READ_KEY = 'digest-read-posts';
   const readState = JSON.parse(localStorage.getItem(READ_KEY) || '{}');
 
+
   function isPostRead(date) {
     const val = readState[date];
     if (val === true) return true;
@@ -80,9 +81,6 @@ document.addEventListener('DOMContentLoaded', () => {
       const date = el.dataset.postDate;
       const read = isPostRead(date);
       el.classList.toggle('is-read', read);
-      for (const btn of el.querySelectorAll('.digest-btn-mark-read')) {
-        btn.classList.toggle('is-active', read);
-      }
     }
     updateArticleReadUI();
   }
