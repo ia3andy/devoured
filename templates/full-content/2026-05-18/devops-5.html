@@ -1,0 +1,59 @@
+<h1>My Thoughts on Bun's Rust Rewrite</h1>
+<p>Before we discuss <a href="https://github.com/oven-sh/bun/pull/30412">Rewrite Bun in Rust</a>, there's something that needs to be said, because no one is saying it.</p>
+<p>Bun stands where it does today because of Zig.</p>
+<p>Jarred chose Zig back then not because it was "cool," but because Zig enabled a small team to rapidly prototype a high-performance JS runtime without a GC, without a heavy runtime. Zig's low friction, direct memory manipulation, and straightforward C interop were the core reasons Bun could punch above its weight on performance with an extremely small team in its early days. The architecture, data structures, and low-level design of Bun that you see today – that was shaped by Zig.</p>
+<p>Jarred himself said: the architecture doesn't change, the data structures don't change.</p>
+<p>In plain English: <strong>the skeleton that the Rust rewrite inherits was built with Zig.</strong> Building the foundation with Zig, shipping the product with Zig, raising funding with Zig, and then switching to a more "mainstream" tech stack after the company gets acquired and has grown strong – there's nothing wrong with this. It's a normal business decision. That's how tech debt works in Silicon Valley startups.</p>
+<p>The Zig community doesn't need Bun's gratitude, but please don't pretend this rewrite happened because Zig itself is inadequate.</p>
+<h2>The Real Issue No One Dares to Say</h2>
+<p>Now, let's discuss <a href="https://github.com/oven-sh/bun/pull/30412">the rewrite</a> itself.</p>
+<p>6,755 commits, branch name <code>claude/phase-a-port</code>, PR opened May 8th, merged May 14th.</p>
+<p>Six days. A full rewrite of a production-grade JS runtime, merged in six days.</p>
+<p>Let that number sit in your mind for a second.</p>
+<p>There's a fundamental principle in software engineering: <strong>code you don't understand should not run in production.</strong> Not because it necessarily has bugs, but because when it does bug out, you won't know where to start looking. This principle isn't conservatism – it's the baseline of maintainability.</p>
+<p>6,755 commits, not a single line written by a human. The PR's reviewer list: <code>coderabbitai[bot]</code> reviewed it, <code>claude[bot]</code> reviewed it, and the only human reviewer alii's status was "Awaiting requested review" – hadn't even looked.</p>
+<p>Code written by Claude, reviewed by Claude. This closed loop isn't logically impossible, but it means: <strong>no human being has actually read this codebase in its entirety.</strong></p>
+<h2>"All Tests Pass" Doesn't Mean What You Think</h2>
+<p>Someone will push back here: the test suite passes on all platforms – isn't that validation?</p>
+<p>No.</p>
+<p>A test suite validates <strong>the correctness of known behavior on known paths.</strong> It does not validate:</p>
+<ul>
+ <li>Whether error paths are handled correctly</li>
+ <li>Behavior at boundary conditions under stress</li>
+ <li>State consistency in concurrent scenarios</li>
+ <li>Whether the memory model conforms to intent under extreme conditions</li>
+</ul>
+<p>Jarred himself admitted: memory issues when re-entering across JS boundaries – the Rust compiler can't handle that; it still relies on humans.</p>
+<p>And those parts that rely on humans? No human has reviewed them.</p>
+<p>The more fundamental issue is: AI translates code via <strong>local semantic equivalence</strong> – it ensures each function behaves identically to the original in isolation, but it doesn't understand the <strong>global invariants</strong> between functions – those design constraints that aren't written into tests and live only in the original author's head. These constraints might not show up in today's tests, but could manifest six months from now under a specific production load in a completely inexplicable crash.</p>
+<p>This isn't a knock on Claude. This is a problem any translation tool – including human programmers – faces without thorough review. At the scale of 6,755 commits, this risk is amplified 6,755 times.</p>
+<h2>After the Acquisition, the Risk Bearer Has Changed</h2>
+<p>There's a political-economy dimension here that technical discussions usually ignore.</p>
+<p>In the early days, Bun was Jarred betting on himself. Using Zig then, iterating fast, accepting tech debt – that was reasonable startup logic with self-assumed risk.</p>
+<p>Now Bun has been acquired by a major company, and its user base consists of real production systems. The risk bearer of this rewrite is no longer Jarred, but every engineer running Bun in production and the users behind them.</p>
+<p>Jarred says this version is still in canary, and there's optimization and cleanup work to do before official release.</p>
+<p>Canary is a line of defense, but it's not human review. Optimization and cleanup are code quality concerns, not comprehension concerns. <strong>A codebase that no one on the team has fully read – no matter how comprehensive the tests, no matter how long canary runs – its internal state is a black box to its maintainers.</strong></p>
+<p>This will become very real pain at some future severe bug's debugging scene.</p>
+<h2>Zig's "Problems" Were Misdiagnosed</h2>
+<p>Let's return to Jarred's stated reasons for migration: the Zig codebase had too many use-after-free bugs, double-frees, and memory leaks on error paths.</p>
+<p>This is true. But the conclusion that "Zig doesn't work" drawn from this diagnosis is wrong.</p>
+<p>The correct diagnosis is: <strong>in a commercial project that prioritizes rapid iteration, the cognitive tax of manual memory management exceeded the team's budget.</strong> This isn't a bug in Zig – it's a structural mismatch between Zig's design goals and Bun's business model.</p>
+<p>Zig's target users are: systems programmers who know what they're doing and are willing to pay the price for ultimate control. TigerBeetle used Zig to write a database with virtually no memory bugs, because their team culture and project nature align with Zig's philosophy.</p>
+<p>Bun's team culture is fast iteration, fast shipping, fast bug fixes. There's a fundamental tension between this and the rigorous memory discipline that Zig demands. This is a mismatch between Bun and Zig, not a failure of Zig.</p>
+<p>Interpreting "our team frequently makes mistakes with this tool" as "this tool is inadequate" is an attribution error. The hammer doesn't fit, but it's not the hammer's fault.</p>
+<h2>So, Will This Rewrite Work?</h2>
+<p>Honestly: <strong>short-term it'll probably be fine; long-term there are structural risks.</strong></p>
+<p>Short-term: tests cover the main paths, the canary phase will expose obvious issues, and Rust's compiler guarantees eliminate an entire class of memory bugs. On the surface, everything looks normal.</p>
+<p>Long-term: this codebase has 6,755 commits that no human has fully read. When a bizarre concurrency bug appears six months from now, when some boundary condition triggers anomalous behavior under a specific load, the engineer debugging the problem will face a system that no one has ever truly understood.</p>
+<p><strong>A system no one has understood doesn't mean it has no bugs – it means when bugs appear, no one knows why.</strong> The difference between these two becomes crystal clear at 3 AM during a production incident.</p>
+<p>This is the real technical bet of this rewrite: not Zig vs Rust, but <strong>whether AI-generated, unreviewed code can be maintained long-term in production environments.</strong></p>
+<p>This question is far more complex than "all tests pass," and far more profound than "Rust memory safety."</p>
+<p>The answer – we'll wait and see.</p>
+<p><em>Zig built the foundation, Claude erected the building, human reviewers are still en route.</em></p>
+<p><em>How long this building remains habitable depends on whether anyone can read the blueprints the first time it springs a leak.</em></p>
+<h2>References</h2>
+<ul>
+ <li><a href="https://lobste.rs/s/lapqbz/bun_s_rust_rewrite_has_been_merged">https://lobste.rs/s/lapqbz/bun_s_rust_rewrite_has_been_merged</a></li>
+ <li><a href="https://news.ycombinator.com/item?id=48132488">https://news.ycombinator.com/item?id=48132488</a></li>
+ <li><a href="https://ziggit.dev/t/bun-is-being-ported-from-zig-to-rust/15330">https://ziggit.dev/t/bun-is-being-ported-from-zig-to-rust/15330</a></li>
+</ul>

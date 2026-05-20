@@ -1,0 +1,487 @@
+<h1>Gradual deployments in Amazon ECS with linear and canary strategies</h1>
+<p>When deploying new application versions, you need confidence changes won't impact customers. Amazon Elastic Container Service (Amazon ECS) now supports linear and canary deployment strategies, complementing built-in blue/green deployments. With linear deployments, you shift traffic in equal increments with a bake time between each shift. With canary deployments, you route a small percentage to the new revision and monitor before shifting the rest. Both strategies support Amazon CloudWatch alarms for failure detection and rollback, and lifecycle hooks for custom validation.</p>
+<p>In this post, we walk through how linear and canary strategies work in Amazon ECS, how to configure each, and how to set up automatic rollbacks with CloudWatch alarms.</p>
+<h2>How Amazon ECS orchestrates gradual deployments</h2>
+<p>When you configure linear or canary deployments, Amazon ECS uses <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-target-groups.html">Elastic Load Balancing</a> weighted target groups and CloudWatch alarms for traffic shifting and automated rollback.</p>
+<p><img src="https://d2908q01vomqb2.cloudfront.net/fe2ef495a1152561572949784c16bf23abb28057/2026/05/05/image-1-15.png" alt="Diagram showing Amazon ECS architecture for gradual deployments with blue and green revisions connected to a load balancer with weighted target groups monitored by Amazon CloudWatch alarms for automated rollback."></p>
+<h3>Architecture and traffic flow</h3>
+<p>Amazon ECS supports four deployment strategies, each with a different approach to traffic management. Your choice depends on your risk tolerance and required control over the rollout.</p>
+<h4>Rolling: task-by-task replacement</h4>
+<p>Rolling deployments replace tasks progressively without traffic shifting. Amazon ECS starts new tasks before stopping old ones to maintain availability (controlled by the minimumHealthyPercent and maximumPercent parameters). This is the default deployment type.</p>
+<p><img src="https://d2908q01vomqb2.cloudfront.net/fe2ef495a1152561572949784c16bf23abb28057/2026/05/05/image-2-12.png" alt="Diagram showing rolling deployment with four tasks being replaced progressively where new green tasks start before old blue tasks are stopped to maintain availability."></p>
+<p>Consider rolling deployments for cost-sensitive deployments where you want to avoid duplicate infrastructure, and workloads where simplicity is preferred over fine-grained traffic control.</p>
+<h4>Blue/green: full traffic switch</h4>
+<p>Blue/green deployments create a complete replacement environment (green) alongside the existing one (blue). After validation using a test listener, traffic switches instantly from blue to green. The blue environment remains available for rollback.</p>
+<p><img src="https://d2908q01vomqb2.cloudfront.net/fe2ef495a1152561572949784c16bf23abb28057/2026/05/05/image-3-11.png" alt="Diagram showing blue/green deployment with instant traffic switch from blue revision at 100% to green revision at 100% after health checks pass."></p>
+<p>Blue/green deployments work well for database schema changes requiring synchronized cutover, major version upgrades where instant rollback is critical, and services where gradual rollout provides no additional validation benefit.</p>
+<h4>Linear: gradual shift in equal increments</h4>
+<p>Linear deployments shift traffic in equal increments, with a configurable bake time at each stage. If CloudWatch alarms breach or health checks fail, the deployment automatically rolls back.</p>
+<p><img src="https://d2908q01vomqb2.cloudfront.net/fe2ef495a1152561572949784c16bf23abb28057/2026/05/05/image-4-10.png" alt="Diagram showing linear deployment shifting traffic in 10% increments across 10 steps with a 5-minute validation period at each step."></p>
+<h4>Canary: small traffic slice first</h4>
+<p>Canary deployments route a small percentage of traffic to the new version for an extended observation period. If validation succeeds, the remaining traffic shifts in a single step.</p>
+<p><img src="https://d2908q01vomqb2.cloudfront.net/fe2ef495a1152561572949784c16bf23abb28057/2026/05/05/image-5-10.png" alt="Diagram showing canary deployment routing 5% of traffic to the green revision for 15 minutes of extended validation then shifting remaining traffic on success."></p>
+<h3>Choosing your rollout strategy</h3>
+<p>The following table compares all four Amazon ECS deployment strategies to help you decide which approach fits your workload.</p>
+<table>
+ <tbody>
+  <tr>
+   <td><strong>Strategy</strong></td>
+   <td><strong>Traffic Control</strong></td>
+   <td><strong>Rollback Speed</strong></td>
+   <td><strong>Cost Impact</strong></td>
+   <td><strong>Best For</strong></td>
+  </tr>
+  <tr>
+   <td><strong>Rolling</strong></td>
+   <td>No control</td>
+   <td>Slow (redeploy)</td>
+   <td>Low</td>
+   <td>Cost-sensitive workloads, simplicity over traffic control</td>
+  </tr>
+  <tr>
+   <td><strong>Blue/green</strong></td>
+   <td>Instant switch</td>
+   <td>Instant</td>
+   <td>High (2x resources)</td>
+   <td>Critical updates, DB migrations</td>
+  </tr>
+  <tr>
+   <td><strong>Linear</strong></td>
+   <td>Gradual increments</td>
+   <td>Fast (traffic shift)</td>
+   <td>Medium</td>
+   <td>APIs, microservices</td>
+  </tr>
+  <tr>
+   <td><strong>Canary</strong></td>
+   <td>Small test first</td>
+   <td>Fast (traffic shift)</td>
+   <td>Medium</td>
+   <td>Changes requiring careful validation, machine learning models</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Observability and rollbacks</h3>
+<p>Amazon ECS provides several mechanisms to monitor deployments and automatically roll back when issues arise.</p>
+<h4>Amazon CloudWatch alarms for automated failure detection</h4>
+<p>You can associate CloudWatch alarms with your Amazon ECS service for automatic rollback. If an alarm enters the ALARM state, the deployment rolls back.</p>
+<p>Common alarm metrics include:</p>
+<ul>
+ <li><strong>Error rate</strong>: HTTPCode_Target_5XX_Count, HTTPCode_Target_4XX_Count</li>
+ <li><strong>Latency</strong>: TargetResponseTime (p50, p99, p99.9)</li>
+ <li><strong>Availability</strong>: UnHealthyHostCount, HealthyHostCount</li>
+ <li><strong>Custom metrics</strong>: Application-specific business metrics published to Amazon CloudWatch</li>
+</ul>
+<h4>Lifecycle hooks</h4>
+<p>Lifecycle hooks let you run custom validation logic at specific points during the deployment. You can use AWS Lambda functions to implement hooks for:</p>
+<ul>
+ <li><strong>Pre-deployment validation</strong>: Verify prerequisites before creating new tasks</li>
+ <li><strong>Post-deployment testing</strong>: Run automated tests against the new revision</li>
+ <li><strong>Custom health checks</strong>: Validate application-specific health criteria</li>
+ <li><strong>Integration testing</strong>: Test interactions with downstream dependencies</li>
+</ul>
+<p>Hooks can return IN_PROGRESS to indicate ongoing validation, SUCCEEDED to proceed, or FAILED to trigger rollback.</p>
+<h4>Bake time configuration</h4>
+<p>The deployment bake time is a buffer period after traffic shifting completes, during which the old (blue) revision remains running. This gives you instant rollback by shifting traffic back, without redeploying tasks.</p>
+<p>Consider the following bake time configuration:</p>
+<ul>
+ <li><strong>Most workloads: </strong>Set a baseline bake time that covers your typical health check intervals and allows enough time for error rates and latency metrics to surface in CloudWatch alarms.</li>
+ <li><strong>Workloads requiring extended observation: </strong>Increase the bake time for workloads with longer feedback loops, such as batch processing, async workflows, or services where downstream effects take time to manifest.</li>
+ <li><strong>Cost vs. safety tradeoff: </strong>Longer bake times increase costs (running both revisions) but improve rollback capability. Choose based on your service's mean time to detect (MTTD) failures.</li>
+</ul>
+<h2>Prerequisites</h2>
+<p>Before starting either walkthrough, verify that you have the following:</p>
+<ul>
+ <li>An Amazon ECS cluster (AWS Fargate or Amazon Elastic Compute Cloud (Amazon EC2))</li>
+ <li>An <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html">Application Load Balancer</a> or <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/network/introduction.html">Network Load Balancer</a> with two target groups configured</li>
+ <li>A <a href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definitions.html">task definition</a> for your application</li>
+ <li>A running Amazon ECS service configured with a load balancer and advancedConfiguration (two target groups and a production listener rule), along with an IAM role for traffic shifting. For the linear walkthrough, create a service named my-web-service; for the canary walkthrough, create a service named payment-service. See <a href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deploy-linear-service.html">Creating an Amazon ECS linear deployment</a> and <a href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deploy-canary-service.html">Creating an Amazon ECS canary deployment</a> for instructions.</li>
+ <li>AWS Command Line Interface (AWS CLI) installed and configured</li>
+ <li>Appropriate AWS Identity and Access Management (AWS IAM) permissions for Amazon ECS, Elastic Load Balancing, and Amazon CloudWatch</li>
+ <li>An IAM role (for example, ecsBlueGreenRole) that allows Amazon ECS to manage load balancer target group weights during traffic shifting</li>
+ <li>For the canary walkthrough: custom Amazon CloudWatch metrics for business logic validation (optional)</li>
+</ul>
+<h2>Walkthrough: linear strategy implementation</h2>
+<p>In this walkthrough, you deploy a sample application using the linear deployment strategy with automatic rollback capabilities.</p>
+<h3>Step 1: Create CloudWatch alarm for 5XX errors</h3>
+<pre><code># Create alarm for 5XX errors across both target groups
+aws cloudwatch put-metric-alarm \
+  --alarm-name my-service-5xx-errors \
+  --alarm-description "Trigger on high 5XX error rate across both target groups" \
+  --metrics '[
+    \{
+      "Id": "blue5xx",
+      "MetricStat": \{
+        "Metric": \{
+          "Namespace": "AWS/ApplicationELB",
+          "MetricName": "HTTPCode_Target_5XX_Count",
+          "Dimensions": [
+            \{"Name": "TargetGroup", "Value": "targetgroup/blue/xxx"},
+            \{"Name": "LoadBalancer", "Value": "app/my-load-balancer/xxx"}
+          ]
+        },
+        "Period": 60,
+        "Stat": "Sum"
+      },
+      "ReturnData": false
+    },
+    \{
+      "Id": "green5xx",
+      "MetricStat": \{
+        "Metric": \{
+          "Namespace": "AWS/ApplicationELB",
+          "MetricName": "HTTPCode_Target_5XX_Count",
+          "Dimensions": [
+            \{"Name": "TargetGroup", "Value": "targetgroup/green/xxx"},
+            \{"Name": "LoadBalancer", "Value": "app/my-load-balancer/xxx"}
+          ]
+        },
+        "Period": 60,
+        "Stat": "Sum"
+      },
+      "ReturnData": false
+    },
+    \{
+      "Id": "total5xx",
+      "Expression": "SUM([blue5xx, green5xx])",
+      "Label": "Total 5XX Errors",
+      "ReturnData": true
+    }
+  ]' \
+  --evaluation-periods 2 \
+  --threshold 10 \
+  --comparison-operator GreaterThanThreshold
+</code></pre>
+<h3>Step 2: Create alarm for high latency</h3>
+<p>Create an alarm for high response time across both target groups.</p>
+<pre><code># Create alarm for high latency across both target groups
+aws cloudwatch put-metric-alarm \
+  --alarm-name my-service-high-latency \
+  --alarm-description "Trigger on high response time across both target groups" \
+  --metrics '[
+    \{
+      "Id": "blueLatency",
+      "MetricStat": \{
+        "Metric": \{
+          "Namespace": "AWS/ApplicationELB",
+          "MetricName": "TargetResponseTime",
+          "Dimensions": [
+            \{"Name": "TargetGroup", "Value": "targetgroup/blue/xxx"},
+            \{"Name": "LoadBalancer", "Value": "app/my-load-balancer/xxx"}
+          ]
+        },
+        "Period": 60,
+        "Stat": "Average"
+      },
+      "ReturnData": false
+    },
+    \{
+      "Id": "greenLatency",
+      "MetricStat": \{
+        "Metric": \{
+          "Namespace": "AWS/ApplicationELB",
+          "MetricName": "TargetResponseTime",
+          "Dimensions": [
+            \{"Name": "TargetGroup", "Value": "targetgroup/green/xxx"},
+            \{"Name": "LoadBalancer", "Value": "app/my-load-balancer/xxx"}
+          ]
+        },
+        "Period": 60,
+        "Stat": "Average"
+      },
+      "ReturnData": false
+    },
+    \{
+      "Id": "maxLatency",
+      "Expression": "MAX([blueLatency, greenLatency])",
+      "Label": "Max Response Time",
+      "ReturnData": true
+    }
+  ]' \
+  --evaluation-periods 2 \
+  --threshold 1.0 \
+  --comparison-operator GreaterThanThreshold</code></pre>
+<h3>Step 3: Configure the linear strategy</h3>
+<p>Update your Amazon ECS service to use linear deployment with CloudWatch alarm integration. This also enables deployment circuit breakers for automatic rollback.deployment circuit breakers</p>
+<pre><code># Configure linear deployment strategy with CloudWatch alarm integration
+aws ecs update-service \
+  --cluster production-cluster \
+  --service my-web-service \
+  --deployment-configuration '\{
+    "deploymentCircuitBreaker": \{
+      "enable": true,
+      "rollback": true
+    },
+    "strategy": "LINEAR",
+    "linearConfiguration": \{
+      "stepPercent": 10,
+      "stepBakeTimeInMinutes": 5
+    },
+    "alarms": \{
+      "alarmNames": [
+        "my-service-5xx-errors",
+        "my-service-high-latency"
+      ],
+      "enable": true,
+      "rollback": true
+    }
+  }'
+</code></pre>
+<h3>Step 4: Deploy a new version</h3>
+<p>Trigger a deployment by forcing a new deployment of the existing task definition:</p>
+<pre><code># Trigger a deployment by forcing a new deployment of the existing task definition
+aws ecs update-service \
+  --cluster production-cluster \
+  --service my-web-service \
+  --force-new-deployment</code></pre>
+<h3>Step 5: Monitor rollout progress</h3>
+<p>Monitor deployment progress in real time using the DescribeServiceDeployments and DescribeServiceRevisions APIs, which provide detailed information about traffic shifting status, rollout state, and revision details.</p>
+<pre><code># List service deployments to get the deployment ARN
+aws ecs list-service-deployments \
+  --service arn:aws:ecs:region:account:service/production-cluster/my-web-service
+
+# Get detailed deployment status including traffic shifting progress
+aws ecs describe-service-deployments \
+  --service-deployment-arns arn:aws:ecs:region:account:service-deployment/production-cluster/my-web-service/xxx
+
+# Get details about a specific service revision
+aws ecs describe-service-revisions \
+  --service-revision-arns arn:aws:ecs:region:account:service-revision/production-cluster/my-web-service/xxx
+</code></pre>
+<h3>Step 6: Observe traffic shifting</h3>
+<p>During the deployment, traffic shifts in 10% increments every 5 minutes:</p>
+<pre><code>Time    Blue (Old)    Green (New)    Status
+0:00    100%          0%             Deployment started
+0:05    90%           10%            Step 1 complete
+0:10    80%           20%            Step 2 complete
+0:15    70%           30%            Step 3 complete
+...
+0:45    0%            100%           Deployment complete</code></pre>
+<p>If Amazon CloudWatch alarms breach during deployment, Amazon ECS automatically pauses the deployment, shifts traffic back to the stable (blue) revision, terminates the new (green) tasks, and marks the deployment as FAILED.</p>
+<h3>Step 7: Verify rollout status</h3>
+<p>Check the deployment completed successfully:</p>
+<pre><code># Check deployment status
+aws ecs describe-services \
+--cluster production-cluster \
+--services my-web-service \
+--query "services[0].deployments[?status=='PRIMARY'].rolloutState" \
+--output text</code></pre>
+<h3>Step 8: Verify alarm state</h3>
+<p>Confirm no alarms are in ALARM state:</p>
+<pre><code># Confirm no alarms in ALARM state
+aws cloudwatch describe-alarms \
+--alarm-names my-service-5xx-errors my-service-high-latency \
+--query "MetricAlarms[*].[AlarmName,StateValue]" \
+--output table</code></pre>
+<h2>Walkthrough: canary strategy implementation</h2>
+<p>This walkthrough deploys an update using the canary strategy.</p>
+<h3>Step 1: Create CloudWatch alarm for HTTP errors</h3>
+<p>Create an alarm for HTTP 5XX errors using metric math across both target groups.</p>
+<pre><code># Create alarm for 5XX errors across both target groups (blue and green)
+aws cloudwatch put-metric-alarm \
+  --alarm-name payment-service-errors \
+  --alarm-description "Trigger on high 5XX error rate across both target groups" \
+  --metrics '[
+    \{
+      "Id": "blue5xx",
+      "MetricStat": \{
+        "Metric": \{
+          "Namespace": "AWS/ApplicationELB",
+          "MetricName": "HTTPCode_Target_5XX_Count",
+          "Dimensions": [
+            \{"Name": "TargetGroup", "Value": "targetgroup/blue/xxx"},
+            \{"Name": "LoadBalancer", "Value": "app/my-load-balancer/xxx"}
+          ]
+        },
+        "Period": 60,
+        "Stat": "Sum"
+      },
+      "ReturnData": false
+    },
+    \{
+      "Id": "green5xx",
+      "MetricStat": \{
+        "Metric": \{
+          "Namespace": "AWS/ApplicationELB",
+          "MetricName": "HTTPCode_Target_5XX_Count",
+          "Dimensions": [
+            \{"Name": "TargetGroup", "Value": "targetgroup/green/xxx"},
+            \{"Name": "LoadBalancer", "Value": "app/my-load-balancer/xxx"}
+          ]
+        },
+        "Period": 60,
+        "Stat": "Sum"
+      },
+      "ReturnData": false
+    },
+    \{
+      "Id": "total5xx",
+      "Expression": "SUM([blue5xx, green5xx])",
+      "Label": "Total 5XX Errors",
+      "ReturnData": true
+    }
+  ]' \
+  --evaluation-periods 2 \
+  --threshold 5 \
+  --comparison-operator GreaterThanThreshold
+</code></pre>
+<h3>Step 2: Create alarm for business metrics</h3>
+<p>Create a business metric alarm for application monitoring:</p>
+<pre><code># Business metric alarm (custom)
+aws cloudwatch put-metric-alarm \
+  --alarm-name payment-transaction-failure-rate \
+  --metric-name TransactionFailureRate \
+  --namespace CustomApp/Payments \
+  --statistic Average \
+  --period 300 \
+  --evaluation-periods 1 \
+  --threshold 0.5 \
+  --comparison-operator GreaterThanThreshold
+</code></pre>
+<h3>Step 3: Configure the canary strategy</h3>
+<p>Configure the canary with a small initial traffic percentage and an extended bake time:</p>
+<pre><code># Configure canary deployment strategy with CloudWatch alarm integration
+aws ecs update-service \
+  --cluster production-cluster \
+  --service payment-service \
+  --deployment-configuration '\{
+    "deploymentCircuitBreaker": \{
+      "enable": true,
+      "rollback": true
+    },
+    "strategy": "CANARY",
+    "canaryConfiguration": \{
+      "canaryPercent": 5,
+      "canaryBakeTimeInMinutes": 20
+    },
+    "alarms": \{
+      "alarmNames": [
+        "payment-service-errors",
+        "payment-transaction-failure-rate"
+      ],
+      "enable": true,
+      "rollback": true
+    }
+  }'</code></pre>
+<h3>Step 4: Deploy new version</h3>
+<p>Trigger a deployment by forcing a new deployment of the existing task definition:</p>
+<pre><code># Trigger a deployment by forcing a new deployment of the existing task definition
+aws ecs update-service \
+  --cluster production-cluster \
+  --service payment-service \
+  --force-new-deployment</code></pre>
+<h3>Step 5: Observe canary traffic pattern</h3>
+<p>During canary deployment, traffic shifts in two phases:</p>
+<pre><code>Phase 1: Canary testing (20 minutes)
+Time    Blue (Old)    Green (New)    Status
+0:00    100%          0%             Canary deployment started
+0:01    95%           5%             Canary phase - monitoring
+0:05    95%           5%             Canary phase - monitoring
+0:10    95%           5%             Canary phase - monitoring
+0:15    95%           5%             Canary phase - monitoring
+0:20    95%           5%             Canary validation complete
+
+Phase 2: Full rollout (if canary succeeds)
+0:21    0%            100%           Full traffic shift
+0:21    0%            100%           Deployment complete</code></pre>
+<h3>Step 6: Verify rollout status</h3>
+<p>Check the deployment completed successfully:</p>
+<pre><code># Check deployment status
+aws ecs describe-services \
+--cluster production-cluster \
+--services payment-service \
+--query "services[0].deployments[?status=='PRIMARY'].rolloutState" \
+--output text</code></pre>
+<h3>Step 7: Verify alarm state</h3>
+<p>Confirm no alarms are in ALARM state:</p>
+<pre><code># Confirm no alarms in ALARM state
+aws cloudwatch describe-alarms \
+--alarm-names payment-service-errors payment-transaction-failure-rate \
+--query "MetricAlarms[*].[AlarmName,StateValue]" \
+--output table</code></pre>
+<h2>Best practices</h2>
+<p>This section provides guidance on configuring alarms and setting bake times for your deployments.</p>
+<h3>Amazon CloudWatch alarm configuration</h3>
+<p>Consider configuring two tiers of alarms: critical alarms that trigger automatic rollback, and warning alarms for monitoring only. Set thresholds and evaluation periods based on your application's baseline performance and acceptable error rates.</p>
+<p><strong>Critical alarms (immediate rollback)</strong>:</p>
+<ul>
+ <li>HTTPCode_Target_5XX_Count</li>
+ <li>TargetResponseTime (p99)</li>
+ <li>UnHealthyHostCount</li>
+</ul>
+<p><strong>Warning alarms (monitor, don't roll back)</strong>:</p>
+<ul>
+ <li>TargetResponseTime (p50)</li>
+ <li>RequestCount (anomaly detection or percentage decrease)</li>
+ <li>CPUUtilization</li>
+</ul>
+<h3>Bake time guidelines</h3>
+<p><strong>Canary bake time</strong>:</p>
+<ul>
+ <li>Low risk: shorter bake time</li>
+ <li>Medium risk: moderate bake time</li>
+ <li>High risk: extended bake time</li>
+</ul>
+<p><strong>Deployment bake time</strong>:</p>
+<ul>
+ <li>Set a baseline that exceeds your service's mean time to detect (MTTD) failures</li>
+ <li>This gives you instant rollback without redeployment</li>
+</ul>
+<h2>Clean up resources</h2>
+<p>To avoid ongoing charges, delete all resources created during the walkthroughs. Load balancers and running Amazon ECS tasks are the primary cost drivers.</p>
+<p>Warning: The –force flag immediately stops all running tasks without draining connections. This causes service disruption. Make sure no active traffic is being served and back up any necessary data before proceeding.</p>
+<pre><code># Delete the linear walkthrough ECS service
+aws ecs delete-service \
+--cluster production-cluster \
+--service my-web-service \
+--force
+
+# Delete the canary walkthrough ECS service
+aws ecs delete-service \
+--cluster production-cluster \
+--service payment-service \
+--force
+
+# Delete CloudWatch alarms for linear walkthrough
+aws cloudwatch delete-alarms \
+--alarm-names my-service-5xx-errors my-service-high-latency
+
+# Delete CloudWatch alarms for canary walkthrough
+aws cloudwatch delete-alarms \
+--alarm-names payment-service-errors payment-transaction-failure-rate
+
+# Delete target groups (after service deletion completes)
+aws elbv2 delete-target-group \
+--target-group-arn arn:aws:elasticloadbalancing:region:account:targetgroup/blue/xxx
+aws elbv2 delete-target-group \
+--target-group-arn arn:aws:elasticloadbalancing:region:account:targetgroup/green/xxx
+
+If you created the following resources specifically for this walkthrough and no longer need them, delete them:
+
+# Delete the ECS cluster
+aws ecs delete-cluster \
+--cluster production-cluster
+
+# Delete the load balancer
+aws elbv2 delete-load-balancer \
+--load-balancer-arn arn:aws:elasticloadbalancing:region:account:loadbalancer/app/my-load-balancer/xxx
+
+# Deregister task definitions
+aws ecs deregister-task-definition \
+--task-definition my-task-definition:1
+
+# Delete the IAM role
+aws iam delete-role \
+--role-name ecsBlueGreenRole</code></pre>
+<h2>Conclusion</h2>
+<p>In this post, we showed you how to configure linear and canary deployment strategies in Amazon ECS with CloudWatch alarms for automatic rollback, providing native gradual rollout support with automated safety.</p>
+<h3>Next steps</h3>
+<p>To get started, try the linear deployment strategy with a non-production service first. Experiment with different step percentages and bake times to find optimal settings. After validating linear deployments, adopt canary deployments for your most sensitive services.</p>
+<p>These strategies are available today in commercial AWS Regions. For pricing details, see the <a href="https://aws.amazon.com/ecs/pricing/">Amazon ECS pricing page</a>.</p>
+<p>For more information, see the <a href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/Welcome.html">Amazon ECS Developer Guide</a>.</p>
+<h3>Additional resources</h3>
+<ul>
+ <li>For more information about deployment types and configuration options, see <a href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs_service-options.html">Amazon ECS deployment strategies documentation</a>.</li>
+ <li>For more information about automatic rollback mechanisms, see <a href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-circuit-breaker.html">Amazon ECS deployment circuit breaker</a>.</li>
+ <li>For more information about traffic distribution during deployments, see <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-target-groups.html">Elastic Load Balancing weighted target groups</a>.</li>
+</ul>

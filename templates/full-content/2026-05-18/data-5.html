@@ -1,0 +1,144 @@
+<p>SQL is fun and not at all boring. The latest article by Markus Winand on <a href="https://modern-sql.com/blog/2026-05/order-by-history">Order by Has Come a Long Way</a> sent me on quite a journey.</p>
+<p>First, set up a table called <code>nums</code> with one integer column and four rows:</p>
+<pre><code>CREATE TABLE nums (a int);
+INSERT INTO nums VALUES (0), (1), (2), (3);</code></pre>
+<p>Try to guess what these two queries return.</p>
+<pre><code>SELECT -a AS a FROM nums ORDER BY a;
+SELECT -a AS a FROM nums ORDER BY -a;</code></pre>
+<p>Most of us would guess the same rows in a different order. The actual answer is that they produce <strong>exactly the same rows in exactly the same order</strong>. By the same logic you might expect</p>
+<pre><code>SELECT a AS c FROM nums ORDER BY -c;</code></pre>
+<p>to do exactly the same. Except it does not. It errors with <code>column "c" does not exist</code> despite the alias being right there in the statement. Welcome to ORDER BY jungle.</p>
+<h2>Names and expressions are not the same</h2>
+<p>If you ask most developers how <code>ORDER BY</code> works, they will say "you put a column name there and it sorts the rows". In 99% of queries that is exactly what happens. People sort by <code>created_at</code> or <code>id</code> and move on. Strictly speaking, three, if you count <code>ORDER BY 1</code>. Positional references are their own can of worms and out of scope for this post. But <code>ORDER BY</code> accepts two different kinds of things:</p>
+<pre><code>SELECT created_at, user_id FROM events ORDER BY created_at;
+SELECT created_at, user_id FROM events ORDER BY date(created_at);</code></pre>
+<p>Both feel natural. And the thing nobody tells you is that they go down completely different code paths in the parser. Different scope rules, different lookups, different error messages. The first looks at your <code>SELECT</code> list. The second looks at your <code>FROM</code> clause. They never look at the same place.</p>
+<h2>Same answer, two different sorts</h2>
+<p>Look at the first query again.</p>
+<pre><code>SELECT -a AS a FROM nums ORDER BY a;</code></pre>
+<p>You wrote <code>ORDER BY a</code>. A bare identifier, no decoration. Postgres goes down the <em>name</em> path. It scans the <code>SELECT</code> list for something called <code>a</code>, finds the aliased column <code>-a AS a</code>, and sorts by its output values. The negated values are <code>-3, -2, -1, 0</code>, ascending is <code>-3, -2, -1, 0</code>. That is what comes out.</p>
+<p>Now the twin.</p>
+<pre><code>SELECT -a AS a FROM nums ORDER BY -a;</code></pre>
+<p>You wrote <code>ORDER BY -a</code>. This is no longer an identifier. It's an expression: unary minus around a column reference. The parser does not even try the same logic.</p>
+<p>Instead it switches to the <strong>expression path</strong>, where the only <code>a</code> it knows is the column in <code>nums</code>, and sorts the input values negated. And by arithmetic luck, the two queries land on the same row order. Same output, completely different logic. If you don't believe it is just luck, drop the negation from the <code>SELECT</code> list and keep it in <code>ORDER BY</code>:</p>
+<pre><code>SELECT a AS c FROM nums ORDER BY -a;</code></pre>
+<pre><code> c
+---
+ 3
+ 2
+ 1
+ 0
+(4 rows)</code></pre>
+<p><code>ORDER BY -a</code> is an expression, so it sorts by <code>-input_a</code> ascending, which is <code>input_a</code> descending. The alias <code>c</code> was never consulted. The result has nothing to do with whatever <code>c</code> happens to be.</p>
+<p>And <code>ORDER BY -c</code> is now obvious. <code>-c</code> is an expression, so the parser looks for column <code>c</code> in <code>FROM</code>, doesn't find it, and errors. The alias exists, but in a scope this code path cannot see.</p>
+<h2>Above the identifier, or around it</h2>
+<p>Once the rule is clear (bare identifier hits the <code>SELECT</code> list, anything else hits the table) the rest of the surprises fall out.</p>
+<pre><code>SELECT 'hello' AS x FROM nums ORDER BY x::text;
+-- ERROR: column "x" does not exist</code></pre>
+<p>It is probably not surprising that <strong>casts</strong> count as expressions and push the lookup to the table.</p>
+<p>The surprise might come with</p>
+<pre><code>SELECT a AS c FROM nums ORDER BY c DESC NULLS FIRST;</code></pre>
+<p>Which will work as expected. Both <code>DESC</code> and <code>NULLS FIRST</code> are part of the sort clause itself, not of the sort expression. They sit above the identifier in the parse tree, so they never touch it. The parser still sees a bare <code>c</code>, takes the fast path, finds the alias, sorts by it, and then applies "descending, nulls first" on top of the resolved key.</p>
+<p>The same cannot be said about <strong>collation</strong>.</p>
+<pre><code>SELECT 'A'::text AS x FROM nums ORDER BY x COLLATE "C";
+-- ERROR: column "x" does not exist</code></pre>
+<p>This is a really bad one. <code>COLLATE</code> might look the same as a sort modifier, but it is not. It wraps the expression in the parse tree.</p>
+<p>Parentheses are a special case.</p>
+<pre><code>SELECT -a AS a FROM nums ORDER BY (a);
+-- works, sorts by alias</code></pre>
+<p>Postgres collapses redundant parens before the bare-identifier check, so <code>(a)</code> is still bare <code>a</code>. The seam is asymmetric in the way that maximises confusion: <code>COLLATE</code> is "still a name to a human, an expression to the parser", and <code>(a)</code> is "an expression to a human, still a name to the parser". You get both flavours of wrong intuition mixed here.</p>
+<p><strong>Unary plus.</strong> <code>+a</code> and <code>a</code> evaluate to the same value, but they do not parse to the same node.</p>
+<pre><code>SELECT -a AS a FROM nums ORDER BY a;
+SELECT -a AS a FROM nums ORDER BY +a;</code></pre>
+<p>A plus sign you would not even think about changes which rows come out in which order. The parser stores a column reference as a list of name parts: one part when it is unqualified, two or more once you add a table or schema. The fast path only fires on lists of length one.</p>
+<p>Finally, <strong>schema- and table-qualified references</strong>. <code>ORDER BY nums.a</code> looks like an identifier, but it is not.</p>
+<pre><code>SELECT -a AS a FROM nums ORDER BY a;
+SELECT -a AS a FROM nums ORDER BY nums.a;</code></pre>
+<pre><code> a
+----
+ -3
+ -2
+ -1
+  0
+(4 rows)
+
+ a
+----
+  0
+ -1
+ -2
+ -3
+(4 rows)</code></pre>
+<h2>Aliases that aren't the names you think</h2>
+<p>Here is one that cost me an afternoon once. Easy to come across once an ORM or a generated view declared the alias for you. SQLAlchemy, Hibernate, jOOQ, and most code generators quote anything that isn't pure lowercase. Two queries, identical except that the alias is quoted in one. Two different result sets.</p>
+<pre><code>SELECT -a AS  A  FROM nums ORDER BY a;    -- sorts by alias (-3,-2,-1,0)
+SELECT -a AS "A" FROM nums ORDER BY a;    -- sorts by input (0,-1,-2,-3)</code></pre>
+<p>The bare-identifier check compares names with <code>strcmp</code>. Unquoted <code>A</code> folds to lowercase <code>a</code> and matches. Quoted <code>"A"</code> preserves case, stays <code>A</code>, and does not match the lowercase <code>a</code> in the <code>ORDER BY</code>. The lookup fails, the parser falls through to the expression path, the expression path finds the column <code>a</code> in <code>nums</code>, and the query runs successfully while doing something different from what you meant.</p>
+<h2>GROUP BY checks the opposite scope first</h2>
+<p>Both <code>GROUP BY</code> and <code>ORDER BY</code> accept a bare identifier, and both can resolve it either way: to a table column or to a <code>SELECT</code>-list alias. The difference is the order they check:</p>
+<ul>
+ <li><code>ORDER BY a</code> looks at the <code>SELECT</code> list first, then the table.</li>
+ <li><code>GROUP BY a</code> looks at the table first, then the <code>SELECT</code> list.</li>
+</ul>
+<p>For most queries this never matters. The two clauses end up picking the same thing because nothing is shadowed. The surprise happens when an alias has the same name as a base column but a different value:</p>
+<pre><code>SELECT a/2 AS a, count(*)
+FROM nums
+GROUP BY a
+ORDER BY a;</code></pre>
+<p>Now the two clauses disagree about what <code>a</code> means. <code>GROUP BY a</code> picks the input column (four distinct values, four groups, one row each). <code>ORDER BY a</code> picks the alias, which is <code>a/2</code>. The result has four rows because the grouping was on a finer-grained key than the projection:</p>
+<pre><code> a | count
+---+-------
+ 0 |     1
+ 0 |     1
+ 1 |     1
+ 1 |     1</code></pre>
+<p>Two rows where <code>a/2 = 0</code> (from input <code>0</code> and <code>1</code>), two where <code>a/2 = 1</code> (from input <code>2</code> and <code>3</code>). The duplicates are real. The same identifier means two different columns in two adjacent clauses of one query.</p>
+<h2>Window ORDER BY does not even pretend</h2>
+<p>This one trips people up because it does not look like a different clause.</p>
+<pre><code>SELECT a, -a AS neg, row_number() OVER (ORDER BY neg) FROM nums;
+-- ERROR: column "neg" does not exist</code></pre>
+<p><code>OVER (ORDER BY ...)</code> is a different parse path entirely. It does not check the targetlist at all, only the FROM scope. The bare-name fast path simply does not exist here.</p>
+<pre><code>SELECT a, -a AS neg, row_number() OVER (ORDER BY -a) FROM nums;
+-- this works</code></pre>
+<p>Two <code>ORDER BY</code> clauses in the same query, two different scoping rules.</p>
+<h2>UNION ORDER BY is name-only</h2>
+<p>When <code>ORDER BY</code> follows a <code>UNION</code>, neither path is fully open.</p>
+<pre><code>-- ok
+(SELECT a FROM nums) UNION ALL (SELECT 9) ORDER BY a;
+-- ERROR
+(SELECT a FROM nums) UNION ALL (SELECT 9) ORDER BY -a;
+-- ERROR
+(SELECT a FROM nums) UNION ALL (SELECT 9) ORDER BY a COLLATE "C";</code></pre>
+<p>The error message is unusually helpful:</p>
+<blockquote>
+ <p>Only result column names can be used, not expressions or functions. HINT: Add the expression/function to every SELECT, or move the UNION into a FROM clause.</p>
+</blockquote>
+<p>Set operations do not have a single FROM scope to fall back to, so the expression path is closed entirely. Bare names or nothing.</p>
+<h2>The seam, in the source</h2>
+<p>Full disclosure: I got this section wrong three times before Claude Code helped me trace the actual parse tree. Lack of sleep from a whole night of geeking out over <code>ORDER BY</code> is the other plausible explanation. Open <code>src/backend/parser/parse_clause.c</code> and find <code>findTargetlistEntrySQL92</code>. It is forty lines of comment, two <code>if</code> blocks, and a final <code>return</code>. SQL92's two resolution rules are tried first; SQL99 is the fallback.</p>
+<p><strong>Block one: the bare-name path.</strong> The gate is a <code>ColumnRef</code> node with exactly one name part, and that part must be a string identifier (not <code>*</code>, which is also a <code>ColumnRef</code> but with an <code>A_Star</code> field). If the node passes, the function walks the target list looking for a non-<code>resjunk</code> entry whose <code>resname</code> equals the identifier. The loop keeps going past the first match to detect ambiguity: identical expressions are fine (this is why <code>SELECT a, a FROM nums ORDER BY a</code> works), different expressions error out. On a unique match, return.</p>
+<p>If the loop finds nothing, the block does <strong>not</strong> return. Control falls through. This is the case behind the quoted-alias surprise earlier in the post: <code>AS "A"</code> stores <code>resname = "A"</code>, <code>ORDER BY a</code> looks up <code>resname = "a"</code>, the <code>strcmp</code> fails, and the function moves on as if no SQL92 fast path applied.</p>
+<p><code>GROUP BY</code> is the small exception inside this block. The name is first tested against the <code>FROM</code> scope, and a hit there causes the targetlist loop to be skipped. That is how <code>GROUP BY</code> ends up preferring the input column.</p>
+<p><strong>Block two: the positional path.</strong> The gate is <code>IsA(node, A_Const)</code>. A non-integer constant errors immediately ("non-integer constant in ..."), which catches <code>ORDER BY NULL</code>, <code>ORDER BY 'a'</code>, <code>ORDER BY TRUE</code>. An integer is used as a 1-based position into the non-<code>resjunk</code> target list; anything outside the range errors as "position %d is not in select list". Block two never falls through.</p>
+<p>Both <code>1</code> and <code>-1</code> arrive here as integer <code>A_Const</code>s. <code>doNegate</code> in the grammar folds <code>'-' Iconst</code> into a single integer constant before the function ever runs, so <code>ORDER BY 1</code> and <code>ORDER BY -1</code> go through the same code, with only the integer value (and the result of the position lookup) differing.</p>
+<p><strong>The fallthrough.</strong> Anything not caught above reaches the last line:</p>
+<pre><code>/*
+ * Otherwise, we have an expression, so process it per SQL99 rules.
+ */
+return findTargetlistEntrySQL99(pstate, node, tlist, exprKind);</code></pre>
+<p>That is the seam. SQL92 succeeds in two narrow shapes: a bare identifier with a matching alias, or an in-range positive integer. Everything else, including a bare identifier whose alias lookup found nothing, becomes a SQL99 expression resolved against <code>FROM</code>.</p>
+<h2>A useful workaround</h2>
+<p>If you want the alias inside an expression in <code>ORDER BY</code>, the portable trick is to wrap the query in a subselect:</p>
+<pre><code>SELECT *
+FROM (SELECT -a AS x FROM nums) s
+ORDER BY x + 0;</code></pre>
+<p>Now <code>x</code> is a real column in the FROM scope of the outer query. The expression path finds it. The seam has been moved out of the way.</p>
+<p>This is, conceptually, what you would want the engine to do for you when you write <code>ORDER BY x + 0</code> directly. The SQL-99 standard does not actually require that, though, and Postgres (along with SQL Server) documents explicitly that an alias inside an <code>ORDER BY</code> expression is not supported. So you do it by hand.</p>
+<h2>The boring takeaway</h2>
+<p>Most of the time none of this matters. You sort by a column you just selected, the alias and the input column have the same name and the same value, and either parser path gives the same answer. The seam is invisible.</p>
+<p>The minute the alias and the input column disagree in expression, value, case, or anything wrapped around the identifier, the parser picks one or the other silently, by a rule older than most working programmers.</p>
+<p>There are two parsers. The bare-name path is SQL-92, the expression path is SQL-99, and they were stitched together in the late 1990s. They still disagree about which scope your identifiers live in, and knowing which one you triggered tells you which scope.</p>
+<p>If after reading this post you still have to stop and think for a minute before predicting what</p>
+<pre><code>SELECT -a AS a FROM nums ORDER BY a COLLATE "C";</code></pre>
+<p>does, that is the right reaction. It means you have the mental model.</p>
+<p><em>The opening puzzle queries are from Jamie Brandon's <a href="https://lobste.rs/s/zp6fnc/sql_s_order_by_has_come_long_way">comment on the Lobsters thread</a> discussing Markus Winand's <a href="https://modern-sql.com/blog/2026-05/order-by-history">history of <code>ORDER BY</code></a> on modern-sql.com. Everything that follows here is the explanation that comment did not give. Both pieces are worth reading on their own.</em></p>

@@ -1,0 +1,101 @@
+<h1>Our billing pipeline was suddenly slow. The culprit was a hidden bottleneck in ClickHouse</h1>
+<p>At Cloudflare, we are heavy users of ClickHouse, an open source online analytical processing (OLAP) database. Every day, we make millions of calls to ClickHouse to determine how much users should be billed for their usage of Cloudflare products. If we don't finish those jobs in a timely fashion, the invoices become very difficult to reconcile.</p>
+<p>This pipeline powers hundreds of millions of dollars in usage revenue, fraud systems, and more, so being delayed has major downstream implications.</p>
+<p>Which is why it was a big problem when the daily aggregation jobs in ClickHouse – responsible for ensuring Cloudflare's bills go out – had slowed way down, following a migration. All the usual suspects looked clean: I/O, memory, rows scanned, parts read. Everything we would normally check when a ClickHouse query is slow appeared to be normal.</p>
+<p>This is the story of how we discovered a hidden bottleneck buried deep within ClickHouse's internals, and the three patches we wrote to fix it.</p>
+<h2>The setup: a petabyte-scale analytics platform</h2>
+<p>We use ClickHouse to store over a hundred petabytes of data across a few dozen clusters. To simplify onboarding for our many internal teams, we built a system called "Ready-Analytics" in early 2022.</p>
+<p>The premise is simple: instead of designing new tables, teams can stream data into a single, massive table. Datasets are disambiguated by a <code>namespace</code>, and each record uses a standard schema (e.g., 20 float fields, 20 string fields, a timestamp, and an <code>indexID</code>).</p>
+<p>In ClickHouse, the way data is sorted is crucial to query performance. This is where the <code>indexID</code> comes into play. It's a string field, which forms part of the primary key, meaning that every individual namespace can have its data sorted in a way that is optimal for the queries the owners of that namespace expect to be running. Altogether, we end up with a primary key that looks like this: (<code>namespace</code>, <code>indexID</code>, <code>timestamp</code>).</p>
+<p>This system is popular, with hundreds of applications using it. It had already grown to more than 2PiB of data by December 2024, and an ingestion rate of millions of rows per second. But it had one critical flaw: its retention policy.</p>
+<h2>The problem: one retention policy to rule them all</h2>
+<p>Cloudflare has been using ClickHouse for many years, since before it had native Time-to-Live (TTL) features. Consequently, we built our own retention system based on partitioning. The Ready-Analytics table was partitioned by <code>day</code>, and our retention job simply dropped partitions older than 31 days.</p>
+<p>This "one-size-fits-all" 31-day retention was a major limitation. Some teams needed to store data for years due to legal or contractual obligations, while others needed only a few days. This restriction meant these use cases couldn't use Ready-Analytics and had to opt for a conventional setup, which has a far more complex onboarding process.</p>
+<p>We needed a new system that allowed <strong>per-namespace retention</strong>.</p>
+<h2>The solution: a new partitioning scheme</h2>
+<p>We considered two main approaches:</p>
+<ol>
+ <li><strong>A Table-per-Namespace:</strong> This would naturally solve the retention problem but would require significant new automation to manage thousands of tables on demand.</li>
+ <li><strong>A New Partitioning Key:</strong> We could change the partitioning key from just <code>(day)</code> to <code>(namespace, day)</code>.</li>
+</ol>
+<p>We chose the second option. This would allow our existing retention system to continue managing partitions, but now with per-namespace granularity.</p>
+<p>We knew this would increase the total number of data parts in the table, but we made a key assumption: <strong>since every query is filtered by a specific namespace, the <em>number of parts read by any single query</em> shouldn't change.</strong> We believed this meant performance would be unaffected.</p>
+<figure>
+ <img src="https://cf-assets.www.cloudflare.com/zkvhlag99gkb/6d3ywoUP3OE2DCRAJtAgF7/5aa62c5702a923e30889ebf787925ae8/BLOG-3299_image4.png" alt="">
+</figure>
+<p><em>This shows how we changed the partitioning, allowing us to cheaply drop data for a single namespace</em></p>
+<p>This new system also allowed us to build a sophisticated storage management layer. Using the <a href="https://en.wikipedia.org/wiki/Max-min_fairness">max-min fairness algorithm</a>, we could set a target disk utilization (e.g., 90%) and automatically "share" available space. Namespaces using less than their fair share would cede their unused capacity to those that needed more. This allowed us to confidently run our clusters at 90% utilization.</p>
+<p>We began the migration in January 2025. Using ClickHouse's <code>Merge</code> table feature, we combined the old and new tables, writing all new data to the new partitioned table while the old data aged out.</p>
+<h2>The mystery: when billing starts to break</h2>
+<p>Two months later, in late March 2025, our billing team reported that their daily aggregation jobs were slowing down. These jobs are time-critical; if they don't finish, bills don't go out. The jobs were getting progressively slower, and we were approaching a deadline.</p>
+<p>We investigated, but none of the usual suspects were to blame. I/O was fine. Memory was fine. The metrics for individual queries showed they were <em>not</em> reading more data or more parts than before. Our initial assumption seemed correct, yet the system was grinding to a halt.</p>
+<p>It took several days before we even had a theory. Finally, we made a plot of query duration against the <em>total part count</em> in the cluster. The correlation was undeniable.</p>
+<figure>
+ <img src="https://cf-assets.www.cloudflare.com/zkvhlag99gkb/69SY5BVn3bPW5O9n5LrVjU/c7b99fda71d57156fa2784947db675f4/BLOG-3299_image2.png" alt="">
+</figure>
+<p><em>Average SELECT Query Durations on the Ready Analytics ClickHouse Cluster, showing progressive performance degradation.</em></p>
+<figure>
+ <img src="https://cf-assets.www.cloudflare.com/zkvhlag99gkb/2mt08KB04Y3n0vsNJAfK81/86da06fe572126e0e777f7dc4c00d7fb/BLOG-3299_image1.png" alt="">
+</figure>
+<p><em>Linear Growth in Total Data Part Count per Table Replica, following the new (namespace, day) partitioning scheme.</em></p>
+<p>But <em>why</em>? If we weren't <em>reading</em> the extra parts, why did their mere existence slow us down?</p>
+<h2>The investigation: hunting bottlenecks with flame graphs</h2>
+<p>We turned to ClickHouse's built-in <a href="https://clickhouse.com/docs/operations/system-tables/trace_log"><code>trace_log</code></a> to generate flame graphs. This is a built-in table that records traces from the running ClickHouse server. It not only includes traces of what code is being executed, but it associates these with specific users, query IDs and other metadata, meaning you can filter down to quite precise sets of events if necessary. In our case, we wanted to look specifically at <em>leaf SELECT queries</em>. This was easy thanks to the available metadata in this table.</p>
+<p>The first CPU-based flame graph quickly confirmed our suspicion: a huge amount of time was being spent in <strong>query planning</strong>. This is the phase <em>before</em> execution when ClickHouse decides which parts to read.</p>
+<figure>
+ <img src="https://cf-assets.www.cloudflare.com/zkvhlag99gkb/4Tppo6pF4ePCWTTC1lWi03/a1582ce51ef60116a1848cab83fe9516/BLOG-3299_image7.png" alt="">
+</figure>
+<p><em>Flame graph showing that 45% of leaf query CPU time is spent filtering a vector of parts based on the partition ID</em></p>
+<p>The flame graph was clear: 45% of the sampled CPU time was being spent in a single function called <code>filterPartsByPartition</code>.</p>
+<p>Our first attempt at a fix was a small patch to this exact code path. The planner evaluates heuristics to prune parts, and we believed they weren't being evaluated in the optimal order for our table. Our patch changed the order, yielding a small 5% improvement. We were on the right path, but we'd missed the real problem.</p>
+<p>We had been generating "CPU" traces, which only sample active threads. We switched to "Real" traces, which sample <em>all</em> threads, including those that are inactive or waiting. The new flame graph was a revelation.</p>
+<figure>
+ <img src="https://cf-assets.www.cloudflare.com/zkvhlag99gkb/715i8uMnak2T9Sdf4Jtcsy/1c962dbef3692257679136f6c3d36dca/BLOG-3299_image10.png" alt="">
+</figure>
+<p><em>Flame graph showing that more than half of leaf query duration is spent waiting for a mutex that protects the list of active parts</em></p>
+<p>The problem wasn't CPU-bound work; it was <strong>massive lock contention</strong>. More than half of our query duration was spent <em>waiting</em> to acquire a single mutex (<code>MergeTreeData</code>) that protects the table's list of parts. To plan a query, every single thread had to:</p>
+<ol>
+ <li>Acquire an <strong>exclusive lock</strong> on this mutex.</li>
+ <li>Make a complete copy of the list of <em>all</em> parts in the table.</li>
+ <li>Release the lock.</li>
+ <li>Filter that list down to the relevant parts.</li>
+</ol>
+<p>With tens of thousands of parts and hundreds of concurrent queries, they were all just standing in a single-file line.</p>
+<h2>The fixes: a trio of patches</h2>
+<p>This insight helped us plan a series of optimizations to alleviate these hotspots. As with all the patches we make to ClickHouse, we try to make them generic, and eventually get them contributed to the upstream codebase. This makes it easier for us to maintain our fork, and means the community benefits from the changes we make too!</p>
+<h3>Optimization 1: use a shared lock</h3>
+<p>The query planner doesn't <em>modify</em> the parts list; it just <em>reads</em> it. It had no business using an exclusive lock.</p>
+<p><strong>The Fix:</strong> We modified the code to acquire a <strong>shared lock</strong> (<code>std::shared_lock</code>) instead. This allowed all query planners to enter the critical section concurrently.</p>
+<p><strong>The Result:</strong> A massive, immediate drop in query duration. The lock contention vanished.</p>
+<figure>
+ <img src="https://cf-assets.www.cloudflare.com/zkvhlag99gkb/5Kj9AqPYFnhQjQya9C1U5y/122aff70ba4aae88c7fdbc479edd0147/BLOG-3299_image8.png" alt="">
+</figure>
+<p><em>Immediate Impact of the Shared Lock Optimization (Optimization 1) on Average SELECT Query Durations, demonstrating the resolution of lock contention.</em></p>
+<h3>Optimization 2: stop copying the vector</h3>
+<p>Performance was significantly better, but still not back to baseline. We went back to the trace log and made another 'Real' flame graph.</p>
+<figure>
+ <img src="https://cf-assets.www.cloudflare.com/zkvhlag99gkb/77AAAaeIqq6wRHaG8LjVeI/6dccdbf2c8b0c334c1d05b930572ab05/BLOG-3299_image5.png" alt="">
+</figure>
+<p><em>Flame graph showing that we spend a quarter of leaf query duration copying the vector of all parts, and another quarter filtering through it (copying again).</em></p>
+<p>The new flame graph showed the bottleneck had simply moved. Now, time was being spent <em>copying</em> the giant vector of parts, even with the shared lock. Intuitively, copying a vector sounds cheap, but when it contains tens of thousands of elements, and you do it hundreds of times a second, it adds up.</p>
+<p><strong>The Fix:</strong> We deferred the copy entirely. We created a "shared copy" of the parts list. Read-only operations (like query planning) just read from this copy. Any operation that <em>modifies</em> the set of parts (like a new insert) regenerates the cache. Planners now only copy the <em>filtered</em> list of parts they actually need.</p>
+<p><strong>The Result:</strong> Another significant performance improvement.</p>
+<figure>
+ <img src="https://cf-assets.www.cloudflare.com/zkvhlag99gkb/1d63suwP2kJZPqbzMQN1XQ/8ed1c519d1929f27d920d5a740b6b09f/BLOG-3299_image6.png" alt="">
+</figure>
+<p><em>Further Performance Improvement After Rolling Out the Vector Copy Optimization (Optimization 2).</em></p>
+<p>After seeing these massive savings internally, we decided to bring these changes to the community. After some small design iterations with the maintainers at ClickHouse Inc., we got the changes merged under <a href="https://github.com/ClickHouse/ClickHouse/pull/85535">PR #85535</a>. They have been available since <a href="https://clickhouse.com/docs/whats-new/changelog/2025#performance-improvement-1">ClickHouse version 25.11</a>.</p>
+<h3>Optimization 3: binary search for parts</h3>
+<p>We're still not done. As part counts grow, performance <em>still</em> degrades, just much more slowly. The correlation with part count was still there. Coming back to this after a few months, a new flame graph (looking the same as Figure 3) shows the time is spent in the filtering code path (the one we tried to fix first). This code performs a <strong>linear scan</strong> over all parts, evaluating predicates against each one. Over a few months, we were back to select durations from before the optimizations.</p>
+<p>But we know this list of parts is sorted by the partitioning key. Remember that the first column of the partition key is namespace, which the vast majority of queries filter on, because it identifies the "tenant." How can we make use of this?</p>
+<p><strong>The Fix:</strong> We implemented a binary search based on the <code>namespace</code> part of the partition ID. This works because the vector is sorted, so you can filter out a lot of the entries without actually looking at them. This is particularly effective since the <code>namespace</code> is the first part of that sorting key. After this first-pass of binary search, we have a much smaller range of parts we need to examine, and for those we still step through each one, applying the same logic as before to exclude parts based on other conditions.</p>
+<p><strong>The Result:</strong> After deploying this patch in March 2026, query durations dropped by 50% (see Figure 8). More importantly, this finally breaks correlation of query durations with the number of parts. Unfortunately, this solution doesn't generalize that well for arbitrary query conditions (e.g. conditions such as <code>namespace in (5,10)</code>). We are looking into more generic approaches like extending the <a href="https://clickhouse.com/blog/introducing-the-clickhouse-query-condition-cache">query condition cache</a> to cover part filtering.</p>
+<figure>
+ <img src="https://cf-assets.www.cloudflare.com/zkvhlag99gkb/4leNlnUeD3RIQVPT2VN1IB/90b76933cfdd24955c51d4c00287b9b0/BLOG-3299_image3.png" alt="">
+</figure>
+<p><em>Sustained Latency Reduction Following the Implementation of Binary Search for Part Pruning (Optimization 3).</em></p>
+<h2>An uneasy truce</h2>
+<p>These optimizations resolved the immediate crisis with the billing system. But this journey exposed the deep, non-obvious costs of our partitioning choice.</p>
+<p>Other problems remain. In this blog post we've only described the problems increasing part counts had on our select durations, but it has also caused problems for ZooKeeper, which tracks metadata for all the parts in ClickHouse. Perhaps one day we'll tell the story of the 100 gigabyte ZooKeeper cluster.</p>
+<p>We've bought ourselves significant breathing room, but the fundamental question remains: Was this partitioning scheme the right long-term choice? Or will we eventually need to bite the bullet and move to a different architecture? For now, our patches are holding, but the experience was a clear example of how even a well-planned change can fall victim to incorrect assumptions.</p>
+<p>When the billing team first reported this problem we had 30,000 parts per replica. The part rate never stopped growing, and a year later we hit 160k parts per replica, but query durations have been stable thanks to the optimizations we made here.</p>

@@ -38,7 +38,6 @@ import picocli.CommandLine.*;
         DigestHelper.ResummarizeAllCmd.class,
         DigestHelper.DedupCmd.class,
         DigestHelper.TestFetchCmd.class,
-        DigestHelper.SyncSwipeCmd.class,
         DigestHelper.AddRatingCmd.class,
 }, mixinStandardHelpOptions = true)
 public class DigestHelper implements Runnable {
@@ -61,34 +60,34 @@ public class DigestHelper implements Runnable {
     }
 
     static class PostStore {
-        final Path dataFile;
-        JsonArray posts;
+        final Path dataDir;
 
-        PostStore(String dataFilePath) { dataFile = Path.of(dataFilePath); }
+        PostStore(String dataDirPath) { dataDir = Path.of(dataDirPath); }
 
-        void load() throws IOException {
-            if (Files.exists(dataFile)) {
-                posts = GSON.fromJson(Files.readString(dataFile), JsonArray.class);
+        JsonObject findByDate(String date) throws IOException {
+            Path file = dataDir.resolve(date + ".json");
+            if (!Files.exists(file)) return null;
+            return GSON.fromJson(Files.readString(file), JsonObject.class);
+        }
+
+        List<JsonObject> all() throws IOException {
+            if (!Files.exists(dataDir)) return List.of();
+            try (var stream = Files.list(dataDir)) {
+                return stream.filter(p -> p.toString().endsWith(".json")).sorted()
+                    .map(p -> { try { return GSON.fromJson(Files.readString(p), JsonObject.class); }
+                                catch (Exception e) { return null; } })
+                    .filter(Objects::nonNull).toList();
             }
-            if (posts == null) posts = new JsonArray();
         }
 
-        void save() throws IOException { Files.writeString(dataFile, GSON.toJson(posts)); }
-
-        JsonObject findByDate(String date) {
-            for (var el : posts) {
-                if (date.equals(jsonStr(el.getAsJsonObject(), "date"))) return el.getAsJsonObject();
-            }
-            return null;
+        void savePost(JsonObject post) throws IOException {
+            Files.createDirectories(dataDir);
+            Files.writeString(dataDir.resolve(jsonStr(post, "date") + ".json"), GSON.toJson(post) + "\n");
         }
 
-        List<JsonObject> all() {
-            var list = new ArrayList<JsonObject>();
-            for (var el : posts) list.add(el.getAsJsonObject());
-            return list;
+        void removePost(String date) throws IOException {
+            Files.deleteIfExists(dataDir.resolve(date + ".json"));
         }
-
-        void addPost(JsonObject post) throws IOException { posts.add(post); save(); }
     }
 
     static final DoubleAdder totalCostUsd = new DoubleAdder();
@@ -500,7 +499,7 @@ public class DigestHelper implements Runnable {
 
     @Command(name = "add-post", description = "Add a new post to the data file from section JSON files")
     static class AddPostCmd implements Callable<Integer> {
-        @Option(names = "--data-file", required = true, description = "Data JSON file") String dataFile;
+        @Option(names = "--data-file", required = true, description = "Data directory") String dataFile;
         @Option(names = "--date", required = true, description = "Post date (YYYY-MM-DD)") String date;
         @Option(names = "--title", required = true, description = "Post title") String title;
         @Option(names = "--description", defaultValue = "Daily developer news digest", description = "Post description") String description;
@@ -514,7 +513,7 @@ public class DigestHelper implements Runnable {
 
     @Command(name = "write-content", description = "Write digest post content from cached HTML")
     static class WriteContentCmd implements Callable<Integer> {
-        @Parameters(index = "0", description = "Data JSON file") String dataFile;
+        @Parameters(index = "0", description = "Data directory") String dataFile;
         @Parameters(index = "1", description = "Post date") String date;
         @Parameters(index = "2", description = "Cache directory") String cacheDir;
         public Integer call() throws Exception {
@@ -527,7 +526,7 @@ public class DigestHelper implements Runnable {
 
     @Command(name = "clean-all", description = "Clean all digest posts")
     static class CleanAllCmd implements Callable<Integer> {
-        @Parameters(index = "0", description = "Data JSON file") String dataFile;
+        @Parameters(index = "0", description = "Data directory") String dataFile;
         @Parameters(index = "1", description = "Cache directory") String cacheDir;
         public Integer call() throws Exception {
             costContext = "all";
@@ -539,7 +538,7 @@ public class DigestHelper implements Runnable {
 
     @Command(name = "refresh-html", description = "Refresh HTML content for articles")
     static class RefreshHtmlCmd implements Callable<Integer> {
-        @Parameters(index = "0", description = "Data JSON file") String dataFile;
+        @Parameters(index = "0", description = "Data directory") String dataFile;
         @Parameters(index = "1", description = "Post date") String date;
         @Parameters(index = "2", description = "Cache directory") String cacheDir;
         public Integer call() throws Exception {
@@ -550,7 +549,7 @@ public class DigestHelper implements Runnable {
 
     @Command(name = "sync-tags", description = "Synchronize tags across posts")
     static class SyncTagsCmd implements Callable<Integer> {
-        @Parameters(index = "0", description = "Data JSON file") String dataFile;
+        @Parameters(index = "0", description = "Data directory") String dataFile;
         @Parameters(index = "1", description = "Feeds file") String feedsFile;
         public Integer call() throws Exception {
             syncTags(dataFile, feedsFile);
@@ -560,7 +559,7 @@ public class DigestHelper implements Runnable {
 
     @Command(name = "resummarize", description = "Re-summarize a single post with resume support")
     static class ResummarizeCmd implements Callable<Integer> {
-        @Parameters(index = "0", description = "Data JSON file") String dataFile;
+        @Parameters(index = "0", description = "Data directory") String dataFile;
         @Parameters(index = "1", description = "Post date") String date;
         @Parameters(index = "2", description = "Cache directory") String cacheDir;
         public Integer call() throws Exception {
@@ -573,7 +572,7 @@ public class DigestHelper implements Runnable {
 
     @Command(name = "resummarize-all", description = "Re-summarize all posts")
     static class ResummarizeAllCmd implements Callable<Integer> {
-        @Parameters(index = "0", description = "Data JSON file") String dataFile;
+        @Parameters(index = "0", description = "Data directory") String dataFile;
         @Parameters(index = "1", description = "Cache directory") String cacheDir;
         public Integer call() throws Exception {
             costContext = "all";
@@ -592,37 +591,6 @@ public class DigestHelper implements Runnable {
             dedup(files);
             return 0;
         }
-    }
-
-    @Command(name = "sync-swipe", description = "Sync digest-swipe.json from digest-posts.json")
-    static class SyncSwipeCmd implements Callable<Integer> {
-        @Parameters(index = "0", description = "Path to digest-posts.json") String dataFile;
-        @Parameters(index = "1", description = "Path to output digest-swipe.json") String outputFile;
-
-        @Override
-        public Integer call() throws Exception {
-            syncSwipe(dataFile, outputFile);
-            return 0;
-        }
-    }
-
-    static void syncSwipe(String dataFilePath, String outputFilePath) throws Exception {
-        Path dataFile = Path.of(dataFilePath);
-        if (!Files.exists(dataFile)) {
-            System.err.println("Data file not found: " + dataFilePath);
-            return;
-        }
-        JsonArray posts = GSON.fromJson(Files.readString(dataFile), JsonArray.class);
-        JsonArray swipe = new JsonArray();
-        for (var el : posts) {
-            var post = el.getAsJsonObject();
-            var entry = new JsonObject();
-            entry.addProperty("date", jsonStr(post, "date"));
-            entry.addProperty("title", jsonStr(post, "title"));
-            swipe.add(entry);
-        }
-        Files.writeString(Path.of(outputFilePath), GSON.toJson(swipe) + "\n");
-        System.err.println("Synced " + swipe.size() + " entries to " + outputFilePath);
     }
 
     @Command(name = "test-fetch", description = "Test the fetch chain (Jsoup + Facebook) for a single URL")
@@ -672,10 +640,9 @@ public class DigestHelper implements Runnable {
             loadEnv(root);
             ai = createProvider();
 
-            String dataFile = root.resolve("data/digest-posts.json").toString();
+            String dataDir = root.resolve("data/digest-posts").toString();
             String feedsFile = root.resolve("data/feeds.yml").toString();
             String cacheDir = root.resolve(".digest-cache").toString();
-            String swipeFile = root.resolve("data/digest-swipe.json").toString();
             Files.createDirectories(Path.of(cacheDir));
 
             var feeds = parseFeeds(feedsFile);
@@ -689,10 +656,9 @@ public class DigestHelper implements Runnable {
             }
 
             if (date != null) {
-                generatePost(date, dataFile, feedsFile, cacheDir, swipeFile, feeds, maxArticles);
+                generatePost(date, dataDir, feedsFile, cacheDir, feeds, maxArticles);
             } else {
-                var store = new PostStore(dataFile);
-                store.load();
+                var store = new PostStore(dataDir);
                 String lastDate = null;
                 for (var post : store.all()) {
                     if (post.has("draft") && post.get("draft").getAsBoolean()) continue;
@@ -702,13 +668,13 @@ public class DigestHelper implements Runnable {
                 java.time.LocalDate end = java.time.LocalDate.now().minusDays(1);
                 if (lastDate == null) {
                     System.err.println("No existing posts. Generating for yesterday (" + end + ").");
-                    generatePost(end.toString(), dataFile, feedsFile, cacheDir, swipeFile, feeds, maxArticles);
+                    generatePost(end.toString(), dataDir, feedsFile, cacheDir, feeds, maxArticles);
                 } else {
                     java.time.LocalDate start = java.time.LocalDate.parse(lastDate).plusDays(1);
                     if (!start.isAfter(end)) {
                         System.err.println("Backfilling from " + start + " to " + end + "...");
                         for (java.time.LocalDate d = start; !d.isAfter(end); d = d.plusDays(1)) {
-                            generatePost(d.toString(), dataFile, feedsFile, cacheDir, swipeFile, feeds, maxArticles);
+                            generatePost(d.toString(), dataDir, feedsFile, cacheDir, feeds, maxArticles);
                         }
                     } else {
                         System.err.println("Already up to date (last post: " + lastDate + ").");
@@ -717,8 +683,7 @@ public class DigestHelper implements Runnable {
             }
 
             // Backfill missing summaries from recent posts (e.g. from previous budget-limited runs)
-            var store2 = new PostStore(dataFile);
-            store2.load();
+            var store2 = new PostStore(dataDir);
             for (var post : store2.all()) {
                 String d = jsonStr(post, "date");
                 boolean hasMissing = false;
@@ -733,13 +698,12 @@ public class DigestHelper implements Runnable {
                 }
                 if (hasMissing) {
                     System.err.println("Backfilling missing summaries for " + d + "...");
-                    resummarize(dataFile, d, cacheDir);
+                    resummarize(dataDir, d, cacheDir);
                 }
             }
 
             // Backfill missing ratings
-            var store3 = new PostStore(dataFile);
-            store3.load();
+            var store3 = new PostStore(dataDir);
             for (var post : store3.all()) {
                 String d = jsonStr(post, "date");
                 boolean hasMissing = false;
@@ -754,7 +718,7 @@ public class DigestHelper implements Runnable {
                 }
                 if (hasMissing) {
                     System.err.println("Backfilling missing ratings for " + d + "...");
-                    addRating(dataFile, d);
+                    addRating(dataDir, d);
                 }
             }
 
@@ -775,10 +739,9 @@ public class DigestHelper implements Runnable {
         return sb.toString();
     }
 
-    static void generatePost(String targetDate, String dataFile, String feedsFile,
-                             String cacheDir, String swipeFile, List<Feed> feeds, int maxArticles) throws Exception {
-        var store = new PostStore(dataFile);
-        store.load();
+    static void generatePost(String targetDate, String dataDir, String feedsFile,
+                             String cacheDir, List<Feed> feeds, int maxArticles) throws Exception {
+        var store = new PostStore(dataDir);
         var existingPost = store.findByDate(targetDate);
         boolean isDraft = existingPost != null && existingPost.has("draft") && existingPost.get("draft").getAsBoolean();
         if (existingPost != null && !isDraft) {
@@ -867,7 +830,7 @@ public class DigestHelper implements Runnable {
                     .merge(1)
                     .select().where(Objects::nonNull)
                     .collect().asList()
-                    .await().atMost(Duration.ofMinutes(15));
+                    .await().atMost(Duration.ofMinutes(30));
 
             // Merge new sections with existing draft sections
             var allSections = new ArrayList<>(sections);
@@ -902,7 +865,7 @@ public class DigestHelper implements Runnable {
                     java.time.format.DateTimeFormatter.ofPattern("MMMM dd, yyyy", java.util.Locale.US));
 
             // Build and save post (replace draft or create new)
-            if (isDraft) { store.posts.remove(existingPost); }
+            if (isDraft) { store.removePost(targetDate); }
             var post = new JsonObject();
             post.addProperty("title", "Devoured - " + titleDate);
             post.addProperty("description", digestDesc);
@@ -917,23 +880,19 @@ public class DigestHelper implements Runnable {
             for (var s : allSections) sectionsArray.add(s);
             post.add("sections", sectionsArray);
 
-            store.addPost(post);
+            store.savePost(post);
             System.err.println("  Added post for " + targetDate + " with " + allSections.size() + " sections (draft)");
 
             System.err.println("  Syncing new tags...");
-            syncTags(dataFile, feedsFile);
-
-            System.err.println("  Syncing swipe data...");
-            syncSwipe(dataFile, swipeFile);
+            syncTags(dataDir, feedsFile);
 
             System.err.println("  Writing article content files...");
-            boolean contentComplete = writeContent(dataFile, targetDate, cacheDir);
+            boolean contentComplete = writeContent(dataDir, targetDate, cacheDir);
 
-            store.load();
             var published = store.findByDate(targetDate);
             if (published != null && contentComplete) {
                 published.remove("draft");
-                store.save();
+                store.savePost(published);
                 System.err.println("  Post published for " + targetDate);
             } else if (published != null) {
                 System.err.println("  Post kept as draft for " + targetDate + " (content incomplete, re-run to finish)");
@@ -1885,10 +1844,9 @@ public class DigestHelper implements Runnable {
         return section;
     }
 
-    static void addPost(String dataFile, String date, String title, String description,
+    static void addPost(String dataDir, String date, String title, String description,
                         String image, List<String> sectionFiles) throws Exception {
-        var store = new PostStore(dataFile);
-        store.load();
+        var store = new PostStore(dataDir);
 
         if (store.findByDate(date) != null) {
             System.err.println("Post for " + date + " already exists, skipping.");
@@ -1912,7 +1870,7 @@ public class DigestHelper implements Runnable {
         }
         post.add("sections", sections);
 
-        store.addPost(post);
+        store.savePost(post);
         System.err.println("Added post for " + date + " with " + sections.size() + " sections");
     }
 
@@ -2074,9 +2032,8 @@ public class DigestHelper implements Runnable {
         return tags;
     }
 
-    static boolean writeContent(String dataFile, String date, String cacheDir) throws Exception {
-        var store = new PostStore(dataFile);
-        store.load();
+    static boolean writeContent(String dataDir, String date, String cacheDir) throws Exception {
+        var store = new PostStore(dataDir);
         var post = store.findByDate(date);
         if (post == null) { System.err.println("  No post found for " + date); return true; }
 
@@ -2166,23 +2123,22 @@ public class DigestHelper implements Runnable {
             }
         }
 
-        store.save();
+        store.savePost(post);
         System.err.println("  Wrote " + written + " HTML files to " + contentDir);
         int skipped = articles.size() - eligible.size();
         System.err.println("  Skipped " + skipped + " articles (rating < 3)");
         return complete;
     }
 
-    static void cleanAll(String dataFile, String cacheDir) throws Exception {
-        var store = new PostStore(dataFile);
-        store.load();
+    static void cleanAll(String dataDir, String cacheDir) throws Exception {
+        var store = new PostStore(dataDir);
         var posts = store.all();
 
         System.err.println("Processing " + posts.size() + " posts...");
         for (var post : posts) {
             String date = jsonStr(post, "date");
             System.err.println("\n=== " + date + " ===");
-            writeContent(dataFile, date, cacheDir);
+            writeContent(dataDir, date, cacheDir);
         }
         System.err.println("\nDone processing all posts.");
     }
@@ -2208,9 +2164,8 @@ public class DigestHelper implements Runnable {
         }
     }
 
-    static void refreshHtml(String dataFile, String date, String cacheDir) throws Exception {
-        var store = new PostStore(dataFile);
-        store.load();
+    static void refreshHtml(String dataDir, String date, String cacheDir) throws Exception {
+        var store = new PostStore(dataDir);
         var post = store.findByDate(date);
         if (post == null) { System.err.println("  No post found for " + date); return; }
 
@@ -2260,9 +2215,8 @@ public class DigestHelper implements Runnable {
         return tag;
     }
 
-    static void syncTags(String dataFile, String feedsFile) throws IOException {
-        var store = new PostStore(dataFile);
-        store.load();
+    static void syncTags(String dataDir, String feedsFile) throws IOException {
+        var store = new PostStore(dataDir);
         var existing = parseKnownTags(feedsFile);
         var tagCounts = new TreeMap<String, Integer>();
         var renames = new LinkedHashMap<String, String>();
@@ -2280,10 +2234,10 @@ public class DigestHelper implements Runnable {
 
         if (!renames.isEmpty()) {
             System.err.println("  Normalizing tag variants: " + renames);
-            boolean modified = false;
             for (var post : store.all()) {
                 var sections = post.getAsJsonArray("sections");
                 if (sections == null) continue;
+                boolean modified = false;
                 for (var s : sections) {
                     var articles = s.getAsJsonObject().getAsJsonArray("articles");
                     if (articles == null) continue;
@@ -2302,8 +2256,8 @@ public class DigestHelper implements Runnable {
                         if (changed) { obj.add("tags", updated); modified = true; }
                     }
                 }
+                if (modified) store.savePost(post);
             }
-            if (modified) store.save();
         }
 
         var newTags = new ArrayList<String>();
@@ -2442,10 +2396,9 @@ public class DigestHelper implements Runnable {
         return names;
     }
 
-    static void resummarize(String dataFile, String date, String cacheDir) throws Exception {
+    static void resummarize(String dataDir, String date, String cacheDir) throws Exception {
         long startTime = System.currentTimeMillis();
-        var store = new PostStore(dataFile);
-        store.load();
+        var store = new PostStore(dataDir);
         var post = store.findByDate(date);
 
         try (var log = openLog(date)) {
@@ -2464,7 +2417,7 @@ public class DigestHelper implements Runnable {
             }
 
             // Backup: save pre-state to .bak file (skip if exists = resume)
-            Path backupFile = store.dataFile.resolveSibling(store.dataFile.getFileName() + "." + date + ".bak");
+            Path backupFile = store.dataDir.resolve(date + ".bak");
             boolean isResume = Files.exists(backupFile);
             if (!isResume) {
                 Files.writeString(backupFile, GSON.toJson(post));
@@ -2549,12 +2502,7 @@ public class DigestHelper implements Runnable {
             if (aiMap.isEmpty()) {
                 log(log, "  All AI calls failed. Restoring from backup.");
                 var backup = GSON.fromJson(Files.readString(backupFile), JsonObject.class);
-                int idx = -1;
-                for (int i = 0; i < store.posts.size(); i++) {
-                    if (date.equals(jsonStr(store.posts.get(i).getAsJsonObject(), "date"))) { idx = i; break; }
-                }
-                if (idx >= 0) store.posts.set(idx, backup);
-                store.save();
+                store.savePost(backup);
                 return;
             }
 
@@ -2569,7 +2517,7 @@ public class DigestHelper implements Runnable {
                 }
             }
 
-            store.save();
+            store.savePost(post);
 
             int nowSummarized = countSummarized(post);
             long elapsed = (System.currentTimeMillis() - startTime) / 1000;
@@ -2585,10 +2533,9 @@ public class DigestHelper implements Runnable {
         }
     }
 
-    static void resummarizeAll(String dataFile, String cacheDir) throws Exception {
+    static void resummarizeAll(String dataDir, String cacheDir) throws Exception {
         long startAll = System.currentTimeMillis();
-        var store = new PostStore(dataFile);
-        store.load();
+        var store = new PostStore(dataDir);
         var posts = store.all();
 
         int total = posts.size();
@@ -2604,7 +2551,7 @@ public class DigestHelper implements Runnable {
                 done++;
                 log(log, "[" + done + "/" + total + "] " + date);
                 try {
-                    resummarize(dataFile, date, cacheDir);
+                    resummarize(dataDir, date, cacheDir);
                 } catch (Exception e) {
                     errors++;
                     log(log, "  ERROR: " + e.getMessage());
@@ -2620,9 +2567,8 @@ public class DigestHelper implements Runnable {
         }
     }
 
-    static void addRating(String dataFile, String dateArg) throws Exception {
-        var store = new PostStore(dataFile);
-        store.load();
+    static void addRating(String dataDir, String dateArg) throws Exception {
+        var store = new PostStore(dataDir);
 
         List<JsonObject> posts;
         if ("all".equals(dateArg)) {
@@ -2743,7 +2689,7 @@ public class DigestHelper implements Runnable {
                     }
                 }
 
-                store.save();
+                store.savePost(post);
                 log(log, date + ": done");
             }
 

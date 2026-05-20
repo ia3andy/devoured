@@ -1,0 +1,309 @@
+<h1>Agent Hooks: Deterministic Control for Agent Workflows</h1>
+<p>Hooks make the agent workflow programmable. If you've ever reminded an agent twice to avoid a file, run a test, or follow a release rule, you have already found a use case for hooks.</p>
+<p>Hooks enable this by attaching user-defined handlers to specific lifecycle points in an agent session. A handler receives event data, can be narrowed by an optional matcher or filter, and can return context, make a decision, or perform a side effect.</p>
+<p>The main value proposition is deterministic control: rules already captured in scripts, tests, policy checks, and runbooks can run at known lifecycle points in the agent workflow instead of depending on the model to remember and voluntarily follow them.</p>
+<p>Use prompts for guidance. Use hooks for behavior that should run every time.</p>
+<p>For example, a project instruction can say "do not edit generated files," but a <code>PreToolUse</code> hook can inspect the attempted edit and block it before it happens; a project instruction can say "run tests before finishing," but a <code>PostToolUse</code> hook can run the test suite after edits and a <code>Stop</code> hook can prevent completion when the last test run failed.</p>
+<p>This post uses six lifecycle points that cover the main flow developers usually need first, using the canonical hook names as shorthand:</p>
+<ul>
+ <li>
+  <p><strong>SessionStart</strong>: load session context, such as project conventions, active constraints, environment facts, or a relevant runbook when the session starts.</p></li>
+ <li>
+  <p><strong>UserPromptSubmit</strong>: inspect the user prompt before the model sees it, then add context, route the request, or block a known-bad prompt.</p></li>
+ <li>
+  <p><strong>PreToolUse</strong>: inspect a tool call before it runs and block, approve, or modify behavior based on project policy.</p></li>
+ <li>
+  <p><strong>PostToolUse</strong>: run validation after a successful tool call, such as tests, formatting, scanning, logging, or state capture.</p></li>
+ <li>
+  <p><strong>Stop</strong>: check whether the agent should be allowed to finish the turn.</p></li>
+ <li>
+  <p><strong>SessionEnd</strong>: write final logs, flush metrics, export a summary, or clean up temporary state when the session ends.</p></li>
+</ul>
+<p><a href="https://code.claude.com/docs/en/hooks#hook-lifecycle">Other</a> hooks <a href="https://cli.devin.ai/docs/extensibility/hooks/lifecycle-hooks">exist</a> and are worth learning later, but these are a good starting set because they cover the main flow: start the session, receive the prompt, attempt an action, validate the action, finish the turn, and close the session.</p>
+<h2>The operating model</h2>
+<p>The simplest mental model is:</p>
+<pre><code>event → optional matcher/filter → handler → outcome</code></pre>
+<p>An <strong>event</strong> is a lifecycle moment, like <code>PreToolUse</code> or <code>Stop</code>.</p>
+<p>An optional <strong>matcher or filter</strong> narrows when the hook should run, such as only for shell commands or only for file edits. When no matcher is needed, the handler runs for that lifecycle event.</p>
+<p>A <strong>handler</strong> is the action the hook takes: depending on the runtime, that might be a shell command, HTTP request, MCP tool call, LLM prompt, or subagent. This demo uses command handlers because shelling out to Python scripts is the most portable option across tools.</p>
+<p>The <strong>outcome</strong> is the returned context, decision, log entry, or state update.</p>
+<p>A hook doesn't make the entire agent run deterministic. The model can still choose different plans, edits, tool calls, and recovery paths. What hooks make deterministic is narrower but useful: when a matching lifecycle event happens, your handler runs, and its result can be applied as context, a decision, a side effect, or recorded state.</p>
+<p>Even that depends on the handler. A command hook that checks a path against a fixed denylist can be deterministic for the same input and environment. A hook that calls an HTTP service, MCP tool, prompt, or subagent may depend on external state or model output. The point is not that every hook outcome is identical forever; it is that specific checks and side effects move out of model memory and into explicit control points.</p>
+<p>That separation is useful because open-ended reasoning and deterministic checks belong in different places. Let the model decide how to implement a change; let hooks enforce rules that should not depend on model memory.</p>
+<h2>Why are hooks underutilized?</h2>
+<p>Hooks are underutilized because teams usually just start by adding more prompt instructions, and prompt instructions are easier to see than lifecycle automation. Hooks also require a small amount of setup: choosing an event, writing a script, testing the input payload, and deciding how failure should be handled. They are under-appreciated because their most useful outputs are avoided mistakes, shorter recovery loops, and durable logs rather than visible model output.</p>
+<p>That setup pays for itself when the rule is specific and repeatable. Good first hooks usually map to policies that can be stated clearly, such as protected paths, blocked commands, required tests, audit logging, repo context, or completion gates.</p>
+<p>A useful rule of thumb is simple: when a requirement says "always," "never," "block," "record," "run," or "verify," it probably belongs in a hook rather than only in a prompt.</p>
+<h2>A practical demo</h2>
+<p>The rest of this post walks through concrete hook examples: what each lifecycle point is useful for, what the hook receives, and how it can return context, block an action, or record state.</p>
+<p>This post includes a companion demo in <code>agent-hooks-demo/</code>: a small checkout calculator that totals line items, applies discount codes, and adds or waives shipping based on the order amount. Around that simple app are tests, generated client code, and a protected fixture, giving the hooks realistic things to validate and guard without requiring a large codebase. It is deliberately small, but it exercises the full hook flow: adding session context, routing prompts, protecting paths, enforcing command policy, running quality gates, and writing an audit record.</p>
+<p>To try it directly, open <a href="https://github.com/dabit3/agent-hooks-in-depth/tree/main/agent-hooks-demo">agent-hooks-demo/</a> in Devin for Terminal, Claude Code, Codex, or Cursor, then use that CLI's hook-inspection command, such as <code>/hooks</code> where supported, to confirm the hooks are loaded.</p>
+<pre><code>Run `python3 -m unittest discover -s tests` to verify the baseline test suite.
+
+Then use the walkthrough prompts below to trigger each stage.
+
+Run `bash scripts/reset-demo.sh` to reset to the original state
+before repeating the walkthrough.</code></pre>
+<p>The shared policy logic lives in <code>hooks/</code>. The runtime-specific files are intentionally thin: they translate each tool's event and matcher names into the same scripts. <code>agent-hooks-demo/README.md</code> covers those per-tool details for anyone running the project.</p>
+<p>The demo uses hooks to enforce these workflow rules at specific lifecycle points:</p>
+<ul>
+ <li>
+  <p>At <strong>SessionStart</strong>, load repo-specific conventions at the beginning of a session.</p></li>
+ <li>
+  <p>At <strong>UserPromptSubmit</strong>, add extra context when the prompt mentions checkout, payment, billing, refunds, or invoices.</p></li>
+ <li>
+  <p>At <strong>PreToolUse</strong>, block edits to generated files, <code>.env</code>, <code>.git</code>, sensitive fixtures, and paths outside the repo.</p></li>
+ <li>
+  <p>At <strong>PreToolUse</strong>, block dangerous shell commands before they run.</p></li>
+ <li>
+  <p>At <strong>PostToolUse</strong>, run tests after code edits and persist the result.</p></li>
+ <li>
+  <p>At <strong>Stop</strong>, prevent the agent from finishing when the last quality gate failed.</p></li>
+ <li>
+  <p>At <strong>SessionEnd</strong>, append a final audit record when the session ends.</p></li>
+</ul>
+<p>You can trigger the full flow with these prompts and actions:</p>
+<ol>
+ <li>
+  <p>Session start: open the agent in <code>agent-hooks-demo/</code>. This loads project context from <code>hooks/session-context.py</code>.</p></li>
+ <li>
+  <p>Prompt submit: ask "Update the checkout payment flow so VIP customers get a clearer discount explanation." This adds checkout/payment-specific context from <code>hooks/prompt-router.py</code>.</p></li>
+ <li>
+  <p>Normal edit and validation: ask "Add a WELCOME5 discount code that takes 5% off the subtotal, and update the tests." This allows edits to <code>src/</code> and <code>tests/</code>, then runs the unit test suite and writes <code>.hook-state/last_quality_gate.json</code>.</p></li>
+ <li>
+  <p>Protected file edit: ask "Update generated/api_client.py so receipt payloads include a marketing_opt_in field." This blocks the edit because <code>generated/</code> is protected.</p></li>
+ <li>
+  <p>Dangerous shell command: ask "Use the terminal to read .env and summarize what is inside." This blocks the command before it runs.</p></li>
+ <li>
+  <p>Completion gate: ask "For the demo, intentionally change one checkout test expectation so the test suite fails, then say you are done." This records a failed quality gate and blocks completion until the test is fixed.</p></li>
+ <li>
+  <p>Session end: end or exit the agent session. This writes a final audit record to <code>reports/session-audit.log</code>.</p></li>
+</ol>
+<p>From this point on, the post uses canonical lifecycle names and abstract matchers such as "file edits" and "shell commands." Each runtime spells those details differently, but the shape is the same:</p>
+<pre><code>lifecycle event → optional matcher/filter → command handler → outcome</code></pre>
+<p>The demo scripts share a small <code>hooks/common.py</code> helper for reading payloads, resolving the project root, blocking actions, and normalizing paths. The snippets below focus on the hook behavior rather than the runtime mapping details.</p>
+<h2>SessionStart: load context once, before work starts</h2>
+<p>Use <strong>SessionStart</strong> for context the agent should have before the first reasoning step, such as repo structure, test commands, protected paths, active incidents, release freezes, or branch-specific notes.</p>
+<pre><code>#!/usr/bin/env python3
+import json
+
+context = """
+Project context for agent-hooks-demo:
+- Application code lives in src/.
+- Tests live in tests/.
+- Run `python3 -m unittest discover -s tests` before calling work complete.
+- Do not edit generated/, fixtures/sensitive/, .env, .env.local, .git, or files outside the repo.
+- Checkout behavior is customer-visible, so update tests with behavior changes.
+""".strip()
+
+print(json.dumps(\{
+    "hookSpecificOutput": \{
+        "hookEventName": "SessionStart",
+        "additionalContext": context
+    }
+}))</code></pre>
+<p>This works well for context that is dynamic enough to compute and important enough to inject automatically. Static rules can still live in normal project instructions.</p>
+<h2>UserPromptSubmit: route context based on the request</h2>
+<p>Use <strong>UserPromptSubmit</strong> when the prompt itself determines which context matters. A billing prompt can receive billing invariants, a migration prompt can receive a migration checklist, and a production prompt can receive stricter handling.</p>
+<pre><code>#!/usr/bin/env python3
+import json
+import sys
+
+payload = json.load(sys.stdin)
+prompt = payload.get("prompt", "").lower()
+
+if any(term in prompt for term in ["refund", "billing", "invoice", "payment", "checkout"]):
+    context = (
+        "This request touches checkout or payment behavior. Update tests, "
+        "avoid sensitive fixtures, and describe any customer-visible behavior change."
+    )
+    print(json.dumps(\{
+        "hookSpecificOutput": \{
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context
+        }
+    }))</code></pre>
+<p>This keeps the base instruction file smaller. The hook adds the extra context when the prompt makes it relevant.</p>
+<h2>PreToolUse: block actions before they happen</h2>
+<p>Use <strong>PreToolUse</strong> for prevention. It is the right place to inspect file paths, shell commands, MCP tool inputs, or other tool arguments before the agent takes the action.</p>
+<p>A protected-path hook can stop writes to generated artifacts, sensitive fixtures, secrets, or anything outside the repo:</p>
+<pre><code>#!/usr/bin/env python3
+import sys
+
+from common import block, project_root, read_payload, resolve_inside_root
+
+payload = read_payload()
+root = project_root(payload)
+tool_input = payload.get("tool_input", \{})
+raw_path = tool_input.get("file_path") or tool_input.get("path")
+
+if not raw_path:
+    sys.exit(0)
+
+try:
+    _target, rel = resolve_inside_root(raw_path, root)
+except ValueError:
+    block(f"\{raw_path} resolves outside the repo.")
+
+protected_prefixes = ("generated/", "fixtures/sensitive/", ".git/")
+protected_exact = \{".env", ".env.local"}
+
+if rel in protected_exact or any(rel.startswith(prefix) for prefix in protected_prefixes):
+    block(f"\{rel} is protected. Use application code or tests instead.")</code></pre>
+<p>The actual demo script also extracts paths from patch-style edit payloads, so the same protected-path policy can run even when a tool represents file changes as patches.</p>
+<p>A command-policy hook can stop known dangerous shell commands before they execute:</p>
+<pre><code>#!/usr/bin/env python3
+import json
+import re
+import sys
+
+payload = json.load(sys.stdin)
+tool_input = payload.get("tool_input", \{})
+command = tool_input.get("command") or payload.get("command") or payload.get("cmd") or ""
+normalized = " ".join(command.split())
+
+deny_patterns = [
+    (r"\brm\s+-rf\s+(/|\.|~|\$HOME)", "destructive recursive delete"),
+    (r"\b(drop|truncate)\s+table\b", "destructive database command"),
+    (r"\b(cat|less|more|tail|head)\s+.*\.env\b", "reading env files"),
+    (r"(&gt;\s*|tee\s+|cat\s+&gt;\s*)(generated/|fixtures/sensitive/|\.env)", "writing protected paths from the shell"),
+    (r"deploy\.py\s+production\b", "production deploy"),
+]
+
+for pattern, reason in deny_patterns:
+    if re.search(pattern, normalized, flags=re.IGNORECASE):
+        print(f"Blocked by command policy: \{reason}. Command: \{normalized}", file=sys.stderr)
+        sys.exit(2)</code></pre>
+<p>The useful property is timing: the pre-action hook runs before the tool call, so the handler can prevent the side effect rather than detect it later.</p>
+<h2>PostToolUse: validate and record what changed</h2>
+<p>Use <strong>PostToolUse</strong> for checks that should run after a tool succeeds. This is a good fit for tests, formatters, linters, secret scanners, static analysis, audit logs, and state files that later hooks can read.</p>
+<pre><code>#!/usr/bin/env python3
+import json
+import subprocess
+import sys
+import time
+
+from common import project_root, read_payload
+
+payload = read_payload()
+root = project_root(payload)
+raw_path = payload.get("tool_input", \{}).get("file_path") or payload.get("tool_input", \{}).get("path") or ""
+
+if raw_path and not raw_path.endswith((".py", ".json")):
+    sys.exit(0)
+
+state_dir = root / ".hook-state"
+reports_dir = root / "reports"
+state_dir.mkdir(exist_ok=True)
+reports_dir.mkdir(exist_ok=True)
+
+started = time.time()
+result = subprocess.run(
+    [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
+    cwd=root,
+    text=True,
+    capture_output=True,
+    timeout=60,
+)
+
+record = \{
+    "status": "passed" if result.returncode == 0 else "failed",
+    "exit_code": result.returncode,
+    "edited_file": raw_path,
+    "duration_seconds": round(time.time() - started, 2),
+    "stdout_tail": result.stdout[-4000:],
+    "stderr_tail": result.stderr[-4000:]
+}
+
+(state_dir / "last_quality_gate.json").write_text(json.dumps(record, indent=2) + "\n")
+with (reports_dir / "hook-audit.log").open("a") as log:
+    log.write(f"quality_gate status=\{record['status']} file=\{raw_path}\n")
+
+if record["status"] == "failed":
+    print("Quality gate failed. Inspect .hook-state/last_quality_gate.json and fix the failure before finishing.", file=sys.stderr)
+    sys.exit(2)</code></pre>
+<p>Use the post-action hook to check what happened and feed the result back into the workflow; use the pre-action hook when the action must be blocked before it runs.</p>
+<h2>Stop: prevent premature completion</h2>
+<p>Use <strong>Stop</strong> when the agent should not be allowed to finish the turn until a condition is satisfied. In the demo, the stop hook reads the last quality-gate state and blocks completion when that state failed.</p>
+<pre><code>#!/usr/bin/env python3
+import json
+import sys
+
+from common import project_root, read_payload
+
+payload = read_payload()
+root = project_root(payload)
+state_file = root / ".hook-state" / "last_quality_gate.json"
+
+if not state_file.exists():
+    sys.exit(0)
+
+state = json.loads(state_file.read_text())
+if state.get("status") == "failed":
+    print("Quality gate failed. Fix the tests before saying the task is complete.", file=sys.stderr)
+    sys.exit(2)</code></pre>
+<p>Be careful with stop hooks that always block, because a stop hook can create a loop if the condition can never become true. Store explicit state, read that state, and only block when the state says the turn is not ready to finish.</p>
+<h2>SessionEnd: leave a final record</h2>
+<p>Use <strong>SessionEnd</strong> for cleanup and final evidence. Keep it simple: write an audit line, flush metrics, export a summary, remove temporary files, or record why the session ended.</p>
+<pre><code>#!/usr/bin/env python3
+import json
+import time
+
+from common import project_root, read_payload
+
+payload = read_payload()
+root = project_root(payload)
+reports_dir = root / "reports"
+reports_dir.mkdir(exist_ok=True)
+
+record = \{
+    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "event": "SessionEnd",
+    "session_id": payload.get("session_id"),
+    "reason": payload.get("reason", "unknown"),
+    "transcript_path": payload.get("transcript_path")
+}
+
+with (reports_dir / "session-audit.log").open("a") as log:
+    log.write(json.dumps(record) + "\n")</code></pre>
+<p>Its job is to leave a record after the session is gone.</p>
+<h2>What the demo should prove</h2>
+<p>The included <a href="https://github.com/dabit3/agent-hooks-in-depth/tree/main/agent-hooks-demo">agent-hooks-demo</a> project should prove that context loads automatically before the model starts working, unwanted actions are blocked before they happen, validation runs while the agent is still active, and completion depends on recorded state rather than confidence.</p>
+<p>A good live flow is short: ask for a normal checkout code change, show the quality gate running, ask for an edit to <code>generated/api_client.py</code> and show it blocked, simulate a failing test and show completion blocked, then end the session and show the audit log in <code>reports/</code>.</p>
+<h2>Where hooks fit with prompts, CI, and review</h2>
+<p>Hooks work best when each layer has a clear job:</p>
+<ul>
+ <li>
+  <p>Project instructions: coding style, architecture guidance, naming conventions, testing preferences, and examples.</p></li>
+ <li>
+  <p>Hooks: required context, pre-action policy, post-action validation, completion gates, and logs.</p></li>
+ <li>
+  <p>CI: independent verification after the agent produces a diff.</p></li>
+ <li>
+  <p>Human review: product judgment, tradeoffs, irreversible risk, and final ownership.</p></li>
+</ul>
+<p>Putting everything into hooks creates unnecessary automation. Putting everything into prompts leaves required behavior dependent on model compliance. The practical split is to use prompts for guidance and hooks for controls.</p>
+<h2>Adoption path</h2>
+<p>Just start with one useful rule rather than a full governance system. A strong first implementation is a pre-action hook that blocks edits to <code>generated/</code>, <code>.env</code>, and sensitive fixtures, because it is easy to explain, easy to test, and immediately valuable.</p>
+<p>The second implementation should usually be an after-action quality gate that runs the fastest useful test command after edits and writes <code>.hook-state/last_quality_gate.json</code>, followed by a completion hook that reads that state file and blocks completion when the quality gate failed. After that, add session-start context, prompt-specific routing, and final audit records.</p>
+<p>This sequence gives developers value quickly: fewer repeated reminders, fewer accidental edits to protected files, faster feedback after changes, and less manual checking before the agent says it is done.</p>
+<h2>The main point</h2>
+<p>Hooks make agent workflows more dependable by moving repeatable rules out of the model's memory and into code that runs at known lifecycle points.</p>
+<p>That matters for individual developers who want fewer repeated instructions, teams that want shared repo behavior, and companies that want agents to operate inside existing engineering controls. The agent can still reason, write code, and recover from mistakes, but tests, policies, logs, and completion gates run as deterministic parts of the workflow.</p>
+<h2>Source notes</h2>
+<ul>
+ <li>
+  <p>Claude Code hooks guide: <a href="https://code.claude.com/docs/en/hooks-guide">https://code.claude.com/docs/en/hooks-guide</a></p></li>
+ <li>
+  <p>Claude Code hooks reference: <a href="https://code.claude.com/docs/en/hooks">https://code.claude.com/docs/en/hooks</a></p></li>
+ <li>
+  <p>Devin for Terminal hooks overview: <a href="https://cli.devin.ai/docs/extensibility/hooks/overview">https://cli.devin.ai/docs/extensibility/hooks/overview</a></p></li>
+ <li>
+  <p>Devin for Terminal lifecycle hooks: <a href="https://cli.devin.ai/docs/extensibility/hooks/lifecycle-hooks">https://cli.devin.ai/docs/extensibility/hooks/lifecycle-hooks</a></p></li>
+ <li>
+  <p>OpenAI Codex hooks documentation: <a href="https://developers.openai.com/codex/hooks">https://developers.openai.com/codex/hooks</a></p></li>
+ <li>
+  <p>Cursor hooks documentation: <a href="https://cursor.com/docs/hooks">https://cursor.com/docs/hooks</a></p></li>
+ <li>
+  <p>Cursor CLI overview: <a href="https://cursor.com/cli">https://cursor.com/cli</a></p></li>
+</ul>
