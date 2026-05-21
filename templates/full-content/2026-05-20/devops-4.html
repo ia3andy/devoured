@@ -1,0 +1,326 @@
+<h1>Back up and restore your Amazon EKS cluster resources using Velero</h1>
+<p>When you accidentally delete a production namespace or a cluster upgrade fails, rebuilding your Amazon Elastic Kubernetes Service (Amazon EKS) cluster resources means recreating every deployment, service, and persistent volume manually. With Velero, a backup and restore tool for Kubernetes, you capture resource definitions to Amazon Simple Storage Service (Amazon S3) and persistent volume data as Amazon Elastic Block Store (Amazon EBS) snapshots. Velero supports cross-cluster restores, namespace-level granularity, and portability across Kubernetes distributions. If you need centralized, fully managed backup scheduling instead, AWS Backup for Amazon EKS handles that for you.</p>
+<p>In this post, you’ll learn to back up and restore Amazon EKS cluster resources and persistent volume data using Velero. You’ll deploy a sample stateful application, back it up, and restore it to a different namespace within the same cluster. Along the way, you’ll configure least-privilege AWS Identity and Access Management (AWS IAM) roles using Amazon EKS Pod Identity and scope Velero’s Kubernetes permissions with a custom ClusterRole. A ClusterRole is a Kubernetes resource that defines cluster-wide permissions.</p>
+<h2>Prerequisites</h2>
+<p>You’ll spend 45 to 60 minutes on this tutorial and incur costs for Amazon S3 storage (based on data stored), Amazon EBS snapshots (based on snapshot storage), and Amazon EKS cluster usage (based on cluster runtime). For detailed pricing information, see Amazon S3 Pricing, Amazon EBS Pricing, and Amazon EKS Pricing. Clean up instructions at the end help you remove all billable resources. To complete this tutorial, make sure you have the following:</p>
+<ul>
+ <li>An active AWS account with permissions to create Amazon S3 buckets, IAM policies and roles, and Amazon EKS resources</li>
+ <li>An Amazon EKS cluster running Kubernetes 1.35 or later with Amazon EKS Auto Mode enabled. Auto Mode automates networking, node provisioning and scaling. You can use eksctl to create this cluster – Refer steps here</li>
+ <li>AWS CLI v2, Helm v3.x, and kubectl installed and configured</li>
+ <li>Experience with Kubernetes concepts such as pods, deployments, and persistent volumes, and with IAM roles</li>
+</ul>
+<p>The default Velero installation uses cluster-admin, which grants broad access to cluster resources. This tutorial replaces it with a least-privilege ClusterRole. Follow those steps for non-demo environments.</p>
+<h2>Velero overview</h2>
+<p>Velero is an open-source tool that backs up and restores Kubernetes cluster resources and persistent volumes. Unlike traditional backup solutions that require direct access to storage systems, Velero works through the Kubernetes API to discover and back up resources. This API-driven approach provides several advantages:</p>
+<ul>
+ <li>Kubernetes-native: Velero understands Kubernetes resources and their relationships</li>
+ <li>Flexible filtering: You can scope backups by namespace, resource type, or label</li>
+ <li>Cloud-agnostic: The same backup can be restored to different Kubernetes distributions</li>
+ <li>Snapshot integration: Velero integrates with cloud provider snapshot APIs for persistent volume backups</li>
+</ul>
+<p>An application-level backup in Amazon EKS targets two components:</p>
+<ul>
+ <li>Kubernetes objects and configurations stored in the EKS control plane</li>
+ <li>Application data stored in persistent volumes</li>
+</ul>
+<p>Refer to the Velero documentation for details on resource filtering.</p>
+<p><strong>Backup and Restore Workflow</strong></p>
+<p><img src="https://d2908q01vomqb2.cloudfront.net/fe2ef495a1152561572949784c16bf23abb28057/2026/05/12/Velero.png" alt=""></p>
+<p>Velero uses a controller deployed as a Kubernetes Deployment to perform backup and restore tasks. A user submits a Backup manifest or Restore manifest (Custom Resource) to EKS, for the Velero controller to perform Backup or Restore. Velero documentation provides details on how they work here.</p>
+<h2>Tutorial</h2>
+<p>This tutorial uses Amazon EKS Auto Mode to simplify cluster management. Velero does not require Auto Mode and works on any Amazon EKS cluster. The walkthrough backs up an application in namespace <code>myprimary</code> and restores it to another namespace <code>myrestore</code> in the same cluster.</p>
+<h3>Set up environment variables</h3>
+<p>Substitute your cluster name and Region in the following exports. The tutorial references these variables in every subsequent step.</p>
+<pre><code>export CLUSTER_NAME=&lt;&lt;Cluster Name&gt;&gt;
+export AWS_REGION=&lt;&lt;AWS region&gt;&gt;
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --no-cli-pager)
+export BUCKET_NAME=velero-backups-$(date +%s)
+export POLICY_NAME=VeleroBackupPolicy
+export ROLE_NAME=VeleroBackupRole
+export AWS_PAGER=""</code></pre>
+<h3>Configure Amazon S3 and IAM</h3>
+<p>First, provision the Amazon S3 bucket where Velero stores backup data.</p>
+<pre><code>aws s3 mb s3://$\{BUCKET_NAME} --region $\{AWS_REGION}</code></pre>
+<p>Next, define an IAM policy granting Velero read/write access to the bucket and Amazon EBS snapshot permissions.</p>
+<pre><code>cat &gt; velero-s3-policy.json &lt;&lt;EOF
+\{
+  "Version": "2012-10-17",
+  "Statement": [
+    \{
+      "Effect": "Allow",
+      "Action": ["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:GetBucketLocation","s3:GetBucketVersioning","s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
+      "Resource": ["arn:aws:s3:::$\{BUCKET_NAME}","arn:aws:s3:::$\{BUCKET_NAME}/*"]
+    },
+    \{
+      "Effect": "Allow",
+      "Action": ["ec2:CreateSnapshot","ec2:DeleteSnapshot","ec2:DescribeSnapshots","ec2:DescribeVolumes","ec2:DescribeVolumeAttribute","ec2:DescribeVolumesModifications","ec2:DescribeVolumeStatus","ec2:CreateTags","ec2:DescribeTags"],
+      "Resource": "*"
+    }
+  ]
+}
+EOF
+aws iam create-policy --policy-name $\{POLICY_NAME} --policy-document file://velero-s3-policy.json</code></pre>
+<p>The following commands capture the policy ARN, set up an IAM role with EKS Pod Identity trust, and attach the policy. Using EKS Pod Identity, your Kubernetes pods can assume IAM roles without managing credentials.</p>
+<pre><code>export POLICY_ARN=$(aws iam list-policies --query "Policies[?PolicyName=='$\{POLICY_NAME}'].Arn" --output text --no-cli-pager)
+cat &gt; velero-trust-policy.json &lt;&lt;EOF
+\{
+  "Version": "2012-10-17",
+  "Statement": [\{
+    "Effect": "Allow",
+    "Principal": \{"Service": "pods.eks.amazonaws.com"},
+    "Action": ["sts:AssumeRole","sts:TagSession"],
+    "Condition": \{"StringEquals": \{"aws:RequestTag/kubernetes-namespace": "velero","aws:RequestTag/kubernetes-service-account": "velero"}}
+  }]
+}
+EOF
+aws iam create-role --role-name $\{ROLE_NAME} --assume-role-policy-document file://velero-trust-policy.json
+aws iam attach-role-policy --role-name $\{ROLE_NAME} --policy-arn $\{POLICY_ARN}</code></pre>
+<p>With the role created, capture its ARN and associate the Velero service account through Pod Identity.</p>
+<pre><code>export ROLE_ARN=$(aws iam get-role --role-name $\{ROLE_NAME} --query Role.Arn --output text)
+aws eks create-pod-identity-association --cluster-name $\{CLUSTER_NAME} --namespace velero --service-account velero --role-arn $\{ROLE_ARN} --region $\{AWS_REGION}</code></pre>
+<h3>Install Velero</h3>
+<p>Velero uses Amazon EBS snapshots to take backup of Volumes. This requires the snapshot controller add-on to be installed on you EKS cluster. Connect to your cluster and install it first.</p>
+<pre><code>aws eks update-kubeconfig --name $\{CLUSTER_NAME}
+aws eks create-addon --cluster-name $\{CLUSTER_NAME} --addon-name snapshot-controller --region $\{AWS_REGION}</code></pre>
+<p>Generate the Helm values file for Velero chart install. This configures Velero to use your Amazon S3 bucket for backup storage, your Region for Amazon EBS snapshots, and Pod Identity for authentication.</p>
+<pre><code>cat &gt; velero-values.yaml &lt;&lt;EOF
+configuration:
+  backupStorageLocation:
+  - name: default
+    provider: aws
+    bucket: $\{BUCKET_NAME}
+    config:
+      region: $\{AWS_REGION}
+  volumeSnapshotLocation:
+  - name: default
+    provider: aws
+    config:
+      region: $\{AWS_REGION}
+  features: EnableCSI
+credentials:
+  useSecret: false
+serviceAccount:
+  server:
+    create: true
+    name: velero
+initContainers:
+- name: velero-plugin-for-aws
+  image: velero/velero-plugin-for-aws:v1.10.0
+  volumeMounts:
+  - mountPath: /target
+    name: plugins
+upgradeCRDs: false
+cleanUpCRDs: false
+EOF</code></pre>
+<p>Install Velero with Helm and verify the pod is running.</p>
+<pre><code>helm repo add vmware-tanzu https://vmware-tanzu.github.io/helm-charts
+helm repo update
+helm install velero vmware-tanzu/velero --version 11.4.0 --namespace velero --create-namespace --values velero-values.yaml
+kubectl get pods -n velero</code></pre>
+<p>The default Velero installation binds to cluster-admin, granting broader permissions than necessary. Replace it with a least-privilege ClusterRole that scopes permissions to only what Velero needs.</p>
+<pre><code>cat &gt; velero-cluster-role.yaml &lt;&lt;EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: velero-restricted
+rules:
+- apiGroups: [""]
+  resources: [namespaces,persistentvolumes,persistentvolumeclaims,pods,services,configmaps,secrets]
+  verbs: ["get","list","watch","create","update","patch","delete"]
+- apiGroups: ["apps"]
+  resources: [deployments,replicasets]
+  verbs: ["get","list","watch","create","update","patch","delete"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: [clusterrolebindings]
+  verbs: ["get","list"]
+- apiGroups: ["storage.k8s.io"]
+  resources: [storageclasses]
+  verbs: ["get","list","watch"]
+- apiGroups: ["snapshot.storage.k8s.io"]
+  resources: [volumesnapshots,volumesnapshotcontents,volumesnapshotclasses]
+  verbs: ["get","list","watch","create","update","patch","delete"]
+- apiGroups: ["velero.io"]
+  resources: [backups,backups/status,restores,restores/status,schedules,schedules/status,backupstoragelocations,backupstoragelocations/status,volumesnapshotlocations,volumesnapshotlocations/status,podvolumebackups,podvolumebackups/status,podvolumerestores,podvolumerestores/status,backuprepositories,backuprepositories/status]
+  verbs: ["get","list","watch","create","update","patch","delete"]
+EOF
+kubectl apply -f velero-cluster-role.yaml
+kubectl delete clusterrolebinding velero-server
+kubectl create clusterrolebinding velero-restricted-binding --clusterrole=velero-restricted --serviceaccount=velero:velero</code></pre>
+<p>Now define a VolumeSnapshotClass. This Kubernetes resource specifies the Container Storage Interface (CSI) driver for Amazon EBS snapshots. See the Kubernetes VolumeSnapshotClass documentation for options.</p>
+<pre><code>cat &gt; snapshot-class.yaml &lt;&lt;EOF
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: ebs-csi-snapclass
+  labels:
+    velero.io.csi-volumesnapshot-class: "true"
+  annotations:
+    snapshot.storage.kubernetes.io/is-default-class: "true"
+driver: ebs.csi.eks.amazonaws.com
+deletionPolicy: Delete
+EOF
+kubectl apply -f snapshot-class.yaml</code></pre>
+<p>Restart Velero and verify storage locations are available.</p>
+<pre><code>kubectl rollout restart deployment/velero -n velero
+kubectl get backupstoragelocation -n velero
+# Expected: PHASE=Available</code></pre>
+<h2>Back up an application</h2>
+<p>Deploy a sample application that mounts a PersistentVolumeClaim (PVC). A PVC is a Kubernetes request for storage that provisions an Amazon EBS volume. The application writes timestamped messages to a file that you use to verify the restore. The following manifest deploys the application in the myprimary namespace. It creates the namespace, a StorageClass for encrypted gp3 Amazon EBS volumes, a PVC, and a Deployment that writes to the persistent volume.</p>
+<pre><code>cat &gt; deployment-demo-app.yaml &lt;&lt;EOF
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: myprimary
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: auto-ebs-sc
+provisioner: ebs.csi.eks.amazonaws.com
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  type: gp3
+  encrypted: "true"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: auto-ebs-claim
+  namespace: myprimary
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: auto-ebs-sc
+  resources:
+    requests:
+      storage: 8Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-stateful-app
+  namespace: myprimary
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-stateful-app
+  template:
+    metadata:
+      labels:
+        app: demo-stateful-app
+    spec:
+      terminationGracePeriodSeconds: 0
+      nodeSelector:
+        eks.amazonaws.com/compute-type: auto
+      containers:
+      - name: bash
+        image: public.ecr.aws/docker/library/bash:4.4
+        command: ["/usr/local/bin/bash"]
+        args: ["-c", "while true; do echo \"Message from \$POD_NAMESPACE - \$(date -u)\" &gt;&gt; /data/out.txt; sleep 15; done"]
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        resources:
+          requests:
+            cpu: "100m"
+        volumeMounts:
+        - name: persistent-storage
+          mountPath: /data
+      volumes:
+      - name: persistent-storage
+        persistentVolumeClaim:
+          claimName: auto-ebs-claim
+EOF
+kubectl apply -f deployment-demo-app.yaml</code></pre>
+<p>Verify the pod is running. Node provisioning by Amazon EKS might take a couple of minutes.</p>
+<pre><code>kubectl get po -n myprimary
+kubectl exec -n myprimary "$(kubectl get pods -n myprimary -l app=demo-stateful-app -o=jsonpath='\{.items[0].metadata.name}')" -- cat /data/out.txt</code></pre>
+<p>Define a Velero Backup custom resource for the myprimary namespace. This YAML scopes the backup to specific resource types and triggers Amazon EBS snapshots for persistent volumes. See the Velero Backup API documentation for filtering options.</p>
+<pre><code>cat &gt; myprimary-backup.yaml &lt;&lt;EOF
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: backup-myprimary
+  namespace: velero
+spec:
+  includedNamespaces: [myprimary]
+  includedResources: [deployments,pods,persistentvolumeclaims,persistentvolumes,services,configmaps,secrets]
+  snapshotVolumes: true
+  defaultVolumesToFsBackup: false
+  ttl: 720h0m0s
+EOF
+kubectl apply -f myprimary-backup.yaml</code></pre>
+<p>After a couple of minutes, confirm the backup completed.</p>
+<pre><code>kubectl describe backup backup-myprimary -n velero
+# Look for Phase: Completed</code></pre>
+<h2>Restore an application</h2>
+<p>Restore the backup to a new namespace called myrestore. Velero’s namespace mapping redirects resources from myprimary to myrestore. Apply the Restore custom resource. This YAML specifies which backup to restore and how to map namespaces.</p>
+<pre><code>cat &gt; myprimary-restore.yaml &lt;&lt;EOF
+apiVersion: velero.io/v1
+kind: Restore
+metadata:
+  name: myprimary-restore
+  namespace: velero
+spec:
+  backupName: backup-myprimary
+  namespaceMapping:
+    myprimary: myrestore
+  preserveNodePorts: true
+  restorePVs: true
+EOF
+kubectl apply -f myprimary-restore.yaml</code></pre>
+<p>Confirm the restore completed.</p>
+<pre><code>kubectl describe restore myprimary-restore -n velero
+# Look for Phase: Completed</code></pre>
+<p>Check the data file on the restored pod.</p>
+<pre><code>kubectl exec -n myrestore "$(kubectl get pods -n myrestore -l app=demo-stateful-app -o=jsonpath='\{.items[0].metadata.name}')" -- cat /data/out.txt</code></pre>
+<p>The output shows messages from myprimary, confirming that Velero restored the persistent volume data from the Amazon EBS snapshot.</p>
+<h2>Clean up</h2>
+<p>Remove the resources you provisioned to stop incurring charges for Amazon S3 storage, Amazon EBS snapshots, and Amazon EKS compute.</p>
+<pre><code>kubectl delete -f deployment-demo-app.yaml
+kubectl delete namespace myrestore
+helm uninstall velero -n velero
+kubectl delete namespace velero
+kubectl delete clusterrolebinding velero-restricted-binding
+kubectl delete clusterrole velero-restricted
+aws eks delete-addon --cluster-name $\{CLUSTER_NAME} --addon-name snapshot-controller --region $\{AWS_REGION}
+aws s3 rb s3://$BUCKET_NAME --force
+aws iam detach-role-policy --role-name VeleroBackupRole --policy-arn $\{POLICY_ARN}
+aws iam delete-role --role-name VeleroBackupRole
+aws iam delete-policy --policy-arn $\{POLICY_ARN}</code></pre>
+<p>Also check the Amazon EBS console for remaining snapshots or volumes and delete them manually.</p>
+<h2>Conclusion</h2>
+<p>You configured Velero on Amazon EKS to back up and restore Kubernetes cluster resources and persistent volume data with least-privilege AWS IAM roles and a scoped ClusterRole. To build on what you’ve learned, try these next steps:</p>
+<ul>
+ <li>Automate daily backups of your production namespaces with a Velero Schedule resource.</li>
+ <li>Test a cross-cluster restore to a second Amazon EKS cluster in a different Region using the Velero disaster recovery documentation.</li>
+ <li>Evaluate AWS Backup for Amazon EKS and compare centralized scheduling against namespace-level granularity and cross-cluster portability.</li>
+ <li>Harden your cluster security by reviewing the Amazon EKS security best practices guide.</li>
+</ul>
+<p>Share your experiences in the AWS containers community forum.</p>
+<p>For reference, see the following resources:</p>
+<ul>
+ <li>Velero documentation</li>
+ <li>Amazon EKS User Guide</li>
+ <li>Amazon EKS Pod Identity</li>
+ <li>Amazon EBS CSI driver</li>
+ <li>IAM best practices for Amazon EKS</li>
+ <li>Amazon S3 bucket policies</li>
+ <li>AWS Backup Developer Guide</li>
+</ul>
+<table>
+ <tbody>
+  <tr>
+   <td>Interested in hands-on experience? 
+    <ul>
+     <li>Register for a guided hands-on ECS workshop</li>
+     <li>Register for a guided hands-on EKS workshop</li>
+    </ul></td>
+  </tr>
+ </tbody>
+</table>
+<hr>
+<h2>About the authors</h2>
