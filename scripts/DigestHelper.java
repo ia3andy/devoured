@@ -657,8 +657,9 @@ public class DigestHelper implements Runnable {
                 System.err.println("Limiting to " + maxArticles + " articles per feed (test mode).");
             }
 
+            var results = new ArrayList<PostResult>();
             if (date != null) {
-                generatePost(date, dataDir, feedsFile, cacheDir, feeds, maxArticles);
+                results.add(generatePost(date, dataDir, feedsFile, cacheDir, feeds, maxArticles));
             } else {
                 var store = new PostStore(dataDir);
                 String lastDate = null;
@@ -670,18 +671,24 @@ public class DigestHelper implements Runnable {
                 java.time.LocalDate end = java.time.LocalDate.now().minusDays(1);
                 if (lastDate == null) {
                     System.err.println("No existing posts. Generating for yesterday (" + end + ").");
-                    generatePost(end.toString(), dataDir, feedsFile, cacheDir, feeds, maxArticles);
+                    results.add(generatePost(end.toString(), dataDir, feedsFile, cacheDir, feeds, maxArticles));
                 } else {
                     java.time.LocalDate start = java.time.LocalDate.parse(lastDate).plusDays(1);
                     if (!start.isAfter(end)) {
                         System.err.println("Backfilling from " + start + " to " + end + "...");
                         for (java.time.LocalDate d = start; !d.isAfter(end); d = d.plusDays(1)) {
-                            generatePost(d.toString(), dataDir, feedsFile, cacheDir, feeds, maxArticles);
+                            results.add(generatePost(d.toString(), dataDir, feedsFile, cacheDir, feeds, maxArticles));
                         }
                     } else {
                         System.err.println("Already up to date (last post: " + lastDate + ").");
                     }
                 }
+            }
+            results.removeIf(Objects::isNull);
+            if (!results.isEmpty()) {
+                var summary = results.stream().map(PostResult::toString).collect(Collectors.joining("\n"));
+                Files.writeString(root.resolve(".digest-summary"), summary);
+                System.err.println("\n" + summary);
             }
 
             // Backfill missing summaries from recent posts (e.g. from previous budget-limited runs)
@@ -741,14 +748,21 @@ public class DigestHelper implements Runnable {
         return sb.toString();
     }
 
-    static void generatePost(String targetDate, String dataDir, String feedsFile,
+    record PostResult(String date, boolean published, int sections, int articles, String note) {
+        @Override public String toString() {
+            String status = published ? "published" : "draft";
+            return date + " " + status + " (" + sections + " sections, " + articles + " articles" + (note.isEmpty() ? "" : ", " + note) + ")";
+        }
+    }
+
+    static PostResult generatePost(String targetDate, String dataDir, String feedsFile,
                              String cacheDir, List<Feed> feeds, int maxArticles) throws Exception {
         var store = new PostStore(dataDir);
         var existingPost = store.findByDate(targetDate);
         boolean isDraft = existingPost != null && existingPost.has("draft") && existingPost.get("draft").getAsBoolean();
         if (existingPost != null && !isDraft) {
             System.err.println("Post for " + targetDate + " already exists, skipping.");
-            return;
+            return null;
         }
         var existingSections = new HashSet<String>();
         if (isDraft && existingPost.has("sections")) {
@@ -798,7 +812,7 @@ public class DigestHelper implements Runnable {
 
             if (enrichedFiles.isEmpty()) {
                 System.err.println("  No feeds found for " + targetDate + ", skipping.");
-                return;
+                return new PostResult(targetDate, false, 0, 0, "no feeds");
             }
 
             // Phase 2: deduplicate across all enriched files
@@ -842,7 +856,7 @@ public class DigestHelper implements Runnable {
 
             if (allSections.isEmpty()) {
                 System.err.println("  Error: no output for " + targetDate);
-                return;
+                return new PostResult(targetDate, false, 0, 0, "no sections");
             }
 
             // Generate digest description
@@ -891,14 +905,20 @@ public class DigestHelper implements Runnable {
             System.err.println("  Writing article content files...");
             boolean contentComplete = writeContent(dataDir, targetDate, cacheDir);
 
-            var published = store.findByDate(targetDate);
-            if (published != null && contentComplete) {
-                published.remove("draft");
-                store.savePost(published);
+            int totalArticles = allSections.stream().mapToInt(s -> s.getAsJsonArray("articles").size()).sum();
+            var finalPost = store.findByDate(targetDate);
+            boolean isPublished = false;
+            if (finalPost != null && contentComplete) {
+                finalPost.remove("draft");
+                store.savePost(finalPost);
+                isPublished = true;
                 System.err.println("  Post published for " + targetDate);
-            } else if (published != null) {
+            } else if (finalPost != null) {
                 System.err.println("  Post kept as draft for " + targetDate + " (content incomplete, re-run to finish)");
             }
+
+            return new PostResult(targetDate, isPublished, allSections.size(), totalArticles,
+                    contentComplete ? "" : "content incomplete");
 
         } finally {
             // Clean up temp directory
@@ -1705,8 +1725,8 @@ public class DigestHelper implements Runnable {
         .runSubscriptionOn(Infrastructure.getDefaultWorkerPool())
         .onItem().delayIt().by(Duration.ofSeconds(apiDelaySeconds))
         .onFailure(ModelOverloadedException.class).recoverWithUni(t -> {
-            if (attempt >= 5) return Uni.createFrom().failure(new RuntimeException("Model unavailable after 5 retries: " + t.getMessage()));
-            logStep("503 " + context, t.getMessage() + " (retry " + (attempt + 1) + "/5 in 30s)");
+            if (attempt >= 15) return Uni.createFrom().failure(new RuntimeException("Model unavailable after 15 retries: " + t.getMessage()));
+            logStep("503 " + context, t.getMessage() + " (retry " + (attempt + 1) + "/15 in 30s)");
             return Uni.createFrom().voidItem()
                     .onItem().delayIt().by(Duration.ofSeconds(30))
                     .chain(() -> callOpenAIAPI(endpoint, token, model, context, systemPrompt, userMessage, jsonSchema, attempt + 1));
