@@ -1746,12 +1746,12 @@ public class DigestHelper implements Runnable {
         String source = ai != null ? sanitizeText(jsonStr(ai, "source")) : "";
         if (!source.isEmpty()) article.addProperty("source", source);
 
+        var tags = new JsonArray();
         if (ai != null && ai.has("tags")) {
-            var tags = new JsonArray();
             for (var t : ai.getAsJsonArray("tags"))
                 tags.add(t.getAsString().toLowerCase().replaceAll("[^a-z0-9-]", ""));
-            article.add("tags", tags);
         }
+        article.add("tags", tags);
 
         if (!desc.isEmpty()) article.addProperty("description", desc);
 
