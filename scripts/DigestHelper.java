@@ -906,19 +906,30 @@ public class DigestHelper implements Runnable {
             boolean contentComplete = writeContent(dataDir, targetDate, cacheDir);
 
             int totalArticles = allSections.stream().mapToInt(s -> s.getAsJsonArray("articles").size()).sum();
+            int missingSummaries = (int) allSections.stream()
+                    .flatMap(s -> StreamSupport.stream(s.getAsJsonArray("articles").spliterator(), false))
+                    .filter(a -> !a.getAsJsonObject().has("one-liner") || jsonStr(a.getAsJsonObject(), "one-liner").isEmpty())
+                    .count();
+            boolean summariesComplete = missingSummaries == 0;
             var finalPost = store.findByDate(targetDate);
             boolean isPublished = false;
-            if (finalPost != null && contentComplete) {
+            if (finalPost != null && contentComplete && summariesComplete) {
                 finalPost.remove("draft");
                 store.savePost(finalPost);
                 isPublished = true;
                 System.err.println("  Post published for " + targetDate);
             } else if (finalPost != null) {
-                System.err.println("  Post kept as draft for " + targetDate + " (content incomplete, re-run to finish)");
+                var reasons = new ArrayList<String>();
+                if (!contentComplete) reasons.add("content incomplete");
+                if (!summariesComplete) reasons.add(missingSummaries + " articles missing summaries");
+                System.err.println("  Post kept as draft for " + targetDate + " (" + String.join(", ", reasons) + ")");
             }
 
-            return new PostResult(targetDate, isPublished, allSections.size(), totalArticles,
-                    contentComplete ? "" : "content incomplete");
+            String note = String.join(", ", Stream.of(
+                    contentComplete ? "" : "content incomplete",
+                    summariesComplete ? "" : missingSummaries + " missing summaries"
+            ).filter(s -> !s.isEmpty()).toList());
+            return new PostResult(targetDate, isPublished, allSections.size(), totalArticles, note);
 
         } finally {
             // Clean up temp directory
