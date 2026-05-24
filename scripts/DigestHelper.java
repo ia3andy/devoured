@@ -2546,6 +2546,10 @@ public class DigestHelper implements Runnable {
                     var ai = aiMap.get(articleIndex);
                     if (ai != null) setAiFieldsOnArticle(a.getAsJsonObject(), ai);
                 }
+                for (int i = sectionArticles.size() - 1; i >= 0; i--) {
+                    var a = sectionArticles.get(i).getAsJsonObject();
+                    if (a.has("skip") && a.get("skip").getAsBoolean()) sectionArticles.remove(i);
+                }
             }
 
             store.savePost(post);
