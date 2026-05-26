@@ -1,0 +1,180 @@
+<h1>Introducing pulumi do: Direct Resource Operations for Any Cloud</h1><a>Fraser Waters</a><a>Pat Gavlin</a><a>Arun Loganathan</a><a>Christian Nunciato</a>Posted on May 22nd, 2026
+<p>Infrastructure as code is the right model for production systems. State tracking, drift detection, and repeatable deployments all matter when you’re managing real workloads.</p>
+<p>But sometimes, you also need a quick, one-off interaction with the cloud: create a bucket or a database, look up a VPC, delete a stray resource.</p>
+<p>Today we’re introducing <code>pulumi do</code>, a new command for direct resource operations. With <code>pulumi do</code>, you can create, read, update, delete, and query any cloud resource from the terminal with a single command, across thousands of Pulumi-supported providers —&nbsp;no project, code, or state required.</p>
+<h2>The problem: Sometimes IaC is more than you need</h2>
+<p>When you’re managing production workloads, IaC is the proven solution. Code lets you declare complex systems, state tracking catches drift before it becomes a problem, dependency graphs sequence changes safely, and policy keeps everything in bounds. That full lifecycle, especially with the backing of a platform like Pulumi Cloud, is exactly what you want to build systems that scale.</p>
+<p>But when you (or your coding agent) need an ad-hoc Postgres database, the simplest path with IaC still takes several steps: make a directory, create a project, configure your credentials, write the code, preview, deploy. It works, but it’s not always necessary for what should be a simple operation. <code>pulumi do</code> collapses all of those steps into one, using the same Pulumi providers, resource model, and ecosystem that powers the core Pulumi platform.</p>
+<p>Resource creation is also only part of the problem. As Joe laid out in <a>The Agentic Infrastructure Era</a>, the real challenge for AI agents isn’t with code or CLI commands, it’s with everything else: getting a cloud account, resolving credentials, wiring configuration across multiple services. <a>Agent accounts</a>, also <a>released this week</a>, simplify this by letting an agent provision its own ephemeral Pulumi Cloud account, and <a>Pulumi ESC</a> takes care of consolidating credentials across providers. Together, with <code>pulumi do</code>, agents can now go from zero to deployed infrastructure without requiring a human in the loop — and when that one-off resource needs to grow into a more permanent system, there’s a clear graduation path back to full Pulumi IaC.</p>
+<h2>What it looks like</h2>
+<p>As an example, say you wanted to provision an S3 bucket. With the AWS CLI, you’d need to assemble an <code>aws s3api create-bucket</code> invocation with the right set of command-line flags, region constraints, a globally unique name, and so on. With <code>pulumi do</code>, it’s just this:</p>
+<pre><code>$ pulumi do aws:s3:Bucket create
+</code></pre>
+<p>That might not look all that different on the surface — but because you’re using the Pulumi engine and resource model, you can provide a minimal set of input properties, take advantage of provider-defined defaults, and use Pulumi’s <a>auto-naming</a> feature to give the bucket a unique name automatically:</p>
+<pre><code>$ pulumi do aws:s3:Bucket create
+
+This will create aws:s3/bucket:Bucket with the following inputs:
+\{
+  "bucket": "bucket-279ea56",
+  "tagsAll": \{}
+}
+
+Please confirm that this is what you'd like to do by typing `yes`:
+</code></pre>
+<p>Answer <code>yes</code> (or just pass <code>--yes</code>), and you’re done. To delete the bucket:</p>
+<pre><code>$ pulumi do aws:s3:Bucket delete bucket-279ea56 --yes
+</code></pre>
+<p>Need to look up an existing resource? Use a <a>provider function</a>:</p>
+<pre><code>$ pulumi do aws:ec2:getVpc --default
+
+\{
+  "arn": "arn:aws:ec2:us-west-2:663782525873:vpc/vpc-d7b311af",
+  "cidrBlock": "172.31.0.0/16",
+  "enableDnsHostnames": true,
+  "enableDnsSupport": true,
+  "enableNetworkAddressUsageMetrics": false,
+  "id": "vpc-d7b311af",
+  ...
+}
+</code></pre>
+<p>Same CLI, same output contract, same provider ecosystem.</p>
+<h3>The command shape</h3>
+<p>The <code>do</code> command accepts a Pulumi resource type, or <a><em>type token</em></a>, to determine the action to take. Type tokens have the form <code>&lt;package:module:resource&gt;</code>. For example, <code>aws:s3:Bucket</code> refers to the <a>Amazon S3 Bucket resource</a> that belongs to the <code>s3</code> module of the <code>aws</code> package.</p>
+<p>You can also provide a portion of the token to help you find what you’re looking for without ever having to leave the terminal:</p>
+<pre><code>$ pulumi do aws:s3
+
+Functions and resources for the s3 module.
+
+Run 'pulumi do &lt;module/resource/function&gt; --help' for more details on usage.
+
+Functions:
+  aws:s3:getAccessPoint
+  aws:s3:getAccountPublicAccessBlock
+  aws:s3:getBucket
+  aws:s3:getBucketObject
+  ...
+
+Resources:
+  aws:s3:AccessPoint
+  aws:s3:AccountPublicAccessBlock
+  aws:s3:AnalyticsConfiguration
+  aws:s3:Bucket
+  ...
+
+$ pulumi do aws:s3:Bucket read bucket-d20976f
+
+\{
+  "arn": "arn:aws:s3:::bucket-d20976f",
+  "bucket": "bucket-d20976f",
+  "bucketDomainName": "bucket-d20976f.s3.amazonaws.com",
+  "bucketNamespace": "global",
+  ...
+}
+</code></pre>
+<p>The package, module, and resource/function segments all come directly from the Pulumi provider schema, so <code>--help</code> works at every level of the tree. Pass a package name, optional module, and optional function or resource type, and <code>do</code> returns the appropriate level of detail.</p>
+<p>You can also provide the input properties of a resource in a YAML or JSON file with the <code>--input</code> option. To create a container service in Google Cloud Run for example:</p>
+<pre><code># service.yaml
+location: us-central1
+deletionProtection: false
+template:
+  containers:
+    - image: us-docker.pkg.dev/cloudrun/container/hello
+</code></pre>
+<pre><code>$ pulumi do gcp:cloudrunv2:Service create \
+    --input yaml \
+    --input-file service.yaml
+
+This will create gcp:cloudrunv2/service:Service with the following inputs:
+\{
+  "deletionProtection": false,
+  "location": "us-central1",
+  "name": "service-b8af752",
+  "template": \{
+    "containers": [
+      \{
+        "image": "us-docker.pkg.dev/cloudrun/container/hello"
+      }
+    ]
+  }
+}
+</code></pre>
+<p>The result:</p>
+<pre><code>\{
+  "createTime": "2026-05-22T23:00:22.415839Z",
+  ...
+  "urls": [
+    "https://service-b8af752-921927215178.us-central1.run.app",
+    "https://service-b8af752-ctnulmzwoa-uc.a.run.app"
+  ]
+}
+</code></pre>
+<h3>Resource operations</h3>
+<p>Most resources support the full set of CRUD operations — create, read, update, delete, and list — directly from the CLI. Each operation maps to a provider CRUD method using the same provider logic a full Pulumi program would use, and resources are addressable by their cloud provider IDs:</p>
+<pre><code># Create a resource
+$ pulumi do aws:s3:Bucket create --yes | jq -r ".name"
+bucket-4f5cb22
+
+# Fetch it
+$ pulumi do aws:s3:Bucket read bucket-4f5cb22 | jq -r ".hostedZoneId"
+Z3BJ6K6RIION7M
+
+# Update/patch it
+$ pulumi do aws:s3:Bucket patch bucket-4f5cb22 --input yaml --input-file tags.yaml
+
+$ pulumi do aws:s3:Bucket read bucket-4f5cb22 | jq ".tags"
+\{
+  "key": "value"
+}
+
+# Delete it
+$ pulumi do aws:s3:Bucket delete bucket-4f5cb22
+</code></pre>
+<h3>Provider configuration</h3>
+<p>Today, <code>pulumi do</code> resolves provider configuration — for example, applying your AWS credentials — using environment variables or credential files as supported by each individual Pulumi provider. See the <a>Pulumi Registry</a> for provider-specific configuration details.</p>
+<h2>Designed for humans and agents</h2>
+<p>We’ve designed <code>pulumi do</code> to serve humans and coding agents equally well, guided by three fundamental ideas:</p>
+<ul>
+ <li>
+  <p><strong>Consistent command structure across every provider.</strong> The <code>do &lt;package:module:type&gt; &lt;operation&gt;</code> pattern is the same for AWS, Azure, Google Cloud, Kubernetes, Cloudflare, Datadog, and every provider, including packages containing higher-level <a>component resources</a>. Once an agent learns that pattern, it applies across the board.</p></li>
+ <li>
+  <p><strong>Predictable output contract.</strong> JSON on stdout, progress on stderr, consistent exit codes. An agent can parse the result programmatically without scraping human-formatted tables.</p></li>
+ <li>
+  <p><strong>A single CLI command that works across every cloud.</strong> Many cloud and SaaS providers don’t have a full CLI at all. <code>pulumi do</code> generates commands from the provider schema, so if a Pulumi provider exists for it, the CLI just works. Neither humans nor agents need to install, learn, or even know about cloud provider-specific tooling.</p></li>
+</ul>
+<h2>What’s next</h2>
+<p>Resource operations and provider functions are the foundation. The <code>pulumi do</code> roadmap extends the same direct-operation model with credential management, state tracking, and a path to full IaC.</p>
+<h3>Unified credentials with Pulumi ESC</h3>
+<p>One of the hardest parts of multi-cloud operations is credential management. Every provider has its own authentication scheme, environment variables, and session lifecycle. An agent working across AWS, Cloudflare, and Datadog today manages three separate credential mechanisms.</p>
+<p>We’re building <a>Pulumi ESC</a> integration into <code>pulumi do</code> so you can manage credentials in one place and resolve them everywhere. ESC handles credential resolution (including OIDC-based dynamic credential generation and short-lived tokens) across all of your providers. Name the credential set, reference it, and ESC does the rest, with rotation, RBAC, and audit built in.</p>
+<h3>Cross-resource references</h3>
+<p>Real infrastructure has dependencies — subnets need VPCs, security group rules need their security groups, and so on. When you’re building resources one at a time, those references need to flow between commands somehow.</p>
+<p>A future version of <code>pulumi do</code> will let resource inputs reference outputs from previously created resources, allowing the CLI to resolve them automatically and preserve the dependency graph. Later, when the time comes to graduate to a full IaC program, the generated code contains proper resource references rather than hard-coded strings.</p>
+<h3>Stateful mode and the graduation path</h3>
+<p>Today, <code>pulumi do</code> is stateless. Each command runs independently. A planned stateful mode will persist resource state across operations, enabling drift detection, lifecycle management, and a graduation path to full infrastructure as code.</p>
+<p>Here’s what we’re planning:</p>
+<ol>
+ <li>
+  <p><strong>Zero setup.</strong> Your first <code>pulumi do</code> implicitly creates a project and stack. No manual initialization.</p></li>
+ <li>
+  <p><strong>Accumulate resources.</strong> Each operation stores resource state. After a few commands, you have a lightweight representation of your infrastructure.</p></li>
+ <li>
+  <p><strong>Eject to a full project.</strong> When the time comes, generate a Pulumi project in your chosen language with all resources imported and dependency graphs intact.</p></li>
+ <li>
+  <p><strong>Connect to Pulumi Cloud.</strong> Layer on governance, compliance, team collaboration, and deployment automation through <a>Pulumi Cloud</a>. Resources created via <code>pulumi do</code> can be governed by <a>Pulumi Insights</a> from day one, even before you opt into full IaC.</p></li>
+</ol>
+<p>This path works because <code>pulumi do</code> uses the same providers, resource types, and property schemas as every other <code>pulumi</code> operation. Provisioned cloud resources stay where they are as management capabilities are added as needed.</p>
+<h2>Get started</h2>
+<p><code>pulumi do</code> ships as a research preview in <a href="https://github.com/pulumi/pulumi/releases/tag/v3.242.0">Pulumi CLI v3.242.0</a> and later. Install or update the CLI, install a provider plugin, and start running commands. The <a>documentation</a> has the full reference.</p>
+<p>We can’t wait to hear your feedback. <a>Give it a try today</a>, tell us what works (and what doesn’t), and help shape the CLI that agents and humans both reach for first.</p>
+<ul>
+ <li><a>Documentation</a></li>
+ <li><a href="https://github.com/pulumi/pulumi/issues/new">File a feature request</a></li>
+ <li><a href="https://slack.pulumi.com/">Pulumi Community Slack</a> for discussion</li>
+</ul>
+<ul>
+ <li><a>features</a></li>
+ <li><a>pulumi-cli</a></li>
+ <li><a>ai-agents</a></li>
+ <li><a>product-launches</a></li>
+</ul>
+<h4>Subscribe to the Pulumi Monthly Newsletter</h4>
