@@ -1,0 +1,197 @@
+<h1>Extract More Kernel Performance with NVIDIA CompileIQ Auto-Tuning&nbsp;</h1>
+<p>NVIDIA CompileIQ tackles one of the hardest problems in performance engineering: finding the compiler options that unlock the best performance for a specific workload.</p>
+<p>Consider a team that has spent weeks optimizing an LLM inference pipeline on GPUs, tuning batch sizes, quantizing to FP8, adopting flash attention, fusing every kernel they can. The profiler says there’s nothing left to squeeze.</p>
+<p>But what if you could turn the compiler itself into a tunable parameter?&nbsp; Now you can. The release of&nbsp;<a href="https://developer.nvidia.com/blog/nvidia-cuda-13-3-enhances-gpu-development-with-tile-programming-in-cpp-compiler-autotuning-and-python-updates">NVIDIA CUDA 13.3</a> includes CompileIQ, an AI-powered compiler auto-tuning framework that uses evolutionary and genetic algorithms to optimize NVIDIA general purpose GPU compilers for individual workloads.&nbsp;</p>
+<p>NVIDIA GPU compilers apply the same default heuristics (register allocation strategies, instruction scheduling decisions, loop unrolling thresholds, etc.) to every kernel they compile. These heuristics are engineered to produce good results across a vast range of workloads. But “good across the board” and “optimal for your workload” are two very different things.</p>
+<p>The competitive landscape in AI infrastructure has made this gap impossible to ignore. Teams building custom CUDA, <a href="https://github.com/triton-lang/triton/">Triton</a>, and <a href="https://github.com/pytorch/helion">Helion</a> kernels are striving for every percentage point of throughput. Until now, there hasn’t been a way to fine-tune code generation for a specific workload.</p>
+<h2>The 90% problem and the opportunity</h2>
+<p>To understand why compiler-level optimization matters so much, consider where GPU compute actually goes in modern LLM inference.</p>
+<p>In attention inference kernels, GEMMs in the linear layers of FFN/MLP blocks plus the Q, K, V, and output projections account for approximately 70% of total FLOPs. Scaled dot-product attention, fused and flash attention variants account for another 25%. Together, these two kernel families represent more than 90% of end-to-end inference compute.</p>
+<p>This is not unique to AI inference. There are many applications and algorithms where a large portion of the compute time is spent in relatively small portions of the code, which means these small code sections contribute an outsized influence to the performance of the application.&nbsp; Because of this, performance improvements in those code portions, even fractions of a percent, have outsized improvements on overall application performance.</p>
+<h2>Introducing CompileIQ</h2>
+<p><a href="https://github.com/nvidia/compileiq">CompileIQ</a> is an AI-powered compiler auto-tuning framework that uses evolutionary and genetic algorithms to optimize NVIDIA GPU compilers for individual workloads. Instead of accepting one generic compiler configuration for all workloads, CompileIQ flips the script, generating specialized compiler configurations tailored to each of your most critical kernels.</p>
+<p>Under the hood, CompileIQ explores a rich space of internal compiler parameters that aren’t exposed through any public compiler flag: register allocation strategies, instruction scheduling policies, loop transformations, and more. The output is an advanced controls file (ACF) that the compiler ingests via the –apply-controls flag, producing a kernel binary optimized specifically for your workload.</p>
+<p>Think of it this way: Your compiler already has the capability to generate better code for your kernel. It just doesn’t know which combination of internal settings will get there. CompileIQ’s evolutionary search finds that combination automatically.</p>
+<p>The team that hit a wall after exhausting every optimization lever they knew now has a new lever with CompileIQ—the compiler itself.</p>
+<p>CompileIQ is available and can be installed into your favorite Python environment using pip, as shown in the next section. Leading AI labs are already using it in production for their most performance-critical workloads.</p>
+<h2>Getting started in 4 steps</h2>
+<p>CompileIQ is a Python package with a simple workflow:&nbsp;</p>
+<ul>
+ <li>Learn</li>
+ <li>Install</li>
+ <li>Define your objective</li>
+ <li>Run</li>
+</ul>
+<pre>pip install compileiq
+</pre>
+<p>CompileIQ ships with compiler search spaces for both PTXAS and NVCC that are automatically fetched via APIs.&nbsp;No manual downloads or configuration are required.</p>
+<p>Your job as the developer is to define your objective function: for instance, a Python callable that takes a candidate compiler configuration, compiles your kernel with it, benchmarks the result, and returns a score. If you can benchmark your kernel, you can use CompileIQ.</p>
+<p>Here’s an example:</p>
+<pre>import subprocess
+from compileiq.ciq import Search
+from compileiq.types import SearchConfiguration
+
+# Define your objective: compile with the ACF and measure runtime
+def objective(config_blob):
+    with open("config.acf", "wb") as f:
+        f.write(bytes.fromhex(config_blob))
+    result = subprocess.run([
+        "ptxas", "-v", "-arch=sm_90a",
+        "--apply-controls", "config.acf",
+        "my_kernel.ptx"
+    ], capture_output=True, text=True)
+    return extract_runtime(result.stdout)
+
+# Configure and run the evolutionary search
+config = SearchConfiguration(
+    pool_size=32, cull_size=24, generations=20,
+    mutate_rate=0.1, problem_type="min",
+    num_objectives=1
+)
+search = Search(config, objective)
+best_acf = search.run()
+</pre>
+<p>The code above can be separated into three distinct sections:</p>
+<ul>
+ <li>Define your objective: We define the function objective, which takes the configuration to be evaluated in <code>config_blob</code>, saves it to disk, compiles and runs the kernel, and then extracts the metric.</li>
+ <li>Configure the search: Set the parameters that will drive the search, like how many candidates to try in one generation (<code>pool_size</code>), how many generations to run, and the number of objectives to be optimized.</li>
+ <li>Run the search and extract the best candidate.</li>
+</ul>
+<p>That’s it. When the search starts, CompileIQ initializes a population of compiler configurations, evaluates each one against your objective function, selects the best performers, applies mutation and crossover to generate new candidates, and converges on an optimal ACF over successive generations.</p>
+<p>You define what “better” means for your workload in the objective function, and CompileIQ finds it.</p>
+<figure>
+ <img src="https://developer-blogs.nvidia.com/wp-content/uploads/2026/05/image3-4.webp" alt="The evolutionary optimization loop: define your objective, and CompileIQ handles the rest – from population initialization through convergence to a deployable ACF
+">
+ <figcaption>
+  <em>Figure 1. CompileIQ workflow: Define objective, initialize, evaluate, select and mutate, converge, deploy&nbsp;</em>
+ </figcaption>
+</figure>
+<h2>Examples</h2>
+<p>Now let’s focus on self-contained examples that you can try. There are a number of examples in the GitHub repo, and we’ll demonstrate two here.&nbsp;First, the single objective example, which has nothing to do with GPU computing, but demonstrates the principles of using CompileIQ.</p>
+<pre>from compileiq.ciq import Search
+from compileiq.types import SearchConfiguration
+import compileiq.search_spaces.base as ss
+
+def objective(config):
+    score = config["x"] ** 2 + config["y"]
+    return score
+
+def main():
+    dna_config = \{
+        "x": ss.range(start=1.0, end=20.0, step=0.5),
+        "y": ss.choice([1, 2, 3]),
+        "z": ss.literal("this is a constant", knockout_prob=0.5),
+    }
+
+    main_config = SearchConfiguration(
+        generations=5,
+        problem_type="min",
+        num_objectives=1,
+    )
+
+    tuner = Search(
+        objective_function=objective,
+        search_space=dna_config,
+        search_config=main_config,
+    )
+
+    results = tuner.start()
+    print(f"Entire Results Dataframe:\n \{results.get_results()}")
+    print(f"Best Result: \{results.get_best_result()}")
+
+if __name__ == "__main__":
+    main()
+</pre>
+<p>First, the objective function:</p>
+<pre>def objective(config):
+    score = config["x"] ** 2 + config["y"]
+    return score
+</pre>
+<p>This is a simple function that squares x, and adds that value to y.&nbsp; This is the function we’ll optimize:</p>
+<pre>    dna_config = \{
+        "x": ss.range(start=1.0, end=20.0, step=0.5),
+        "y": ss.choice([1, 2, 3]),
+        "z": ss.literal("this is a constant", knockout_prob=0.5),
+</pre>
+<p>The config specifies what values are permitted for the variables.&nbsp;For <strong>x</strong>, the range is between 1.0 and 20.0, with step size of 0.5.&nbsp; For <strong>y</strong>, the choices are either 1, 2 or 3;&nbsp; <strong>z</strong> doesn’t actually contribute to the calculation of the objective, but illustrates dropout.</p>
+<pre>  main_config = SearchConfiguration(
+        generations=5,
+        problem_type="min",
+        num_objectives=1,
+    )
+</pre>
+<p>Next we specify the search configuration.&nbsp;In this case we’ll run 5 generations, we want to minimize the objective function, and there is only one objective being analyzed.</p>
+<p>The rest of the code sets up the arguments and the search. This is a very simple objective function and you can calculate it by hand easily, but for illustrative purposes here’s what happens when you run&nbsp;the code.</p>
+<pre>$ python single_objective.py
+🧬 Generation:  5/5|█| [elapsed: 00:00 · eta: 00:00] , 🏆 best_score=3.2500
+Entire Results Dataframe:
+              metadata  ...                                          params
+0    \{"pid": 2562276}  ...   \{'x': 2.5, 'y': 2, 'z': 'this is a constant'}
+1    \{"pid": 2562276}  ...                              \{'x': 8.5, 'y': 3}
+2    \{"pid": 2562276}  ...  \{'x': 11.0, 'y': 1, 'z': 'this is a constant'}
+3    \{"pid": 2562276}  ...                             \{'x': 19.0, 'y': 2}
+4    \{"pid": 2562276}  ...                             \{'x': 13.5, 'y': 3}
+..                ...  ...                                             ...
+109  \{"pid": 2562276}  ...   \{'x': 1.5, 'y': 3, 'z': 'this is a constant'}
+124  \{"pid": 2562276}  ...   \{'x': 1.0, 'y': 2, 'z': 'this is a constant'}
+126  \{"pid": 2562276}  ...   \{'x': 2.0, 'y': 1, 'z': 'this is a constant'}
+135  \{"pid": 2562276}  ...   \{'x': 3.0, 'y': 2, 'z': 'this is a constant'}
+138  \{"pid": 2562276}  ...                              \{'x': 1.5, 'y': 3}
+[61 rows x 4 columns]
+Best Result: \{'metadata': '\{"pid": 2562276}', 'generation': 4, 'score_1': 3.0, 'params': \{'x': 1.0, 'y': 2, 'z': 'this is a constant'}}</pre>
+<p>Notice the listing of the best result has <strong>x = 1.0</strong> and <strong>y = 2</strong>, which results in a score of 3.0.&nbsp; But we know the best score is actually when <strong>x = 1.0</strong> and <strong>y = 1</strong>, so in this case CompileIQ didn’t find the best answer. Due to the very low number of generations (in our case 5) and the stochastic nature of the search, we didn’t happen to find the absolute best answer. However, in this case if you increase the generation to a larger number, say 15, you will almost always obtain the best answer.&nbsp;</p>
+<p>Let’s move to an example that measures GPU performance of a specific kernel.&nbsp; In the GitHub repo there is an example using NVCC to build a reduction kernel.&nbsp; We won’t include the entire code here for brevity, but will show snippets to illustrate the concepts.&nbsp;&nbsp;</p>
+<p>In the Python function which sets up the search, we have this code:</p>
+<pre># Configure and run search
+    search_space = args.search_space if args.search_space else NvccSearchSpace(version=cuda_version)
+    config = SearchConfiguration(
+        problem_type=ProblemType.MIN,
+        generations=args.generations,
+        pool_size=args.pool_size,
+    )
+</pre>
+<p>The search space is configured to use the <code>NvccSearchSpace</code> for CUDA 13.3. And you can see the problem type to optimize for is <code>MIN</code>, which means we want to find the minimum of the objective function. Generations and pool size are command line arguments which default to 10 and 15 respectively in this Python script. The GPU kernel code is set up to run a reduction and then print out the time, and the objective function (not listed here) essentially builds and runs the kernel, and searches for the <code>Time =</code> string and this is the value that is minimized over the search space.</p>
+<p>Assuming you’re in the <code>compilers/nvcc_example</code> folder, here’s what it looks like when you run the search.</p>
+<pre>$ python optimize_reduction.py --arch sm_120
+Running baseline...
+Baseline: 0.777 ms
+Starting optimization (10 generations, pool=15)...
+🧬 Generation:  10/10|█| [elapsed: 09:29 · eta: 00:00] , 🏆 best_score=0.7700, a
+Baseline:  0.777 ms
+Optimized: 0.770 ms
+Speedup:   1.01x
+Config saved: reduction_best_config.bin
+Usage: nvcc --apply-controls reduction_best_config.bin -arch=sm_120 ...</pre>
+<p>The performance increase found via the search is roughly 1%, and you can see that to apply this saved configuration you just need to use the <code>–-apply-controls</code> option and add the ACF that you just generated.</p>
+<h2>Multi-objective optimization and IP protection</h2>
+<p>Most auto-tuning tools optimize for a single metric, typically runtime. CompileIQ goes further,&nbsp; supporting multi-objective optimization, simultaneously exploring trade-offs across competing objectives like runtime, compile time, and power consumption.</p>
+<p>This matters because “fastest possible” isn’t always the right answer. A power-constrained datacenter might accept a marginal runtime increase in exchange for significantly lower power draw. A CI/CD pipeline might prioritize compile time to keep iteration cycles fast. An embedded deployment might need to balance all three.</p>
+<p>CompileIQ’s evolutionary engine computes a <a href="https://en.wikipedia.org/wiki/Pareto_front"><strong>Pareto frontier</strong></a> of non-dominated solutions, or configurations where no single objective can be improved without worsening another. Your team picks the trade-off that fits your constraints, rather than being locked into a single optimization axis.</p>
+<p>This capability extends CompileIQ’s applicability well beyond LLM inference. Anywhere NVIDIA compilers are used—scientific computing, autonomous vehicles, image processing, recommendation systems—CompileIQ can explore the optimization space and surface configurations that default heuristics miss.</p>
+<p>On the IP protection front, CompileIQ is designed so that both sides stay secure. Compiler internals remain encapsulated within the search space and ACFs. Users need not concern themselves with compiler parameters. User workloads never leave their own environment; the objective function runs locally, and only the resulting ACF is produced. ACFs are safe to commit to version control and share across teams.</p>
+<figure>
+ <img src="https://developer-blogs.nvidia.com/wp-content/uploads/2026/05/image5-3.webp" alt="Multi-objective optimization produces a Pareto frontier of non-dominated solutions. Teams can select configurations optimized for low runtime (orange), low power (gold), low compile time (cyan), or an optimal trade-off (teal)
+">
+ <figcaption>
+  <em>Figure 2.&nbsp; 3D Pareto frontier: Runtime vs compile time vs power&nbsp;</em>
+ </figcaption>
+</figure>
+<h2>Results and production adoption</h2>
+<p>CompileIQ has been validated across GPU and CPU targets on production workloads. For example, Meta has seen up to 15% performance improvement on both TritonBench and Helion kernels as shown in this <a href="https://www.nvidia.com/en-us/on-demand/session/gtc26-s81859/">GTC talk</a>.</p>
+<p>These gains come on top of already-optimized baselines in kernels that were considered “done” by their authors. The improvements are the direct result of CompileIQ discovering compiler configurations that the default heuristics would never select.</p>
+<p>Leading AI labs are already using CompileIQ in production for their most performance-critical inference and training workloads. The ACFs it produces are fully reproducible and portable: the same ACF generates the same optimized binary across deployments as long as the same benchmark and underlying compiler are matching. Teams commit ACFs to version control alongside their kernel source code, making compiler optimization a versioned, reviewable part of the development workflow.</p>
+<h2>Your turn</h2>
+<p>Compiler search spaces are available for both <strong>PTXAS</strong> and <strong>NVCC</strong>. Identify your highest-impact kernels – GEMM and attention are the best candidates – write a benchmark that measures what matters to your workload, and run CompileIQ.</p>
+<p>Documentation, API reference, and useful examples are available at the CompileIQ <a href="https://nvidia.github.io/CompileIQ/">documentation</a> site. For questions and support, file an issue on the <a href="https://github.com/NVIDIA/CompileIQ">CompileIQ GitHub </a>repository.</p>
+<p>One thing we should be clear on: CompileIQ is not a magic tool that automatically turns poorly-written code into high-performing code.&nbsp;To get the best value from CompileIQ, you need to start with reasonably high-performing code, which then enables the final compiler-heuristics tweaks to take you to maximum performance.</p>
+<p>But, if your team has exhausted every optimization lever they know of, CompileIQ gives them a new lever—the compiler itself.</p>
+<p>Download CompileIQ, check out the examples in GitHub, and start optimizing your kernels today<em>.</em></p>
+<h2>About the Authors</h2>
+<p><b> About Aditya Srikanth </b><br>
+  Aditya is the engineering manager for CompileIQ at NVIDIA, and is involved with CompileIQ engagements and adoption across various workflows. Outside of work, he enjoys cooking, riding motorcycles, and spending time with his dogs.</p>
+<p><b> About Pedro Torruella </b><br>
+  Pedro is a senior software engineer on the SW Compilers Team at NVIDIA, currently focused on enabling agentic and machine learning optimizations across the GPU kernel programming stack. He is a product-centric engineer, with prior experience as a devrel, program manager, and startup founder. Pedro holds a joint master's degree in electrical and computer engineering from the University of Southampton (UK) and RPTU Kaiserslautern (Germany). In his free time you can find him riding his bicycle, listening to music on vinyl, or pulling espresso shots.</p>
+<p><b> About Jonathan Bentz </b><br>
+  Jonathan Bentz leads the CUDA technical marketing engineering team at NVIDIA, where his team focuses on creating and delivering engaging content and connecting with CUDA developers. Jonathan holds a PhD in Chemistry and a master’s degree in Computer Science from Iowa State University.</p>
+<p><b> About Tony Scudiero </b><br>
+  Tony Scudiero is a technical marketing engineer for the CUDA platform. He works to bring CUDA to developers of every type and ability. He has worked with large HPC systems and applications, real-time acoustic simulations (VRWorks Audio), and the Omniverse RTX Renderer during his tenure at NVIDIA.</p>
