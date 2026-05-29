@@ -1,0 +1,157 @@
+<p>Secure MCP Tunnel lets you connect private MCP servers to supported OpenAI products without opening inbound firewall ports or exposing those servers to the public internet. Run <code>tunnel-client</code> inside the network that can already reach your MCP server; it opens an outbound HTTPS path to OpenAI, pulls queued MCP work, forwards requests locally, and returns responses through the same tunnel.</p>
+<h2>What is an MCP tunnel?</h2>
+<p>An MCP tunnel is an outbound-only connection from a host inside your network to an OpenAI-hosted MCP endpoint. Use it when your MCP server is private, on-premises, or behind a firewall, but ChatGPT, Codex, the Responses API, or another supported OpenAI surface still needs to call it.</p>
+<p>Secure MCP Tunnel keeps the MCP server private while giving supported OpenAI products a normal MCP request path. <code>tunnel-client</code> polls OpenAI for work, forwards MCP requests locally, and returns responses through the same tunnel.</p>
+<h2>Use Secure MCP Tunnel when</h2>
+<ul>
+ <li>Your MCP server runs on a private network, on-premises, on a developer machine, or behind existing access controls.</li>
+ <li>You want ChatGPT, Codex, the Responses API, or another supported OpenAI surface to use that server without making the MCP server public.</li>
+ <li>Your network allows the host running <code>tunnel-client</code> to make outbound HTTPS requests to <code>api.openai.com:443</code> by default, or <code>mtls.api.openai.com:443</code> when control-plane mTLS is configured, and reach the private MCP server.</li>
+ <li>Start with the <a>MCP and Connectors guide</a> for general MCP concepts.</li>
+</ul>
+<h2>How it works</h2>
+<ol>
+ <li>Create or manage an OpenAI-hosted MCP tunnel endpoint in Platform tunnel settings.</li>
+ <li>Run <code>tunnel-client</code> inside the network that can reach your private MCP server.</li>
+ <li>Configure <code>tunnel-client</code> with the tunnel identity and the private MCP server address.</li>
+ <li>OpenAI products send MCP requests to the OpenAI-hosted tunnel endpoint.</li>
+ <li><code>tunnel-client</code> long-polls for queued work, forwards each <code>JSON-RPC</code> request to the private MCP server, and posts the response back through the tunnel.</li>
+</ol>
+<p>The private MCP server does not need a public listener. The OpenAI-hosted endpoint gives supported products a normal MCP request path, while the network initiation point stays inside your boundary. When a connector asks for streamed results, the tunnel path can forward intermediate server-sent events.</p>
+<figure>
+ <figcaption>
+  <p>OpenAI products call the OpenAI-hosted tunnel endpoint; <code>tunnel-client</code> long-polls for queued work and returns the MCP response through the same tunnel.</p>
+ </figcaption>
+</figure>
+<h2>Before you start</h2>
+<p>You need:</p>
+<ul>
+ <li>A <code>tunnel_id</code> from <a href="https://platform.openai.com/settings/organization/tunnels">Platform tunnel settings</a>.</li>
+ <li>A runtime API key for <code>tunnel-client</code>. The key principal needs Tunnels <strong>Read</strong> + <strong>Use</strong> for the target tunnel.</li>
+ <li>A tunnel manager with Tunnels <strong>Read</strong> + <strong>Manage</strong> if you need to create or edit tunnel metadata.</li>
+ <li>An MCP server that <code>tunnel-client</code> can reach over stdio or HTTP from inside your network.</li>
+</ul>
+<h2>Network requirements</h2>
+<p><code>tunnel-client</code> does not need inbound internet access. It needs outbound HTTPS to OpenAI and local reachability to the private MCP server:</p>
+<table>
+ <thead>
+  <tr>
+   <th>From</th>
+   <th>To</th>
+   <th>Used for</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Host running <code>tunnel-client</code></td>
+   <td><code>api.openai.com:443</code> over HTTPS on <code>/v1/tunnel/*</code></td>
+   <td>Default polling and response posting.</td>
+  </tr>
+  <tr>
+   <td>Host running <code>tunnel-client</code></td>
+   <td><code>mtls.api.openai.com:443</code> over HTTPS on <code>/v1/tunnel/*</code></td>
+   <td>Polling and response posting when control-plane mTLS is configured.</td>
+  </tr>
+  <tr>
+   <td>Host running <code>tunnel-client</code></td>
+   <td>The configured stdio command or MCP server URL</td>
+   <td>Forwarding MCP requests from inside your network.</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Set up tunnel-client</h2>
+<p>Open <a href="https://platform.openai.com/settings/organization/tunnels">Platform tunnel settings</a>, then use the download link there or the latest public <code>tunnel-client</code> release from <a href="https://github.com/openai/tunnel-client/releases/latest">openai/tunnel-client</a>. Keep your runbook pointed at the latest-release URL instead of hard-coding a specific release URL.</p>
+<p>If you already have a binary, start with <code>tunnel-client help quickstart</code>. For a named local stdio profile, use:</p>
+<pre><code><code>1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+</code>export CONTROL_PLANE_API_KEY="sk-..."
+
+tunnel-client init \
+  --sample sample_mcp_stdio_local \
+  --profile local-stdio \
+  --tunnel-id tunnel_0123456789abcdef0123456789abcdef \
+  --mcp-command "python /path/to/server.py"
+
+tunnel-client doctor --profile local-stdio --explain
+tunnel-client run --profile local-stdio</code></pre>
+<p>For an HTTP MCP server, use <code>--mcp-server-url https://mcp.internal.example.com/mcp</code> instead of <code>--mcp-command</code>.</p>
+<p>Keep <code>tunnel-client run ...</code> healthy while you create or test the connector. Connector discovery and MCP tool calls depend on the running client.</p>
+<figure>
+ <figcaption>
+  <p>The local admin UI at <code>/ui</code> shows whether the running client is healthy, ready, and connected before you test from ChatGPT, Codex, or an API flow.</p>
+ </figcaption>
+</figure>
+<h2>Choose where to run tunnel-client</h2>
+<p>Run <code>tunnel-client</code> in the same trust boundary that can already reach the private MCP server. Common deployment patterns are:</p>
+<ul>
+ <li><strong>Kubernetes sidecar:</strong> Run <code>tunnel-client</code> beside the MCP server in one Pod and connect over <code>localhost</code>.</li>
+ <li><strong>Dedicated Kubernetes deployment:</strong> Run <code>tunnel-client</code> separately when the MCP server is already reachable through a private Service.</li>
+ <li><strong>VM or systemd service:</strong> Run <code>tunnel-client</code> on a host that can reach the MCP server over private networking.</li>
+</ul>
+<h2>Connect from ChatGPT</h2>
+<p>Open <a href="https://chatgpt.com/#settings/Connectors">ChatGPT connector settings</a>, create a custom connector, and choose <strong>Tunnel</strong> under <strong>Connection</strong>. Select an available tunnel when ChatGPT lists it, or paste a valid <code>tunnel_id</code> if you already have one.</p>
+<p>If the tunnel does not appear in ChatGPT, verify that the tunnel is associated with the target workspace and that the connector operator has Tunnels <strong>Read</strong> + <strong>Use</strong>.</p>
+<h2>Security and networking</h2>
+<figure>
+ <figcaption>
+  <p>The private MCP server stays inside the customer-controlled environment. <code>tunnel-client</code> reaches OpenAI over outbound HTTPS using the runtime API key and, when required, optional control-plane mTLS.</p>
+ </figcaption>
+</figure>
+<ul>
+ <li>The MCP server address stays private and is used only from inside the environment where <code>tunnel-client</code> runs.</li>
+ <li><code>tunnel-client</code> authenticates to the OpenAI tunnel control plane; supported OpenAI products use the OpenAI-hosted tunnel endpoint.</li>
+ <li>Tunnel access follows the existing organization and workspace context instead of introducing a separate public ingress path.</li>
+ <li><code>tunnel-client</code> supports enterprise networking requirements such as outbound proxies, custom CA bundles, control-plane client certificates, and MCP-side <code>mTLS</code>.</li>
+</ul>
+<h2>Advanced: allowlisted HTTP callouts</h2>
+<p>Secure MCP Tunnel can also support narrowly scoped HTTP callouts from supported agent or API flows into a customer network. <code>tunnel-client</code> includes an embedded MCP server, Harpoon, that exposes configured HTTP targets by label and lets callers invoke them through the tunnel with bounded request/response limits.</p>
+<p>Use this when you need to reach a small set of private REST endpoints without exposing them publicly. Harpoon is not a general-purpose proxy: callers cannot choose arbitrary hosts, and requests are limited to the targets and methods configured by the customer.</p>
+<h2>Troubleshooting</h2>
+<ul>
+ <li><strong>Tunnel not visible in ChatGPT:</strong> Check the tunnel workspace scope and the connector operator’s Tunnels <strong>Use</strong> permission.</li>
+ <li><strong>Connector discovery or tool calls fail:</strong> Confirm that <code>tunnel-client run ...</code> is still running, then re-run <code>tunnel-client doctor --profile &lt;name&gt; --explain</code>.</li>
+ <li><strong>You can inspect a tunnel but cannot edit it:</strong> The operator likely has Tunnels <strong>Read</strong> but not Tunnels <strong>Manage</strong>.</li>
+ <li><code>tunnel-client</code> exposes <code>/healthz</code>, <code>/readyz</code>, <code>/metrics</code>, and a local admin UI at <code>/ui</code>.</li>
+ <li>The admin UI is loopback-only by default. Expose it remotely only when you intentionally need an operator network to reach it.</li>
+ <li>Use those surfaces to confirm that the client is healthy, ready, and polling before testing from ChatGPT, Codex, or an API flow.</li>
+ <li>If the client is not connected, requests through the tunnel fail until <code>tunnel-client</code> reconnects.</li>
+ <li>Raw HTTP logging is disabled by default, and support exports are redacted.</li>
+</ul>
+<h2>OAuth</h2>
+<ul>
+ <li>OAuth discovery can travel through the tunnel path so the MCP server itself can remain private.</li>
+ <li>The tunnel preserves the upstream authorization server metadata needed for browser-facing OAuth flows.</li>
+ <li>The authorization server itself is not automatically tunneled. If it is unreachable from the public internet and from the <code>tunnel-client</code> host, the OAuth flow can still fail even when the MCP server is reachable.</li>
+</ul>
+<h2>Where to configure it</h2>
+<ul>
+ <li>Manage OpenAI-hosted MCP tunnel endpoints in <a href="https://platform.openai.com/settings/organization/tunnels">Platform tunnel settings</a>.</li>
+ <li>Use a tunnel when creating a connector from <a href="https://chatgpt.com/#settings/Connectors">ChatGPT connector settings</a>.</li>
+ <li>For Codex or API flows, use the tunnel-backed MCP target exposed by the supported product surface.</li>
+</ul>
+<h2>Next steps</h2>
+<ul>
+ <li>Create or manage the tunnel in <a href="https://platform.openai.com/settings/organization/tunnels">Platform tunnel settings</a>.</li>
+ <li>Validate your <code>tunnel-client</code> profile with <code>tunnel-client doctor --profile &lt;profile&gt; --explain</code>.</li>
+ <li>Connect the tunnel from <a href="https://chatgpt.com/#settings/Connectors">ChatGPT connector settings</a> or the supported OpenAI surface you are using.</li>
+</ul>
+<figure>
+ <a href="https://platform.openai.com/settings/organization/tunnels"><img alt="Sanitized OpenAI Platform tunnel settings screenshot."></a>
+ <figcaption>
+  <p>Create and manage OpenAI-hosted MCP tunnel endpoints from Platform tunnel settings.</p>
+ </figcaption>
+</figure>
+<figure>
+ <a href="https://chatgpt.com/#settings/Connectors"><img alt="Sanitized ChatGPT connector settings screenshot with Tunnel selected."></a>
+ <figcaption>
+  <p>Select Tunnel when connecting a ChatGPT connector to a private MCP server.</p>
+ </figcaption>
+</figure>

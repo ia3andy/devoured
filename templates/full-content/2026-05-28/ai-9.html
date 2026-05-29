@@ -1,0 +1,55 @@
+<h2>Overcoming Autoregressive Bottlenecks in VLM Grounding</h2>
+<p>Vision-language models (VLMs) commonly formulate visual grounding and detection as a coordinate-token generation problem, serializing each 2D box into multiple 1D tokens that are learned and decoded largely independently. This token-by-token decoding mismatches the coupled structure of box geometry and creates a practical inference bottleneck due to strictly sequential generation.</p>
+<p>We introduce <strong>LocateAnything</strong>, a unified generative grounding and detection framework based on <strong>Parallel Box Decoding (PBD)</strong>. By decoding geometric elements such as bounding boxes and points as atomic units in a single step, LocateAnything preserves intra-box geometric coherence and unlocks substantial parallelism. We show that PBD improves both decoding throughput and localization accuracy.</p>
+<p>We further develop a scalable data engine and curate <strong>LocateAnything-Data</strong>, a large-scale dataset with more than 138 million training samples, substantially increasing data diversity for high-precision localization. Extensive evaluations show that LocateAnything advances the speed–accuracy frontier, achieving significantly higher decoding throughput while improving high-IoU localization quality across diverse benchmarks. The results highlight the complementary benefits of Parallel Box Decoding and large-scale training data in enabling efficient and precise unified visual grounding and detection.</p>
+<h2>LocateAnything: Parallel Box Decoding</h2>
+<p>To reconcile high-throughput decoding with reliable localization, we propose <strong>LocateAnything</strong>, a unified framework for VLM-based visual detection and grounding built upon <strong>Parallel Box Decoding (PBD)</strong>.</p>
+<h3>Box-Aligned Atomic Units</h3>
+<ul>
+ <li><strong>Input:</strong> An image and a natural language text query. The vision encoder extracts visual tokens at native resolution, preserving fine-grained spatial details for high-precision localization.</li>
+ <li><strong>Parallel Decoding:</strong> LocateAnything treats each bounding box (or point) as an <em>atomic unit</em> of constant length and predicts the full coordinate set (x1, y1, x2, y2) in one parallel step, avoiding arbitrary chunking of coordinate tokens.</li>
+ <li><strong>Architecture:</strong> Built upon a Moon-ViT vision encoder and a Qwen2.5 language decoder, bridged by a MLP projector, directly converting visual tokens into a sequence of box-aligned block-level predictions.</li>
+</ul>
+<h3>Flexible Inference Modes</h3>
+<ul>
+ <li><strong>Fast Mode (MTP):</strong> Predicts full boxes in parallel for maximum throughput, suitable for latency- and compute-constrained settings such as on-device robotics and embodied agents.</li>
+ <li><strong>Slow Mode (NTP):</strong> Decodes coordinate tokens autoregressively for maximum stability, appropriate for high-precision labeling, dataset curation, and accuracy-oriented offline evaluation.</li>
+ <li><strong>Hybrid Mode:</strong> Uses Fast Mode by default and falls back to Slow Mode when format irregularity or spatial ambiguity is detected, preserving most speed gains while maintaining robust outputs.</li>
+</ul>
+<h3>On-Demand Inference: Corrected NTP Re-decoding</h3>
+<p>When parallel decoding encounters <em>Format Irregularity</em> (malformed syntax at category boundaries) or <em>Spatial Ambiguity</em> (intermediate coordinates between densely arranged objects), the compromised block is discarded and generation reverts to the last verified prefix. NTP then autoregressively generates tokens for the problematic block before switching back to MTP.</p>
+<h2>138M Diverse Language Queries and 785M Boxes</h2>
+<p>To train a highly capable model for general-purpose visual detection and grounding, we curate <strong>LocateAnything-Data</strong>, a multi-domain dataset encompassing 12M unique images and massive, dense supervisory signal spatial signals.</p>
+<h3>General Object Detection</h3>
+<p>66.9% of queries and 83.1% of boxes. Provides essential bounding box supervision for precise and dense coordinate alignments.</p>
+<h3>GUI Element Grounding</h3>
+<p>16.5% of queries. Enables the model to support embodied agents and graphical user interface navigation tasks.</p>
+<h3>Referring Comprehension</h3>
+<p>7.3% of queries. Links complex natural language intents to specific spatial regions within images.</p>
+<h3>Text Localization (OCR)</h3>
+<p>3.6% of queries. Perceives and tightly grounds textual information within images.</p>
+<h3>Layout Grounding</h3>
+<p>3.5% of queries. Enriches the structural reasoning capabilities for document and scene layout understanding.</p>
+<h3>Point-Based Localization</h3>
+<p>2.2% of queries. Refines spatial precision for fine-grained coordinate predictions.</p>
+<h2>State-of-the-Art Visual Grounding &amp; Detection</h2>
+<p>We report accuracy metrics and throughput (BPS, measured on a single NVIDIA H100 GPU) of LocateAnything under the default Hybrid Mode. LocateAnything achieves 12.7 BPS, over 10× faster than textual-based Qwen3-VL (1.1 BPS) and 2.5× faster than quantized-based Rex-Omni (5.0 BPS).</p>
+<h3>High-Quality Multi-Object Detection</h3>
+<p><strong>Results on LVIS and COCO.</strong> LocateAnything improves the mean F1 by +3.8% on LVIS and +1.8% on COCO compared to Rex-Omni at identical model size, with particularly strong gains at high IoU thresholds (31.1 vs. 20.7 at IoU=0.95 on LVIS). <strong>Dense Object Detection.</strong> On dense detection benchmarks Dense200 and VisDrone, LocateAnything achieves 58.7 and 39.9 mean F1 respectively, substantially outperforming Rex-Omni (58.3 / 35.8), demonstrating superior boundary delineation in heavily overlapping environments.</p>
+<h3>Precise Open-World Localization</h3>
+<p><strong>GUI Grounding (ScreenSpot-Pro).</strong> LocateAnything achieves a SOTA mean F1 of 60.3, surpassing generalist VLMs like Qwen3-VL-30B-A3B and specialized models such as GUI-Owl-32B, with particularly strong performance on icon-based queries. <strong>Layout Grounding &amp; OCR.</strong> LocateAnything establishes new standards on document understanding: 76.8 and 70.1 mean F1 on DocLayNet and M6Doc respectively, outperforming Rex-Omni by substantial margins (+6.1 / +14.5). On TotalText OCR, it achieves 43.3 mean F1, surpassing all compared methods. <strong>Referring Expression Comprehension.</strong> LocateAnything seamlessly aligns nuanced human intents with visual regions, achieving 78.7 mean F1 on HumanRef and remaining highly competitive on RefCOCOg against top-tier models. <strong>Point-Based Localization.</strong> Evaluation on point-based grounding across COCO, LVIS, Dense200, VisDrone, HumanRef, and RefCOCOg benchmarks.</p>
+<h2>Analyzing Design Choices and Decoding Efficiency</h2>
+<p>We conduct ablation studies on the COCO dataset to validate our core designs across coordinate representation, MTP formulation, decoding mode, box output order, and throughput scaling.</p>
+<p><strong>Coordinate Representation, MTP Formulation &amp; Decoding Modes.</strong> (a) PBD (Slow Mode) achieves the highest F1 of 52.1, proving box-aligned formulation provides stronger supervision than 1D serialization. (b) PBD dramatically outpaces structure-agnostic MTP methods (16.9 BPS vs. 5.5 BPS for SDLM-B6) while improving F1. (c) Joint training pushes Slow Mode to 52.1 F1; Hybrid Mode preserves most speed gains (13.2 BPS) at 51.6 F1. <strong>Decoding Mode Comparison.</strong> Joint dual-formulation training successfully pushes the Slow Mode upper bound from 50.1 to 52.1 F1. Hybrid Mode seamlessly resolves the speed-accuracy trade-off, achieving robust high-precision localization while preserving most speed gains. <strong>Box Ordering &amp; Decoding Throughput.</strong> <em>Left:</em> X-Y Corner Order sorting yields the highest F1-score among four spatial ordering strategies. <em>Right:</em> As target boxes increase from 20 to 300, NTP methods suffer from severe latency bottleneck, while Parallel Box Decoding achieves a 2× to 6× speedup, scaling throughput from 12 BPS to ~25 BPS in dense scenes.</p>
+<h2>High-Quality Grounding In The Wild</h2>
+<p>LocateAnything achieves precise visual grounding across document understanding, GUI interaction, and object detection tasks.</p>
+<p>Dense Object Detection High-precision OCR Referring Expression Comprehension</p>
+<h2>LocateAnything</h2>
+<p>If you find LocateAnything's parallel box decoding useful for your research, please consider citing our work.</p>
+<pre>@article\{wang2025locateanything,
+  title   = \{LocateAnything: Fast and High-Quality Vision-Language Grounding with Parallel Box Decoding},
+  author  = \{Shihao Wang and Shilong Liu and Yuanguo Kuang and Xinyu Wei and Yangzhou Liu and Zhiqi Li and Yunze Man and Guo Chen and Andrew Tao and Guilin Liu and Jan Kautz and Lei Zhang and Zhiding Yu},
+  journal = \{arXiv preprint arXiv:2605.27365},
+  year    = \{2026},
+}
+</pre>
