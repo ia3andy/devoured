@@ -1,0 +1,176 @@
+<h1>pi-dynamic-workflows</h1>
+<blockquote>
+ <p>Claude-Code-style dynamic workflows for <a href="https://github.com/earendil-works/pi">Pi</a>.</p>
+</blockquote>
+<p>A Pi extension that adds a <code>workflow</code> tool. Instead of one assistant doing everything sequentially, the model writes a small JavaScript script that fans out the work across many isolated subagents, then synthesizes the results.</p>
+<p>Great for codebase audits, multi-perspective review, large refactors, and fan-out research.</p>
+<p>Inspired by Anthropic's <a href="https://claude.com/blog/introducing-dynamic-workflows-in-claude-code">dynamic workflows in Claude Code</a>.</p>
+<h2>Install</h2>
+<pre>pi install npm:pi-dynamic-workflows
+# or from a local checkout
+pi install /path/to/pi-dynamic-workflows</pre>
+<p>Then in Pi:</p>
+<pre><code>/reload
+</code></pre>
+<p>That's it. The extension registers a <code>workflow</code> tool and activates it on session start.</p>
+<h2>Usage</h2>
+<p>Just ask Pi for a workflow in plain language:</p>
+<pre><code>Run a workflow to inspect this repository and summarize the main modules.
+</code></pre>
+<p>The model will write a workflow script and call the <code>workflow</code> tool. Live progress shows up inline:</p>
+<pre><code>◆ Workflow: inspect_project (3/3 done)
+  ✓ Scan 1/1
+    #1 ✓ repo inventory
+  ✓ Analyze 2/2
+    #2 ✓ source modules
+    #3 ✓ final summary
+</code></pre>
+<p>Press <code>Esc</code> to cancel a running workflow. Active subagents are aborted and surfaced as skipped.</p>
+<h2>Workflow script shape</h2>
+<p>A workflow is plain JavaScript. The first statement must export literal metadata. <code>name</code> and <code>description</code> are required; <code>phases</code> is optional documentation for an expected outline. The live progress view is driven by <code>phase(...)</code> calls at runtime:</p>
+<pre>export const meta = \{
+  name: 'inspect_project',
+  description: 'Inspect a repository and summarize the main modules',
+  phases: [
+    \{ title: 'Scan' },
+    \{ title: 'Analyze' },
+  ],
+}
+
+phase('Scan')
+const inventory = await agent('Inspect the repository structure.', \{
+  label: 'repo inventory',
+})
+
+phase('Analyze')
+const summary = await agent(
+  'Summarize the main modules from this inventory:\n' + inventory,
+  \{ label: 'module summary' },
+)
+
+return \{ inventory, summary }</pre>
+<p>Phases are discovered as the script runs, so conditional and loop-created phases work naturally. If a branch is skipped, its phase does not show up as an empty progress row.</p>
+<h3>Editor IntelliSense</h3>
+<p>Reusable workflow files can opt into editor hints for workflow globals:</p>
+<pre>/// &lt;reference types="pi-dynamic-workflows/workflow" /&gt;</pre>
+<p>This declares <code>agent</code>, <code>parallel</code>, <code>pipeline</code>, <code>phase</code>, <code>log</code>, <code>args</code>, <code>cwd</code>, and <code>budget</code> for TypeScript-aware editors.</p>
+<h3>Available globals</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Global</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>agent(prompt, opts)</code></td>
+   <td>Spawn an isolated subagent. Returns its final text or, with <code>opts.schema</code>, a validated object.</td>
+  </tr>
+  <tr>
+   <td><code>parallel(thunks)</code></td>
+   <td>Run an array of <code>() =&gt; agent(...)</code> thunks concurrently. Results are returned in input order.</td>
+  </tr>
+  <tr>
+   <td><code>pipeline(items, ...stages)</code></td>
+   <td>Run each item through sequential stages while items fan out. Each stage receives <code>(prev, original, index)</code>.</td>
+  </tr>
+  <tr>
+   <td><code>phase(title)</code></td>
+   <td>Mark the current phase. Used for grouping in the live progress view.</td>
+  </tr>
+  <tr>
+   <td><code>log(message)</code></td>
+   <td>Append a workflow-level log line.</td>
+  </tr>
+  <tr>
+   <td><code>args</code></td>
+   <td>Optional JSON value passed in via the tool's <code>args</code> parameter.</td>
+  </tr>
+  <tr>
+   <td><code>cwd</code>, <code>process.cwd()</code></td>
+   <td>Current working directory for subagents.</td>
+  </tr>
+  <tr>
+   <td><code>budget</code></td>
+   <td><code>\{ total, spent(), remaining() }</code> token budget tracker.</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Determinism rules</h3>
+<p>Workflow scripts are evaluated inside a Node <code>vm</code> sandbox. The following are intentionally unavailable:</p>
+<ul>
+ <li><code>Date.now()</code>, <code>new Date()</code></li>
+ <li><code>Math.random()</code></li>
+ <li><code>require</code>, <code>import</code>, <code>fs</code>, network APIs</li>
+ <li>spreads, computed keys, template interpolation, function calls inside <code>meta</code></li>
+</ul>
+<p>This keeps <code>meta</code> parseable, runs reproducible, and the surface area small.</p>
+<h3>Structured subagent output</h3>
+<p>Pass a JSON Schema via <code>opts.schema</code> and the subagent will return a validated object:</p>
+<pre>const finding = await agent('Find security-sensitive files.', \{
+  label: 'security scan',
+  schema: \{
+    type: 'object',
+    properties: \{
+      paths: \{ type: 'array', items: \{ type: 'string' } },
+      reason: \{ type: 'string' },
+    },
+    required: ['paths', 'reason'],
+  },
+})</pre>
+<p>Under the hood this is a Pi <code>structured_output</code> tool with <code>terminate: true</code>, so the subagent ends on that call without an extra assistant turn.</p>
+<h2>How it works</h2>
+<pre><code>user prompt
+  → Pi model writes a workflow script
+  → workflow tool parses + runs script in a vm sandbox
+  → script calls agent(), parallel(), pipeline()
+  → each agent() spawns an in-memory Pi subagent session
+  → snapshots stream back as compact progress
+  → final structured result returned to the parent assistant
+</code></pre>
+<p>Subagents run in fresh in-memory Pi sessions with the standard coding tools, so they can read files, run shell commands, and call structured output exactly like a normal Pi turn.</p>
+<h2>Library modules</h2>
+<table>
+ <thead>
+  <tr>
+   <th>File</th>
+   <th>Purpose</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>src/workflow.ts</code></td>
+   <td>AST-validated parser and sandboxed workflow runtime.</td>
+  </tr>
+  <tr>
+   <td><code>src/workflow-tool.ts</code></td>
+   <td>The Pi <code>workflow</code> tool, prompt guidelines, rendering, abort handling.</td>
+  </tr>
+  <tr>
+   <td><code>src/agent.ts</code></td>
+   <td><code>WorkflowAgent</code>, an in-memory Pi subagent runner.</td>
+  </tr>
+  <tr>
+   <td><code>src/structured-output.ts</code></td>
+   <td>Terminating structured-output tool backed by TypeBox/JSON Schema.</td>
+  </tr>
+  <tr>
+   <td><code>src/display.ts</code></td>
+   <td>Workflow snapshots and compact text renderers.</td>
+  </tr>
+  <tr>
+   <td><code>extensions/workflow.ts</code></td>
+   <td>The Pi extension entrypoint.</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Development</h2>
+<pre>npm install
+npm test     # biome check + tsc + unit tests
+npm run dev</pre>
+<p>Parser unit tests live in <code>tests/workflow-parser.test.ts</code> and cover both accepted and rejected script shapes.</p>
+<h2>Status</h2>
+<p>This is a prototype. It implements the core workflow primitive (script, subagents, parallel/pipeline, phases, abort, structured output) but does not yet implement persisted or resumable runs, or a <code>/workflows</code> manager.</p>
+<h2>License</h2>
+<p>MIT</p>
