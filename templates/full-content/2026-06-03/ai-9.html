@@ -1,0 +1,75 @@
+<h1>Wall Attention</h1>
+<p>Wall Attention is an attention variant with a <strong>per-channel, per-timestep multiplicative decay</strong> baked into the QK inner product. Where standard attention scores a pair $(i, j)$ with $\sum_n q_\{i,n}, k_\{j,n}$, Wall Attention weights each channel $n$ by a learned decay accumulated between the two positions. This gives each query channel an independent, content-dependent forgetting rate, generalizing scalar gating (FoX) and RoPE-style decays to the full channel dimension. Setting $g = 0$ recovers vanilla softmax attention.</p>
+<p>This repo packages the two kernels used in practice, each on its own:</p>
+<ul>
+ <li><strong>Training / prefill</strong> (<code>wall_attn</code>): a fused forward + backward Triton kernel (FlashAttention-style streaming softmax) with analytic gradients for $q, k, v, g$.</li>
+ <li><strong>Decode</strong> (<code>wall_attn_decode</code>): a single-step kernel that reads a <strong>pre-rescaled KV cache</strong>, so per-token generation costs one small GEMV-like pass instead of recomputing the prefix.</li>
+</ul>
+<h2>Installation</h2>
+<pre># Using uv (recommended)
+uv sync
+source .venv/bin/activate
+
+# or with pip
+pip install -e .</pre>
+<h2>Usage</h2>
+<h3>Training / prefill</h3>
+<pre>import torch
+from wall_attn import wall_attn
+
+B, T, H, HQ, K, V = 2, 1024, 4, 8, 64, 64  # GQA: HQ query heads, H kv heads
+q = torch.randn(B, T, HQ, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+k = torch.randn(B, T, H,  K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+v = torch.randn(B, T, H,  V, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+g = torch.randn(B, T, HQ, K, device="cuda", dtype=torch.bfloat16, requires_grad=True) * 0.02
+
+o = wall_attn(q, k, v, g, scale=K**-0.5)  # [B, T, HQ, V]
+o.sum().backward()</pre>
+<p>Optional arguments: <code>g_scalar</code> ([B, T, HQ] FoX-style additive gate), <code>sink_bias</code> ([HQ] attention sink), <code>window_size</code> (sliding window), and <code>cu_seqlens</code> (varlen packing, requires <code>B == 1</code>).</p>
+<h3>Decode (cached generation)</h3>
+<p>Build the pre-rescaled cache once at prefill, then decode one token at a time:</p>
+<pre>import torch
+from fla.ops.utils.constant import RCP_LN2
+from fla.ops.utils.cumsum import chunk_global_cumsum
+from wall_attn import build_wall_kv_cache, wall_attn_decode
+
+C = 64                                  # cache chunk size (anchor granularity)
+P = chunk_global_cumsum(g, scale=RCP_LN2)              # [B, T, HQ, K] prefix
+k_tilde, r_cache = build_wall_kv_cache(k, P, chunk_size=C)
+
+o, _ = wall_attn_decode(
+    q=q[:, -1:],                        # current query [B, 1, HQ, K]
+    v=v,                                # cached values [B, T_kv, H, V]
+    p_curr=P[:, -1:],                   # prefix at the current row
+    k_tilde=k_tilde,                    # pre-rescaled keys [B, T_kv, HQ, K]
+    r_cache=r_cache,                    # per-chunk anchors [B, ceil(T_kv/C), HQ, K]
+    sink_bias=None,
+    scale=K**-0.5,
+    cache_chunk_size=C,
+)</pre>
+<p><code>build_wall_kv_cache</code> folds the decay into the keys (<code>k_tilde[j] = k[j] · exp2(R_c − P[j])</code>) using a per-chunk anchor <code>R_c</code>, so the decode kernel never re-accumulates the prefix. See <code>tests/test_decode.py::test_decode_streaming_matches_full_forward</code> for the full append-as-you-go serving loop.</p>
+<h2>Code structure</h2>
+<pre><code>wall_attn/
+├── __init__.py    # public API
+├── training.py    # forward/backward Triton kernels + autograd Function + wall_attn()
+├── decode.py      # single-step decode kernel + build_wall_kv_cache()
+└── reference.py   # eager PyTorch reference (correctness oracle)
+tests/
+├── test_training.py   # parity + analytic gradients (finite-difference checked)
+└── test_decode.py     # decode == prefill forward, streaming, cache shapes
+</code></pre>
+<h2>Features</h2>
+<ul>
+ <li><strong>GQA</strong>: query heads <code>HQ</code> may exceed kv heads <code>H</code> (<code>HQ % H == 0</code>).</li>
+ <li><strong>Per-channel decay <code>g</code></strong> with exact analytic gradient, plus an optional <strong>scalar gate</strong> <code>g_scalar</code>.</li>
+ <li><strong>Attention sink</strong> (<code>sink_bias</code>), <strong>sliding window</strong> (<code>window_size</code>), and <strong>varlen packing</strong> (<code>cu_seqlens</code>).</li>
+ <li><strong>Pre-rescaled decode cache</strong> for cheap autoregressive generation, numerically stable to long context (per-chunk anchors keep <code>exp2</code> bounded).</li>
+ <li>BF16/FP32 inputs; autotuned block sizes for Hopper / Ampere.</li>
+</ul>
+<h2>Testing</h2>
+<pre>pytest                 # requires a CUDA GPU</pre>
+<p>Every kernel path is checked against the eager <code>wall_attn_reference</code>, and the <code>g</code> / <code>g_scalar</code> gradients are verified against central finite differences. The decode kernel is checked to reproduce the training forward token-for-token, including a streaming generation loop.</p>
+<h2>Acknowledgments</h2>
+<p>The Triton kernels build on the parallel-attention machinery from <a href="https://github.com/fla-org/flash-linear-attention">flash-linear-attention</a> (MIT). We thank the FLA team for their excellent work on efficient attention.</p>
+<h2>License</h2>
+<p>MIT, see <a>LICENSE</a>.</p>

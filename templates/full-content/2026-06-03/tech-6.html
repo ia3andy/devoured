@@ -1,0 +1,105 @@
+<h1>Karpathy's Autoresearch found a 3-year-old bug in our query engine (and improved performance by 11%)</h1>
+<p>A few weeks ago at a team offsite in Lisbon, we pointed an AI agent at our query engine, fed it slow queries from production, and let it run overnight.</p>
+<p>By the next morning it had found something embarrassing: for almost three years, every query with a timestamp filter had not been using ClickHouse's primary key correctly. <a href="https://github.com/PostHog/posthog/pull/54819">The fix</a> cut the number of granules ClickHouse had to scan by 62% on the benchmark query, and made the query itself meaningfully faster.</p>
+<p>This post is about the setup we used, the bug itself, and what we're building now so this kind of analysis happens automatically.</p>
+<h2>What's autoresearch?</h2>
+<p>The general idea isn't ours. Andrej Karpathy <a href="https://github.com/karpathy/autoresearch">packaged it up</a> and gave it a name in March 2026: give an AI agent a small but real system, a benchmark, and a budget, and let it loop; propose a change, run the benchmark, keep what helps, throw away what doesn't.</p>
+<p>Karpathy ran it for two days against a depth-12 nanochat training run and found <a href="https://x.com/karpathy/status/2031135152349524125">about 20 changes that improved validation loss</a>, some of which transferred to a bigger model. The shape isn't new (DeepMind's <a href="https://www.nature.com/articles/s41586-023-06924-6">FunSearch</a> (2023) and <a href="https://sakana.ai/ai-scientist/">Sakana's AI Scientist</a> (2024) are earlier examples), but Karpathy's repo is small and concrete enough to inspire you to build your own version in an afternoon.</p>
+<p>The interesting part for us is the second-order effect: the agent doesn't carry the bias that comes from living in a codebase. To us, the <code>toTimeZone()</code> wrap had just always been there. The kind of code you stop seeing. The agent has no priors. It runs every diagnostic, reads the surrounding ClickHouse and PostHog source for context, and treats a three-year-old expression with the same suspicion as the line you wrote yesterday.</p>
+<h2>Setting up autoresearch for ClickHouse in a hackathon</h2>
+<p>Every year, we run <a>hackathons</a> at company offsites. A lot of what's now PostHog (<a>session replay</a>, the <a>data warehouse</a>, <a>logs</a>, and more) started this way. At a smaller joint team offsite for the <a>Analytics Platform</a> and <a>Query Performance</a> teams in Lisbon, our hackathon project was to do Karpathy's thing, but for ClickHouse query performance.</p>
+<p>The stack we used:</p>
+<ul>
+ <li>
+  <p><strong><a href="https://pi.dev/">pi</a></strong>: a small terminal coding agent built by <a href="https://github.com/badlogic">Mario Zechner</a>. It speaks to whatever LLM you point it at, exposes a small SDK, and is small enough that you can read the entire codebase.</p></li>
+ <li>
+  <p><strong><a href="https://github.com/davebcn87/pi-autoresearch"><code>pi-autoresearch</code></a></strong>: a community extension by <code>davebcn87</code> that wires Karpathy's loop into pi. You give it an objective, a baseline, a benchmark command, and a target metric. It iterates, commits each candidate, runs the benchmark, and keeps a journal so the run survives context resets.</p></li>
+ <li>
+  <p><strong>A campaign orchestration contract</strong> that we wrote on top of <code>pi-autoresearch</code>. The basic loop "try something, measure, keep or discard" is too loose when a single ClickHouse query has hundreds of plausible rewrites. Without a structure, an agent can fiddle with a corner of the query until it gives up; with it, you get something closer to how someone would actually run an investigation. We structured each investigation into four parts:</p>
+  <ol>
+   <li>A <strong>campaign</strong> with one slow query and one git branch.</li>
+   <li>This is broken into <strong>lanes</strong>, optimization directions tied to a suspected bottleneck: predicate ordering, <a>JSON parsing</a>, timezone handling, primary key usage, and so on. Lanes can be paused when they stop yielding signal, split when they turn out to be two ideas, or merged when wins from different lanes turn out to combine.</li>
+   <li>A concrete, testable <strong>hypothesis</strong> inside each lane.</li>
+   <li>An <strong>experiment</strong> inside each hypothesis with one run, benchmark, and verdict. The agent has to do an explicit reflection pass after every experiment instead of letting the loop just hill-climb.</li>
+  </ol></li>
+ <li>
+  <p><strong>A throwaway ClickHouse test cluster</strong>: this kept iteration speed high and benchmark numbers predictable. The same data shape as production but anonymized and running on cheaper hardware dedicated to the agent. Running on a developer laptop would have been too slow for a useful inner loop; running on production would have meant fighting noisy neighbors and risking interference with customer queries.</p></li>
+</ul>
+<p>Range-narrowing also helped. When a target query times out, the agent halves the range (30 days, 14, 7, 3, 1) until it completes in one to ten seconds, then optimizes against that narrowed version. That window is short enough for fast iteration but long enough that index and partition effects still matter. The current best candidate is periodically retested at the full range; once it completes there, the campaign "graduates" back and continues from the original query.</p>
+<p>During the hackathon, we hand-fed it slow queries that we'd grumbled about in the past and ones we found by hand in <code>system.query_log</code> (we're now automating this now).</p>
+<h2>Discovering our silently broken primary key</h2>
+<p>ClickHouse is fast because it can skip work. Our <code>events</code> table is <code>PARTITION BY toYYYYMM(timestamp)</code> and the primary key is <code>(team_id, toDate(timestamp), event, …)</code>. A well-formed query with a timestamp bound should make ClickHouse drop entire months of data and then jump straight to the right week within the months it does have to look at.</p>
+<p>That's not what was happening.</p>
+<p>When we added per-team timezone support to HogQL <a href="https://github.com/PostHog/posthog/pull/14968">in April 2023</a>, we did the sensible thing and wrapped every reference to <code>timestamp</code> in <code>toTimeZone(timestamp, team_tz)</code> so display dates were correct. What we didn't realize is that the ClickHouse query planner can't see through <code>toTimeZone()</code>. This meant it couldn't derive bounds on:</p>
+<ul>
+ <li><code>toYYYYMM(timestamp)</code> from <code>toTimeZone(timestamp, tz) &gt;= '2024-03-01'</code>, so partition pruning was off.</li>
+ <li><code>toDate(timestamp)</code> so the primary key was being used for <code>team_id</code> and <code>event</code> but stopping there.</li>
+</ul>
+<p>The reason this hadn't already paged us is that ClickHouse also has a <a href="https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree#available-types-of-indices">MinMax skip index</a> on <code>timestamp</code>. A MinMax index stores the smallest and largest value of a column per "granule" (8,192 rows by default). When you compare <code>toTimeZone(timestamp, tz)</code> against a constant, ClickHouse can still evaluate that against each granule's min/max and skip the ones whose range doesn't overlap. This is much weaker than partition pruning, but it works, so queries weren't catastrophically slow, just measurably slower than they should have been.</p>
+<p>That's the kind of bug that hides forever. It's slow, but not "page someone" slow. Every query is affected, so nobody can A/B compare against a "good" version. And the smoking gun lives in the output of <code>EXPLAIN PLAN indexes=1, json=1</code>, which nobody runs unless they already suspect something.</p>
+<p>In one of the lanes, the autoresearch loop ran the <code>EXPLAIN</code>. It noticed <code>Partition: Condition='true'</code> (i.e. no pruning) so tried two things:</p>
+<ol>
+ <li>Adding <code>indexHint()</code> with bare-timestamp bounds.</li>
+ <li>Rewriting the comparison so the field side was bare and the constant carried the timezone.</li>
+</ol>
+<p>The second approach won, by a lot, and that's what we <a href="https://github.com/PostHog/posthog/pull/54819">shipped</a>:</p>
+<pre><code>
+            -- Before: planner can't see through toTimeZone
+            toTimeZone(timestamp, 'US/Pacific') &gt;= '2024-03-01'
+             
+            -- After: bare field on the left, timezone-annotated constant on the right
+            timestamp &gt;= toDateTime64('2024-03-01', 6, 'US/Pacific')</code></pre>
+<p>The semantics are identical because <code>toTimeZone()</code> only changes display metadata: the underlying epoch is unchanged. The planner now sees a bare <code>timestamp</code> and can do its job.</p>
+<p>On a 7-day funnel against a real team in production (<code>load_balancing='in_order'</code> so each variant hits the same shard, five runs each, trimmed mean of the middle three):</p>
+<table>
+ <thead>
+  <tr>
+   <th>Metric</th>
+   <th>Baseline</th>
+   <th>This fix</th>
+   <th>Change</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Best run</td>
+   <td>2,824 ms</td>
+   <td>2,192 ms</td>
+   <td><strong>−22%</strong></td>
+  </tr>
+  <tr>
+   <td>Trimmed mean (mid 3)</td>
+   <td>4,694 ms</td>
+   <td>2,954 ms</td>
+   <td><strong>−37%</strong></td>
+  </tr>
+  <tr>
+   <td>Skip-index granules</td>
+   <td>60,683</td>
+   <td>23,291</td>
+   <td><strong>−62%</strong></td>
+  </tr>
+ </tbody>
+</table>
+<p>The speedup is biggest on queries with short date ranges, because that's where partition pruning matters most. At a 7-day range, you can drop most of the partitions if the planner cooperates. Wider ranges have to look at more partitions regardless, so the relative win shrinks: a 90-day query is still faster, just not by 37%. The granule reduction is real on every range; it just translates into a smaller wall-clock improvement when there are more granules to scan in absolute terms.</p>
+<p>The bug had been there since the timezone change landed. About three years.</p>
+<h2>What's next: doing this without the hackathon</h2>
+<p>We were hand-feeding slow queries to the agent during the offsite. That doesn't scale. The pipeline we're now building is closer to what you'd actually want:</p>
+<ol>
+ <li>
+  <p><strong>Fetch slow queries from <code>system.query_log</code>.</strong> The orchestrator that does this lives at <a href="https://github.com/PostHog/posthog/blob/master/products/query_performance_ai/orchestrator/slow_queries.py"><code>products/query_performance_ai/orchestrator/slow_queries.py</code></a>.</p></li>
+ <li>
+  <p><strong>Spin up a sandbox per candidate query</strong>, the same sandboxes we use to run <a>PostHog Code</a>, our coding agent and product editor (currently in beta).</p></li>
+ <li>
+  <p><strong>Run <code>pi-autoresearch</code> in each sandbox</strong>, each with its own benchmark target and budget.</p></li>
+ <li>
+  <p><strong>Have an LLM dedup the suggestions and spawn a PostHog Code session for each surviving idea.</strong> Different sandboxes often land on the same idea, so the LLM collapses those before dispatching. PostHog Code writes the actual change against the real codebase, with tests and benchmarks.</p></li>
+ <li>
+  <p><strong>Post the resulting PRs into our team Slack channel</strong> so a human reviews and merges.</p></li>
+</ol>
+<p>If this works, "some queries in our codebase don't use the primary key correctly" becomes a thing the system finds overnight while we're all asleep, not a thing that takes three years and a team offsite to uncover. We'll write up the second-order results once they're real.</p>
+<p>In the meantime, the recipe isn't specific to slow queries. If there's a metric in your system you've been quietly tolerating (speed, memory, cost, accuracy, error rate, anything you can put a number on), build a harness you can run cheaply and don't mind being mean to, point an agent at it, and look at what comes back.</p>
+<blockquote>
+ PostHog is an all-in-one developer platform for building successful products. We provide <a>product analytics</a>, <a>web analytics</a>, <a>session replay</a>, <a>error tracking</a>, <a>feature flags</a>, <a>experiments</a>, <a>surveys</a>, <a>AI Observability</a>, <a>logs</a>, <a>workflows</a>, <a>endpoints</a>, <a>data warehouse</a>, <a>CDP</a>, and an <a>AI product assistant</a> to help debug your code, ship features faster, and keep all your usage and customer data in one stack.
+</blockquote>
+<h3>Community questions</h3>
