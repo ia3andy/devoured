@@ -418,7 +418,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!firstUnread) { postCta.style.display = 'none'; return; }
         postCta.querySelector('.digest-cta-title').textContent = firstUnread.dataset.oneliner || '';
         if (window.matchMedia('(min-width: 769px)').matches) {
-          postCta.querySelector('.digest-cta-btn').href = '#' + firstUnread.id;
+          postCta.querySelector('.digest-cta-btn').href = '#' + firstUnread.dataset.articleId;
           postCta.querySelector('.digest-cta-btn-text').textContent = 'Start reading';
         }
         postCta.style.display = '';
