@@ -1,0 +1,133 @@
+<ul>
+ <li>Liquid Clustering is the data layout for open table formats that outperforms partitioning while sidestepping its limitations</li>
+ <li>8 common myths keep teams tied to partitioning, and none of them hold up anymore</li>
+ <li>Customers using Liquid Clustering report dramatic improvements in query latency, write throughput, storage efficiency, and data freshness, with the largest gains compounding at petabyte scale</li>
+</ul>
+<h2>Introduction</h2>
+<p>Laying out data is one of the oldest problems in computing.&nbsp;</p>
+<p>For over 15 years, since the advent of Hadoop and Hive, partitioning has been the standard way to physically organize data for processing and analysis. However, today’s Lakehouses serve agents, real-time pipelines, and query patterns that shift faster than any human can re-partition for.&nbsp;</p>
+<p><strong>Liquid Clustering</strong> is the modern standard and customers are running it at every scale, including dozens with petabyte scale tables in production. In this blog, we’ll cover why Liquid Clustering wins in the Lakehouse. Along the way, we’ll debunk 8 common data layout myths, walk through 3 success stories of teams converting partitioned tables to Liquid Clustering, preview what’s coming next, and show how to get started.</p>
+<h2>Why Liquid Clustering wins in the modern lakehouse</h2>
+<p>Hive-style partitioning forces users to commit, at table-creation time, to a physical organization of data that manifests in the file structure. Pick a column with too high cardinality and you get billions of tiny files. Pick the wrong column and queries may get slower, not faster. Either way, you’re stuck rewriting the table. It’s common to get wrong: in our analysis, <strong>Hive-style partitioning leads to over-partitioning and small-file problems in more than 75% of cases.</strong></p>
+<p>Liquid treats clustering keys as input that the engine uses to guide optimal file organization. Keys can be changed at any time, or intelligently selected through Automatic Liquid Clustering. Cardinality isn’t a constraint, and the layout can evolve over time without unnecessary rewrites.&nbsp;</p>
+<p>The benefits of Liquid Clustering all derive from the above principle: better skew handling, row-level concurrency, no small-file problems, multi-dimensional clustering, and lower write amplification.&nbsp;</p>
+<figure>
+ <img alt="Small files and data skew with partitioning; good file-sizing and clustering with Liquid" src="https://www.databricks.com/sites/default/files/inline-images/partitioning-vs-liquid-clustering.png">
+ <figcaption>
+  Small files and data skew with partitioning; good file-sizing and clustering with Liquid
+ </figcaption>
+</figure>
+<p>In 2026, the layout <em>should</em> be an implementation detail of the table, with every engine that reads or writes benefitting from it. This is increasingly important as agents enter the Lakehouse, generating and consuming more data than ever. Humans and agents need forgiving interfaces, free of the potential side-effects of Hive-style partitioning.</p>
+<h2>Debunking 8 common data layout myths</h2>
+<p>Liquid Clustering became Generally Available in 2024. Since then, we’ve iterated on it non-stop with customers running it at scale. In that time, some common myths about Liquid Clustering and partitioning have persisted, and today we want to debunk them.&nbsp;</p>
+<h3>Myth #1: Partitioning is faster because it can prune directories instead of files</h3>
+<p>The myth goes: With partitioning, Spark or other engines can prune whole directories without opening any files inside of them.&nbsp;</p>
+<p>Reality: Directory-pruning does not exist on modern open table formats like Delta and Iceberg. Delta, for example, uses a transaction log to track every data file along with per-column statistics, and pruning happens against those statistics, not the directory structure. The engine never lists directories to plan a query. It reads the transaction log, evaluates filters against statistics, and skips files that don’t match. Liquid Clustering uses the same mechanism. Whether your data lives in `date=x/hour=y/` or a flat directory of clustered files, the engine prunes at file granularity. There is no directory-level shortcut to lose.</p>
+<h3>Myth #2: Partitioning is better when filtering on a low-cardinality column</h3>
+<p>The myth goes: For a column with a small number of distinct values, partitioning gives you perfect data separation <em>and</em> good file sizes.&nbsp;</p>
+<p>Reality: Liquid Clustering automatically detects when to apply low-cardinality optimizations. For example, if you cluster by (date, user_id), and date has low cardinality, the system aims for each file to contain rows from only a single date. Higher-cardinality columns, like user_id, are then automatically used for finer-grained sorting within each date's files, without having to rely on other sorting techniques like Z-Ordering.</p><img src="https://www.databricks.com/sites/default/files/inline-images/low-cardinality-liquid-clustering-optimization.png" alt="low-cardinality liquid clustering optimizationg">
+<p>We saw the following improvements while benchmarking this Liquid optimization on a real-world data warehousing benchmark: <strong>35% lower time for clustering and 22% faster query times.</strong></p>
+<p>Additionally, Liquid Clustering is designed to be better than partitioning when clustering on a high-cardinality column, as it always tries to create files of a good size.</p>
+<h3>Myth #3: Liquid Clustering doesn’t support metadata-only operations</h3>
+<p>The myth goes: Metadata-only operations are uniquely supported by partitioning. A DELETE aligned with partition boundaries only updates the table’s metadata, and aggregates on partition columns can be computed without scanning files. Liquid Clustering can’t do the same.</p>
+<p>Reality: Liquid Clustering also supports metadata-only operations including DELETEs, COUNT, DISTINCT, and GROUP BY queries. The engine uses the same per-file min/max stats it uses for data skipping to determine when a query’s answer can be computed from metadata alone. In our benchmarks, metadata-only DELETEs on Liquid Clustered tables ran <strong>~90% faster</strong> than full-rewrite DELETEs. Other metadata-only aggregate queries saw up to <strong>27x speedups.</strong>&nbsp;</p>
+<h3>Myth #4: Liquid Clustering doesn’t work well at petabyte scale</h3>
+<p>The myth goes: OPTIMIZE on a PB-size table can run for hours, and the cost of maintenance is too high.</p>
+<p>Reality: We’ve made a number of significant improvements to OPTIMIZE, and dozens of customers now have PB-scale Liquid Clustered tables in production. Two years ago, planning, the first phase of OPTIMIZE, could take up to 12 hours on a 10 PB Liquid table in some cases. We’ve spent the time since reducing planning time down to 23 minutes. Execution, the second phase of OPTIMIZE, got <strong>5x </strong>faster on a Medium DBSQL cluster.</p><img src="https://www.databricks.com/sites/default/files/inline-images/optimize-planning-and-execution-time.png" alt="optimize planning and execution time">
+<h3>Myth #5: Liquid Clustering only benefits a subset of readers</h3>
+<p>The myth goes: Liquid Clustering is only beneficial for Databricks readers to UC managed Delta tables.</p>
+<p>Reality: Liquid Clustering is a write-side optimization. It’s how the engine organizes files for efficient data skipping. The output is standard Parquet files with min/max stats, written into open table formats like Delta/Iceberg. Any compatible reader (e.g. open-source Apache Spark, DuckDB, etc.) can use those stats to skip files. Liquid Clustering is available on both external / managed and Delta / Iceberg tables, and the benefit is applicable regardless of the reader.&nbsp;</p>
+<h3>Myth #6: Partitioning is necessary for concurrent ETL</h3>
+<p>The myth goes: Concurrent ETL needs write boundaries. Without partitioning, two writers updating the same table risk colliding, and Delta/Iceberg concurrency control forces one of them to retry or fail. Partition and give each writer its own slice of the table, so two pipelines never touch the same files.&nbsp;</p>
+<p>Reality: Operating at partition granularity was a workaround for an older concurrency model. Unlike partitioning which only has file-level concurrency, Liquid provides row-level concurrency. Two writers updating different rows no longer conflict, even if those rows live in the same file. This removes one of the main reasons teams partitioned tables: maintaining write boundaries to avoid serialization. With Liquid Clustering, ETL can easily operate concurrently against the same table.</p>
+<h3>Myth #7: Z-Ordering makes up for partitioning’s shortcomings</h3>
+<p>The myth goes: Partitioning handles the partition column’s filters, and Z-Ordering handles the rest. By running OPTIMIZE ZORDER BY, the engine sorts data for optimal skipping on filters that don’t align with the partition scheme.&nbsp;</p>
+<p>Reality: Z-Ordering doesn’t save partitioning. In fact, it has its own structural problems.&nbsp;</p>
+<ul>
+ <li>The first is <strong>poor clustering quality</strong>. Z-Order doesn’t maintain a true ordering across the table. Values for the same column can get spread across many files, so per-file min/max ranges are wider and queries skip fewer files than they would with Liquid.</li>
+ <li>The second is <strong>unnecessary rewrites</strong>. Z-Order has to be rerun periodically as new data lands, and each rerun rewrites large amounts of old, possibly already-clustered data to restore clustering quality. With continuous ingestion, the cost of keeping data well-clustered with Z-Order grows along with the table.&nbsp;</li>
+</ul>
+<p>Liquid clusters incrementally, including at write time, so the layout stays optimal without unnecessary rewrites.</p>
+<h3>Myth #8: Partitioning is necessary for selective data overwrites</h3>
+<p>The myth goes: Being able to selectively overwrite data is only available through Dynamic Partition Overwrites.&nbsp;</p>
+<p>Reality: Selective overwrites work on Liquid tables natively. Databricks supports REPLACE USING and REPLACE ON, two SQL syntaxes for selectively overwriting data on any data layout: Liquid Clustered, partitioned, or plain unclustered tables. Unlike Dynamic Partition Overwrite which requires a Spark config, REPLACE USING and REPLACE ON can be used on any compute: classic clusters, SQL warehouses, and Serverless. The operation is atomic and matches on any column you choose.</p>
+<h2>Success stories: migrating from partitioning to Liquid Clustering</h2>
+<h3>7.7x query speedup on Arctic Wolf’s 3.8 PB security telemetry table</h3>
+<p>Arctic Wolf runs a 3.8+ PB security telemetry table ingesting 1+ trillion events per day, where threat hunters depend on fresh data to detect active attacks.</p>
+<p>After migrating from partitioning to Liquid Clustering on Unity Catalog managed tables with Predictive Optimization, Arctic Wolf saw:</p>
+<ul>
+ <li>90-day queries drop from 51 seconds to 6.6 seconds</li>
+ <li>File count dropped from 4M to 2M</li>
+ <li>Data freshness improved from hours to minutes</li>
+</ul>
+<h3>Read and write improvements on critical CDC tables for Bolt</h3>
+<p>Bolt recently tried Liquid Conversion (currently in Private Preview), which converts partitioned tables to Liquid in-place using ALTER TABLE .. REPLACE PARTITIONED BY WITH CLUSTER BY. They observed the following read and write benefits on a TB-scale CDC table after converting to Liquid Clustering:</p>
+<ul>
+ <li>Write throughput (rows/sec) increased by 138%</li>
+ <li>Read times were reduced by up to 63%, with an average of 21% reduction across 9 representative queries</li>
+</ul>
+<blockquote>
+ Liquid Clustering dramatically reduced the work that each write was doing, increasing our throughput significantly on our most critical CDC table. Reads also improved across the board. The best thing was: we ran the conversion from partitioning alongside live ingestion with zero downtime. With this, Liquid Clustering provided us exactly the kind of performance and reliability we needed at platform scale. — Marcin, a senior platform engineer at Bolt
+</blockquote>
+<h3>5.9x speedup in query time on a petabyte-scale internal workload</h3>
+<p>We run a 1.1 PB table internally that's queried thousands of times a day, mostly by engineers running production investigations and observability dashboards. Originally it was partitioned by date and hour, assuming time-range scans would dominate. However, that assumption turned out to be incomplete. While time-range scans were common, the table was also frequently queried by source and id, forcing the engine to scan every file in the relevant date and hour partitions to find a handful of rows.&nbsp;</p>
+<p>Adding source and id as partitions wasn’t viable, because there were too many distinct values. This would have created billions of tiny files. Liquid Clustering removed the trade-off, allowing clustering on time <em>and</em> the additional identifier columns simultaneously, while maintaining good file sizes.</p>
+<table>
+ <thead>
+  <tr>
+   <th>&nbsp;</th>
+   <th>Layout</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Before</strong></td>
+   <td>Partitioned by date,&nbsp;hour</td>
+  </tr>
+  <tr>
+   <td><strong>After</strong></td>
+   <td>Clustered by date,&nbsp;hour,&nbsp;source,&nbsp;id</td>
+  </tr>
+ </tbody>
+</table>
+<p>Benchmarks showed massive improvements across 16 representative production queries:</p>
+<table>
+ <thead>
+  <tr>
+   <th><strong>Metric</strong></th>
+   <th><strong>Before (partitioned)</strong></th>
+   <th><strong>After (Liquid)</strong></th>
+   <th><strong>Improvements</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Wall Clock Time</td>
+   <td>406s</td>
+   <td>70s</td>
+   <td>5.9x speedup</td>
+  </tr>
+  <tr>
+   <td>Bytes Read</td>
+   <td>3.5 TB</td>
+   <td>0.48 TB</td>
+   <td>86% fewer bytes read</td>
+  </tr>
+ </tbody>
+</table>
+<p>The table itself got smaller too. Total size dropped from <strong>1.1 PB to 0.8 PB</strong>, a 27% reduction with no change in the underlying data. Better-clustered files compress more efficiently, and the small-file tax that comes with over-partitioning disappears.</p>
+<h2>What’s coming next for Liquid Clustering</h2>
+<h3>Optimizing Liquid-to-Liquid joins: up to 51% faster with 87% less shuffle</h3>
+<p>Today, joining Liquid tables on their clustering columns can require a full data shuffle, even when the data is already organized by those columns. Co-clustered joins (now in Private Preview) remove that shuffle automatically. On a real-world data warehousing benchmark, a Liquid-to-Liquid join ran <strong>~51% faster </strong>(28 minutes → 14 minutes) and <strong>shuffled 87% less data</strong> (1.2 TiB → 150 GiB) than the same query without the optimization.</p>
+<h3>Easy Liquid Conversion of partitioned tables</h3>
+<p>Before, converting a partitioned table to Liquid Clustering required a full table rewrite and downstream breaking changes with REPLACE TABLE or a cutover with dual writes and planned downtime. We’re introducing a new command (now in Private Preview) that makes this conversion easier, minimizing both downtime and rewrites.&nbsp;</p>
+<h2>Getting started with Liquid Clustering</h2>
+<p>Create a table with Liquid Clustering:</p>
+<p>Or, if you’re using UC managed tables with Predictive Optimization, use Automatic Liquid Clustering to intelligently select clustering keys based on your workload and query patterns:</p>
+<p>Liquid Clustering is the layout for the modern Lakehouse. Try it on your next table, or reach out to your account team today to try the Private Previews for partitioned-to-Liquid Conversion and Co-Clustered joins!</p>
+<p>Don’t forget to catch us at DAIS!</p>
+<ul>
+ <li>Optimize Lakehouse Cost and Performance with Intelligent Storage and Liquid Clustering</li>
+</ul>
+<h3>Get the latest posts in your inbox</h3>
+<p>Subscribe to our blog and get the latest posts delivered to your inbox.</p>

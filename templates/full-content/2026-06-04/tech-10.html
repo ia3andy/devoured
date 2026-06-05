@@ -1,0 +1,37 @@
+<p>The <a href="https://en.wikipedia.org/wiki/Domain_Name_System">Domain Name System</a> exists because it's difficult for people to remember IP addresses (185.15.59.224) and much easier to remember domain names (wikipedia.org).</p>
+<p>Regarding internet-accessible services, it makes sense to publish websites, API endpoints or similar services using DNS, as people have to interfact with them. The added benefit of a domain name is that the associated IP address can change without the client being affected.</p>
+<p>This article isn't against DNS for public services, but it questions if we should use DNS for internal IT infrastructure (independent of cloud vs. onprem)</p>
+<h2>It's always DNS</h2>
+<p>Although DNS can be a very beneficial service, it can also become a liability. If you want a reliable system, you want as little components as possible. Every additional component adds a potential risk of failure. In addition, more components may create unforeseen behaviour and interactions that can cause outages (circular dependancies, and so on). If you can avoid adding components, you'll have a better chance of building a reliable system.</p>
+<p>Within the IT operations space, DNS has made a bit of a name for itself. Many may remember this little haiku.</p>
+<pre><code>It’s not DNS
+There’s no way it’s DNS
+It was DNS
+</code></pre>
+<p><a href="https://www.reddit.com/r/sysadmin/comments/4oj7pv/comment/d4czk91/">(source)</a></p>
+<p>There are <a href="https://en.wikipedia.org/wiki/2021_Facebook_outage">multiple(1)</a> <a href="https://aws.amazon.com/message/101925/">high-profile(2)</a> incidents where DNS was involved. In these linked cases, the root-cause of the incident isn't the DNS system itself. Yet, because the root-cause affects the DNS service - which is in the critical path for virtually all services - the incident has such a huge impact.</p>
+<p>The Facebook / Meta outage was so significant because it locked people out of buildings (physical access) due to 'circular' dependancies on DNS being available. Again, it can be said that the circular dependancy is the root-cause, but the blast radius of DNS is in many cases so enormous that it may be difficult to have a clear end-to-end picture of potential risk.</p>
+<h2>The case against DNS for internal IT infrastructure</h2>
+<p>From the perspective of IT operations, DNS has a drawback: DNS clients cache DNS records based on TTL. Different DNS client implementations can behave differently, but even if you have a fairly homogenous environment, the only way to assure clients (in this case other servers) use the updated IP address, is to control them and force a DNS refresh.</p>
+<p>That got me thinking, why would we use DNS for infrastructure services? It isn't necessary for machine-to-machine communication. Instead of configuring domain names that may not resolve, we can just directly inject the appropriate IP address(ess) into configuration files. It's easy to configure systems with tools like Ansible or pyinfra at scale.</p>
+<p>The counter argument could be that DevOPS / platform engineers are also humans, and it's much easier to spot misconfigurations or to troubleshoot if domain names are configured Instead of IP addresses.</p>
+<p>Fortunately, we still have <code>/etc/hosts</code>, which we can easily provision. Still no DNS service required! This way, we can configure domain names and pretend to use DNS. I also suspect that DNS queries against /etc/hosts are quite responsive.</p>
+<h2>DNS as generic security risk</h2>
+<p>As of today, most network traffic is encrypted by default, or tunneled through an encrypted channel. DNS is - by default - the exception. Regarding internal IT infrastructure (cloud or 'onprem'), the network may be considered as a secure environment. An attack on the DNS service, spoofing packets, and so on, can be very disruptive though. Setting up DNSSEC may alleviate this problem, but that also introduces another administrative burden with it's own risk of misconfiguration. It's yet another layer of complexity. And we assume that internal infrastructure supports DNSSEC.</p>
+<h2>DNS as an Egress Exfiltration risk</h2>
+<p>Because <a href="https://en.wikipedia.org/wiki/Egress_filtering">egress filtering</a> (filtering of outbound connections) can be cumbersome, it's often omitted, because the systems involved are 'trusted'. This is unfortunate as this makes life easier for an attacker. Any kind of resource required for an attack can be acquired on the vulnerable system with a simple outbound query towards the internet. Proper egress filtering of network traffic can be the difference between a succesfull and unsuccessful hacking attempt.</p>
+<p>A lack of egress filtering also makes it much easier for an attacker to exfiltrate data. And the thing is: any IP protocol can be used to exfiltrate data, including DNS<a>1</a>.</p>
+<p>This is how: the attacker gets a domain runs their internet-accessible authoritative nameserver for this domain. Now the attacker can make DNS requests to said domain like sensitivedata.evil.domain from the hacked system and you can extract all the data from the rogue DNS server logs<a>2</a>.</p>
+<p>Although a hacked server may not be able to directly interact with the attacker-controlled DNS server, by issuing DNS requests for the attacker-controlled domain, these requests will pass the local forwarding DNS server and be forwarded towards the attacker-controlled authoritative DNS server. See also tools like <a href="https://github.com/iagox86/dnscat2">dnscat2</a> or <a href="https://code.kryo.se/iodine/">iodine</a></p>
+<p>Due to this risk, there is a case to be made, to - at least - not allow systems to query public DNS records. As servers may need to interfact with services on the internet (update servers, APIs, and so on), such access can be facilitated by a proxy server using allow-listed domains.</p>
+<h2>Evaluation and closing words</h2>
+<p>In the end, everything is a tradeoff, where people must balance benefits and drawbacks against the context of their infrastructure, their particular risk appetite and even organisational structure and culture.</p>
+<p>That said, I think it's reasonable to explore if DNS can be avoided altogether within the IT infrastructure to increase reliability and robustness.</p>
+<p>Feel free to share your thoughts and feelings about this if you feel so inclined. Maybe leave a comment on the <a href="https://news.ycombinator.com/item?id=48391957">Hacker News thread</a>.</p>
+<hr>
+<ol>
+ <li>
+  <p>Don't forget about services like NTP or ICMP.&nbsp;<a>↩</a></p></li>
+ <li>
+  <p>I have demonstrated this attack using this exact method with a domain I own for a customer that thought they had properly prevented egress traffic, including blocking NTP and ICMP.&nbsp;<a>↩</a></p></li>
+</ol>
