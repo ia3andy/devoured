@@ -1,0 +1,410 @@
+<h2>What is Open Code Review?</h2>
+<p>Open Code Review is an AI-powered code review CLI tool. It originated as Alibaba Group's internal official AI code review assistant — over the past two years, it has served tens of thousands of developers and identified millions of code defects. After thorough validation at massive scale, we incubated it into an open source project for the community. Simply configure a model endpoint to get started.</p>
+<p>It reads Git diffs, sends changed files to a configurable LLM via an agent with tool-use capabilities, and generates structured review comments with line-level precision. The agent can read full file contents, search the codebase, inspect other changed files for context, and produce deep reviews — not just surface-level diff feedback.</p>
+<h2>Why Open Code Review?</h2>
+<h3>The Problem with General-Purpose Agents</h3>
+<p>If you've used general-purpose agents like Claude Code with Skills for code review, you've likely encountered these pain points:</p>
+<ul>
+ <li><strong>Incomplete coverage</strong> — On larger changesets, agents tend to "cut corners," selectively reviewing only some files and missing others.</li>
+ <li><strong>Position drift</strong> — Reported issues frequently don't match the actual code location, with line numbers or file references drifting off target.</li>
+ <li><strong>Unstable quality</strong> — Natural-language-driven Skills are hard to debug, and review quality fluctuates significantly with minor prompt variations.</li>
+</ul>
+<p>The root cause: a purely language-driven architecture lacks hard constraints on the review process.</p>
+<h3>Core Design: Deterministic Engineering × Agent Hybrid</h3>
+<p>Open Code Review's core philosophy is to combine deterministic engineering with an agent, each handling what it does best.</p>
+<p><strong>Deterministic Engineering — Hard Constraints</strong></p>
+<p>For review steps that <em>must not go wrong</em>, engineering logic — not the language model — guarantees correctness:</p>
+<ul>
+ <li><strong>Precise file selection</strong> — Determines exactly which files need review and which should be filtered, ensuring no important change is missed.</li>
+ <li><strong>Smart file bundling</strong> — Groups related files into a single review unit (e.g., <code>message_en.properties</code> and <code>message_zh.properties</code> are bundled together). Each bundle runs as a sub-agent with isolated context — a divide-and-conquer strategy that stays stable on very large changesets and naturally supports concurrent review.</li>
+ <li><strong>Fine-grained rule matching</strong> — Matches review rules to each file's characteristics, keeping the model's attention sharply focused and eliminating information noise at the source. Compared to purely language-driven rule guidance, template-engine-based rule matching is more stable and predictable.</li>
+ <li><strong>External positioning and reflection modules</strong> — Independent comment-positioning and comment-reflection modules systematically improve both the location accuracy and content accuracy of AI feedback.</li>
+</ul>
+<p><strong>Agent — Dynamic Decision-Making</strong></p>
+<p>The agent's strengths are concentrated where they matter most — dynamic decisions and dynamic context retrieval:</p>
+<ul>
+ <li><strong>Scenario-tuned prompts</strong> — Prompt templates deeply optimized for code review, improving effectiveness while reducing token consumption.</li>
+ <li><strong>Scenario-tuned toolset</strong> — Distilled from deep analysis of tool-call traces in large-scale production data — including call frequency distributions, per-tool repetition rates, and the impact of new tools on the overall call chain — resulting in a purpose-built toolset that is more stable and predictable for code review than a generic agent toolkit.</li>
+</ul>
+<h2>How to Use</h2>
+<h3>CLI</h3>
+<h4>Install</h4>
+<p><strong>Via NPM (Recommended)</strong></p>
+<pre><code>npm install -g @alibaba-group/open-code-review</code></pre>
+<p>After installation, the <code>ocr</code> command is available globally.</p>
+<p><strong>From GitHub Release</strong></p>
+<p>Download the latest binary from GitHub Releases:</p>
+<pre><code># macOS (Apple Silicon)
+curl -Lo ocr https://github.com/alibaba/open-code-review/releases/latest/download/opencodereview-darwin-arm64
+chmod +x ocr &amp;&amp; sudo mv ocr /usr/local/bin/ocr
+
+# macOS (Intel)
+curl -Lo ocr https://github.com/alibaba/open-code-review/releases/latest/download/opencodereview-darwin-amd64
+chmod +x ocr &amp;&amp; sudo mv ocr /usr/local/bin/ocr
+
+# Linux (x86_64)
+curl -Lo ocr https://github.com/alibaba/open-code-review/releases/latest/download/opencodereview-linux-amd64
+chmod +x ocr &amp;&amp; sudo mv ocr /usr/local/bin/ocr
+
+# Linux (ARM64)
+curl -Lo ocr https://github.com/alibaba/open-code-review/releases/latest/download/opencodereview-linux-arm64
+chmod +x ocr &amp;&amp; sudo mv ocr /usr/local/bin/ocr
+
+# Windows (x86_64) — move ocr.exe to a directory in your PATH
+curl -Lo ocr.exe https://github.com/alibaba/open-code-review/releases/latest/download/opencodereview-windows-amd64.exe
+
+# Windows (ARM64) — move ocr.exe to a directory in your PATH
+curl -Lo ocr.exe https://github.com/alibaba/open-code-review/releases/latest/download/opencodereview-windows-arm64.exe</code></pre>
+<p><strong>From Source</strong></p>
+<pre><code>git clone https://github.com/alibaba/open-code-review.git
+cd open-code-review
+make build
+sudo cp dist/opencodereview /usr/local/bin/ocr</code></pre>
+<h4>Quick Start</h4>
+<p><strong>1. Configure LLM</strong></p>
+<p><strong>You must configure an LLM before reviewing code.</strong></p>
+<pre><code># Option A: Interactive config
+ocr config set llm.url https://api.anthropic.com/v1/messages
+ocr config set llm.auth_token your-api-key-here
+ocr config set llm.model claude-opus-4-6
+ocr config set llm.use_anthropic true
+
+# Option B: Environment variables (highest priority)
+export OCR_LLM_URL=https://api.anthropic.com/v1/messages
+export OCR_LLM_TOKEN=your-api-key-here
+export OCR_LLM_MODEL=claude-opus-4-6
+export OCR_USE_ANTHROPIC=true</code></pre>
+<p>Config is stored in <code>~/.opencodereview/config.json</code>.</p>
+<p>It is also compatible with Claude Code environment variables (<code>ANTHROPIC_BASE_URL</code>, <code>ANTHROPIC_AUTH_TOKEN</code>, <code>ANTHROPIC_MODEL</code>) and parses <code>~/.zshrc</code> / <code>~/.bashrc</code> for those exports.</p>
+<blockquote>
+ <p><strong>Note for CC-Switch Users</strong>: If you are using CC-Switch with routing service enabled, you can point <code>llm.url</code> to the CC-Switch proxy address without additional configuration:</p>
+ <ul>
+  <li>For <strong>Claude</strong> provider: set <code>llm.url</code> to <code>http://127.0.0.1:15721</code></li>
+  <li>For <strong>CodeX</strong> provider: set <code>llm.url</code> to <code>http://127.0.0.1:15721/v1</code></li>
+  <li>Set <code>llm.model</code> according to your provider settings</li>
+  <li><code>llm.auth_token</code> can be any value</li>
+  <li><code>extra_body</code> settings still apply</li>
+ </ul>
+</blockquote>
+<p><strong>2. Test Connectivity</strong></p>
+<pre><code>ocr llm test</code></pre>
+<p><strong>3. Review</strong></p>
+<pre><code>cd your-project
+
+# Workspace mode — review all staged, unstaged, and untracked changes
+ocr review
+
+# Branch range — compare two refs
+ocr review --from main --to feature-branch
+
+# Single commit
+ocr review --commit abc123</code></pre>
+<h3>Integrate with Coding Agents</h3>
+<p>OCR can be seamlessly integrated into AI coding agents as a slash command, enabling code review directly within your agent workflow.</p>
+<h4>Option 1: Install as a Skill</h4>
+<p>Use <code>npx</code> to install the OCR skill into your project:</p>
+<pre><code>npx skills add alibaba/open-code-review --skill open-code-review</code></pre>
+<p>This installs the <code>open-code-review</code> skill, which teaches your coding agent how to invoke <code>ocr</code> for code review, classify issues by priority, and optionally apply fixes.</p>
+<h4>Option 2: Install as a Claude Code Plugin</h4>
+<p>For Claude Code, install the command plugin through the following command in Claude Code:</p>
+<pre><code>/plugin marketplace add alibaba/open-code-review
+/plugin install open-code-review@open-code-review</code></pre>
+<p>This registers the <code>/open-code-review:review</code> slash command, which runs OCR and automatically filters and fixes issues.</p>
+<h4>Option 3: Copy the Command File Directly</h4>
+<p>For a quick setup without any package manager, simply copy the command file to use the <code>/open-code-review</code> slash command in Claude Code.</p>
+<p><strong>Project-level</strong> (shared with team via git):</p>
+<pre><code>mkdir -p .claude/commands
+curl -o .claude/commands/open-code-review.md \
+  https://raw.githubusercontent.com/alibaba/open-code-review/main/plugins/open-code-review/commands/review.md</code></pre>
+<p><strong>User-level</strong> (personal global use across all projects):</p>
+<pre><code>mkdir -p ~/.claude/commands
+curl -o ~/.claude/commands/open-code-review.md \
+  https://raw.githubusercontent.com/alibaba/open-code-review/main/plugins/open-code-review/commands/review.md</code></pre>
+<blockquote>
+ <p><strong>Prerequisite</strong>: All integration methods require the <code>ocr</code> CLI to be installed and an LLM configured.</p>
+</blockquote>
+<h3>CI/CD Integration</h3>
+<p>OCR can be integrated into CI/CD pipelines to automate code review on Merge Requests / Pull Requests.</p>
+<p>The core command for CI integration:</p>
+<pre><code>ocr review \
+  --from "origin/main" \
+  --to "origin/feature-branch" \
+  --format json</code></pre>
+<p>The <code>--format json</code> flag outputs machine-readable results suitable for parsing in CI scripts.</p>
+<h2>Commands</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Command</th>
+   <th>Alias</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>ocr review</code></td>
+   <td><code>ocr r</code></td>
+   <td>Start a code review</td>
+  </tr>
+  <tr>
+   <td><code>ocr rules check &lt;file&gt;</code></td>
+   <td>—</td>
+   <td>Preview which review rule applies to a file path</td>
+  </tr>
+  <tr>
+   <td><code>ocr config set &lt;key&gt; &lt;value&gt;</code></td>
+   <td>—</td>
+   <td>Set configuration values</td>
+  </tr>
+  <tr>
+   <td><code>ocr llm test</code></td>
+   <td>—</td>
+   <td>Test LLM connectivity</td>
+  </tr>
+  <tr>
+   <td><code>ocr viewer</code></td>
+   <td><code>ocr v</code></td>
+   <td>Launch WebUI session viewer on <code>localhost:5483</code></td>
+  </tr>
+  <tr>
+   <td><code>ocr version</code></td>
+   <td>—</td>
+   <td>Show version info</td>
+  </tr>
+ </tbody>
+</table>
+<h3><code>ocr review</code> Flags</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Flag</th>
+   <th>Shorthand</th>
+   <th>Default</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>--repo</code></td>
+   <td>—</td>
+   <td>current dir</td>
+   <td>Git repository root</td>
+  </tr>
+  <tr>
+   <td><code>--from</code></td>
+   <td>—</td>
+   <td>—</td>
+   <td>Source ref (e.g., <code>main</code>)</td>
+  </tr>
+  <tr>
+   <td><code>--to</code></td>
+   <td>—</td>
+   <td>—</td>
+   <td>Target ref (e.g., <code>feature-branch</code>)</td>
+  </tr>
+  <tr>
+   <td><code>--commit</code></td>
+   <td><code>-c</code></td>
+   <td>—</td>
+   <td>Single commit to review</td>
+  </tr>
+  <tr>
+   <td><code>--preview</code></td>
+   <td><code>-p</code></td>
+   <td><code>false</code></td>
+   <td>Preview which files will be reviewed without running the LLM</td>
+  </tr>
+  <tr>
+   <td><code>--format</code></td>
+   <td><code>-f</code></td>
+   <td><code>text</code></td>
+   <td>Output format: <code>text</code> or <code>json</code></td>
+  </tr>
+  <tr>
+   <td><code>--concurrency</code></td>
+   <td>—</td>
+   <td><code>8</code></td>
+   <td>Max concurrent file reviews</td>
+  </tr>
+  <tr>
+   <td><code>--timeout</code></td>
+   <td>—</td>
+   <td><code>10</code></td>
+   <td>Concurrent task timeout in minutes</td>
+  </tr>
+  <tr>
+   <td><code>--audience</code></td>
+   <td>—</td>
+   <td><code>human</code></td>
+   <td><code>human</code> (show progress) or <code>agent</code> (summary only)</td>
+  </tr>
+  <tr>
+   <td><code>--rule</code></td>
+   <td>—</td>
+   <td>—</td>
+   <td>Path to custom JSON review rules</td>
+  </tr>
+  <tr>
+   <td><code>--max-tools</code></td>
+   <td>—</td>
+   <td>built-in</td>
+   <td>Max tool call rounds per file; only takes effect when greater than template default</td>
+  </tr>
+  <tr>
+   <td><code>--tools</code></td>
+   <td>—</td>
+   <td>—</td>
+   <td>Path to custom JSON tools config</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Examples</h2>
+<pre><code># Preview which files will be reviewed (no LLM calls)
+ocr review --preview
+ocr review -c abc123 -p
+
+# Review workspace changes with default settings
+ocr review
+
+# Review branch diff with higher concurrency
+ocr review --from main --to my-feature --concurrency 4
+
+# Review a specific commit with verbose JSON output
+ocr review --commit abc123 --format json --audience agent
+
+# Use custom review rules
+ocr review --rule /path/to/my-rules.json
+
+# Preview which rule applies to a file
+ocr rules check src/main/java/com/example/Foo.java
+ocr rules check --rule custom.json src/main/resources/mapper/UserMapper.xml
+
+# View review session history in browser
+ocr viewer
+ocr viewer --addr :3000</code></pre>
+<h3>Viewer security</h3>
+<p>The viewer serves session JSONL contents over HTTP. It enforces a Host-header allowlist on every request: loopback names (<code>localhost</code>, <code>127.0.0.0/8</code>, <code>::1</code>) and the concrete bind host are always allowed. Wildcard binds and other non-loopback Hostnames must be added via the <code>OCR_VIEWER_ALLOWED_HOSTS</code> environment variable (comma-separated):</p>
+<pre><code>OCR_VIEWER_ALLOWED_HOSTS=review.internal,ocr.lan ocr viewer --addr :3000</code></pre>
+<p>This blocks DNS-rebinding attacks against the local viewer.</p>
+<h2>Review Rules</h2>
+<p>OCR resolves review rules using a four-layer priority chain. Each layer uses first-match-wins: if a file path matches a pattern, that rule is used; otherwise it falls through to the next layer.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Priority</th>
+   <th>Source</th>
+   <th>Path</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>1 (highest)</td>
+   <td><code>--rule</code> flag</td>
+   <td>User-specified path</td>
+   <td>CLI explicit override</td>
+  </tr>
+  <tr>
+   <td>2</td>
+   <td>Project config</td>
+   <td><code>&lt;repoDir&gt;/.opencodereview/rule.json</code></td>
+   <td>Per-project rules, can be committed to git</td>
+  </tr>
+  <tr>
+   <td>3</td>
+   <td>Global config</td>
+   <td><code>~/.opencodereview/rule.json</code></td>
+   <td>User-wide personal preferences</td>
+  </tr>
+  <tr>
+   <td>4 (lowest)</td>
+   <td>System default</td>
+   <td>Embedded <code>system_rules.json</code></td>
+   <td>Built-in rules covering common languages and file types</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Rule File Format</h3>
+<p>Layers 1–3 share the same JSON format:</p>
+<pre><code>\{
+  "rules": [
+    \{
+      "path": "force-api/**/*.java",
+      "rule": "All new methods must validate required parameters for null values"
+    },
+    \{
+      "path": "**/*mapper*.xml",
+      "rule": "Check SQL for injection risks, parameter errors, and missing closing tags"
+    }
+  ]
+}</code></pre>
+<ul>
+ <li><code>path</code> supports <code>**</code> recursive matching and <code>\{java,kt}</code> brace expansion.</li>
+ <li>Within each layer, rules are evaluated in declaration order — the first match wins.</li>
+ <li>If a rule file does not exist, it is silently skipped.</li>
+</ul>
+<h2>Configuration Reference</h2>
+<p>Config file: <code>~/.opencodereview/config.json</code></p>
+<table>
+ <thead>
+  <tr>
+   <th>Key</th>
+   <th>Type</th>
+   <th>Example</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>llm.url</code></td>
+   <td>string</td>
+   <td><code>https://api.openai.com/v1/chat/completions</code></td>
+  </tr>
+  <tr>
+   <td><code>llm.auth_token</code></td>
+   <td>string</td>
+   <td><code>sk-xxxxxxx</code></td>
+  </tr>
+  <tr>
+   <td><code>llm.model</code></td>
+   <td>string</td>
+   <td><code>claude-opus-4-6</code></td>
+  </tr>
+  <tr>
+   <td><code>llm.use_anthropic</code></td>
+   <td>boolean</td>
+   <td><code>true</code> | <code>false</code></td>
+  </tr>
+  <tr>
+   <td><code>language</code></td>
+   <td>string</td>
+   <td><code>English</code> | <code>Chinese</code> (default: Chinese)</td>
+  </tr>
+  <tr>
+   <td><code>telemetry.enabled</code></td>
+   <td>boolean</td>
+   <td><code>true</code> | <code>false</code></td>
+  </tr>
+  <tr>
+   <td><code>telemetry.exporter</code></td>
+   <td>string</td>
+   <td><code>console</code> | <code>otlp</code></td>
+  </tr>
+  <tr>
+   <td><code>telemetry.otlp_endpoint</code></td>
+   <td>string</td>
+   <td>OTLP collector address</td>
+  </tr>
+  <tr>
+   <td><code>telemetry.content_logging</code></td>
+   <td>boolean</td>
+   <td>Include prompts in telemetry</td>
+  </tr>
+ </tbody>
+</table>
+<p>Environment variables take precedence over the config file.</p>
+<h2>Telemetry</h2>
+<p>OpenTelemetry integration for observability (spans, metrics). Disabled by default.</p>
+<pre><code>ocr config set telemetry.enabled true
+ocr config set telemetry.exporter otlp
+ocr config set telemetry.otlp_endpoint localhost:4317</code></pre>
+<p>Set <code>telemetry.content_logging</code> to include LLM prompts and responses in exported data.</p>

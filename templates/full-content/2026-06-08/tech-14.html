@@ -1,0 +1,120 @@
+<h2>Durable Execution inside PostgreSQL</h2>
+<p>Long-running, fault-tolerant SQL functions for teams that already keep their state in Postgres and want to stop stitching together cron jobs, workers, queues, and status tables to make background work reliable. Define the workflow in SQL, let pg_durable checkpoint each step, and resume after crashes, restarts, or failed steps.</p>
+<p>Durable execution is now a standard industry pattern, and pg_durable brings it inside Postgres with no extra service infrastructure required. Part of our mission to bring compute close to data.</p>
+<blockquote>
+ <p><strong>Try pg_durable now in Azure HorizonDB,</strong> Microsoft's new PostgreSQL cloud service engineered for performance and built with pg_durable inside</p>
+</blockquote>
+<h2>Is this for me?</h2>
+<h3>Who it's for</h3>
+<ul>
+ <li>Backend and data engineers who want workflows to live next to the data they touch.</li>
+ <li>DBAs and SREs automating runbooks that must survive restarts and be auditable in SQL.</li>
+ <li>Teams building data or AI pipelines that need durable execution per row, document, or batch.</li>
+</ul>
+<h3>The core idea</h3>
+<p>A pg_durable function is a graph of SQL steps that PostgreSQL executes and checkpoints as it goes. If the database crashes, restarts, or a step fails, execution resumes from the last durable checkpoint instead of making you reconstruct state by hand.</p>
+<h3>Workloads this is useful for</h3>
+<ul>
+ <li>Vector embedding pipelines: chunk, call an embedding API, and upsert into <code>pgvector</code>.</li>
+ <li>Ingest pipelines: stage, deduplicate, transform, and publish large batches.</li>
+ <li>Scheduled maintenance: detect bloat, notify, wait for approval, then run the next action.</li>
+ <li>Fan-out aggregation: run independent queries in parallel, then join the results.</li>
+ <li>External API workflows: enrichment, classification, and webhook-style calls from SQL.</li>
+</ul>
+<h3>What you're probably doing today instead</h3>
+<ul>
+ <li><code>pg_cron</code> plus a jobs table, status columns, retry counters, and a polling worker.</li>
+ <li>An external orchestrator such as Airflow, Temporal, Step Functions, or Argo calling back into Postgres.</li>
+ <li>A queue plus workers plus a separate state table to coordinate retries and partial completion.</li>
+ <li>A <code>plpgsql</code> procedure that works until a crash or long-running transaction forces you to start over.</li>
+</ul>
+<h3>Pain points it addresses</h3>
+<ul>
+ <li>A restart in the middle of a long job means rerunning work that already succeeded.</li>
+ <li>One failed row or one failed API call turns into manual cleanup and uncertain replay.</li>
+ <li>Long transactions hold locks, grow WAL, and make batch jobs fragile at larger scale.</li>
+ <li>Parallel work in the app tier creates more places for partial-failure bugs and drift.</li>
+ <li>The workflow logic ends up spread across SQL, workers, queues, dashboards, and status tables.</li>
+</ul>
+<h3>What changes in your architecture</h3>
+<ul>
+ <li>The workflow definition moves into SQL and starts with <code>df.start(...)</code>.</li>
+ <li>Retry state, progress tracking, and checkpointing move into Postgres instead of bespoke app code.</li>
+ <li>Some app-tier workers, queue consumers, or scheduler glue can disappear entirely.</li>
+ <li>Operational visibility comes from Postgres tables such as <code>df.instances</code>, using the same auth and backup model as your data.</li>
+</ul>
+<h3>When not to use it</h3>
+<ul>
+ <li>The job is already a single <code>INSERT ... SELECT</code> or one ordinary SQL statement.</li>
+ <li>You need sub-millisecond synchronous request handling rather than durable background execution.</li>
+ <li>You cannot install extensions or run a background worker in your Postgres environment.</li>
+ <li>The workflow mostly lives outside Postgres and spans many heterogeneous systems.</li>
+ <li>You need arbitrary application logic that does not map cleanly to SQL steps, branching, loops, or HTTP calls.</li>
+</ul>
+<h3>How it works</h3>
+<ol>
+ <li>Define a workflow in SQL using composable operators such as <code>~&gt;</code> and <code>|=&gt;</code>.</li>
+ <li>Start it with <code>df.start()</code> and get back an instance ID.</li>
+ <li>Let the runtime execute each step durably with checkpointing between steps.</li>
+ <li>Query status and results from PostgreSQL while the workflow runs or after it completes.</li>
+</ol>
+<h3>Limitations</h3>
+<p>The model is intentionally SQL-shaped. If a step needs arbitrary code, a non-HTTP SDK, or rich in-memory control flow, you may need to wrap that logic in a SQL function, expose it behind an HTTP endpoint for <code>df.http()</code>, or use a general-purpose orchestrator for that part of the system.</p>
+<h2>Features</h2>
+<ul>
+ <li><strong>Durable</strong> — Function state persists to PostgreSQL. Survives crashes, restarts, and failovers.</li>
+ <li><strong>SQL-native</strong> — Define functions in SQL using composable operators.</li>
+ <li><strong>Database-aware</strong> — First-class primitives for scheduling, conditions, and parallel execution.</li>
+ <li><strong>Zero infrastructure</strong> — Runs as a PostgreSQL extension. No Redis, no Temporal, no external services.</li>
+</ul>
+<h2>Quick Example</h2>
+<pre><code>-- A durable function that processes data in steps
+SELECT df.start(
+    'SELECT id FROM documents WHERE processed = false LIMIT 100' |=&gt; 'batch'
+    ~&gt; 'UPDATE documents SET processed = true WHERE id = ANY($batch)'
+);</code></pre>
+<h2>Packages</h2>
+<p>Tagged releases publish Debian packages for PostgreSQL 17 and 18 on amd64 from the GitHub release assets. After installing a package, add <code>pg_durable</code> to <code>shared_preload_libraries</code>, restart PostgreSQL, and create the extension in the configured pg_durable database:</p>
+<pre><code>CREATE EXTENSION pg_durable;</code></pre>
+<h2>Development Installation</h2>
+<h3>Prerequisites</h3>
+<ul>
+ <li>PostgreSQL 17 or 18</li>
+ <li>Rust (nightly)</li>
+ <li>cargo-pgrx 0.16.1</li>
+</ul>
+<h2>Multi-User Setup</h2>
+<p><code>CREATE EXTENSION pg_durable</code> does <strong>not</strong> grant any privileges to <code>PUBLIC</code>. After installing the extension, the admin must explicitly grant access to application roles.</p>
+<p><strong>Grant privileges to an application role:</strong></p>
+<pre><code>-- Grant to specific roles after CREATE EXTENSION
+SELECT df.grant_usage('app_role');</code></pre>
+<h2>Architecture</h2>
+<p>pg_durable is a PostgreSQL extension (built with pgrx) — everything runs inside the PostgreSQL server, no external services. The extension exposes a SQL DSL for building function graphs and registers a background worker that executes them durably on top of two lower-level Rust libraries:</p>
+<ul>
+ <li>duroxide — a durable task framework providing the orchestration runtime (deterministic replay, checkpoints, sub-orchestrations, timers).</li>
+ <li>duroxide-pg — a PostgreSQL-backed state provider for duroxide. It persists runtime state (instances, history, work queues) in a dedicated <code>duroxide.*</code> schema owned by the extension.</li>
+</ul>
+<pre><code>┌────────────────────────────────────────────────────────────────────┐
+│                             PostgreSQL                             │
+│                                                                    │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                 pg_durable extension (pgrx)                  │  │
+│  │                                                              │  │
+│  │  SQL DSL     'sql' |=&gt; 'name' ~&gt; 'sql2'                      │  │
+│  │              df.if() | df.join() | df.loop()                 │  │
+│  │                                                              │  │
+│  │  Background worker (hosts the duroxide runtime in-process)   │  │
+│  │  ┌────────────────────────────────────────────────────────┐  │  │
+│  │  │  duroxide        (orchestration runtime)               │  │  │
+│  │  │  ┌──────────────────────────────────────────────────┐  │  │  │
+│  │  │  │  duroxide-pg   (PostgreSQL state provider)       │  │  │  │
+│  │  │  └──────────────────────────────────────────────────┘  │  │  │
+│  │  └────────────────────────────────────────────────────────┘  │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                    │
+│  Schemas                                                           │
+│    df.*         DSL graphs (nodes, instances, vars)                │
+│    duroxide.*   runtime state (owned by duroxide-pg)               │
+└────────────────────────────────────────────────────────────────────┘</code></pre>
+<h2>Status</h2>
+<p><strong>Preview</strong> - This project is currently in preview.</p>

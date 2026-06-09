@@ -1,0 +1,75 @@
+<h1>Give your agent its own computer</h1>
+<p>LLMs can reason. But reasoning alone doesn't get much done.</p>
+<p>Running code execution in an AI agent is harder than it looks. Your agent needs a real computer (filesystem, shell, package manager, persistent state) but handing it access to your infrastructure is dangerous.</p>
+<p>Think about it this way: you use one laptop. You are n of one. But agents are going to run millions of tasks, and each one needs its own computer to work from. That's the infrastructure shift happening right now. Satya Nadella put it plainly: "Every agent needs a computer." The question is what that computer looks like, and how you give it to them safely.</p>
+<p>LangSmith Sandboxes are our answer to that. Here's why it matters, and why doing it yourself is harder than it sounds.</p>
+<h2>What becomes possible when an agent has a computer</h2>
+<p>Think about what Cursor, Claude Code, or ChatGPT's code interpreter can do that a plain chat interface can't. They don't just answer questions: they run the code, see the error, fix it, run it again, and hand you something that works. That feedback loop is what makes them useful.</p>
+<p>That same loop is what separates a demo agent from a production agent. Once your agent can execute, a whole category of work opens up:</p>
+<ul>
+ <li>A <strong>coding assistant</strong> that doesn't just suggest a fix: it applies the fix, runs your tests, and confirms nothing broke</li>
+ <li>A <strong>data analyst</strong> that pulls a CSV, runs Python against it, and hands you a formatted report</li>
+ <li>A <strong>CI agent</strong> that clones your repo, installs dependencies, runs the full test suite, and opens a PR</li>
+ <li>A <strong>research agent</strong> that browses, scrapes, synthesizes, and writes — not just searches</li>
+ <li>A <strong>content pipeline</strong> that generates, renders, and exports finished artifacts</li>
+ <li>An <strong>RL or eval harness</strong> that needs to spin up environments in parallel, run episodes at burst scale, and tear them down immediately — zero to thousands of sandboxes, then back to zero</li>
+</ul>
+<p>The common thread: these agents need more than a token stream. They need a place to <em>work</em>.</p>
+<h2>Why you can't just hand your agent your laptop</h2>
+<p>The obvious next question is: why not just let the agent run code locally? Or in a Docker container? Teams do this in early prototypes. It stops working in production for two reasons.</p>
+<p><strong>First: agents run untrusted code by definition.</strong></p>
+<p>The code your agent executes might come from a model, a user prompt, a cloned repo, or an installed package. You didn't write it. You can't fully vet it. In September 2025, a self-replicating npm worm called Shai-Hulud backdoored 500+ packages — code that executed in preinstall before any validation could run. A second wave in November hit 796 more packages and 25,000+ GitHub repos in hours. An agent that installs npm packages as part of its workflow is exposed to exactly this.</p>
+<p><strong>Second: containers aren't enough.</strong></p>
+<p>The common instinct is "just run it in Docker." Containers are great for isolating known, vetted application code (i.e. a web server, a background job). They're not designed for an agent that's installing arbitrary dependencies, running model-generated scripts, and persisting state across a long-running session. And critically: containers share a kernel with the host. A kernel exploit reaches through them. Copy Fail (CVE-2026-31431) is a 732-byte Python script that roots every major Linux distribution back to 2017 via the kernel crypto API. <em>AI tooling found it in about an hour.</em></p>
+<p>A container boundary is not an isolation boundary. For untrusted, model-generated code, you need hardware-level separation.</p>
+<h2>LangSmith Sandboxes: a computer for every agent</h2>
+<p>The mental model that helps here: a sandbox needs to be two things at once. It needs the instant startup of a serverless function because you can't make an agent wait two minutes for a VM to boot. And it needs the statefulness of a full machine because agents aren't stateless request-handlers; they're mid-session workers that install dependencies, edit files, and pick up where they left off.</p>
+<p>LangSmith Sandboxes are built for that model. Each one is a hardware-virtualized microVM. Not a container, a full machine with its own kernel. The agent gets:</p>
+<pre><code>Agent
+└── its own computer
+    ├── filesystem
+    ├── shell
+    ├── package manager
+    ├── network access
+    ├── code execution
+    └── persistent state</code></pre>
+<p>It can install packages, run scripts, edit files, spin up a local server, and keep working across a long session — all without touching your production infrastructure or any other agent's sandbox. When the work is done, the sandbox disappears.</p>
+<p>You access it through the same LangSmith SDK and API key you already use:</p>
+<pre><code>from langsmith import Client
+
+client = Client()
+sandbox = client.create_sandbox()
+
+# Give the agent a shell
+result = sandbox.run("pip install pandas &amp;&amp; python analysis.py")
+print(result.stdout)</code></pre>
+<p>It just takes one call, and your agent has a computer.</p>
+<p>There's also a less obvious benefit for teams running GPU workloads: when your sandbox spins up instantly, your GPU doesn't idle waiting for CPU compute to provision. Fast sandboxes are a GPU efficiency multiplier — a detail that compounds quickly at scale.</p>
+<h2>What you get beyond basic execution</h2>
+<p>A sandbox is more than a place to run code. The GA release ships a set of primitives that make agent workflows production-ready:</p>
+<p><strong>Snapshots and forks:</strong> Capture a sandbox mid-session and boot new ones from it. Forks use copy-on-write, so spinning up ten parallel branches costs roughly the same as one. When your agent goes down the wrong path, restore and try again, without rebuilding from scratch.</p>
+<p><strong>Blueprints for pre-warmed environments:</strong> Define a base image (your repo cloned, your deps installed, your config in place) and boot sandboxes from it in seconds instead of minutes.</p>
+<p><strong>Service URLs:</strong> If the agent starts a local web server — say, to preview a generated report — you get an authenticated URL you can open in a browser or share with a teammate. No port forwarding.</p>
+<p><strong>Auth proxy:</strong> Outbound requests from the sandbox flow through a proxy that injects credentials at the network layer. Secrets never touch the agent runtime.</p>
+<p><strong>Creator-private by default:</strong> Only the user who launched a sandbox (and workspace admins) can access it. Share when you're ready.</p>
+<h2>When to reach for Sandboxes</h2>
+<p>Sandboxes are the right layer when your agent needs to <em>do</em> something, not just <em>say</em> something. Concretely:</p>
+<ul>
+ <li>Your agent generates code and you want it to verify that code runs before responding</li>
+ <li>You're building a coding assistant, CI agent, or data pipeline that operates on real files</li>
+ <li>You're running multi-step workflows where state needs to persist across tool calls</li>
+ <li>You need burst capacity (i.e. thousands of parallel environments for RL training or evals) that has to scale from zero in seconds</li>
+ <li>You're accepting any user-supplied input that could end up being executed</li>
+</ul>
+<p>Sandboxes are overkill if your agent only calls APIs with fixed schemas and never executes dynamic code. A retrieval agent that searches docs and returns citations doesn't need one. An agent that writes and runs a Python script does.</p>
+<h2>How teams are using this today</h2>
+<p>At monday.com, Sandboxes power their Sidekick AI assistant, giving it a secure environment to write and run code for advanced user workflows, including data analysis and multimedia generation.</p>
+<blockquote>
+ <em>"LangSmith Sandboxes are helping us make our Sidekick much more capable for monday.com users. With secure environments, Sidekick can write and run code, and use the results to create richer workflows, like running data analysis and generating multimedia."</em>
+ <br>
+  — Omri Bruchim, AI Platform Group Manager, monday.com
+</blockquote>
+<h2>The shift worth paying attention to</h2>
+<p>For the last few years, making an agent more capable meant giving it better tools: a search API, a calculator, a database connector. That's still true. But the ceiling on what predefined tools can do is low.</p>
+<p>The agents that will actually replace workflows (not just assist with them!) are the ones that can pick up whatever tool they need, run it, see what happened, and adapt. That's what having a computer makes possible. It's not an infrastructure detail. It's the difference between an agent that can <em>think</em> and an agent that can <em>act</em>.</p>
+<p>You use one laptop. Your agents will each need their own. LangSmith Sandboxes are how you give them one.</p>

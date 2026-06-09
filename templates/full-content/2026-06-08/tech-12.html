@@ -1,0 +1,403 @@
+<h2>Semantic version control built on Git.</h2>
+<p>Instead of lines changed, sem tells you what entities changed: functions, methods, classes.</p>
+<p>sem is a semantic version control tool that works on top of Git. It parses your code with tree-sitter, extracts every function, class, and method as an entity, and diffs at the entity level instead of lines. This means you see "function <code>blahh</code> was modified" instead of "lines x-y changed."</p>
+<p>It works in any Git repo with no setup.</p>
+<h2>Install</h2>
+<pre><code>brew install sem-cli</code></pre>
+<p>Or install the npm wrapper into <code>node_modules</code>:</p>
+<pre><code>npm install --save-dev @ataraxy-labs/sem</code></pre>
+<p>With Bun, trust the package so its <code>postinstall</code> script can download the binary:</p>
+<pre><code>bun add -d @ataraxy-labs/sem
+bun pm trust @ataraxy-labs/sem</code></pre>
+<p>Or build from source (requires Rust):</p>
+<pre><code>cargo install --git https://github.com/Ataraxy-Labs/sem sem-cli</code></pre>
+<p>Or grab a binary from GitHub Releases.</p>
+<p>Or run via Docker:</p>
+<pre><code>docker build -t sem .
+docker run --rm -it -u "$(id -u):$(id -g)" -v "$(pwd):/repo" sem diff</code></pre>
+<h2>Name conflict with GNU Parallel</h2>
+<p>GNU Parallel ships a <code>sem</code> binary (<code>/usr/bin/sem</code>) as a symlink to <code>parallel</code>. If you have both installed, they'll collide. Run <code>sem --version</code> to check which one you're using.</p>
+<p><strong>Quick fixes:</strong></p>
+<pre><code># Option 1: alias in your shell profile (~/.bashrc, ~/.zshrc)
+alias sem="$HOME/.cargo/bin/sem"
+
+# Option 2: make sure cargo bin comes first in PATH
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# Option 3: if installed via Homebrew
+export PATH="$(brew --prefix)/bin:$PATH"</code></pre>
+<p>If you installed via npm/bun, the binary lives in <code>node_modules/.bin/sem</code> and is invoked through <code>npx sem</code> or <code>bunx sem</code>, which avoids the conflict entirely.</p>
+<h2>Commands</h2>
+<p>Works in any Git repo. No setup required. Also works outside Git for arbitrary file comparison.</p>
+<p>sem stores its SQLite entity cache outside the repository, under the OS cache directory by default. Set <code>SEM_CACHE_DIR=/path/to/cache</code> to override the cache root; repo-local overrides are ignored so cache files do not dirty the working tree.</p>
+<h3>sem diff</h3>
+<p>Entity-level diff with rename detection, structural hashing, and word-level inline highlights.</p>
+<pre><code># Semantic diff of working changes
+sem diff
+
+# Staged changes only
+sem diff --staged
+
+# Specific commit
+sem diff --commit abc1234
+
+# Commit range
+sem diff --from HEAD~5 --to HEAD
+
+# Verbose mode (word-level inline diffs for each entity)
+sem diff -v
+
+# Plain text output (git status style)
+sem diff --format plain
+
+# JSON output (for AI agents, CI pipelines)
+sem diff --format json
+
+# Markdown output (for PRs, reports)
+sem diff --format markdown
+
+# Compare any two files (no git repo needed)
+sem diff file1.ts file2.ts
+
+# Read file changes from stdin (no git repo needed)
+echo '[\{"filePath":"src/main.rs","status":"modified","beforeContent":"...","afterContent":"..."}]' \
+  | sem diff --stdin --format json
+
+# Only specific file types
+sem diff --file-exts .py .rs</code></pre>
+<h3>sem impact</h3>
+<p>Cross-file dependency graph shows what breaks if an entity changes.</p>
+<pre><code># Full impact analysis
+sem impact authenticateUser
+
+# Direct dependencies only
+sem impact authenticateUser --deps
+
+# Direct dependents only
+sem impact authenticateUser --dependents
+
+# Affected tests only
+sem impact authenticateUser --tests
+
+# JSON output
+sem impact authenticateUser --json
+
+# Disambiguate by file
+sem impact authenticateUser --file src/auth.ts
+
+# Include generated/build directories that repo-wide scans skip by default
+sem impact authenticateUser --no-default-excludes</code></pre>
+<h3>sem blame</h3>
+<p>Entity-level blame showing who last modified each function, class, or method.</p>
+<pre><code>sem blame src/auth.ts
+
+# JSON output
+sem blame src/auth.ts --json</code></pre>
+<h3>sem log</h3>
+<p>Track how a single entity evolved through git history.</p>
+<pre><code>sem log authenticateUser
+
+# Verbose mode (show content diff between versions)
+sem log authenticateUser -v
+
+# Limit commits scanned
+sem log authenticateUser --limit 20
+
+# JSON output
+sem log authenticateUser --json</code></pre>
+<h3>sem entities</h3>
+<p>List all entities under a file or directory path. No path is the same as <code>.</code>.</p>
+<pre><code>sem entities
+
+sem entities .
+
+sem entities src/auth.ts
+
+# JSON output
+sem entities --json
+sem entities src/auth.ts --json
+
+# Include generated/build directories that repo-wide scans skip by default
+sem entities --no-default-excludes</code></pre>
+<h3>sem context</h3>
+<p>Token-budgeted context for LLMs: the entity, its dependencies, and its dependents, fitted to a strict content token budget. When the target signature itself does not fit, JSON output reports <code>target_omitted: true</code>.</p>
+<pre><code>sem context authenticateUser
+
+# Custom token budget
+sem context authenticateUser --budget 4000
+
+# JSON output
+sem context authenticateUser --json
+
+# Include generated/build directories that repo-wide scans skip by default
+sem context authenticateUser --no-default-excludes</code></pre>
+<h2>Use as default Git diff</h2>
+<p>Replace <code>git diff</code> output with entity-level diffs. Agents and humans get sem output automatically without changing any commands.</p>
+<pre><code>sem setup</code></pre>
+<p>Now <code>git diff</code> shows entity-level changes instead of line-level. No prompts, no agent configuration needed. Everything that calls <code>git diff</code> gets sem output automatically. Also installs a pre-commit hook that shows entity-level blast radius of staged changes.</p>
+<p>To disable and go back to normal git diff:</p>
+<pre><code>sem unsetup</code></pre>
+<h2>What it parses</h2>
+<p>28 programming languages with full entity extraction via tree-sitter:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Language</th>
+   <th>Extensions</th>
+   <th>Entities</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>TypeScript</td>
+   <td><code>.ts</code> <code>.tsx</code> <code>.mts</code> <code>.cts</code></td>
+   <td>functions, classes, interfaces, types, enums, exports</td>
+  </tr>
+  <tr>
+   <td>JavaScript</td>
+   <td><code>.js</code> <code>.jsx</code> <code>.mjs</code> <code>.cjs</code></td>
+   <td>functions, classes, variables, exports</td>
+  </tr>
+  <tr>
+   <td>Python</td>
+   <td><code>.py</code></td>
+   <td>functions, classes, decorated definitions</td>
+  </tr>
+  <tr>
+   <td>Go</td>
+   <td><code>.go</code></td>
+   <td>functions, methods, types, vars, consts</td>
+  </tr>
+  <tr>
+   <td>Rust</td>
+   <td><code>.rs</code></td>
+   <td>functions, structs, enums, impls, traits, mods, consts</td>
+  </tr>
+  <tr>
+   <td>Java</td>
+   <td><code>.java</code></td>
+   <td>classes, methods, interfaces, enums, fields, constructors</td>
+  </tr>
+  <tr>
+   <td>C</td>
+   <td><code>.c</code> <code>.h</code></td>
+   <td>functions, structs, enums, unions, typedefs</td>
+  </tr>
+  <tr>
+   <td>C++</td>
+   <td><code>.cpp</code> <code>.cc</code> <code>.hpp</code></td>
+   <td>functions, classes, structs, enums, namespaces, templates</td>
+  </tr>
+  <tr>
+   <td>C#</td>
+   <td><code>.cs</code></td>
+   <td>classes, methods, interfaces, enums, structs, properties</td>
+  </tr>
+  <tr>
+   <td>Ruby</td>
+   <td><code>.rb</code></td>
+   <td>methods, classes, modules</td>
+  </tr>
+  <tr>
+   <td>PHP</td>
+   <td><code>.php</code></td>
+   <td>functions, classes, methods, interfaces, traits, enums</td>
+  </tr>
+  <tr>
+   <td>Swift</td>
+   <td><code>.swift</code></td>
+   <td>functions, classes, protocols, structs, enums, properties</td>
+  </tr>
+  <tr>
+   <td>Elixir</td>
+   <td><code>.ex</code> <code>.exs</code></td>
+   <td>modules, functions, macros, guards, protocols</td>
+  </tr>
+  <tr>
+   <td>Bash</td>
+   <td><code>.sh</code></td>
+   <td>functions</td>
+  </tr>
+  <tr>
+   <td>HCL/Terraform</td>
+   <td><code>.hcl</code> <code>.tf</code> <code>.tfvars</code></td>
+   <td>blocks, attributes (qualified names for nested blocks)</td>
+  </tr>
+  <tr>
+   <td>Kotlin</td>
+   <td><code>.kt</code> <code>.kts</code></td>
+   <td>classes, interfaces, objects, functions, properties, companion objects</td>
+  </tr>
+  <tr>
+   <td>Fortran</td>
+   <td><code>.f90</code> <code>.f95</code> <code>.f</code></td>
+   <td>functions, subroutines, modules, programs</td>
+  </tr>
+  <tr>
+   <td>Vue</td>
+   <td><code>.vue</code></td>
+   <td>template/script/style blocks + inner TS/JS entities</td>
+  </tr>
+  <tr>
+   <td>XML</td>
+   <td><code>.xml</code> <code>.plist</code> <code>.svg</code> <code>.csproj</code></td>
+   <td>elements (nested, tag-name identity)</td>
+  </tr>
+  <tr>
+   <td>ERB</td>
+   <td><code>.erb</code> <code>.html.erb</code></td>
+   <td>blocks, expressions, code tags</td>
+  </tr>
+  <tr>
+   <td>Svelte</td>
+   <td><code>.svelte</code> <code>.svelte.js</code> <code>.svelte.ts</code></td>
+   <td>component blocks + rune JS/TS modules</td>
+  </tr>
+  <tr>
+   <td>Perl</td>
+   <td><code>.pl</code> <code>.pm</code> <code>.t</code></td>
+   <td>subroutines, packages</td>
+  </tr>
+  <tr>
+   <td>Dart</td>
+   <td><code>.dart</code></td>
+   <td>classes, mixins, extensions, enums, type aliases, functions</td>
+  </tr>
+  <tr>
+   <td>OCaml</td>
+   <td><code>.ml</code> <code>.mli</code></td>
+   <td>values, modules, types, classes, externals</td>
+  </tr>
+  <tr>
+   <td>Scala</td>
+   <td><code>.scala</code> <code>.sc</code> <code>.sbt</code></td>
+   <td>classes, objects, traits, enums, functions, vals, extensions</td>
+  </tr>
+  <tr>
+   <td>Nix</td>
+   <td><code>.nix</code></td>
+   <td>bindings, inherit declarations</td>
+  </tr>
+  <tr>
+   <td>Haskell</td>
+   <td><code>.hs</code></td>
+   <td>functions, signatures, data types, newtypes, classes, instances, type synonyms</td>
+  </tr>
+  <tr>
+   <td>Zig</td>
+   <td><code>.zig</code></td>
+   <td>functions, tests, variables</td>
+  </tr>
+ </tbody>
+</table>
+<p>Plus structured data formats:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Format</th>
+   <th>Extensions</th>
+   <th>Entities</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>JSON</td>
+   <td><code>.json</code></td>
+   <td>properties, objects (RFC 6901 paths)</td>
+  </tr>
+  <tr>
+   <td>YAML</td>
+   <td><code>.yml</code> <code>.yaml</code></td>
+   <td>sections, properties (dot paths)</td>
+  </tr>
+  <tr>
+   <td>TOML</td>
+   <td><code>.toml</code></td>
+   <td>sections, properties</td>
+  </tr>
+  <tr>
+   <td>CSV</td>
+   <td><code>.csv</code> <code>.tsv</code></td>
+   <td>rows (first column as identity)</td>
+  </tr>
+  <tr>
+   <td>Markdown</td>
+   <td><code>.md</code> <code>.mdx</code></td>
+   <td>heading-based sections</td>
+  </tr>
+ </tbody>
+</table>
+<p>Everything else falls back to chunk-based diffing.</p>
+<h3>Custom extensions and extensionless files</h3>
+<p>For files with non-standard extensions, create a <code>.semrc</code> in your project root:</p>
+<pre><code>.xyz = cpp
+.j = json
+.mypy = python</code></pre>
+<p>sem also reads <code>.gitattributes</code> patterns (<code>diff=</code> and <code>linguist-language=</code>) if you already have those set up. <code>.semrc</code> takes priority when both define the same extension.</p>
+<p>For files with no extension at all, sem detects the language automatically from content (imports, declarations, shebang lines, vim modelines). This covers 19 languages with no config needed.</p>
+<h2>How matching works</h2>
+<p>Three-phase entity matching:</p>
+<ol>
+ <li><strong>Exact ID match</strong> — same entity in before/after = modified or unchanged</li>
+ <li><strong>Structural hash match</strong> — same AST structure, different name = renamed or moved (ignores whitespace/comments)</li>
+ <li><strong>Fuzzy similarity</strong> — &gt;80% token overlap = probable rename</li>
+</ol>
+<p>This means sem detects renames and moves, not just additions and deletions. Structural hashing also distinguishes cosmetic changes (whitespace, formatting) from real logic changes.</p>
+<h2>MCP Server</h2>
+<p>sem includes an MCP server with 6 tools for AI agents: <code>sem_entities</code>, <code>sem_diff</code>, <code>sem_blame</code>, <code>sem_impact</code>, <code>sem_log</code>, <code>sem_context</code>. These mirror the CLI commands exactly.</p>
+<pre><code>\{
+  "mcpServers": \{
+    "sem": \{
+      "command": "sem-mcp"
+    }
+  }
+}</code></pre>
+<p>Install the MCP binary:</p>
+<pre><code>cd sem/crates
+cargo install --path sem-mcp</code></pre>
+<h2>JSON output</h2>
+<pre><code>sem diff --format json</code></pre>
+<pre><code>\{
+  "summary": \{
+    "fileCount": 2,
+    "added": 1,
+    "modified": 1,
+    "deleted": 1,
+    "moved": 0,
+    "renamed": 0,
+    "reordered": 0,
+    "binary": 0,
+    "orphan": 0,
+    "total": 3
+  },
+  "changes": [
+    \{
+      "entityId": "src/auth.ts::function::validateToken",
+      "changeType": "added",
+      "entityType": "function",
+      "entityName": "validateToken",
+      "startLine": 12,
+      "endLine": 18,
+      "oldStartLine": null,
+      "oldEndLine": null,
+      "filePath": "src/auth.ts"
+    }
+  ],
+  "binaryChanges": []
+}</code></pre>
+<p>The named change-type buckets (<code>added</code>, <code>modified</code>, <code>deleted</code>, <code>moved</code>, <code>renamed</code>, <code>reordered</code>) always sum to <code>total</code>. <code>orphan</code> is a cross-cutting metadata count for module-level changes, and those changes are already included in the named change-type buckets.</p>
+<h2>As a library</h2>
+<p>sem-core can be used as a Rust library dependency:</p>
+<pre><code>[dependencies]
+sem-core = \{ git = "https://github.com/Ataraxy-Labs/sem", version = "0.5" }</code></pre>
+<p>Used by weave (semantic merge driver) and inspect (entity-level code review).</p>
+<h2>Architecture</h2>
+<ul>
+ <li><strong>tree-sitter</strong> for code parsing (native Rust, not WASM)</li>
+ <li><strong>git2</strong> for Git operations</li>
+ <li><strong>rayon</strong> for parallel file processing</li>
+ <li><strong>xxhash</strong> for structural hashing</li>
+ <li>Plugin system for adding new languages and formats</li>
+</ul>
+<h2>License</h2>
+<p>MIT OR Apache-2.0</p>

@@ -1,0 +1,66 @@
+<p>Inspektor Gadget, the open source eBPF-based toolkit for Kubernetes observability and Linux host inspection, has completed its first independent security audit. The audit was coordinated by the Open Source Technology Improvement Fund (OSTIF), funded by the CNCF and carried out by Shielder. The findings, the fixes, and the hardening recommendations are now public, and every reported vulnerability has a patch available.</p>
+<p>This post walks through what Inspektor Gadget does, how the audit was scoped, what the researchers found, and what the results mean for teams running it in production.</p>
+<h2>What is Inspektor Gadget?</h2>
+<p>Inspektor Gadget is a framework and toolkit that uses eBPF to collect and inspect data on Kubernetes clusters and Linux hosts. It manages the packaging, deployment, and execution of “gadgets” — eBPF programs packaged as OCI images. OCI (the Open Container Initiative) is a Linux Foundation project that defines open industry standards for container image formats and runtimes, so the same image can be distributed and run across any compliant tool or registry.</p>
+<p>For teams running Kubernetes in production that need to understand what is happening inside a cluster, Inspektor Gadget provides that visibility without the usual tradeoffs. There is no need to rebuild container images with extra instrumentation, inject sidecars into every pod, attach debuggers or strace to running processes, restart workloads to toggle tracing on and off, or ship custom kernel modules to nodes. Instead, eBPF programs are loaded into the kernel at runtime to safely observe syscalls, network activity, and file access. Applications keep running unchanged while operators get the data they need.</p>
+<h2>Why a security audit?</h2>
+<p>Any tool that runs with elevated privileges on shared infrastructure needs to earn trust. Inspektor Gadget runs with root-level access on nodes to do its job, so an independent review of its security posture is a natural step as the project matures and adoption grows.</p>
+<p>OSTIF is a nonprofit dedicated to improving the security of open source software. Over the past ten years, OSTIF has managed security engagements that have uncovered more than 800 vulnerabilities across 120 open source projects.</p>
+<h2>How the audit was scoped</h2>
+<p>OSTIF engaged Shielder, to perform the assessment. Two researchers worked on the audit in early 2026. Their methodology combined:</p>
+<ul>
+ <li>Collaborative threat modeling with the Inspektor Gadget maintainers</li>
+ <li>Manual source code review</li>
+ <li>Dynamic testing on dedicated lab environments</li>
+ <li>Static analysis using tools such as Semgrep and GoSec</li>
+ <li>AI-assisted code review for broader coverage</li>
+</ul>
+<p>The researchers built three test environments that reflect how Inspektor Gadget is deployed in the wild: a local Linux host deployment, a remote daemon deployment, and a Kubernetes deployment on minikube.</p>
+<h2>What the audit found</h2>
+<p>The audit identified three vulnerabilities. None were rated Critical or High severity.</p>
+<h3>Two Medium severity findings</h3>
+<ol>
+ <li>Command injection in ig image build (CVE-2026-24905). The image build process used Makefiles that embedded user-controlled input without proper escaping, creating a command injection vector. This matters most in CI/CD pipelines that build untrusted gadgets. Fixed in release v0.48.1.</li>
+ <li>Denial of service via event flooding. A malicious container could flood the eBPF ring buffer (hard-coded to 256 KB), causing the system to silently drop events from other containers. For teams using Inspektor Gadget as part of a security monitoring pipeline, this could allow an attacker to hide activity by generating noise. Fixed in release v0.50.1.</li>
+</ol>
+<h3>One Low severity finding</h3>
+<ol>
+ <li>Unsanitized ANSI escape sequences in columns output mode (CVE-2026-25996). When rendering events in the terminal, Inspektor Gadget did not sanitize ANSI escape sequences, allowing a compromised container to inject terminal escape codes into an operator’s display. Fixed in release v0.49.1.</li>
+</ol>
+<h2>Hardening recommendations</h2>
+<p>Beyond the specific vulnerabilities, Shielder delivered six hardening recommendations. These are not active exploits — they are areas where the project can reduce its attack surface over time:</p>
+<ul>
+ <li>Enforce TLS by default on TCP listeners. When the daemon starts a TCP listener without TLS, it currently logs a warning and continues in plaintext. The recommendation is to require an explicit opt-out flag.</li>
+ <li>Pin and verify external dependencies in CI/CD. Several build dependencies were downloaded without hash or signature verification. The project has already landed fixes or has pull requests open for most of these.</li>
+ <li>Implement a Kubernetes namespace blocklist to prevent unintended tracing on sensitive namespaces such as kube-system.</li>
+ <li>Restrict remote clients from enabling host-level tracing through the daemon, or clearly document the risk.</li>
+ <li>Automate third-party vulnerability scanning for project dependencies.</li>
+ <li>Reduce RBAC permissions on the DaemonSet pod — specifically the nodes/proxy GET permission, which could be leveraged for privilege escalation if the service account token is compromised.</li>
+</ul>
+<p>The maintainers are working through these systematically. Some are already merged; others, notably the RBAC refactor and namespace blocklist, will take more time.</p>
+<h2>Gadget bypass testing</h2>
+<p>One of the most technically interesting parts of the audit was the gadget bypass testing. The researchers asked: can a compromised container perform operations that a gadget is meant to trace, without triggering any events? They identified six bypass scenarios, ranging from using newer Linux syscalls that certain gadgets don’t hook (for example, openat2 instead of openat) to evasion through io_uring and statically linked libraries.</p>
+<p>These results reflect the cat-and-mouse nature of kernel-level tracing. Linux keeps evolving, new syscalls and subsystems keep appearing, and eBPF-based tracing tools have to keep up. The Inspektor Gadget maintainers have already addressed several of the identified gaps and are documenting the inherent limitations of the approach so operators understand what eBPF tracing can and cannot guarantee.</p>
+<h2>What this means for users</h2>
+<p>The actionable step for organizations running Inspektor Gadget is to update to v0.50.1 or later, which includes fixes for all three reported vulnerabilities. Shielder’s own conclusion, from the final report, is that “the overall security posture of Inspektor Gadget is adequately mature from both a secure coding and design point of view.”</p>
+<p>For the wider cloud native community, this audit is an example of how the ecosystem is supposed to work. A project reaches a level of adoption where independent security review becomes necessary, OSTIF coordinates a qualified engagement, researchers do the work in the open, maintainers land the fixes, and the full report is published so users can make informed decisions.</p>
+<h2>Resources</h2>
+<ul>
+ <li>Inspektor Gadget on GitHub</li>
+ <li>Inspektor Gadget release v0.50.1</li>
+ <li>OSTIF (Open Source Technology Improvement Fund)</li>
+ <li>Shielder</li>
+</ul>
+<h3>Audit announcement and resources</h3>
+<ul>
+ <li>Full Report – Downloadable PDF</li>
+ <li>Blog post – Inspektor Gadget</li>
+ <li>Blog post – OSTIF</li>
+ <li>Blog post – Shielder</li>
+ <li>Blog post – Microsoft</li>
+</ul>
+<h3>CVEs</h3>
+<ul>
+ <li>CVE-2026-24905: Command Injection in ig image build</li>
+ <li>CVE-2026-25996: Unsanitized ANSI Escape Sequences</li>
+</ul>

@@ -1,0 +1,130 @@
+<h1>Defending Code Reference Harness</h1>
+<p>A reference implementation for autonomous vulnerability discovery and remediation with Claude, based on our learnings from partnering with security teams at several organizations since launching Claude Mythos Preview. For a write up of these learnings along with best practices, see the accompanying blog post (also available in <code>blog-post.md</code>). For a lightweight SDK-only walkthrough of the same recon → find → triage → report → patch loop, see the companion cookbook.</p>
+<p>This repo is not maintained and is not accepting contributions.</p>
+<blockquote>
+ <p>🔒 <strong>Want a managed option?</strong> Anthropic offers Claude Security, a hosted product that finds and fixes vulnerabilities in your source code across multiple projects. Claude Security scans your repository for vulnerabilities, applies a multi-stage verification pipeline to reduce false positives, and lets you manage findings through their lifecycle: triage, fix validation, and rapid fix generation.</p>
+ <p>This repository is an open-source reference implementation based on general best practices for finding vulnerabilities using Claude. You can use it to build your own vulnerability finding pipeline, customize the logic, and it can be used with whatever access you have to Claude APIs (including Bedrock, Vertex, or Azure).</p>
+</blockquote>
+<h2>Contents</h2>
+<ul>
+ <li><strong>Claude Code skills</strong>: <code>/quickstart</code>, <code>/threat-model</code>, <code>/vuln-scan</code>, <code>/triage</code>, <code>/patch</code>, <code>/customize</code>: interactive scoping, scanning, triage, and patching. Open this repo in Claude Code and run <code>/quickstart</code> to get oriented.</li>
+ <li><strong><code>harness/</code></strong>: the autonomous reference pipeline (recon → find → verify → report → patch), configured for finding C/C++ memory vulnerabilities using Docker and ASAN. This harness is a <strong>reference, not a product</strong>. The general shape, prompts, and sandboxing are reusable, but the harness will not work on every codebase out of the box. Run <code>/customize</code> to port it to your language, detector, or vuln class.</li>
+</ul>
+<blockquote>
+ <p>⚠️ <strong>Security:</strong> <code>/quickstart</code>, <code>/threat-model</code>, <code>/vuln-scan</code>, and <code>/triage</code> only read and write files. Running <code>/patch</code> on static findings (<code>TRIAGE.json</code> or <code>VULN-FINDINGS.json</code>) is likewise read- and write-only. <code>/customize</code> edits the harness code and runs validation commands. Any of these skills are safe to run unsandboxed, as long as you review and approve each tool use in Claude Code. The autonomous reference pipeline (including <code>/patch</code> on pipeline results) <strong>executes target code</strong>, so it refuses to run outside of a gVisor sandbox unless explicitly overridden. To get set up, run <code>scripts/setup_sandbox.sh</code> once, then invoke the pipeline via <code>bin/vp-sandboxed</code>.</p>
+</blockquote>
+<h2>Getting Started</h2>
+<pre><code>git clone https://github.com/anthropics/defending-code-reference-harness
+cd defending-code-reference-harness
+claude
+
+# 30-sec intro + guided first run on the canary target
+&gt; /quickstart
+
+&gt; /quickstart how do I port the pipeline to Java?
+&gt; /quickstart how do I triage all these bugs?</code></pre>
+<h2>Further Reading</h2>
+<ul>
+ <li><strong>Blog Post</strong> · The accompanying blog post with learnings + best practices</li>
+ <li><strong>Pipeline</strong> · How it works: diagram, stages, CLI flags</li>
+ <li><strong>Security</strong> · Sandboxing, what not to mount</li>
+ <li><strong>Agent sandbox</strong> · gVisor isolation + egress allowlist for every agent</li>
+ <li><strong>Customize</strong> · Port to my stack; which files change and why</li>
+ <li><strong>Patching</strong> · Generate and verify fixes for verified crashes</li>
+ <li><strong>Troubleshooting</strong> · Duplicates, rate limits, subagent model pinning</li>
+ <li><strong>Safeguards</strong> · Block for dangerous cyber work</li>
+</ul>
+<h2>Ramp Up</h2>
+<p>The most successful security teams we've partnered with are those that have gotten hands-on the fastest. Though it's tempting to spend months designing the perfect pipeline, we recommend starting small on Day 1 and building from there as learnings come. The steps below follow that pattern and set an ambitious (but reasonable) pace based on what we've seen.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Step</th>
+   <th>Timeline</th>
+   <th>Activity</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Step 1</td>
+   <td>Day 1</td>
+   <td>Build a threat model and run your first static scan + triage</td>
+  </tr>
+  <tr>
+   <td>Step 2</td>
+   <td>Day 2</td>
+   <td>Run the reference pipeline on a C/C++ library</td>
+  </tr>
+  <tr>
+   <td>Step 3</td>
+   <td>Days 3-5</td>
+   <td>Customize the pipeline for your target</td>
+  </tr>
+  <tr>
+   <td>Step 4</td>
+   <td>Week 2</td>
+   <td>Start autonomous scanning, triage, and patching</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Step 1 (Day 1): Build a threat model and run your first static scan + triage</h3>
+<p>Day 1 is focused on seeing the whole loop end-to-end. Using only the interactive skills, you'll build a threat model, run a static scan scoped by it, triage what comes back, and draft candidate fixes. You'll finish the day with a threat model, a ranked list of static findings, and candidate patches.</p>
+<p>The relevant skills <strong>only read and write files</strong> in your repo. As long as you run Claude Code interactively and approve each tool use, no sandbox is needed.</p>
+<pre><code># Pin every subagent to the model you want
+export CLAUDE_CODE_SUBAGENT_MODEL=&lt;model-id&gt;
+claude
+
+# 0. intro + guided first run
+&gt; /quickstart
+
+# 1. Build a threat model (aim before you shoot)
+&gt; /threat-model bootstrap targets/canary
+
+# 2. Run a static scan, scoped by that threat model
+&gt; /vuln-scan targets/canary
+
+# 3. Verify, dedupe, and rank what came back
+&gt; /triage targets/canary/VULN-FINDINGS.json
+
+# 4. Generate candidate fixes for the verified findings
+&gt; /patch ./TRIAGE.json --repo targets/canary</code></pre>
+<h3>Step 2 (Day 2): Run the reference pipeline on a C/C++ library</h3>
+<p>On Day 2, you'll move from interactive skills to your first autonomous run using the reference pipeline. You'll run the full recon → find → verify → report loop in your environment on a known-vulnerable open-source library, then generate a candidate patch for what it finds.</p>
+<pre><code># One-time setup
+python3 -m venv .venv &amp;&amp; .venv/bin/pip install -e .
+./scripts/setup_sandbox.sh   # installs gVisor, builds the agent images, and verifies isolation
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# Run the recon → find → verify → report loop
+bin/vp-sandboxed run drlibs --model &lt;model-id&gt; --runs 3 --parallel --stream --auto-focus
+# Generate a candidate patch for each finding
+bin/vp-sandboxed patch results/drlibs/&lt;timestamp&gt;/ --model &lt;model-id&gt;</code></pre>
+<p>The pipeline walks through seven stages: <strong>Build</strong>, <strong>Recon</strong>, <strong>Find</strong>, <strong>Verify</strong>, <strong>Dedupe</strong>, <strong>Report</strong>, and <strong>Patch</strong>.</p>
+<h3>Step 3 (Days 3-5): Customize the pipeline for your target</h3>
+<p>On Days 3-5, you'll customize the harness for your own target. By the end of the week, you'll have a <code>targets/&lt;your-service&gt;/</code> directory that the pipeline can run against.</p>
+<pre><code>claude
+
+&gt; /quickstart how do I customize this for ~/code/my-service?
+
+&gt; /threat-model bootstrap-then-interview ~/code/my-service
+&gt; /vuln-scan ~/code/my-service
+&gt; /triage ~/code/my-service/VULN-FINDINGS.json --repo ~/code/my-service
+
+&gt; /customize use ~/code/my-service/\{THREAT_MODEL.md,VULN-FINDINGS.json} and ./TRIAGE.md</code></pre>
+<h3>Step 4 (Week 2): Start autonomous scanning, triage, and patching</h3>
+<p>In Week 2, you'll use the pipeline you customized in Step 3 on your own targets, running multiple pipeline scans, triaging findings, and applying patches.</p>
+<pre><code># Scan - run a wave of parallel runs against your target
+bin/vp-sandboxed run my-service --model &lt;model-id&gt; --runs 5 --parallel --stream --auto-focus
+
+# Triage - dedupe and rank every finding across all waves
+&gt; /triage results/my-service/ --repo ~/code/my-service --auto --votes 5
+
+# Patch - generate and validate fixes
+&gt; /patch results/my-service/&lt;timestamp&gt;/ --model &lt;model-id&gt;</code></pre>
+<h2>Looking Forward</h2>
+<ol>
+ <li>Reviewing all their internal repos and key open-source dependencies.</li>
+ <li>Setting up bespoke infrastructure for scanning to move scans off of laptops.</li>
+ <li>Incorporating scans into their SDLC.</li>
+ <li>Testing and experimenting with the models to find what works best for them.</li>
+</ol>

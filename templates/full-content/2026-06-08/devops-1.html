@@ -1,0 +1,75 @@
+<h2>TL;DR</h2>
+<ul>
+ <li>The vast majority of v1.x control planes can upgrade to Crossplane v2 right away with no changes. Claims, composite resources (XRs), Compositions, and cluster-scoped managed resources all keep working.</li>
+ <li>A small set of v1 features were removed or changed in v2. If your control plane uses one, you'll want to find that out before you upgrade.</li>
+ <li><code>crossplane beta upgrade check</code> is a new, read-only CLI command that scans a live v1.x control plane and reports exactly what (if anything) would break, which resource is responsible, and how to fix it.</li>
+ <li>It ships in the v1.20 CLI, so install the latest v1.20 CLI and run it against your cluster before you upgrade.</li>
+</ul>
+<h2>Ready to upgrade?</h2>
+<p>When we designed Crossplane v2, backward compatibility was a first-class goal: the vast majority of v1.x control planes can upgrade without changing a thing. Your claims, composite resources (XRs), compositions, and cluster-scoped managed resources all keep working in v2.</p>
+<p>But "the vast majority" isn't "everyone." Crossplane v2 does remove or change the behavior of a small set of v1 features, and if your control plane uses any of them, you'll want to catch it before you upgrade. Until now, that meant reading the backward compatibility notes and then spelunking through every composition, package, and resource in your cluster for something that's going away - tedious and easy to get wrong on a control plane of any real size. Understandably, that uncertainty has kept some folks from upgrading to v2.</p>
+<p><code>crossplane beta upgrade check</code> is now available to give you a definitive answer. It's a read-only command that connects to a live v1.x control plane and exhaustively scans it for anything v2 removes or changes in a breaking way. Point it at your cluster before you upgrade and it takes you straight to the resources that need attention, with the exact fix for each.</p>
+<h2>What it checks</h2>
+<p>The command covers every breaking change called out in the v2 backward compatibility notes. For each one, it reports the specific resources responsible so you can act on them directly:</p>
+<ul>
+ <li><strong>Native patch-and-transform Compositions.</strong> Composition Functions are how you compose resources in Crossplane v2. Native patch-and-transform (P&amp;T) Composition, where resources and patches are embedded directly in the Composition, is removed. This is the change most likely to affect you, so any Composition still using it needs to move to a function pipeline.</li>
+ <li><strong>ControllerConfig usage.</strong> The <code>ControllerConfig</code> type is removed, replaced by <code>DeploymentRuntimeConfig</code>. The check finds both <code>ControllerConfigs</code> themselves and the Providers or Functions that still reference one.</li>
+ <li><strong>External secret stores.</strong> This alpha feature is removed in v2. The check finds where it's enabled and where your Compositions and resources still publish connection details through it.</li>
+ <li><strong>Unqualified package sources.</strong> Crossplane v2 drops the implicit default registry, so every package reference (Providers, Configurations, Functions, and their dependencies) must be fully qualified with its registry hostname.</li>
+ <li><strong>Composite resource connection details.</strong> This one is informational. Legacy XRs and Claims keep aggregating connection details in v2, so the upgrade itself needs no action here. The check highlights resources you'd only need to revisit if you later migrate them to v2-style namespaced XRs, which do not support connection details at the XR level.</li>
+</ul>
+<p>The command is also careful about false positives. Crossplane's controllers and the API server inject defaults onto every cluster, and the check knows to look past those and flag only the features you actually opted into. A finding means real usage you'll need to address.</p>
+<h2>Let's see it in action</h2>
+<p>Running the command is as simple as pointing it at a cluster. By default it uses your current kubeconfig context and sweeps the entire control plane: all of your Crossplane configuration, cluster-scoped resources, and every namespace:</p>
+<pre><code>crossplane beta upgrade check</code></pre>
+<p>On a control plane that's already clean, you get the answer you're hoping for and a zero exit code:</p>
+<pre><code>[✓] 0 issues, 0 informational, 0 incomplete checks.</code></pre>
+<p>There we go - ready to upgrade. On a control plane that still leans on some v1-only features, the report tells you precisely what stands in the way. Here's a representative output from a control plane that is still using native patch-and-transform and external secret stores:</p>
+<pre><code>[✗] 4 issues, 0 informational, 0 incomplete checks.
+
+[✗] Native patch-and-transform Compositions - 3 issues
+    │
+    │  Crossplane v2 removes native patch-and-transform (P&amp;T) Composition. Compositions must use mode: Pipeline with Composition Functions.
+    │  Fix:   Migrate to Composition Functions (spec.mode: Pipeline with spec.pipeline steps). Run "crossplane beta convert pipeline-composition" to convert existing Compositions.
+    │  Docs:  https://docs.crossplane.io/latest/guides/upgrade-to-crossplane-v2/#native-patch-and-transform-composition
+    │         https://docs.crossplane.io/v1.20/cli/command-reference/#beta-convert
+    │
+    │    NAME                                                            FIELD
+    │    composition.apiextensions.crossplane.io/nativepnt-composition   .spec.mode
+    │    composition.apiextensions.crossplane.io/nativepnt-composition   .spec.patchSets
+    │    composition.apiextensions.crossplane.io/nativepnt-composition   .spec.resources
+    └──
+[✓] ControllerConfig usage
+[✗] External secret stores - 1 issue
+    │
+    │  Crossplane v2 removes support for external secret stores. Publish connection details as Kubernetes Secrets composed by your Compositions, or adopt External Secrets Operator if
+    │  you need an external store.
+    │  Fix:   Disable --enable-external-secret-stores on the Crossplane Deployment, replace StoreConfig-based publishing with composed Kubernetes Secrets (or adopt External Secrets
+    │         Operator), then delete StoreConfig resources. No automated converter exists.
+    │  Docs:  https://docs.crossplane.io/latest/guides/upgrade-to-crossplane-v2/#external-secret-stores
+    │         https://docs.crossplane.io/latest/guides/connection-details-composition
+    │         https://github.com/external-secrets/external-secrets
+    │
+    │    NAMESPACE           NAME                         FIELD
+    │    crossplane-system   deployment.apps/crossplane   .spec.template.spec.containers[0].args
+    └──
+[✓] Composite resource connection details
+[✓] Unqualified package sources
+
+crossplane: error: blockers found</code></pre>
+<p>Each finding is self-contained. The top line summarizes the breaking change in plain language, the <code>Fix:</code> line tells you what to do about it - often naming the exact <code>crossplane beta convert</code> command that will migrate the resource for you - and the <code>Docs:</code> line links straight to the relevant section of the upgrade guide. Below that, a table lists every resource and field responsible, so there's no guesswork about <em>which</em> of your Compositions needs attention.</p>
+<p>The command exits non-zero when it finds blockers and zero when it doesn't, and <code>-o json</code> emits the same findings as structured data:</p>
+<pre><code>crossplane beta upgrade check -o json</code></pre>
+<h2>Performance Tuning</h2>
+<p>Scanning every managed resource for external secret stores usage is the most expensive part of the run on control planes with many provider CRDs, and these flags let you make a trade off for execution time versus the load the command puts on your API server:</p>
+<ul>
+ <li><code>--skip-managed-resources</code> skips the managed-resource scan entirely. The command still inspects <code>StoreConfig</code> resources, the Crossplane <code>Deployment</code>, and composite resources for external secret stores usage; it just doesn't scan managed resources. This gives the biggest reduction in run time, at the cost of not catching external secret stores usage on managed resources.</li>
+ <li><code>--concurrency</code> (default <code>10</code>) bounds how many resources the command processes in parallel. Lower it, for example <code>--concurrency 2</code>, to put less load on a busy production control plane you don't want to overload; raise it to finish faster at the cost of more load on the API server.</li>
+</ul>
+<h2>How to get it</h2>
+<p>Because this tool is only useful <em>before</em> you upgrade, it ships exclusively in the <strong>v1.20 Crossplane CLI</strong> - a v2 control plane has nothing left to check, and the v1-only types these checks rely on don't even exist there. We made a deliberate exception to v1.20's critical-fixes-only maintenance policy to ship this in the v1.20.9 patch release, precisely so the whole community can check their control planes before they make the jump.</p>
+<p>If you're running a v1.x control plane, you likely already have the CLI on hand. You just need a build that includes <code>upgrade check</code>, which means the latest v1.20 patch release. Install it with:</p>
+<pre><code>curl -sL "https://raw.githubusercontent.com/crossplane/crossplane/main/install.sh" | XP_VERSION=v1.20.9 sh</code></pre>
+<h2>Upgrade with confidence</h2>
+<p>Most of you will run <code>crossplane beta upgrade check</code>, see a clean report, and upgrade to v2 the same day - which is exactly the outcome all that backward compatibility work was for. For everyone else, it trades guesswork for a precise list of what to change before you go. Either way, you upgrade deliberately, knowing exactly where your control plane stands.</p>
+<p>This check is just a first step. It tells you what needs to change, and for some breaking changes it can already point you at a <code>crossplane beta convert</code> command that does the rewrite for you, but it stops short of migrating your control plane end to end. Smoothing that path is where the community should head next.</p>

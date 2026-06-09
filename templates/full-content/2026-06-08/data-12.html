@@ -1,0 +1,30 @@
+<p><em>This post is a little side-quest from my “Kafka Share Groups and Parallelizing Consumption” series.</em></p>
+<p>My “Kafka Share Groups and Parallelizing Consumption” series has been laser focused on how different configurations and behaviors affect parallel consumption in share groups (Queues for Kafka). <strong>So far I’ve shown that you most definitely can hold share groups wrong</strong>. You could quite easily and inadvertently create a work queue and with the right combination of things going against you, see a small number of consumers dominate, leaving most consumers starved of messages. All the while lag builds and builds. You need to know the settings and what they do. Don’t just rely on the defaults.</p>
+<p>But it’s worth asking the question: <strong>is parallelizing consumption what share groups are for?</strong></p>
+<p>The answer is no.</p>
+<p>If your only concern is parallel consumption, then there are other options. Chuck Larrieu Casias wrote a good post on LinkedIn pointing out that people shouldn’t be thinking of share groups as THE solution to parallelizing work (without exploding the partition count).</p>
+<p>Share groups exist to expose queue-like semantics over a log. Unlike a normal consumer group, a share group lets you accept one record and reject another for retry. A consumer group tracks one committed offset per partition. A share group has to track many individual records independently: which records are available, which have been delivered (to whom), which have been acknowledged, and which should become available again.</p>
+<p>But just because share groups don’t exist primarily to parallelize work doesn’t mean it’s not a tool that can be used for that purpose. If your messages are independent or you are otherwise ok with loose ordering then share groups could be a simple choice for breaking away from partition count as the unit of parallelism.</p>
+<p>The central theme I took from Chuck’s post is that parallelism has to be accounted for <em>somewhere</em>. The unit of parallelism can be broker-visible and broker-managed, or client-local and client-managed. Broker-visible/managed can only take you so far.</p>
+<h2>Where should your unit of parallelism live?</h2>
+<p>When you need to process 1,000 messages in parallel to cope with the producer rate, what represents those 1,000 parallel units of work? Is it partitions, consumers, virtual threads/async tasks?</p>
+<p>If the unit of parallelism is the consumer itself then we must scale out serial consumers to scale the parallel processing (with a matching partition count with consumers groups). Every parallel unit of work (consumer) becomes visible to the broker as protocol interactions and state plus one or more TCP connections.</p>
+<p>If parallelism comes in part from the client itself, the unit of parallelism could be a virtual thread, an async task or even an OS thread. This is invisible to the broker. You need fewer consumers, fewer TCP connections, and less broker-visible protocol interaction/state.</p>
+<p>This split of where the unit of parallelism is accounted for, broker-side vs client-side, exists across all messaging systems. It’s not specific to Kafka.</p>
+<h2>How many units of parallelism?</h2>
+<p>A simple calculation for aggregate parallelism is easy:</p>
+<pre><code>aggregate parallelism = rate * avg processing time in seconds</code></pre>
+<ul>
+ <li>60000 msg/s * 1s = 60000</li>
+ <li>60000 msg/s * 5s = 300000</li>
+ <li>100 msg/s * 20s = 2000</li>
+ <li>10000 msg/s * 0.5s = 5000</li>
+ <li>50 msg/s * 5s = 250</li>
+</ul>
+<p>Once you know how many messages must be processed in parallel, you can figure out your tactics. The formula tells you how much parallelism you need, then it’s up to you to figure out where that parallelism should live.</p>
+<p>Let’s use our 60,000 messages per second workload from the share group series. If it takes 1 second to process each message, then we need to support 60,000 messages being processed at any given moment. If each unit of parallelism is a serial consumer, then that means 60,000 consumers! That’s a lot of connections, a lot of protocol state, and a really big consumer group.</p>
+<p>What if it takes 10 seconds on average to process a message, you’d need 600,000 consumers, and well over 1 million TCP connections!</p>
+<p>If most of the work is I/O, and the CPU spends a lot of time waiting around then can’t we make a single client do more work? What if one client can handle processing 1000 messages in parallel? Then we’d only need 60 consumers for the “60K msg/s + 1 second processing time” example.</p>
+<h2>Takeaway</h2>
+<p>If the ultimate unit of parallelism is visible to the broker as something it must manage, it can get really expensive in resources for highly parallel workloads (no matter which messaging system you use). Managing virtual threads, or even OS threads, is much cheaper than managing one or more TCP connections + metadata per unit of parallelism. This is true of all messaging systems I have ever used. The cost is greater complexity on the client, but if you don’t want to roll your own logic, there are libraries to help here (see Chuck’s post for some). Unfortunately, the ParallelConsumer library is no longer being maintained (though a fork might be in the future). This library not only added internal client-side parallel processing but queue semantics as well (on top of consumer groups). Now that we have share groups, perhaps we need a new library that adds client-side parallelism to share groups.</p>
+<p>I’m going back to writing Part 3 of my parallelism in share groups series. We’ll be comparing broker-managed vs client-managed parallelism with share groups and consumer groups.</p>
