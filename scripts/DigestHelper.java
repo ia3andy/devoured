@@ -425,8 +425,9 @@ public class DigestHelper implements Runnable {
             case "gemini" -> new OpenAIProvider("gemini",
                     "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
                     env("GEMINI_API_KEY"),
-                    Map.of("summarize", "gemini-2.5-flash", "description", "gemini-2.5-flash-lite", "clean-html", "gemini-2.5-flash-lite"),
-                    6, 5, 18);
+                    // Gemini free tier (2026-06): 3.1 Flash Lite = 15 RPM, 250K TPM, 500 RPD
+                    Map.of("summarize", "gemini-3.1-flash-lite", "description", "gemini-3.1-flash-lite", "clean-html", "gemini-3.1-flash-lite"),
+                    6, 15, 500);
             case "github" -> new OpenAIProvider("github",
                     "https://models.github.ai/inference/chat/completions",
                     env("GITHUB_TOKEN"),
@@ -1633,12 +1634,10 @@ public class DigestHelper implements Runnable {
             "articles":{"type":"array","items":""" + RATING_ARTICLE_SCHEMA + """
             }},"required":["articles"],"additionalProperties":false}""";
 
-    // Gemini free tier quotas (2026-05):
-    //   Flash:      5 RPM, 250K TPM, 20 RPD (rate, not hard cap)
-    //   Flash Lite: 10 RPM, 250K TPM, 20 RPD (rate, not hard cap)
-    // RPD is a pace limit (sliding window), not a daily counter.
-    // 429 with "limit: 20" = bursting too fast, not daily exhaustion.
-    // Post-response delay: 60/rpm + 3s safety margin
+    // Gemini free tier quotas (2026-06):
+    //   3.1 Flash Lite: 15 RPM, 250K TPM, 500 RPD
+    //   RPD is a pace limit (sliding window), not a daily counter.
+    //   Post-response delay: 60/rpm + 3s safety margin
     static int apiDelaySeconds = 15;
 
     static Uni<JsonObject> callOpenAIAPI(String endpoint, String token, String model, String context,
