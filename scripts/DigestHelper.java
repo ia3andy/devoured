@@ -911,25 +911,28 @@ public class DigestHelper implements Runnable {
                     .flatMap(s -> StreamSupport.stream(s.getAsJsonArray("articles").spliterator(), false))
                     .filter(a -> !a.getAsJsonObject().has("one-liner") || jsonStr(a.getAsJsonObject(), "one-liner").isEmpty())
                     .count();
-            boolean summariesComplete = missingSummaries == 0;
+            int missingSections = (int) feedNames.stream()
+                    .filter(name -> allSections.stream().noneMatch(s -> name.equalsIgnoreCase(jsonStr(s, "name"))))
+                    .count();
+
+            var reasons = new ArrayList<String>();
+            if (!contentComplete) reasons.add("content incomplete");
+            if (missingSummaries > 0) reasons.add(missingSummaries + " articles missing summaries");
+            if (missingSections > 0) reasons.add(missingSections + " feeds missing sections");
+            boolean complete = reasons.isEmpty();
+
             var finalPost = store.findByDate(targetDate);
             boolean isPublished = false;
-            if (finalPost != null && contentComplete && summariesComplete) {
+            if (finalPost != null && complete) {
                 finalPost.remove("draft");
                 store.savePost(finalPost);
                 isPublished = true;
                 System.err.println("  Post published for " + targetDate);
             } else if (finalPost != null) {
-                var reasons = new ArrayList<String>();
-                if (!contentComplete) reasons.add("content incomplete");
-                if (!summariesComplete) reasons.add(missingSummaries + " articles missing summaries");
                 System.err.println("  Post kept as draft for " + targetDate + " (" + String.join(", ", reasons) + ")");
             }
 
-            String note = String.join(", ", Stream.of(
-                    contentComplete ? "" : "content incomplete",
-                    summariesComplete ? "" : missingSummaries + " missing summaries"
-            ).filter(s -> !s.isEmpty()).toList());
+            String note = String.join(", ", reasons);
             return new PostResult(targetDate, isPublished, allSections.size(), totalArticles, note);
 
         } finally {
