@@ -93,6 +93,40 @@ public class TemplateExtensions {
         return new RawString(json.toString());
     }
 
+    static RawString jsonLd(DocumentPage page) {
+        var data = page.data();
+        var articles = articlesByRating(data);
+        var items = new JsonArray();
+        int position = 0;
+        for (var article : articles) {
+            position++;
+            var item = new JsonObject()
+                    .put("@type", "ListItem")
+                    .put("position", position);
+            var newsArticle = new JsonObject()
+                    .put("@type", "NewsArticle")
+                    .put("headline", article.getString("title", ""))
+                    .put("datePublished", data.getString("date", ""));
+            String oneLiner = article.getString("one-liner", "");
+            if (!oneLiner.isEmpty()) newsArticle.put("description", oneLiner);
+            String image = article.getString("image", "");
+            if (!image.isEmpty()) newsArticle.put("image", image);
+            String link = article.getString("link", "");
+            if (!link.isEmpty()) newsArticle.put("url", link);
+            String source = article.getString("source", "");
+            if (!source.isEmpty()) newsArticle.put("publisher", new JsonObject()
+                    .put("@type", "Organization").put("name", source));
+            item.put("item", newsArticle);
+            items.add(item);
+        }
+        var ld = new JsonObject()
+                .put("@context", "https://schema.org")
+                .put("@type", "ItemList")
+                .put("name", data.getString("title", ""))
+                .put("itemListElement", items);
+        return new RawString(ld.encodePrettily());
+    }
+
     static List<JsonObject> articlesByRating(JsonObject postData) {
         var all = new ArrayList<JsonObject>();
         var sections = postData.getJsonArray("sections");
