@@ -5,6 +5,7 @@ import java.util.Comparator;
 import java.util.List;
 
 import io.quarkiverse.roq.frontmatter.runtime.model.DocumentPage;
+import io.quarkiverse.roq.frontmatter.runtime.model.Page;
 import io.quarkiverse.roq.frontmatter.runtime.model.Site;
 import io.quarkiverse.roq.plugin.lunr.runtime.RoqPluginLunrTemplateExtension;
 import io.quarkus.qute.RawString;
@@ -91,6 +92,32 @@ public class TemplateExtensions {
             }
         }
         return new RawString(json.toString());
+    }
+
+    static String seoTitle(Page page) {
+        if (!(page instanceof DocumentPage)) return page.title();
+        return seoTitle((DocumentPage) page);
+    }
+
+    static String seoTitle(DocumentPage page) {
+        var articles = articlesByRating(page.data());
+        String topOneLiner = "";
+        for (var a : articles) {
+            String oneLiner = a.getString("one-liner", "");
+            if (!oneLiner.isEmpty() && !oneLiner.startsWith("Skipped")) {
+                topOneLiner = oneLiner;
+                break;
+            }
+        }
+        String date = page.date().format(java.time.format.DateTimeFormatter.ofPattern("MMM d", java.util.Locale.US));
+        String suffix = " | " + date;
+        int maxHook = 60 - suffix.length();
+        if (topOneLiner.length() > maxHook) {
+            int cut = topOneLiner.lastIndexOf(' ', maxHook);
+            if (cut > 20) topOneLiner = topOneLiner.substring(0, cut) + "...";
+            else topOneLiner = topOneLiner.substring(0, maxHook) + "...";
+        }
+        return topOneLiner.isEmpty() ? page.title() : topOneLiner + suffix;
     }
 
     static RawString jsonLd(DocumentPage page) {
