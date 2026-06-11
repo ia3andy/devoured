@@ -1,0 +1,202 @@
+<h2>FlashMemory DS-V4 Retriever</h2>
+<p>A lightweight retriever that sparsifies <strong>DeepSeek-V4 Compressed-Sparse-Attention (CSA) KV-cache</strong>.</p>
+<p>Given the hidden state of a decode token, the retriever predicts which CSA KV-cache chunks the next ~64 tokens will attend to. Only the top-scoring chunks stay resident on the GPU; the rest can be offloaded to CPU/disk. In downstream evaluation it matches or beats the full-attention baseline while keeping <strong>~10–15% of the KV cache</strong> on-device.</p>
+<p><strong><a href="https://huggingface.co/libertywing/FlashMemory-Deepseek-V4">Model weights on Hugging Face</a></strong></p>
+<h2>Quick start</h2>
+<pre><code>pip install torch safetensors
+
+# Demo with mock inputs
+python demo.py --ckpt weights/flashmemory_ds_v4.safetensors
+
+# Toy sparse-decode loop
+python toy_flashmemory_inference.py --ckpt weights/flashmemory_ds_v4.safetensors</code></pre>
+<h2>Usage</h2>
+<pre><code>from retriever import FlashMemoryRetriever
+
+model = FlashMemoryRetriever.from_checkpoint(
+    "weights/flashmemory_ds_v4.safetensors", device="cuda"
+)
+
+# hidden:     [B, 4096] decode-token hidden state
+# comp_k:     [B, N, 132] uint8 compressed CSA keys
+# positions:  [B] int64 token positions
+
+# Per-layer sigmoid scores: \{"l10": [B,N], "l12": [B,N], "l20": [B,N]}
+per_layer = model(hidden, comp_k, positions)
+
+# Cross-layer ensemble (mode="max" or "mean")
+scores = model.ensemble(hidden, comp_k, positions, mode="max")       # [B, N]
+
+# Boolean keep mask
+keep = model.select_topk(hidden, comp_k, positions, top_k=512)       # top-K
+keep = model.select_topk(hidden, comp_k, positions, threshold=0.5)   # threshold</code></pre>
+<h3><code>compressed_k</code> format</h3>
+<p>Each chunk = <code>HEAD_DIM + 4 = 132</code> <code>uint8</code> bytes:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Bytes</th>
+   <th>Type</th>
+   <th>Meaning</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>[:128]</code></td>
+   <td><code>float8_e4m3</code></td>
+   <td>Quantized key values</td>
+  </tr>
+  <tr>
+   <td><code>[128:132]</code></td>
+   <td><code>float32</code></td>
+   <td>Per-chunk dequant scale</td>
+  </tr>
+ </tbody>
+</table>
+<p>Dequant: <code>fp8_values.view(float8_e4m3).float() * scale</code>.</p>
+<h2>Architecture</h2>
+<p>Per CSA layer, scores are computed as:</p>
+<pre><code>hidden [B, 4096]
+    → wq_a        (4096 → Q_LORA_RANK)
+    → RMSNorm     (q_norm_weight, eps=1e-6)
+    → wq_b        (Q_LORA_RANK → N_HEADS * HEAD_DIM)
+    → reshape     [B, N_HEADS, HEAD_DIM]
+    → RoPE        (YaRN, last ROPE_DIM=64 dims, base=160000)
+    → Hadamard    (normalized Walsh-Hadamard)
+    → q           [B, N_HEADS, HEAD_DIM]
+
+hidden [B, 4096]
+    → weights_proj (4096 → N_HEADS)
+    → × weight_scale  (= HEAD_DIM^-0.5 * N_HEADS^-0.5)
+    → fused_w     [B, N_HEADS]
+
+compressed_k [B, N, HEAD_DIM + 4] (uint8)
+    → bytes[:HEAD_DIM]  viewed as float8_e4m3 → dequant
+    → × bytes[HEAD_DIM:]  viewed as float32   → k [B, N, HEAD_DIM]
+
+score = sigmoid( sum_heads( relu(k @ q^T) * fused_w ) )   in [0, 1]</code></pre>
+<h3>Joint checkpoint + ensemble</h3>
+<p>The checkpoint holds <strong>three independent CSA layers</strong> (<code>l10</code>, <code>l12</code>, <code>l20</code>), each with its own weights. At inference time per-layer sigmoid scores are <strong>ensembled per chunk</strong> — <code>max</code> (union, default) or <code>mean</code> — to produce a single keep/drop decision.</p>
+<h3>Hyperparameters</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Param</th>
+   <th>Value</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>N_HEADS</code></td>
+   <td>128</td>
+  </tr>
+  <tr>
+   <td><code>HEAD_DIM</code></td>
+   <td>128</td>
+  </tr>
+  <tr>
+   <td><code>Q_LORA_RANK</code></td>
+   <td>2048</td>
+  </tr>
+  <tr>
+   <td><code>ROPE_DIM</code></td>
+   <td>64 (last 64 dims)</td>
+  </tr>
+  <tr>
+   <td><code>ROPE_BASE</code></td>
+   <td>160000 (YaRN)</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Toy inference reference (<code>toy_flashmemory_inference.py</code>)</h2>
+<p>A self-contained illustration of how the retriever drives memory recall during decode — the actual control flow used inside DeepSeek-V4-FlashMemory.</p>
+<h3>Inference flow</h3>
+<pre><code> ┌──────────┐  compress &amp; store    ┌────────────────────────────┐
+ │ PREFILL  │  historical K/V      │  CSA KV-cache (the memory) │
+ │ (dense   │ ───────────────────► │  N compressed chunks,      │
+ │  attn)   │                      │  each = [132] uint8 fp8-K  │
+ └────┬─────┘                      └──────────────┬─────────────┘
+      │ last hidden state                         │ scored every 64 steps
+      ▼                                           │
+ ┌──────────────────────── DECODE LOOP ──────────┼──────────────────────────┐
+ │ for each decode step t:                       │                          │
+ │   hidden = toy_decoder.step(token, keep_mask)  │  (sparse memory attn)   │
+ │                                               │                          │
+ │   every RETRIEVAL_INTERVAL (= 64) steps:      ▼                          │
+ │     scores[N]   = retriever.ensemble(hidden, compressed_k, pos)          │
+ │     keep_mask[N] = top-K (or sigmoid&gt;thresh) of scores                   │
+ │     -&gt; unselected chunks masked to -inf in next 64 steps                 │
+ └──────────────────────────────────────────────────────────────────────────┘</code></pre>
+<ol>
+ <li><strong>Prefill (dense).</strong> Short prompt runs through dense memory attention. Its last hidden state seeds the first retrieval cycle.</li>
+ <li><strong>Decode loop.</strong> Toy decoder produces a <code>[B, 4096]</code> hidden state each step.</li>
+ <li><strong>Retrieval cycle (every 64 steps).</strong> The real <code>FlashMemoryRetriever</code> scores all <code>N</code> compressed-K chunks, ensembles per-layer scores, selects keep chunks.</li>
+ <li><strong>Sparse attention.</strong> Unselected chunks' attention logits are set to <code>-inf</code>.</li>
+</ol>
+<h3>What this simulates</h3>
+<ul>
+ <li><strong>This toy does NOT</strong> perform real CPU↔GPU KV-cache transfer. The swap engine is internal FlashMemory infrastructure and is not included.</li>
+ <li><strong>We simulate memory recall by masking attention logits</strong> to <code>-inf</code>. A masked chunk contributes nothing to attention — the same effect as not loading its KV.</li>
+</ul>
+<h2>Downstream evaluation</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Task</th>
+   <th>Context</th>
+   <th>vs. Full-Attn</th>
+   <th>KV Saved</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>RULER (64k–512k)</td>
+   <td>64K–512K</td>
+   <td>−1 ~ +2 pp</td>
+   <td>~80–90%</td>
+  </tr>
+  <tr>
+   <td>LongMemEval-s</td>
+   <td>125K</td>
+   <td>±1 pp</td>
+   <td>~86%</td>
+  </tr>
+  <tr>
+   <td>LongMemEval-m</td>
+   <td>500K</td>
+   <td>±1 pp</td>
+   <td>~91%</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Files</h2>
+<table>
+ <thead>
+  <tr>
+   <th>File</th>
+   <th>Purpose</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>retriever.py</code></td>
+   <td><code>FlashMemoryRetriever</code> model + RoPE/Hadamard + FP8 dequant</td>
+  </tr>
+  <tr>
+   <td><code>weights/flashmemory_ds_v4.safetensors</code></td>
+   <td>Trained weights (~510 MB, on Hugging Face)</td>
+  </tr>
+ </tbody>
+</table>
+<h2>License</h2>
+<p>MIT</p>
+<h2>Citation</h2>
+<pre><code>@article\{wang2026flashmemory,
+  title   = \{FlashMemory-DeepSeek-V4: Lightning Index Ultra-Long Context via Lookahead Sparse Attention},
+  author  = \{Yan Wang and Qifan Zhang and Jiachen Yu and Tian Liang and Dongyang Ma and
+             Xiang Hu and Zibo Lin and Chunyang Li and Zhichao Wang and Jia Li and
+             Yujiu Yang and Haitao Mi and Dong Yu},
+  year    = \{2026},
+  journal = \{arXiv preprint arXiv:2606.09079},
+  url     = \{https://huggingface.co/papers/2606.09079},
+}</code></pre>

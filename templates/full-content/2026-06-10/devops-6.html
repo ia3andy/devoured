@@ -1,0 +1,125 @@
+<h2>Part one</h2>
+<p>The last twelve months have been rough on the open source supply chain. Axios was compromised on npm and shipped a remote access trojan inside otherwise normal-looking releases. LiteLLM’s PyPI package was hijacked to exfiltrate environment variables. Typosquatted forks of Trivy were published to catch people who fat-finger go install. And the canonical example, the 2020 SolarWinds breach, is still the cautionary tale we keep coming back to: attackers got into the build system and pushed malware through normal Orion updates to roughly 18,000 organizations, including U.S. federal agencies, NATO, and Microsoft. The malware sat dormant for months. The breach went undetected for the better part of a year.</p>
+<p>Cilium runs in the kernel-level networking path of millions of Kubernetes pods. If our supply chain were compromised, the blast radius would not be small. Hardening the project against that scenario is something we work on continuously, and we wanted to write down what we actually do, in detail. Most of what follows isn’t Cilium-specific: any open source project running CI/CD on GitHub Actions can apply these patterns. We’ve also called out where we still fall short, in case any of it makes a useful starting point for someone else.</p>
+<p>This is the first post in a three-part series. This post covers access control: who can trigger builds and what code CI is allowed to execute. Part 2 will cover dependency hardening, and Part 3 credential isolation, release verification, and the gaps we’re still closing.</p>
+<h2><strong>TL;DR</strong></h2>
+<p>If you don’t have time to read the whole series, here’s what Cilium does to harden its supply chain today, organized by which layer of the pipeline each control lives at:</p>
+<table>
+ <tbody>
+  <tr>
+   <td>Layer</td>
+   <td>Control</td>
+   <td>What it does</td>
+  </tr>
+  <tr>
+   <td>Who triggers builds</td>
+   <td>Trigger control via Ariane</td>
+   <td>Only verified org members can fire CI workflows from PR comments, against an explicit allow-list of workflows.</td>
+  </tr>
+  <tr>
+   <td>What code CI executes</td>
+   <td>Two-phase checkouts for pull_request_target</td>
+   <td>Trusted code (composite actions, scripts, signing logic) is loaded from the base branch; the PR head is only used as Docker build context, never executed as a script.</td>
+  </tr>
+  <tr>
+   <td>Who reviews CI changes</td>
+   <td>CODEOWNERS gates</td>
+   <td>Anything under .github/ requires review from the security-focused CI team, and auto-approve.yaml requires a maintainer.</td>
+  </tr>
+  <tr>
+   <td>What dependencies CI pulls in</td>
+   <td>SHA-pinned actions and images</td>
+   <td>Every uses: references a 40-character commit SHA; container images are pinned by @sha256: digest. Renovate keeps the pins fresh and waits 5 days before picking up new releases.</td>
+  </tr>
+  <tr>
+   <td>What Go modules ship in the binary</td>
+   <td>Vendored Go dependencies</td>
+   <td>Everything is checked into vendor/ and reviewed by the @cilium/vendor team, so a typosquatted or hijacked module shows up as a diff at review time.</td>
+  </tr>
+  <tr>
+   <td>What workflows are even allowed to look like</td>
+   <td>Static analysis on workflows</td>
+   <td>CodeQL enforces explicit permissions: on every workflow, actionlint catches unsafe patterns, and both flag GitHub Actions expression injection in run: blocks.</td>
+  </tr>
+  <tr>
+   <td>What credentials are reachable</td>
+   <td>CI vs. production credential isolation</td>
+   <td>CI credentials can only push to *-ci development tags; production registry credentials sit behind a protected release environment that requires maintainer approval.</td>
+  </tr>
+  <tr>
+   <td>What consumers can verify</td>
+   <td>Signed releases</td>
+   <td>Every release image and Helm chart is signed with Sigstore Cosign using keyless OIDC, with SBOM attestations attached.</td>
+  </tr>
+  <tr>
+   <td>Where we still fall short</td>
+   <td>Gaps we’re still closing</td>
+   <td>No SLSA provenance yet, no PR-time dependency review, no govulncheck in CI, and a handful of internal @main references that need to move to a dedicated composite-actions repo.</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Controlling who runs what</h2>
+<p>The first question in any CI supply chain story is: who can trigger a build, and what code does it execute? Plenty of CI compromises start right here, by tricking the system into running attacker-controlled code with elevated privileges.</p>
+<h3>Workflow trigger restrictions with Ariane</h3>
+<p>Ariane is a GitHub bot we wrote in-house to dispatch CI workflows from PR comments. When a maintainer types /test or /ci-eks on a pull request, Ariane checks that the commenter belongs to the organization-members team, figures out which workflows to fire (including dependencies, like tests that need a fresh image build first), and dispatches them via workflow_dispatch.</p>
+<p>The interesting bit is the allow-list. Only verified org members can trigger workflows, and the set of workflows that can be triggered is enumerated by hand in the config:</p>
+<pre><code>.github/ariane-config.yaml</code></pre>
+<pre><code>allowed-teams:
+  - organization-members
+
+triggers:
+  /test\s*:
+    workflows:
+      - conformance-aws-cni.yaml
+      - conformance-clustermesh.yaml
+      - conformance-eks.yaml
+    # ...and so on
+    depends-on:
+      - /build-images-dependency
+  /ci-aks:
+    workflows:
+      - conformance-aks.yaml
+    depends-on:
+      - /build-images-dependency
+</code></pre>
+<p>A random external commenter typing /test in a PR is ignored. They can’t kick off our expensive cloud-provider conformance suites or burn through our CI minutes.</p>
+<h3>Separating trusted and untrusted code in CI</h3>
+<p>When somebody opens a PR we need to build their code, but we obviously can’t trust it. This is the classic pull_request_target problem. We avoid pull_request_target where we can, but a handful of workflows still need it, and we wrap those in mitigating controls.</p>
+<p>The image build workflow is the canonical example. It splits the checkout in two:</p>
+<pre><code>.github/workflows/build-images-ci.yaml</code></pre>
+<pre><code>- name: Checkout base or default branch (trusted)
+  uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+  with:
+    ref: $\{\{ github.base_ref || github.event.repository.default_branch }}
+    persist-credentials: false
+
+# ...trusted setup steps run here, including loading composite actions...
+
+# Warning: since this is a privileged workflow, subsequent workflow job
+# steps must take care not to execute untrusted code.
+- name: Checkout pull request branch (NOT TRUSTED)
+  uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+  with:
+    persist-credentials: false
+    ref: $\{\{ steps.tag.outputs.sha }}
+</code></pre>
+<p>The first checkout grabs the <em>base branch</em> (code that’s already been reviewed and merged) so we can load our composite actions, scripts, and the Cosign signing logic from a known-good source. Only after that does the workflow check out the PR head, and that checkout is used purely as build context for docker build. Nothing from the PR branch is ever executed as a script.</p>
+<ul>
+ <li>No run: steps execute scripts from the untrusted checkout. Every shell block after the second checkout is written inline in the workflow YAML (disk usage checks, file copies, digest output). Nothing is sourced from the PR branch.</li>
+ <li>No composite actions are loaded from the untrusted checkout either. All composite actions (set-runtime-image, cosign, set-env-variables) come from the trusted base-branch checkout or from the saved ../cilium-base-branch/ directory. We’re also working on moving these composite actions into a dedicated repository so we don’t have to check out source to run them at all.</li>
+ <li>Docker BuildKit does execute the untrusted Dockerfile, and that’s the whole point of building a CI image from a PR. BuildKit runs in isolation: no GitHub Actions environment variables, no repo secrets, no access to the runner’s Docker credential store. The build args we pass contain no secrets, just the runtime image reference and the operator variant name.</li>
+ <li>Untrusted data flows into exactly one trusted action. The runtime-image*.txt file from the PR is fed into the trusted set-runtime-image action, which checks the image reference starts with quay.io/cilium/ and strips newlines so an attacker can’t smuggle in a GITHUB_ENV injection. There’s no way to repoint the build to anything outside the Cilium namespace.</li>
+ <li>Only CI credentials are in scope. The Docker login uses QUAY_USERNAME_CI / QUAY_PASSWORD_CI, which can only push to the -ci development registry. Production credentials aren’t on the runner at all.</li>
+</ul>
+<p>The worst-case outcome of a compromised PR build is a malicious CI image landing in the development registry, which is the same blast radius any CI system that builds contributor code carries. We do appreciate every report and read each one carefully, but this pattern is intentional.</p>
+<h3>CODEOWNERS as a review gate</h3>
+<p>We lean on CODEOWNERS pretty heavily so that changes always land in front of the people with the most context. For CI configuration that means anything under .github/ is owned by @cilium/github-sec (our security-focused CI team) plus @cilium/ci-structure, and the auto-approve.yaml workflow is owned by @cilium/cilium-maintainers:</p>
+<pre><code>CODEOWNERS
+/.github/                          @cilium/github-sec @cilium/ci-structure
+/.github/ariane-config.yaml        @cilium/github-sec @cilium/ci-structure
+/.github/renovate.json5            @cilium/github-sec @cilium/ci-structure
+/.github/workflows/                @cilium/github-sec @cilium/ci-structure
+/.github/workflows/auto-approve.yaml  @cilium/cilium-maintainers
+</code></pre>
+<p>Nobody can change the CI pipeline without an explicit review from the team responsible for keeping it safe.</p>
+<p>Next up, Part 2 we will cover how we lock down what code builds actually pull in: SHA-pinned actions, automated dependency updates, and Go module vendoring.</p>
