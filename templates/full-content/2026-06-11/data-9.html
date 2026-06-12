@@ -1,0 +1,91 @@
+<h1>Introducing Streamling: Performant and Extensible Data Streaming Runtime</h1>
+<h3>Transactional engine built with Rust, Arrow and DataFusion.</h3>
+<p><a href="https://github.com/goldsky-io/streamling">Streamling</a> is a performant and extensible data streaming runtime built with the RAD stack (Rust, Arrow, DataFusion).</p>
+<p>I shared some progress before (<a href="https://www.streamingdata.tech/p/exploring-apache-datafusion-streaming-framework">post one</a>, <a href="https://www.streamingdata.tech/p/streaming-and-the-rad-stack">post two</a>), but it’s finally open-sourced! I’ve been working on Streamling together with a great team at <a href="https://goldsky.com/">Goldsky</a>. Goldsky uses Streamling as the engine for its flagship product, <a href="https://goldsky.com/products/turbo-pipelines">Turbo Pipelines</a>. It’s been running in production for months, powering hundreds of pipelines.</p>
+<p>Jeff Ling, Goldsky’s CTO, wrote <a href="https://goldsky.com/blog/open-sourcing-streamling">an announcement on the Goldsky blog</a> covering Streamling’s vision, adoption, and next steps. In this post, I’d like to focus on some interesting implementation details and Streamling positioning (when should you use Streamling, over, say, Apache Flink?)</p>
+<pre><code>sources:
+  raw.transactions:
+    type: kafka
+    topic: raw.event.transaction
+transforms:
+  large_transactions:
+    type: sql
+    primary_key: id
+    sql: |
+      SELECT *
+      FROM raw.transactions
+      WHERE amount &gt; 1000
+sinks:
+  pg.large_transactions:
+    from: large_transactions
+    type: postgres
+    schema: public
+    table: large_transactions
+    primary_key: id</code></pre>
+<p>This is a sample Streamling pipeline that consumes data from a Kafka topic and writes it to a Postgres table, while also executing a SQL transformation to filter data.</p>
+<p>Streamling has several built-in connectors and transforms (more can be added via a flexible plugin system; I’ll expand on that below). Kafka, ClickHouse, Postgres, HTTP enrichment - all covered.</p>
+<h3>Yet Another Runtime?</h3>
+<p>Is there really a need for yet another data streaming runtime? Let’s first explore existing options on the market:</p>
+<ul>
+ <li>Classic “Big Data” engines: Apache Flink, Apache Spark, Kafka Streams. Fairly complex distributed systems, primarily designed to support streaming analytics workloads.</li>
+ <li>A new category of Streaming Databases: Materialize, Feldera, RisingWave, Arroyo. SQL-only interface, but typically stronger consistency guarantees.</li>
+ <li>Data integration tools: Kafka Connect, Redpanda Connect, Vector.</li>
+</ul>
+<p>Most of these tools are targeted at <em>data engineers</em> building analytical data pipelines.</p>
+<p><strong>What makes Streamling different is its focus on transactional workloads</strong>. It doesn’t support joins or aggregations (the bread and butter of streaming analytics). Instead, it offers a streaming engine that can be used by application developers, back-end engineers, and folks building data pipelines that power user-facing products. Here are a few concrete examples:</p>
+<ul>
+ <li>As an application developer, you rarely want to write complex SQL to describe business logic. That’s why Streamling offers first-class support for TypeScript transforms (thanks to WebAssembly).</li>
+ <li>As an application developer, a lot of your data sources and data destinations are HTTP API endpoints. Not Kafka clusters or data lakes. Streamling supports using HTTP endpoints for transformations (e.g., for enrichment) and for sinks (e.g., as webhooks).</li>
+ <li>As an application developer, you want to write processed data to a database you’re familiar with, not another Kafka topic or an S3 bucket. That’s why Streamling has great support for Postgres.</li>
+</ul>
+<p>Thanks to these features, Streamling really shines when it comes to connecting different application datastores and processing/routing data powering application backends.</p>
+<p>Streamling can also be used for the classic realtime ETL and data integration pipelines. Thanks to DataFusion, you have access to <a href="https://datafusion.apache.org/user-guide/sql/scalar_functions.html">a wide range of functions</a>. Why use it over something like Apache Flink or similar tools in this case?</p>
+<ul>
+ <li>It’s much simpler to understand. No distributed shuffles, single binary to run.</li>
+ <li>It’s much more cost-efficient - it’s designed to work at a small scale very efficiently, but it can be scaled out too.</li>
+ <li>YAML-driven declarative configuration is a really good fit for agentic tools. We had a lot of success with generating pipeline configurations with LLMs. Streamling comes with a no-op “--validate” mode, which can be used by the agentic harness.</li>
+</ul>
+<p>And because it’s so extensible, you can bring your domain knowledge into the engine. For example, <a href="https://goldsky.com/products/turbo-pipelines">Goldsky uses it to process blockchain datasets</a>. But you can also implement a few plugins to support your custom datasets. Or ingest IoT telemetry. Or process financial transactions.</p>
+<h3>Architecture</h3>
+<ul>
+ <li><strong>[Mostly] Single-node execution.</strong> Streamling is built on top of <a href="https://datafusion.apache.org/">Apache DataFusion</a>, an extensible query engine. Even though the engine is single-node, you can still easily parallelize work by leveraging the mechanics provided by data sources. For example, when using Kafka as a source, multiple Streamling instances use the same Kafka Consumer group, which naturally distributes source partitions across instances. Single-node execution simplifies debugging and makes local development very straightforward.</li>
+ <li><strong>[Mostly] Stateless processing.</strong> Streamling provides a State Backend that can be used by any component in the system. It’s currently designed to store small amounts of metadata: Kafka source stores its current consumer group offsets after receiving an acknowledged checkpoint. SQLite and Postgres are supported State Backends, but more implementations can be added in the future.</li>
+ <li><strong>Serious delivery guarantees.</strong> Streamling leverages the Chandy–Lamport style of checkpoints to ensure at-least-once delivery. There are also various deduplication mechanisms, including UPSERT semantics in most sinks. Combining at-least-once delivery and deduplication mechanisms ensures effectively-once delivery in many scenarios.</li>
+ <li><strong>Extreme efficiency.</strong> Thanks to Rust and Arrow, Streamling can process tens of thousands of messages per second on a <em>0.5 CPU core</em>! And you can go as low as <em>0.25 CPU cores</em> for some workloads.</li>
+ <li><strong>Delightful developer experience.</strong> Almost everything can be extended as a plugin. Built-in validation mode. Live inspection of in-flight data. Print and blackhole (no-op) sinks for debugging / testing. Instant startup. OpenTelemetry integration.</li>
+</ul>
+<p>There are also a few important implementation details to highlight:</p>
+<ul>
+ <li>Streamling relies on DataFusion as much as possible. Native connectors are implemented as Table Providers; SQL transform is “just” running DataFusion SQL, but with custom operators and UDFs. If you really zoom out, the runtime can be simplified as passing <a href="https://arrow.apache.org/">Apache Arrow</a> batches using <a href="https://tokio.rs/tokio/tutorial/streams">Tokio Streams</a>. This forms a simple, but very efficient pull-based data processing engine.</li>
+ <li>Apache Arrow is used as the main in-memory data format and as a type system. Even though it’s column-oriented, it’s slowly becoming a standard not just for analytical systems, but for data processing in general. Especially when some kind of interop is needed, e.g. between Python and JVM: Arrow data is stored in memory in a language-independent format. Streamling leverages native Arrow support as much as possible. For example, ClickHouse integration relies on <a href="https://clickhouse.com/docs/interfaces/formats/Arrow">native Arrow support in ClickHouse</a>, which <a href="https://goldsky.com/blog/making-historical-blockchain-backfills-faster">dramatically reduces</a> serialization/deserialization cost.</li>
+ <li>Using columnar data layout for streaming workloads is still not very common. But it makes a lot of sense in practice.</li>
+</ul>
+<h3>But Stateless?</h3>
+<p>You could argue that having a mostly stateless streaming system must be very limiting. Maybe you don’t need windowed aggregations or joins for analytical use cases, but these are still useful building blocks. For example, a join is a typical way to perform lookups. You may have a small “dimensional” dataset that you need to match against your data stream. This is common outside of analytics.</p>
+<p>In fact, we’ve seen this use case over and over again, especially in the context of data filtering. Imagine you have a stream of user activity data, but you need to filter a small subset of it based on a list of user IDs, product IDs, or other dimensions. Can you build it without stateful joins?</p>
+<p>We approached this pragmatically and developed a feature called <a href="https://docs.goldsky.com/turbo-pipelines/transforms/dynamic-tables">dynamic tables</a>. Not only can you perform filtering without storing any state in a streaming system, but you can also update the lookup data dynamically, without restarting or redeploying your pipelines. The implementation is quite straightforward: we use Postgres (again) to store the lookup data, so you can easily modify it programmatically or with your favourite Postgres client. At runtime, Streamling queries the underlying Postgres database, combines the data and applies filtering. Since Streamling operates on batches of data, we can perform lookups quite efficiently, amortizing the cost of an external call across thousands of rows in a single batch. We’re able to achieve decent throughput without introducing any additional in-memory cache, although it remains an option.</p>
+<h3>Plugins</h3>
+<p>Streamling is designed to be easily extendable with plugins. As you probably expect, you can implement your own <strong>source</strong>, <strong>transformation</strong>, or <strong>sink</strong> as a plugin.</p>
+<p>These plugin types offer two different levels of abstraction. At the higher level, as a plugin developer, you just need to implement the following interface (an example for sinks):</p>
+<pre><code>#[async_trait]
+pub trait SinkPlugin: SupportsGracefulShutdown + Send + Sync \{
+    async fn initialize(&amp;self) -&gt; Result&lt;(), PluginError&gt;;
+    fn labels(&amp;self) -&gt; Vec&lt;PluginLabel&gt;
+    async fn process_batch(&amp;self, data: RecordBatch) -&gt; Result&lt;(), PluginError&gt;;
+    async fn process_checkpoint_marker(&amp;self, epoch: CheckpointEpoch) -&gt; Result&lt;(), PluginError&gt;;
+    async fn process_checkpoint_finalizer(&amp;self, epoch: CheckpointEpoch)
+    -&gt; Result&lt;(), PluginError&gt;;
+}</code></pre>
+<p><strong>process_batch</strong> is where you’d implement the sink logic: simply react to the incoming RecordBatch payloads. And if you want to participate in the checkpointing mechanism (which is required for at-least-once delivery), implement your checkpointing acknowledgment logic in <strong>process_checkpoint_marker (</strong>“prepare” phase) and finalize processing in <strong>process_checkpoint_finalizer</strong> (“commit” phase).</p>
+<p>You can also implement custom <strong>UDFs</strong> (for SQL transforms) and even custom topology <strong>preprocessor</strong> plugins: these allow you to programmatically modify the defined topology before starting.</p>
+<pre><code>#[async_trait]
+pub trait PreprocessorPlugin: Send + Sync \{
+    async fn preprocess_topology(&amp;self, config: String) -&gt; Result&lt;String, PluginError&gt;;
+}</code></pre>
+<p>As you can see, all plugins have a very simple interface: the engine handles message passing, backpressure and checkpointing. When you create a plugin, you also get access to the input schema, the State Backend, and the metrics recorder. <strong>The important part is that as a plugin developer, you don’t need to think about the typical complexity that comes with stream processing: Streamling abstracts most of it from you</strong>.</p>
+<p>A plugin can be built as a regular Rust/Cargo project and dynamically linked at runtime by adding it to the STREAMLING__PLUGIN__PATH environment variable.</p>
+<h3>Conclusion</h3>
+<p>Streamling is a new performant and extensible data streaming runtime for transactional workloads. It makes it easy to build data pipelines for everyone, not just data engineers.</p>
+<p>When we designed Streamling, we wanted to make pragmatic choices and minimize complexity. Is a distributed shuffle needed for the workloads we have? Not really. Can we avoid using a heavyweight state backend with something like RocksDB? Absolutely. Is it possible to use a lightweight scripting language for describing transformations instead of SQL? Definitely.</p>
+<p>Streamling has been in development for the past few years, but it feels like we’re just getting started!</p>
+<p>I encourage you to try out examples and consider contributing. I already have some ideas in mind that I want to prototype next - like <a href="https://slatedb.io/">SlateDB</a> State Backend support or integrating <a href="https://github.com/datafusion-contrib/datafusion-distributed">datafusion-distributed</a>.</p>

@@ -1,0 +1,72 @@
+<h2>Inside QuestDB's Query Engine: Tracing Three Queries</h2>
+<p>I’ve been exploring the QuestDB codebase, a time series columnar database, and, specifically, trying to learn how its query engine works. And whenever we discuss a query engine <strong>execution</strong>, certain kinds of dimensions and options within those dimensions arise in the conversation. For example:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Dimension</th>
+   <th>Options</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Dataflow</td>
+   <td>Pull-based vs. Push-based</td>
+  </tr>
+  <tr>
+   <td>Processing Granularity</td>
+   <td>Tuple-at-a-time vs. Vectorized (batch-at-a-time)</td>
+  </tr>
+  <tr>
+   <td>Code Generation</td>
+   <td>Interpreted vs. Compiled</td>
+  </tr>
+  <tr>
+   <td>Parallelism Model</td>
+   <td>Single-threaded vs. Operator Parallelism vs. Morsel-Driven Parallelism</td>
+  </tr>
+ </tbody>
+</table>
+<p>This taxonomy is not necessarily something that is agreed on in the literature or in the database industry. It’s just how I usually think about it based on my research, and also for the purposes of this blog post we are mostly focused on the execution part of a query engine, so we’ll ignore the parsing, optimization, and most of the planning.</p>
+<p>You might think that those dimensions are orthogonal to each other and a query engine is essentially composed of one option of each dimension. But in reality, things are much more nuanced, and a query engine can express a unique mix of those options.</p>
+<p>In this blog post, I explore how QuestDB expresses these dimensions and try to build a strong mental model of its query engine execution. This blog post assumes some understanding of these dimensions. Also, I try not to get too distracted by details of the codebase and implementation and focus more on what techniques are applied and in which context they are applied.</p>
+<p>I ended up with 3 queries that I think are good enough to get a gist of what is going on:</p>
+<pre><code>SELECT symbol, SUM(amount) FROM trades GROUP BY symbol;
+SELECT symbol, side, SUM(amount) FROM trades GROUP BY symbol, side;
+SELECT symbol, side, SUM(amount) FROM trades WHERE side != 'SELL' GROUP BY symbol, side;</code></pre>
+<h2>Dataflow</h2>
+<p>When I started, one of the first things that I noticed was the presence of classes extending <code>AbstractRecordCursorFactory</code> everywhere. For example, <code>AsyncFilteredRecordCursorFactory</code>, <code>GroupByRecordCursorFactory</code> , and <code>AsyncGroupByRecordCursorFactory</code>.</p>
+<p><code>SqlCompiler</code> returns a cursor in which one record at a time is returned. From that we infer that QuestDB is implementing a pull-based tuple-at-a-time dataflow à la Volcano. You might be thinking, how in the world could there be vectorization, or JIT, or parallelism underneath that? That’s what we explore next.</p>
+<h2>First query</h2>
+<p>Tracing our first query, <code>SELECT symbol, SUM(amount) FROM trades GROUP BY symbol</code>, we get the following trace log:</p>
+<pre><code>[shared-network_7] &gt; vect.GroupByRecordCursorFactory.getCursor  [vectorized parallel aggregate, aggregates=1 shards=14]
+[shared-network_7] &lt; vect.GroupByRecordCursorFactory.getCursor
+[shared-network_7] &gt; vect.GroupByRecordCursorFactory.getCursor  [vectorized parallel aggregate, aggregates=1 shards=14]
+[shared-network_7] &lt; vect.GroupByRecordCursorFactory.getCursor
+[shared-network_7] . vect.GroupByRecordCursorFactory.buildMaps  [frames=5 aggregates=1 =&gt; total tasks dispatched=5]
+[shared-network_7] . vect.GroupByRecordCursorFactory.runWhatsLeft  [dispatcher (workerId=7) drained queue cursor=12 after dispatch finished]
+[shared-network_7] . SumDoubleVectorAggregateFunction.aggregate  [native keyedIntSumDouble kernel processing 100000 rows (one SIMD-friendly C++ loop over key + value columns)]
+[shared-query_3] . GroupByVectorAggregateJob.doRun  [worker=3 cursor=13 (executes Vect.sumDouble etc on a page-frame column)]
+[shared-query_3] . SumDoubleVectorAggregateFunction.aggregate  [native keyedIntSumDouble kernel processing 100000 rows (one SIMD-friendly C++ loop over key + value columns)]
+[shared-query_8] . GroupByVectorAggregateJob.doRun  [worker=8 cursor=14 (executes Vect.sumDouble etc on a page-frame column)]
+[shared-query_12] . GroupByVectorAggregateJob.doRun  [worker=12 cursor=15 (executes Vect.sumDouble etc on a page-frame column)]
+[shared-query_12] . SumDoubleVectorAggregateFunction.aggregate  [native keyedIntSumDouble kernel processing 100000 rows (one SIMD-friendly C++ loop over key + value columns)]
+[shared-query_8] . SumDoubleVectorAggregateFunction.aggregate  [native keyedIntSumDouble kernel processing 100000 rows (one SIMD-friendly C++ loop over key + value columns)]
+[shared-query_1] . GroupByVectorAggregateJob.doRun  [worker=1 cursor=16 (executes Vect.sumDouble etc on a page-frame column)]
+[shared-query_1] . SumDoubleVectorAggregateFunction.aggregate  [native keyedIntSumDouble kernel processing 100000 rows (one SIMD-friendly C++ loop over key + value columns)]
+[shared-network_7] . vect.GroupByRecordCursorFactory.merge  [vaf=0 fold pRosti[3] (size=10) into pRostiBig (size=10) via native kernel]
+[shared-network_7] . vect.GroupByRecordCursorFactory.merge  [vaf=0 fold pRosti[7] (size=10) into pRostiBig (size=10) via native kernel]
+[shared-network_7] . vect.GroupByRecordCursorFactory.merge  [vaf=0 fold pRosti[8] (size=10) into pRostiBig (size=10) via native kernel]
+[shared-network_7] . vect.GroupByRecordCursorFactory.merge  [vaf=0 fold pRosti[12] (size=10) into pRostiBig (size=10) via native kernel]</code></pre>
+<p>The first thing to notice is the thread name. That already hints to us the parallelism going on under the hood. <code>shared-network_7</code> is one worker, from the <code>shared-network</code> pool of workers, that is responsible for starting the execution of the query and returning the results. The <code>shared-query</code> workers are part of another worker pool executing tasks in parallel.</p>
+<p>The operator that represents our query is <code>RostiRecordCursor</code> created by <code>vect.GroupByRecordCursorFactory</code> and when <code>hasNext</code> (we don’t trace the <code>hasNext</code> call because that would pollute our log), it tries to build the internal hash map by calling <code>buildMaps</code>. The operator has access to the storage through <code>PageFrameCursor</code> that returns chunks of the data called frames.</p>
+<p>From my research on query parallelism, these techniques resemble a lot of morsel-driven parallelism; frames (morsels) being the unit of dispatch, and workers working in parallel on those units.</p>
+<h2>Second query</h2>
+<p>Before tracing our next query, <code>SELECT symbol, side, SUM(amount) FROM trades GROUP BY symbol, side;</code>, let’s compare its query plan to the query plan of the former query.</p>
+<p>We can see that <code>AsyncGroupByRecordCursor</code> is the cursor that is built, and after the <code>buildMap</code> call a <code>dispatchAndAwait</code> call on <code>UnorderedPageFrameSequence</code> is called. From the thread names we can see the execution happening in parallel: <code>shared-query_12</code> got frame 1, <code>shared-query_3</code> got frame 2, <code>shared-query_5</code> got frame 3, and <code>shared-query_8</code> got frame 4.</p>
+<p>Within <code>aggregate</code> <code>computeKeyedBatch</code> from <code>SumDoubleGroupByFunction</code> is called on a batch of <code>2048</code> rows. And you can see it’s a for-loop over the rows updating the value stored in the address of the hash map.</p>
+<h2>Third query</h2>
+<p>Now let’s take a look at our last query: <code>SELECT symbol, side, SUM(amount) FROM trades WHERE side != 'SELL' GROUP BY symbol, side;</code></p>
+<p>The trace log is similar to the last query, except for <code>filterAndAggregate</code>. What I found interesting here is that, since we added a new operator to our query, I was expecting some kind of cursor composition where the <em>group-by</em> cursor receives the <em>filter</em> cursor as a child. I found out that what is happening here is something called filter stealing. The <em>group-by</em> cursor “steals” the filter, and the filter operation becomes embedded in the <em>group-by</em> cursor without the need for another cursor.</p>
+<p>Now to the JIT. From what I could verify, only WHERE clauses are JIT’d. If JIT is enabled and the expression is JIT-able, the expression is compiled to native code, and a function pointer is stored in <code>CompiledFilter.fnAddress</code>. And we saw how the compiled filter was passed to <code>AsyncGroupByRecordCursorFactory</code>, <code>AsyncGroupByRecordCursorFactory.filterAndAggregate</code> calls that function to filter the rows of a frame before aggregating them.</p>
+<h2>Wrapping up</h2>
+<p>In this blog post, we investigated 3 queries that gave us a good sense of what is going on in QuestDB’s engine in terms of the dimensions we talked about. We clearly see it’s an engine that applies different techniques according to the context of the query. Although it is a pull-based tuple-at-a-time engine, internally, leaf nodes can parallelize the query execution using a morsel-driven-like design. The data is broken into frames, and jobs are queued for workers to process. In some cases it outsources operations to native code, as in the case of SUM, using SIMD to calculate the aggregate, and WHERE, using JIT’d expressions to filter rows.</p>
