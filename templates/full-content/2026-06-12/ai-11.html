@@ -1,0 +1,939 @@
+<h1>SkillSpector</h1>
+<p><strong>Security scanner for AI agent skills.</strong> Detect vulnerabilities, malicious patterns, and security risks before installing agent skills.</p>
+<h2>Overview</h2>
+<p>AI agent skills (used by Claude Code, Codex CLI, Gemini CLI, etc.) execute with implicit trust and minimal vetting. Research shows that <strong>26.1% of skills contain vulnerabilities</strong> and <strong>5.2% show likely malicious intent</strong>.</p>
+<p>SkillSpector helps you answer: <strong>"Is this skill safe to install?"</strong></p>
+<h2>Documentation</h2>
+<ul>
+ <li><strong>Development guide</strong> — Architecture, package layout, and how to extend the analyzer pipeline.</li>
+</ul>
+<h2>Features</h2>
+<ul>
+ <li><strong>Multi-format input</strong>: Scan Git repos, URLs, zip files, directories, or single files</li>
+ <li><strong>64 vulnerability patterns</strong> across 16 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning</li>
+ <li><strong>Two-stage analysis</strong>: Fast static analysis + optional LLM semantic evaluation</li>
+ <li><strong>Live vulnerability lookups</strong>: SC4 queries OSV.dev for real-time CVE data with automatic offline fallback</li>
+ <li><strong>Multiple output formats</strong>: Terminal, JSON, Markdown, and SARIF reports</li>
+ <li><strong>Risk scoring</strong>: 0-100 score with severity labels and clear recommendations</li>
+</ul>
+<h2>Quick Start</h2>
+<h3>Installation</h3>
+<p>Create and activate a virtual environment first (all <code>make</code> targets assume the venv is active). Use <strong>uv</strong> or <strong>pip</strong>; the Makefile uses <code>uv</code> if available, otherwise <code>pip</code>.</p>
+<pre><code># Clone the repository
+git clone https://github.com/NVIDIA/skillspector.git
+cd skillspector
+
+# Create and activate virtual environment
+uv venv .venv &amp;&amp; source .venv/bin/activate
+# or: python3 -m venv .venv &amp;&amp; source .venv/bin/activate
+
+# Install for production use
+make install
+
+# Or install with development dependencies
+make install-dev</code></pre>
+<h3>Basic Usage</h3>
+<pre><code># Scan a local skill directory
+skillspector scan ./my-skill/
+
+# Scan a single SKILL.md file
+skillspector scan ./SKILL.md
+
+# Scan a Git repository
+skillspector scan https://github.com/user/my-skill
+
+# Scan a zip file
+skillspector scan ./my-skill.zip</code></pre>
+<h3>Output Formats</h3>
+<pre><code># Terminal output (default) - pretty formatted
+skillspector scan ./my-skill/
+
+# JSON output - machine readable
+skillspector scan ./my-skill/ --format json --output report.json
+
+# Markdown output - for documentation
+skillspector scan ./my-skill/ --format markdown --output report.md
+
+# SARIF output - for CI/CD integration and IDE tooling
+skillspector scan ./my-skill/ --format sarif --output report.sarif</code></pre>
+<h3>LLM Analysis</h3>
+<p>For the best results, configure an OpenAI-compatible LLM endpoint for semantic analysis. Pick a provider with <code>SKILLSPECTOR_PROVIDER</code>; each ships its own bundled default model. SkillSpector also works against local OpenAI-compatible servers (Ollama, vLLM, llama.cpp) and managed inference gateways.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Provider (<code>SKILLSPECTOR_PROVIDER</code>)</th>
+   <th>Credential env var</th>
+   <th>Endpoint</th>
+   <th>Default model</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>openai</code></td>
+   <td><code>OPENAI_API_KEY</code> (+ optional <code>OPENAI_BASE_URL</code>)</td>
+   <td>api.openai.com (or any OpenAI-compatible URL)</td>
+   <td><code>gpt-5.4</code></td>
+  </tr>
+  <tr>
+   <td><code>anthropic</code></td>
+   <td><code>ANTHROPIC_API_KEY</code></td>
+   <td>api.anthropic.com</td>
+   <td><code>claude-opus-4-6</code></td>
+  </tr>
+  <tr>
+   <td><code>nv_build</code></td>
+   <td><code>NVIDIA_INFERENCE_KEY</code></td>
+   <td>build.nvidia.com</td>
+   <td><code>deepseek-ai/deepseek-v4-flash</code></td>
+  </tr>
+ </tbody>
+</table>
+<pre><code># Stock OpenAI
+export SKILLSPECTOR_PROVIDER=openai
+export OPENAI_API_KEY=sk-...
+skillspector scan ./my-skill/
+
+# Anthropic
+export SKILLSPECTOR_PROVIDER=anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
+skillspector scan ./my-skill/
+
+# NVIDIA build.nvidia.com
+export SKILLSPECTOR_PROVIDER=nv_build
+export NVIDIA_INFERENCE_KEY=nvapi-...
+skillspector scan ./my-skill/
+
+# Local Ollama or any OpenAI-compatible endpoint
+export SKILLSPECTOR_PROVIDER=openai
+export OPENAI_API_KEY=ollama
+export OPENAI_BASE_URL=http://localhost:11434/v1
+export SKILLSPECTOR_MODEL=llama3.1:8b
+skillspector scan ./my-skill/
+
+# Override the provider's default model
+export SKILLSPECTOR_MODEL=gpt-5.2
+skillspector scan ./my-skill/
+
+# Skip LLM analysis (faster, static analysis only)
+skillspector scan ./my-skill/ --no-llm</code></pre>
+<h2>Vulnerability Patterns</h2>
+<p>SkillSpector detects <strong>64 vulnerability patterns</strong> across 16 categories:</p>
+<h3>Prompt Injection (5 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>P1</td>
+   <td>Instruction Override</td>
+   <td>HIGH</td>
+   <td>Commands to ignore safety constraints</td>
+  </tr>
+  <tr>
+   <td>P2</td>
+   <td>Hidden Instructions</td>
+   <td>HIGH</td>
+   <td>Malicious directives in comments/invisible text</td>
+  </tr>
+  <tr>
+   <td>P3</td>
+   <td>Exfiltration Commands</td>
+   <td>HIGH</td>
+   <td>Instructions to transmit context externally</td>
+  </tr>
+  <tr>
+   <td>P4</td>
+   <td>Behavior Manipulation</td>
+   <td>MEDIUM</td>
+   <td>Subtle instructions altering agent decisions</td>
+  </tr>
+  <tr>
+   <td>P5</td>
+   <td>Harmful Content</td>
+   <td>CRITICAL</td>
+   <td>Instructions that could cause physical harm</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Data Exfiltration (4 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>E1</td>
+   <td>External Transmission</td>
+   <td>MEDIUM</td>
+   <td>Sending data to external URLs</td>
+  </tr>
+  <tr>
+   <td>E2</td>
+   <td>Env Variable Harvesting</td>
+   <td>HIGH</td>
+   <td>Collecting API keys and secrets</td>
+  </tr>
+  <tr>
+   <td>E3</td>
+   <td>File System Enumeration</td>
+   <td>MEDIUM</td>
+   <td>Scanning directories for sensitive files</td>
+  </tr>
+  <tr>
+   <td>E4</td>
+   <td>Context Leakage</td>
+   <td>HIGH</td>
+   <td>Transmitting conversation context externally</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Privilege Escalation (3 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>PE1</td>
+   <td>Excessive Permissions</td>
+   <td>LOW</td>
+   <td>Requesting access beyond stated functionality</td>
+  </tr>
+  <tr>
+   <td>PE2</td>
+   <td>Sudo/Root Execution</td>
+   <td>MEDIUM</td>
+   <td>Invoking elevated system privileges</td>
+  </tr>
+  <tr>
+   <td>PE3</td>
+   <td>Credential Access</td>
+   <td>HIGH</td>
+   <td>Reading SSH keys, tokens, passwords</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Supply Chain (6 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>SC1</td>
+   <td>Unpinned Dependencies</td>
+   <td>LOW</td>
+   <td>No version constraints on packages</td>
+  </tr>
+  <tr>
+   <td>SC2</td>
+   <td>External Script Fetching</td>
+   <td>HIGH</td>
+   <td>curl | bash and remote code execution</td>
+  </tr>
+  <tr>
+   <td>SC3</td>
+   <td>Obfuscated Code</td>
+   <td>HIGH</td>
+   <td>Base64/hex encoded execution</td>
+  </tr>
+  <tr>
+   <td>SC4</td>
+   <td>Known Vulnerable Dependencies</td>
+   <td>HIGH</td>
+   <td>Dependencies with known CVEs (live OSV.dev lookup)</td>
+  </tr>
+  <tr>
+   <td>SC5</td>
+   <td>Abandoned Dependencies</td>
+   <td>MEDIUM</td>
+   <td>Unmaintained packages without security updates</td>
+  </tr>
+  <tr>
+   <td>SC6</td>
+   <td>Typosquatting</td>
+   <td>HIGH</td>
+   <td>Package names similar to popular packages</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Excessive Agency (4 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>EA1</td>
+   <td>Unrestricted Tool Access</td>
+   <td>HIGH</td>
+   <td>Unfettered tool access without constraints</td>
+  </tr>
+  <tr>
+   <td>EA2</td>
+   <td>Autonomous Decision Making</td>
+   <td>HIGH</td>
+   <td>High-impact decisions without human-in-the-loop</td>
+  </tr>
+  <tr>
+   <td>EA3</td>
+   <td>Scope Creep</td>
+   <td>MEDIUM</td>
+   <td>Capabilities extending beyond stated purpose</td>
+  </tr>
+  <tr>
+   <td>EA4</td>
+   <td>Unbounded Resource Access</td>
+   <td>MEDIUM</td>
+   <td>No rate limits or quotas on resource consumption</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Output Handling (3 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>OH1</td>
+   <td>Unvalidated Output Injection</td>
+   <td>HIGH</td>
+   <td>Model output used without sanitization</td>
+  </tr>
+  <tr>
+   <td>OH2</td>
+   <td>Cross-Context Output</td>
+   <td>MEDIUM</td>
+   <td>Output flows across trust boundaries without validation</td>
+  </tr>
+  <tr>
+   <td>OH3</td>
+   <td>Unbounded Output</td>
+   <td>MEDIUM</td>
+   <td>No limits on output size or generation rate</td>
+  </tr>
+ </tbody>
+</table>
+<h3>System Prompt Leakage (3 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>P6</td>
+   <td>Direct Leakage</td>
+   <td>HIGH</td>
+   <td>Instructions that expose system prompts or internal rules</td>
+  </tr>
+  <tr>
+   <td>P7</td>
+   <td>Indirect Extraction</td>
+   <td>MEDIUM</td>
+   <td>Extraction via rephrasing, translation, or side-channels</td>
+  </tr>
+  <tr>
+   <td>P8</td>
+   <td>Tool-Based Exfiltration</td>
+   <td>HIGH</td>
+   <td>System prompts exfiltrated via file writes or network requests</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Memory Poisoning (3 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>MP1</td>
+   <td>Persistent Context Injection</td>
+   <td>HIGH</td>
+   <td>Content designed to persist across interactions</td>
+  </tr>
+  <tr>
+   <td>MP2</td>
+   <td>Context Window Stuffing</td>
+   <td>MEDIUM</td>
+   <td>Filler content displacing safety constraints</td>
+  </tr>
+  <tr>
+   <td>MP3</td>
+   <td>Memory Manipulation</td>
+   <td>HIGH</td>
+   <td>Tampering with agent memory or stored state</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Tool Misuse (3 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>TM1</td>
+   <td>Tool Parameter Abuse</td>
+   <td>HIGH</td>
+   <td>Crafted parameters for unintended behavior (shell=True, --force)</td>
+  </tr>
+  <tr>
+   <td>TM2</td>
+   <td>Chaining Abuse</td>
+   <td>HIGH</td>
+   <td>Tool chains that bypass individual safety checks</td>
+  </tr>
+  <tr>
+   <td>TM3</td>
+   <td>Unsafe Defaults</td>
+   <td>MEDIUM</td>
+   <td>Overly permissive defaults (disabled TLS, no auth)</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Rogue Agent (2 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>RA1</td>
+   <td>Self-Modification</td>
+   <td>CRITICAL</td>
+   <td>Modifying own code or configuration at runtime</td>
+  </tr>
+  <tr>
+   <td>RA2</td>
+   <td>Session Persistence</td>
+   <td>HIGH</td>
+   <td>Unauthorized persistence via cron jobs or startup scripts</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Trigger Abuse (3 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>TR1</td>
+   <td>Overly Broad Trigger</td>
+   <td>MEDIUM</td>
+   <td>Trigger patterns matching common words</td>
+  </tr>
+  <tr>
+   <td>TR2</td>
+   <td>Shadow Command Trigger</td>
+   <td>HIGH</td>
+   <td>Triggers that shadow built-in commands or other skills</td>
+  </tr>
+  <tr>
+   <td>TR3</td>
+   <td>Keyword Baiting Trigger</td>
+   <td>MEDIUM</td>
+   <td>Generic triggers designed to maximize activation</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Behavioral AST (8 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>AST1</td>
+   <td>exec() Call</td>
+   <td>CRITICAL</td>
+   <td>Direct exec() enabling arbitrary code execution</td>
+  </tr>
+  <tr>
+   <td>AST2</td>
+   <td>eval() Call</td>
+   <td>HIGH</td>
+   <td>Direct eval() evaluating arbitrary expressions</td>
+  </tr>
+  <tr>
+   <td>AST3</td>
+   <td>Dynamic Import</td>
+   <td>HIGH</td>
+   <td>__import__() loading arbitrary modules at runtime</td>
+  </tr>
+  <tr>
+   <td>AST4</td>
+   <td>subprocess Call</td>
+   <td>HIGH</td>
+   <td>External command execution via subprocess</td>
+  </tr>
+  <tr>
+   <td>AST5</td>
+   <td>os.system / exec-family</td>
+   <td>HIGH</td>
+   <td>Shell commands via os module</td>
+  </tr>
+  <tr>
+   <td>AST6</td>
+   <td>compile() Call</td>
+   <td>MEDIUM</td>
+   <td>Code object creation from strings</td>
+  </tr>
+  <tr>
+   <td>AST7</td>
+   <td>Dynamic getattr()</td>
+   <td>MEDIUM</td>
+   <td>Arbitrary attribute access with non-literal names</td>
+  </tr>
+  <tr>
+   <td>AST8</td>
+   <td>Dangerous Execution Chain</td>
+   <td>CRITICAL</td>
+   <td>exec/eval combined with dynamic source (network, encoded data)</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Taint Tracking (5 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>TT1</td>
+   <td>Direct Taint Flow</td>
+   <td>HIGH</td>
+   <td>Data flows directly from a source to a sink without sanitization</td>
+  </tr>
+  <tr>
+   <td>TT2</td>
+   <td>Variable-Mediated Taint Flow</td>
+   <td>MEDIUM</td>
+   <td>Data flows from source to sink through intermediate variables</td>
+  </tr>
+  <tr>
+   <td>TT3</td>
+   <td>Credential Exfiltration Chain</td>
+   <td>CRITICAL</td>
+   <td>Credentials (env vars, secrets) flow to network output sinks</td>
+  </tr>
+  <tr>
+   <td>TT4</td>
+   <td>File Read to Network Exfiltration</td>
+   <td>HIGH</td>
+   <td>File contents flow to network output sinks</td>
+  </tr>
+  <tr>
+   <td>TT5</td>
+   <td>External Input to Code Execution</td>
+   <td>CRITICAL</td>
+   <td>Network or user input flows to exec/eval/subprocess sinks</td>
+  </tr>
+ </tbody>
+</table>
+<h3>YARA Signatures (4 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>YR1</td>
+   <td>Malware Match</td>
+   <td>CRITICAL</td>
+   <td>YARA rule match for known malware signatures</td>
+  </tr>
+  <tr>
+   <td>YR2</td>
+   <td>Webshell Match</td>
+   <td>CRITICAL</td>
+   <td>YARA rule match for webshell patterns</td>
+  </tr>
+  <tr>
+   <td>YR3</td>
+   <td>Cryptominer Match</td>
+   <td>HIGH</td>
+   <td>YARA rule match for crypto mining indicators</td>
+  </tr>
+  <tr>
+   <td>YR4</td>
+   <td>Hack Tool / Exploit Match</td>
+   <td>HIGH</td>
+   <td>YARA rule match for hack tools or exploit code</td>
+  </tr>
+ </tbody>
+</table>
+<h3>MCP Least Privilege (4 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>LP1</td>
+   <td>Underdeclared Capability</td>
+   <td>HIGH</td>
+   <td>Code uses capabilities not listed in declared permissions</td>
+  </tr>
+  <tr>
+   <td>LP2</td>
+   <td>Wildcard Permission</td>
+   <td>MEDIUM</td>
+   <td>Permission list contains wildcards (*, all, full, any)</td>
+  </tr>
+  <tr>
+   <td>LP3</td>
+   <td>Missing Permission Declaration</td>
+   <td>MEDIUM</td>
+   <td>No permissions field but code has detectable capabilities</td>
+  </tr>
+  <tr>
+   <td>LP4</td>
+   <td>Overdeclared Permission</td>
+   <td>LOW</td>
+   <td>Permission declared but no corresponding code capability found</td>
+  </tr>
+ </tbody>
+</table>
+<h3>MCP Tool Poisoning (4 patterns)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>ID</th>
+   <th>Pattern</th>
+   <th>Severity</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>TP1</td>
+   <td>Hidden Instructions</td>
+   <td>HIGH</td>
+   <td>Hidden directives in metadata (HTML comments, zero-width chars, base64, data URIs)</td>
+  </tr>
+  <tr>
+   <td>TP2</td>
+   <td>Unicode Deception</td>
+   <td>HIGH</td>
+   <td>Homoglyphs, RTL overrides, mixed-script identifiers in tool metadata</td>
+  </tr>
+  <tr>
+   <td>TP3</td>
+   <td>Parameter Description Injection</td>
+   <td>MEDIUM</td>
+   <td>Injection patterns in parameter definitions (overrides, system tokens, malicious defaults)</td>
+  </tr>
+  <tr>
+   <td>TP4</td>
+   <td>Description-Behavior Mismatch</td>
+   <td>MEDIUM</td>
+   <td>Declared tool description does not match actual code behavior (LLM-powered)</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Risk Scoring</h2>
+<h3>Score Calculation</h3>
+<ul>
+ <li><strong>CRITICAL issues</strong>: +50 points</li>
+ <li><strong>HIGH issues</strong>: +25 points</li>
+ <li><strong>MEDIUM issues</strong>: +10 points</li>
+ <li><strong>LOW issues</strong>: +5 points</li>
+ <li><strong>Executable scripts</strong>: 1.3x multiplier</li>
+</ul>
+<h3>Severity Levels</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Score</th>
+   <th>Severity</th>
+   <th>Recommendation</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>0-20</td>
+   <td>LOW</td>
+   <td>SAFE</td>
+  </tr>
+  <tr>
+   <td>21-50</td>
+   <td>MEDIUM</td>
+   <td>CAUTION</td>
+  </tr>
+  <tr>
+   <td>51-80</td>
+   <td>HIGH</td>
+   <td>DO NOT INSTALL</td>
+  </tr>
+  <tr>
+   <td>81-100</td>
+   <td>CRITICAL</td>
+   <td>DO NOT INSTALL</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Example Output</h2>
+<h3>Terminal Output</h3>
+<pre><code> SkillSpector Security Report  v2.0.0
+
+Skill: suspicious-skill
+Source: ./suspicious-skill/
+Scanned: 2026-01-29 10:30:00 UTC
+
+        Risk Assessment
+ Metric          Value
+ Score           78/100
+ Severity        HIGH
+ Recommendation  DO NOT INSTALL
+
+        Components (3)
+ File              Type      Lines  Executable
+ SKILL.md          markdown    142  No
+ scripts/sync.py   python       87  Yes
+ requirements.txt  text          3  No
+
+Issues (2)
+
+  HIGH: Env Variable Harvesting (E2)
+    Location: scripts/sync.py:23
+    Finding: for key, val in os.environ.items():...
+    Confidence: 94%
+    Explanation: This code collects environment variables containing
+    API keys and secrets, then sends them to an external server.
+
+  HIGH: External Transmission (E1)
+    Location: scripts/sync.py:45
+    Finding: requests.post("https://api.skill.io/env"...
+    Confidence: 89%
+    Explanation: Data is being sent to an external server. Combined
+    with env harvesting above, this indicates credential exfiltration.
+</code></pre>
+<h2>Configuration</h2>
+<h3>Environment Variables</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Variable</th>
+   <th>Description</th>
+   <th>Required</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>SKILLSPECTOR_PROVIDER</code></td>
+   <td>Active LLM provider: <code>openai</code>, <code>anthropic</code>, or <code>nv_build</code>. Each provider has its own bundled <code>model_registry.yaml</code> and default model. Defaults to <code>nv_build</code>.</td>
+   <td>Optional</td>
+  </tr>
+  <tr>
+   <td><code>NVIDIA_INFERENCE_KEY</code></td>
+   <td>Credential for the <code>nv_build</code> provider (build.nvidia.com).</td>
+   <td>Required for LLM analysis when <code>SKILLSPECTOR_PROVIDER=nv_build</code></td>
+  </tr>
+  <tr>
+   <td><code>OPENAI_API_KEY</code></td>
+   <td>Credential for the OpenAI provider (<code>SKILLSPECTOR_PROVIDER=openai</code>). Also serves as the tier-2 fallback.</td>
+   <td>Required for LLM analysis when <code>SKILLSPECTOR_PROVIDER=openai</code></td>
+  </tr>
+  <tr>
+   <td><code>OPENAI_BASE_URL</code></td>
+   <td>Override the OpenAI endpoint (e.g. point at Ollama).</td>
+   <td>Optional</td>
+  </tr>
+  <tr>
+   <td><code>ANTHROPIC_API_KEY</code></td>
+   <td>Credential for the Anthropic provider (<code>SKILLSPECTOR_PROVIDER=anthropic</code>).</td>
+   <td>Required for LLM analysis when <code>SKILLSPECTOR_PROVIDER=anthropic</code></td>
+  </tr>
+  <tr>
+   <td><code>SKILLSPECTOR_MODEL</code></td>
+   <td>Override the active provider's default model.</td>
+   <td>Optional</td>
+  </tr>
+  <tr>
+   <td><code>SKILLSPECTOR_MODEL_REGISTRY</code></td>
+   <td>Override the bundled per-provider YAML registry with a custom path.</td>
+   <td>Optional</td>
+  </tr>
+  <tr>
+   <td><code>SKILLSPECTOR_LOG_LEVEL</code></td>
+   <td>Log level: <code>DEBUG</code>, <code>INFO</code>, <code>WARNING</code>, <code>ERROR</code> (default: <code>WARNING</code>).</td>
+   <td>Optional</td>
+  </tr>
+ </tbody>
+</table>
+<h3>CLI Options</h3>
+<pre><code>skillspector scan --help
+
+Options:
+  -f, --format [terminal|json|markdown|sarif]  Output format [default: terminal]
+  -o, --output PATH                            Output file path
+  --no-llm                                     Skip LLM analysis (static only)
+  -V, --verbose                                Show detailed progress
+  --help                                       Show this message and exit</code></pre>
+<h2>Development</h2>
+<h3>Setup</h3>
+<p>All <code>make</code> targets assume a virtual environment is already created and activated. The Makefile uses <strong>uv</strong> if available, else <strong>pip</strong>.</p>
+<pre><code># Clone, create venv, activate, install dev dependencies
+git clone https://github.com/NVIDIA/skillspector.git
+cd skillspector
+uv venv .venv &amp;&amp; source .venv/bin/activate
+# or: python3 -m venv .venv &amp;&amp; source .venv/bin/activate
+make install-dev
+
+# Run tests
+make test
+
+# Run tests with coverage
+make test-cov
+
+# Run linting
+make lint
+
+# Format code
+make format</code></pre>
+<h2>How It Works</h2>
+<p>SkillSpector uses a two-stage detection pipeline:</p>
+<h3>Stage 1: Static Analysis</h3>
+<ul>
+ <li>Fast regex-based pattern matching across 11 static analyzers</li>
+ <li>AST-based behavioral analysis detecting dangerous calls (exec, eval, subprocess, etc.)</li>
+ <li>Live vulnerability lookups via OSV.dev for known CVEs in dependencies</li>
+ <li>Scans all files in the skill</li>
+ <li>High recall (catches most issues)</li>
+ <li>Moderate precision (some false positives)</li>
+</ul>
+<h3>Stage 2: LLM Semantic Analysis (Optional)</h3>
+<ul>
+ <li>Evaluates context and intent</li>
+ <li>Filters false positives</li>
+ <li>Provides human-readable explanations</li>
+ <li>Improves precision to ~87%</li>
+</ul>
+<h2>Live Vulnerability Lookups (SC4)</h2>
+<p>SC4 uses the OSV.dev API to check dependencies against the full Open Source Vulnerabilities database.</p>
+<ul>
+ <li><strong>No API key required</strong> — OSV.dev is free and unauthenticated.</li>
+ <li><strong>Batch queries</strong> — all dependencies are checked in a single HTTP call.</li>
+ <li><strong>Automatic fallback</strong> — if OSV.dev is unreachable, a small built-in fallback list is used.</li>
+ <li><strong>Caching</strong> — results are cached in-memory for 1 hour.</li>
+</ul>
+<h2>Limitations</h2>
+<ul>
+ <li><strong>Non-English content</strong>: May miss patterns in other languages</li>
+ <li><strong>Image-based attacks</strong>: Cannot analyze text in images</li>
+ <li><strong>Encrypted/binary code</strong>: Cannot analyze compiled or encrypted content</li>
+ <li><strong>Runtime behavior</strong>: Static analysis only, no dynamic execution</li>
+ <li><strong>Offline SC4</strong>: Without network access, SC4 uses a small static fallback list</li>
+</ul>
+<h2>Research Background</h2>
+<p>Based on research from "Agent Skills in the Wild: An Empirical Study of Security Vulnerabilities at Scale" (Liu et al., 2026):</p>
+<ul>
+ <li><strong>Dataset</strong>: 42,447 skills from major marketplaces</li>
+ <li><strong>Vulnerable</strong>: 26.1% contain at least one vulnerability</li>
+ <li><strong>High-severity</strong>: 5.2% show likely malicious intent</li>
+ <li><strong>Key finding</strong>: Skills with executable scripts are 2.12x more likely to be vulnerable</li>
+</ul>
+<h2>Python API Integration</h2>
+<pre><code>from skillspector import graph
+
+# Invoke the LangGraph workflow
+result = graph.invoke(\{
+    "input_path": "/path/to/skill",
+    "output_format": "json",   # terminal, json, markdown, or sarif
+    "use_llm": True,           # False for static-only analysis
+})
+
+# Access results
+print(f"Risk Score: \{result['risk_score']}/100")
+print(f"Severity: \{result['risk_severity']}")
+print(f"Recommendation: \{result['risk_recommendation']}")
+
+for finding in result["filtered_findings"]:
+    print(f"[\{finding['severity']}] \{finding['rule_id']}: \{finding['message']}")</code></pre>
+<h2>License</h2>
+<p>Apache License 2.0 - see LICENSE for details.</p>
+<h2>Contributing</h2>
+<p>Contributions are welcome! Please read our contributing guidelines and submit pull requests.</p>
+<h2>Support</h2>
+<ul>
+ <li><strong>Issues</strong>: GitHub Issues</li>
+</ul>

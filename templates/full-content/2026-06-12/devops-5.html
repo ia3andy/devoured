@@ -1,0 +1,95 @@
+<h1>Safe Terraform auto-apply with conftest</h1>
+<p>You know the ritual: a change is made, Terraform plans, someone reviews it, approves it, and it gets applied. At low enough velocity, this works. The reviewer catches the odd mistakes, and everyone sleeps well.</p>
+<p>Past a certain point, <strong>the reviewer becomes the bottleneck</strong>. Plans pile up, engineers either rush through them or let them sit, and you start losing either velocity or review quality. Often both.</p>
+<p>Our immediate next thought is to <strong>delegate review to AI</strong>. And while you can <em>complement</em> your plan review with AI—the most interesting solution I’ve found in this space is Overmind—you cannot fully delegate plan review to it, not for production infrastructure:</p>
+<ul>
+ <li>it’s <strong>non-deterministic</strong>: the same plan may pass today and fail tomorrow;</li>
+ <li>it often <strong>violates audit/compliance requirements</strong> that mandate human sign-off with clear accountability; and critically</li>
+ <li>it <strong>removes responsibility from the feedback loop</strong>, no one owns the decision, which is exactly what you don’t want when something breaks.</li>
+</ul>
+<p>There’s a third option: evaluating Terraform plans programmatically and deterministically using policy-as-code. That’s what we do, with conftest.</p>
+<h2><code>conftest</code></h2>
+<p>conftest is a policy-as-code tool built on Open Policy Agent. You write policies in Rego, feed it JSON data, and it tells you whether your data satisfies your policy.</p>
+<p>The key insight is that <strong>Terraform can export its plan as JSON</strong>:</p>
+<pre><code>terraform plan -out=plan.tfplan
+terraform show -json plan.tfplan &gt; plan.json</code></pre>
+<p>That JSON file contains <strong>every resource change</strong> Terraform intends to make: what’s being created, updated, deleted, and the before/after values of each attribute. It’s the same information a human reviewer would look at, in a structured format a policy engine—like conftest—can evaluate:</p>
+<pre><code>conftest test plan.json</code></pre>
+<p>If the plan satisfies your policy, it passes. If it doesn’t, it fails with an explicit reason. <strong>The decision is auditable, testable, and reproducible.</strong></p>
+<h2>An example policy</h2>
+<p>Here’s a Rego policy that only allows plans where every change is a no-op, a resource create, or a data source read. Any update or delete fails the policy:</p>
+<pre><code>package main
+
+import rego.v1
+
+safe_actions := \{"no-op", "create", "read"}
+
+deny contains msg if \{
+  some resource_change in input.resource_changes
+  some action in resource_change.change.actions
+  not action in safe_actions
+  msg := sprintf(
+    "resource %q has action %q, which is not in the safe set %v",
+    [resource_change.address, action, safe_actions],
+  )
+}</code></pre>
+<p>This policy iterates over every <code>resource_changes</code> entry in the JSON-formatted Terraform plan. For each one, it checks whether all of its actions are in the <code>safe_actions</code> set. If any action falls outside that set (an <code>update</code> or a <code>delete</code>), the policy emits a denial with the offending resource and action.</p>
+<p>That’s it. If this policy passes, the plan only creates new resources, reads data sources, or does nothing, so it’s safe to auto-apply. If it fails, the pipeline stops and a human reviews.</p>
+<p><em><strong>Note:</strong> depending on what Terraform providers you use, new resource creation may not be completely harmless. Point here is that you create your own policy to suit your organization’s definition of what a “safe to auto-apply” plan means, as we will see below.</em></p>
+<h2>Wiring it into your pipeline</h2>
+<p>The CI/CD integration is straightforward. After Terraform plans, export the plan to JSON, run <code>conftest</code>, and branch on the result:</p>
+<pre><code>terraform plan -out=plan.tfplan
+terraform show -json plan.tfplan &gt; plan.json
+
+if conftest test plan.json; then
+  terraform apply plan.tfplan
+else
+  # gate on human approval
+fi</code></pre>
+<p>What makes this work well is that the decision boundary is <strong>explicit</strong>. You’re not asking someone (or something) to judge whether a plan “looks safe”. You’re checking whether it satisfies a set of rules you defined, tested, and versioned alongside your infrastructure code.</p>
+<h2>Extending the policy</h2>
+<p>The example above is deliberately minimal: it only allows creates, data source reads, and no-ops. In practice, you’ll want a richer policy, and the JSON Terraform plan gives you plenty to work with:</p>
+<p><strong>Resource types.</strong> Not all resources carry the same risk. You might auto-apply changes to CloudWatch alarms, but always gate on RDS instances or IAM policies. The <code>type</code> field on each <code>resource_changes</code> entry gives you this:</p>
+<pre><code>safe_resource_types := \{"aws_cloudwatch_metric_alarm"}
+
+deny contains msg if \{
+  some resource_change in input.resource_changes
+  not resource_change.type in safe_resource_types
+  some action in resource_change.change.actions
+  action not in \{"no-op", "read"}
+  msg := sprintf("resource %q has type %q, which is not in the auto-apply safe set", [resource_change.address, resource_change.type])
+}</code></pre>
+<p><strong>Resource fields.</strong> Sometimes the resource type isn’t enough—you want to auto-apply changes that only touch certain attributes. The <code>change</code> object in the JSON plan let you diff individual fields. This policy denies any update that modifies fields beyond <code>tags</code>:</p>
+<pre><code>deny contains msg if \{
+  some resource_change in input.resource_changes
+  some action in resource_change.change.actions
+  action == "update"
+  changed_keys := \{key |
+    some key in object.keys(resource_change.change.after)
+    resource_change.change.before[key] != resource_change.change.after[key]
+  }
+  changed_keys != \{"tags", "tags_all"}
+  msg := sprintf("resource %q changes fields other than tags: %v", [resource_change.address, changed_keys])
+}</code></pre>
+<p><strong>Blast radius.</strong> A plan that touches 2 resources is different from one that touches 200. You can count the resources with actual changes and gate when the number exceeds a given threshold:</p>
+<pre><code>max_auto_apply_changes := 10
+
+deny contains msg if \{
+  changed := \{resource_change.address |
+    some resource_change in input.resource_changes
+    some action in resource_change.change.actions
+    action not in \{"no-op", "read"}
+  }
+  count(changed) &gt; max_auto_apply_changes
+  msg := sprintf("plan affects %d resources, which exceeds the auto-apply limit of %d", [count(changed), max_auto_apply_changes])
+}</code></pre>
+<p><strong>Environment.</strong> Auto-apply in staging, gate in production. If your resources are tagged with their environment, you can read that from the plan. This policy denies any non-trivial change to a resource whose <code>Environment</code> tag is not <code>staging</code>:</p>
+<pre><code>deny contains msg if \{
+  some resource_change in input.resource_changes
+  some action in resource_change.change.actions
+  action not in \{"no-op", "read"}
+  resource_change.change.after.tags.Environment != "staging"
+  msg := sprintf("resource %q is not in staging, requires human review", [resource_change.address])
+}</code></pre>
+<p>These rules compose. You can combine them in the same policy file, and <code>conftest</code> will evaluate all of them. A plan must pass <strong>every</strong> rule to auto-apply, and any single denial is enough to fail the policy. The policy grows with your confidence, and because it’s code, you can version it and test it like you do with any other code.</p>
+<p>A mechanism like this becomes ever more important as you introduce AI agents to your SDLC, and let them propose and execute changes to your live infrastructure. Without a deterministic way of attesting plan safety, <strong>you either compromise on confidence, velocity, or both</strong>.</p>
