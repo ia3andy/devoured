@@ -123,6 +123,7 @@ public class TemplateExtensions {
     static RawString jsonLd(DocumentPage page) {
         var data = page.data();
         var articles = articlesByRating(data);
+        String pageUrl = page.url().absolute();
         var items = new JsonArray();
         int position = 0;
         for (var article : articles) {
@@ -138,8 +139,8 @@ public class TemplateExtensions {
             if (!oneLiner.isEmpty()) newsArticle.put("description", oneLiner);
             String image = article.getString("image", "");
             if (!image.isEmpty()) newsArticle.put("image", image);
-            String link = article.getString("link", "");
-            if (!link.isEmpty()) newsArticle.put("url", link);
+            String id = article.getString("id", "");
+            if (!id.isEmpty()) newsArticle.put("url", pageUrl + "?a=" + id);
             String source = article.getString("source", "");
             if (!source.isEmpty()) newsArticle.put("publisher", new JsonObject()
                     .put("@type", "Organization").put("name", source));
