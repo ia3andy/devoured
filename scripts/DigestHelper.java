@@ -1862,10 +1862,11 @@ public class DigestHelper implements Runnable {
             var a = articles.get(i).getAsJsonObject();
             var ai = aiMap.get(i + 1);
             if (ai != null && ai.has("skip") && ai.get("skip").getAsBoolean()) continue;
+            String link = normalizeUrl(sanitizeUrl(jsonStr(a, "link")));
+            if (link.isEmpty()) continue;
 
             index++;
             String id = sectionId + "-" + index;
-            String link = normalizeUrl(sanitizeUrl(jsonStr(a, "link")));
             String image = sanitizeUrl(ai != null && ai.has("image") ? jsonStr(ai, "image") : jsonStr(a, "ogImage"));
             String desc = sanitizeMarkdown(jsonStr(a, "description"));
 
