@@ -1055,8 +1055,10 @@ public class DigestHelper implements Runnable {
                 String title = titleLink.text().trim();
                 String link = titleLink.attr("abs:href");
                 if (link.isEmpty()) continue;
-                if (title.toLowerCase().contains("(sponsor)")) continue;
-                if (link.contains("jobs.ashbyhq.com") || link.contains("jobs.lever.co")) continue;
+                String titleLower = title.toLowerCase();
+                if (titleLower.contains("(sponsor)")) continue;
+                if (titleLower.contains("tldr is hiring") || titleLower.contains("(tldr")) continue;
+                if (link.contains("jobs.ashbyhq.com") || link.contains("jobs.lever.co") || link.contains("tldr.tech/jobs")) continue;
 
                 if (title.length() < 3) {
                     title = titleFromUrl(link);
@@ -1751,10 +1753,14 @@ public class DigestHelper implements Runnable {
     }
 
     static JsonObject buildArticleJson(String id, String title, String link, String image, String desc, JsonObject ai) {
+        if (link.isEmpty()) {
+            logStep("warn", "article " + id + " has no link, skipping: " + title);
+            return null;
+        }
         var article = new JsonObject();
         article.addProperty("id", id);
         article.addProperty("title", stripReadingTime(sanitizeText(title)));
-        if (!link.isEmpty()) article.addProperty("link", link);
+        article.addProperty("link", link);
         if (!image.isEmpty()) article.addProperty("image", image);
         String source = ai != null ? sanitizeText(jsonStr(ai, "source")) : "";
         if (!source.isEmpty()) article.addProperty("source", source);
@@ -1862,15 +1868,15 @@ public class DigestHelper implements Runnable {
             var a = articles.get(i).getAsJsonObject();
             var ai = aiMap.get(i + 1);
             if (ai != null && ai.has("skip") && ai.get("skip").getAsBoolean()) continue;
-            String link = normalizeUrl(sanitizeUrl(jsonStr(a, "link")));
-            if (link.isEmpty()) continue;
 
             index++;
             String id = sectionId + "-" + index;
+            String link = normalizeUrl(sanitizeUrl(jsonStr(a, "link")));
             String image = sanitizeUrl(ai != null && ai.has("image") ? jsonStr(ai, "image") : jsonStr(a, "ogImage"));
             String desc = sanitizeMarkdown(jsonStr(a, "description"));
 
-            sectionArticles.add(buildArticleJson(id, jsonStr(a, "title"), link, image, desc, ai));
+            var built = buildArticleJson(id, jsonStr(a, "title"), link, image, desc, ai);
+            if (built != null) sectionArticles.add(built);
         }
 
         section.add("articles", sectionArticles);
