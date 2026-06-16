@@ -1,0 +1,184 @@
+<h1>MiniMax Sparse Attention (MSA)</h1>
+<p><strong>MSA</strong> (<code>fmha_sm100</code>) ships dense FlashAttention and sparse top-k attention kernels for <strong>NVIDIA SM100</strong>. Two JIT-compiled stacks share one Python package:</p>
+<blockquote>
+ <p>Algorithm reference: MiniMax Sparse Attention paper.</p>
+</blockquote>
+<table>
+ <thead>
+  <tr>
+   <th>Stack</th>
+   <th>Path</th>
+   <th>What it gives you</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>csrc JIT</strong></td>
+   <td><code>python/fmha_sm100/csrc/</code></td>
+   <td>Dense FMHA (<code>fmha_sm100</code>, <code>fmha_sm100_plan</code>) + <code>sparse_topk_select</code> indexer, compiled from Jinja templates by <code>jit.py</code> at runtime.</td>
+  </tr>
+  <tr>
+   <td><strong>CuTe-DSL</strong></td>
+   <td><code>python/fmha_sm100/cute/</code></td>
+   <td>Full sparse attention (forward + paged FP8 decode, BF16 / FP8 / NVFP4 / FP4), compiled at runtime via <code>cute.compile</code>.</td>
+  </tr>
+  <tr>
+   <td><strong>Bridge</strong></td>
+   <td><code>python/fmha_sm100/sparse_fmha_adapter.py</code></td>
+   <td>Adapts the <code>fmha_sm100</code> API to call <code>sparse_atten_func</code> for sparse prefill paths.</td>
+  </tr>
+ </tbody>
+</table>
+<blockquote>
+ <p><strong>License: MIT.</strong> Self-authored files carry <code>SPDX-License-Identifier: MIT</code>. See LICENSE and NOTICE. Bundled / derived third-party code retains its own license — see Third-party licenses.</p>
+</blockquote>
+<h2>Requirements</h2>
+<ul>
+ <li><strong>GPU</strong>: NVIDIA SM100.</li>
+ <li><strong>Toolchain</strong>: CUDA Toolkit with <code>nvcc</code> on <code>PATH</code> (or <code>CUDA_HOME</code> / <code>CUDA_PATH</code> set).</li>
+ <li><strong>Python</strong>: ≥ 3.10.</li>
+ <li><strong>OS</strong>: Linux x86_64 (aarch64 untested; JIT builds may need small Makefile edits on WSL).</li>
+</ul>
+<p>Quick sanity check before installing:</p>
+<pre><code>nvcc --version                # expect ≥ 12.x
+nvidia-smi --query-gpu=compute_cap --format=csv | grep "10.0"  # confirm SM100
+python -c "import sys; print(sys.version_info[:2])"              # ≥ (3, 10)</code></pre>
+<h2>Using with the <code>kernels</code> library</h2>
+<p>To quickly get started using MSA kernels, you can use the <code>kernels</code> library:</p>
+<pre><code># make sure `kernels` is installed: `pip install -U kernels`
+from kernels import get_kernel
+
+kernel_module = get_kernel("MiniMaxAI/msa", version=0)
+sparse_atten_func = kernel_module.sparse_atten_func
+
+sparse_atten_func(...)</code></pre>
+<h2>Install</h2>
+<pre><code># --recursive pulls the NVIDIA CUTLASS submodule (python/fmha_sm100/cutlass/),
+# whose headers are required for JIT/AOT compilation.
+git clone --recursive https://github.com/MiniMax-AI/MSA.git msa
+cd msa
+# If you cloned without --recursive:
+#   git submodule update --init --recursive
+pip install .           # standard install (works from a wheel too)
+# or
+pip install -e .        # editable install for development</code></pre>
+<p>This pulls in the CuTe-DSL stack via <code>nvidia-cutlass-dsl</code> and <code>quack-kernels</code>; the csrc kernels are JIT-compiled at first import from sources shipped inside the package.</p>
+<h2>Verify</h2>
+<p>Run a small CUDA smoke test. <strong>The first run JIT-compiles <code>sparse_topk_select</code>, which takes 30 s – a few minutes on a cold nvcc cache</strong> — this is normal, not a hang. Subsequent runs hit the JIT cache and finish in seconds.</p>
+<pre><code>python tests/smoke/test_sparse_topk_forced.py</code></pre>
+<h2>Usage</h2>
+<pre><code>import torch
+from fmha_sm100 import fmha_sm100, fmha_sm100_plan, sparse_topk_select
+
+# Page size and top-k for the sparse prefill path.
+page_size, topk = 128, 16
+
+# Dense proxy pass: compute per-block max score from a cheap Q slice.
+proxy_plan = fmha_sm100_plan(
+    qo_lens, kv_lens, proxy_q.shape[1],
+    num_kv_heads=1,
+    page_size=page_size,
+    output_maxscore=True,
+)
+_, max_score = fmha_sm100(
+    proxy_q, proxy_k_pages, proxy_v_pages, proxy_plan,
+    kv_indices=kv_indices,
+    output_o=False,
+    output_maxscore=True,
+)
+
+# max_score -&gt; sparse KV block indexes.
+kv_block_indexes = sparse_topk_select(
+    max_score.contiguous(), topk, num_valid_pages=num_pages,
+)
+
+# Sparse attention with the selected blocks.
+sparse_plan = fmha_sm100_plan(
+    qo_lens, kv_lens, q.shape[1],
+    num_kv_heads=k_pages.shape[1],
+    page_size=page_size,
+    kv_block_num=topk,
+)
+out, _ = fmha_sm100(
+    q, k_pages, v_pages, sparse_plan,
+    kv_indices=kv_indices,
+    kv_block_indexes=kv_block_indexes,
+)</code></pre>
+<h2>Test</h2>
+<pre><code># Fast smoke tests.
+python -m pytest tests/smoke -q
+
+# API and end-to-end integration tests.
+python -m pytest tests/integration -q
+python tests/integration/test_proxy_kv_e2e.py
+
+# Large regression suites.
+python tests/regression/test_correctness.py
+python tests/regression/test_sparse_attn.py
+
+# CuTe-DSL forward-only sparse attention.
+cd python/fmha_sm100/cute
+python -m pytest test_sparse_atten.py -q</code></pre>
+<h2>Benchmark</h2>
+<p><code>benchmarks/bench_sparse_attention_ops.py</code> covers dense prefill, paged prefill, sparse prefill, dense decode, paged decode, sparse decode, in <code>fp8</code> and <code>bf16</code> (<code>nvfp4</code> is sparse-prefill only).</p>
+<pre><code>python benchmarks/bench_sparse_attention_ops.py --help     # full flag list</code></pre>
+<h2>Layout</h2>
+<pre><code>python/fmha_sm100/                  Python package
+  __init__.py                       Public re-exports (lazy for the CuTe-DSL stack)
+  api.py                            fmha_sm100 / fmha_sm100_plan / sparse_topk_select
+  jit.py                            Runtime JIT (nvcc + ninja) for the csrc stack
+  sparse.py                         Lazy shim that loads the cute/ stack
+  sparse_fmha_adapter.py            Bridge: fmha_sm100 API → sparse_atten_func
+  csrc/                             CUDA kernels + Jinja templates (JIT-compiled)
+    include/                        Vendored FlashInfer / CUTLASS-derived / TRT-LLM headers
+  cutlass/                          NVIDIA CUTLASS git submodule (include/ + tools/util/include/)
+  cute/                             CuTe-DSL sparse attention (loaded via sys.path)
+tests/                              Correctness tests
+  smoke/  integration/  regression/
+scripts/                            Warmup + cache-management helpers
+benchmarks/                         bench_sparse_attention_ops.py</code></pre>
+<h2>Stacks</h2>
+<ul>
+ <li><strong>csrc JIT</strong> — dense FlashAttention, page KV, and <code>sparse_topk_select</code> indexer. Compiled at runtime from <code>csrc/*.cu.jinja</code> plus <code>csrc/include/</code>. Public entry: <code>fmha_sm100.plan → run</code>.</li>
+ <li><strong>CuTe-DSL</strong> — block-sparse prefill, FP8 / NVFP4 / FP4 quantization, paged FP8 decode (<code>SparseDecodePagedAttentionWrapper</code>), FP4 block-score indexer. Public entry: <code>fmha_sm100.sparse_atten_func</code>, <code>fmha_sm100.sparse_decode_atten_func</code>, <code>fmha_sm100.fp4_indexer_block_scores</code>.</li>
+ <li><strong>Bridge</strong> — <code>sparse_fmha_plan</code> / <code>sparse_fmha</code> adapt the dense-API call site to the sparse backend for prefill paths; useful when you already drive the dense kernel and want a one-line swap to sparse.</li>
+</ul>
+<h2>Third-party licenses</h2>
+<p><code>fmha_sm100</code> bundles, derives from, or depends on the third-party components below. Each retains its original license; this section summarizes them.</p>
+<h3>Vendored / derived source (shipped in this repo)</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Component</th>
+   <th>License</th>
+   <th>Where</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>NVIDIA CUTLASS</strong></td>
+   <td>BSD-3-Clause</td>
+   <td>Git submodule at <code>python/fmha_sm100/cutlass/</code> (provides <code>include/</code> + <code>tools/util/include/</code>), plus BSD-3-tagged headers under <code>python/fmha_sm100/csrc/include/</code>.</td>
+  </tr>
+  <tr>
+   <td><strong>FlashInfer</strong></td>
+   <td>Apache-2.0</td>
+   <td>Headers and sources under <code>python/fmha_sm100/csrc/</code> and <code>python/fmha_sm100/csrc/include/</code>.</td>
+  </tr>
+  <tr>
+   <td><strong>NVIDIA TensorRT-LLM + NAVER Corp (CLOVA)</strong></td>
+   <td>Apache-2.0</td>
+   <td>Portions of <code>python/fmha_sm100/csrc/include/sparse_topk_select.cuh</code>.</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Citation</h2>
+<pre><code>@software\{msa2026,
+  title  = \{MiniMax Sparse Attention (MSA): FlashAttention and block-sparse
+            attention kernels for NVIDIA SM100},
+  author = \{\{MiniMax}},
+  year   = \{2026},
+  url    = \{https://github.com/MiniMax-AI/MSA}
+}</code></pre>
+<h2>Contributing</h2>
+<p>Issues and PRs welcome on the issue tracker. For kernel or runtime-contract changes, open an issue first to align on the public surface.</p>

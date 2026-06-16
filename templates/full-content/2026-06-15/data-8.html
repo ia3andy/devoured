@@ -1,0 +1,59 @@
+<h1>Apache DataFusion 54.0.0 Released</h1>
+<p>We are proud to announce the release of <a href="https://crates.io/crates/datafusion/54.0.0">DataFusion 54.0.0</a>. This post highlights some of the major improvements since <a href="https://datafusion.apache.org/blog/2026/04/02/datafusion-53.0.0/">DataFusion 53.0.0</a>. Notable additions include <code>LATERAL</code> joins, SQL lambda functions, and a new Avro reader, alongside significant join, scan, and planning performance improvements. The complete list of changes is available in the <a href="https://github.com/apache/datafusion/blob/branch-54/dev/changelog/54.0.0.md">changelog</a>. This release represents roughly 11 weeks of development and 740 commits. Thanks to the <a href="https://github.com/apache/datafusion/blob/branch-54/dev/changelog/54.0.0.md#credits">139 contributors</a> (a new record!) for making it possible.</p>
+<h2>Performance Improvements</h2>
+<p>We continue to make significant performance improvements in DataFusion, as explained below. This release prunes more redundant work out of plans and makes joins, repartitioning, scans, and many built-in functions faster.</p>
+<h3>Execution Operator Improvements</h3>
+<p><strong>Physical Execution of Uncorrelated Scalar Subqueries</strong>: DataFusion previously executed an uncorrelated scalar subquery (one that doesn't depend on the outer query) by rewriting it into a join. DataFusion 54 instead evaluates it once with a new physical operator. This lets functions use their specialized scalar code paths, and allows uncorrelated scalar subqueries in <code>ORDER BY</code>, <code>JOIN ON</code>, and as arguments to aggregate functions.</p>
+<p><strong>Faster Sort-Merge Joins</strong>: Semi, anti, and mark joins now track matches with a per-row bitset instead of materializing <code>(outer, inner)</code> pairs. Batched deferred filtering makes near-unique <code>LEFT</code> and <code>FULL</code> joins 20-50x faster. Finally, join-key comparisons now use a <code>DynComparator</code> that resolves the column type once rather than per row, making microbenchmarks up to 12% faster and TPC-H ~5% faster overall.</p>
+<p><strong>Faster Repartitioning</strong>: <code>RepartitionExec</code> now coalesces batches before sending them to distributor channels, cutting per-batch overhead for up to 50% faster execution on some repartition-heavy queries.</p>
+<p><strong>Faster Functions and Hashing</strong>: DataFusion ships hundreds of built-in functions, so speeding them up pays off across many workloads. This release optimizes many, including array_to_string, array_concat, array_sort, split_part, substr, strpos, left, right, string_agg, and approx_distinct, plus better <code>NULL</code> handling across many array and datetime functions. The <code>first_value</code> and <code>last_value</code> aggregates are also substantially faster over <code>Utf8</code> and <code>Binary</code> columns thanks to a new <code>GroupsAccumulator</code>. DataFusion 54 also swaps <code>ahash</code> for foldhash in <code>datafusion-common</code>, and optimizes regexp_replace by stripping trailing <code>.*</code> from anchored patterns.</p>
+<h3>Planner Improvements</h3>
+<p><strong>Pruning Functionally Redundant Sort Keys</strong>: Sorting is expensive, so it pays to sort by as few columns as possible. DataFusion 54 now drops functionally redundant <code>ORDER BY</code> keys: when an earlier key determines a later one, the later key can't change the ordering, so removing it cuts sorting cost without affecting results.</p>
+<p><strong>Skip Redundant Parquet Filters</strong>: When statistics prove a filter matches every row in a Parquet row group, DataFusion now skips evaluating it — both row filters and page-level pruning — for that row group instead of re-checking each row.</p>
+<p><strong>Statistics-Driven Sort Pushdown and TopK</strong>: Files and Parquet row groups are now ordered using statistics, which can avoid sorting entirely and improve dynamic filtering and early stopping for TopK (<code>ORDER BY ... LIMIT</code>) queries. The most promising data is read first, often satisfying the <code>LIMIT</code> before scanning the rest.</p>
+<p><strong>Improved Statistics and Cardinality Estimation</strong>: Good plans depend on good statistics. This release extracts NDV (number of distinct values) statistics from Parquet metadata, uses NDV for equality-filter selectivity, adds a pluggable StatisticsRegistry for operator-level statistics propagation, and improves cardinality estimation for semi and anti joins.</p>
+<h3>Scan Improvements</h3>
+<p><strong>Morsel-Driven Parquet Scans</strong>: Parquet scan parallelism was previously bounded by the slowest scan thread, so data skew (large row groups, less-selective filters, or variable object store latency) left cores underutilized. DataFusion 54 reworks the Parquet scan around a morsel-driven design, where idle threads dynamically pull small units of work ("morsels") instead of each being assigned a fixed partition up front. This spreads work more evenly and can be up to ~2x faster for skewed scans such as ClickBench.</p>
+<p><strong>Struct Field Filter Pushdown and Leaf-Level Projection</strong>: Filters on struct fields (e.g. <code>WHERE s['foo'] &gt; 67</code>) are now pushed down into the Parquet decoder rather than evaluated after a full scan, and both filtering and projection read only the struct leaves they actually access, significantly improving performance for nested and <code>Variant</code> data in large Parquet files.</p>
+<h2>New Features</h2>
+<h3><code>LATERAL</code> Joins</h3>
+<p>Lateral joins have been long requested. DataFusion 54 adds basic support for <code>CROSS JOIN LATERAL</code>, <code>INNER JOIN LATERAL</code>, and <code>LEFT JOIN LATERAL</code>. A lateral subquery in the <code>FROM</code> clause can reference columns from preceding tables — handy for expanding a per-row series or correlating against a set-returning function. It uses decorrelation, so the subquery is evaluated once rather than re-executed per outer row.</p>
+<pre><code>-- For each row in t1, expand a series 1..t1_int and join the values back
+SELECT t1_id, t1_name, i
+FROM join_t1 t1
+CROSS JOIN LATERAL (
+    SELECT * FROM unnest(generate_series(1, t1_int))
+) AS series(i);
+</code></pre>
+<h3>Lambda Functions</h3>
+<p>DataFusion now supports lambda expressions (<code>x -&gt; expr</code>) with column capture, plus new higher-order array UDFs like array_transform, array_filter, and array_any_match. Lambdas express per-element computation directly in SQL:</p>
+<pre><code>-- Apply `x * 10` to every element
+SELECT array_transform([1, 2, 3, 4, 5], x -&gt; x * 10);
+-- [10, 20, 30, 40, 50]
+
+-- Keep only elements where `x &gt; 2`
+SELECT array_filter([1, 2, 3, 4, 5], x -&gt; x &gt; 2);
+-- [3, 4, 5]
+
+-- True if any element satisfies `x &gt; 2`
+SELECT array_any_match([1, 2, 3], x -&gt; x &gt; 2);
+-- true
+</code></pre>
+<h3>Spilling Nested Loop Joins</h3>
+<p><code>NestedLoopJoinExec</code> previously failed with an out-of-memory error when the build side exceeded the memory budget. DataFusion 54 adds a memory-limited path that transparently spills to disk and completes the query instead, with zero overhead when memory is sufficient. It currently covers <code>INNER</code>, <code>LEFT</code>, <code>LEFT SEMI</code>, <code>LEFT ANTI</code>, and <code>LEFT MARK</code> joins.</p>
+<h3>New Avro Reader</h3>
+<p>The Avro reader now uses the <code>arrow-avro</code> crate, replacing internal conversion code with a faster, better-maintained implementation shared with the Arrow ecosystem.</p>
+<h3>Extension Type Registry</h3>
+<p>Arrow extension types let users layer their own semantics on top of a physical storage type. DataFusion 54 adds a registry for registering their behavior, several more canonical extension types, and the ability to cast to an extension type in logical expressions.</p>
+<h3>Content-Defined Chunking for Parquet</h3>
+<p>DataFusion's Parquet writer can now use content-defined chunking (CDC), which aligns data page boundaries with the data rather than fixed row counts. This improves deduplication and incremental storage, since inserting or editing a few rows no longer shifts every later page boundary.</p>
+<h3>New Functions</h3>
+<p><strong>SQL and Scalar Functions</strong>: DataFusion 54 adds new scalar functions including array_compact, cosine_distance, inner_product, array_normalize, cast_to_type, and with_metadata, plus nanosecond <code>date_part</code> support and the <code>:</code> JSON access operator. The cosine_distance, inner_product, and array_normalize additions round out DataFusion's vector-search building blocks.</p>
+<p><strong>Spark-Compatible Functions</strong>: The datafusion-spark crate gains many new or improved Spark-compatible functions, including round, floor, ceil, soundex, xxhash64, array_contains, array_compact, int/float-to-timestamp casts, and UTF-8 validation functions.</p>
+<h2>Upgrade Guide and Changelog</h2>
+<p>Upgrading to 54.0.0 should be straightforward for most users, though there are some breaking changes. See the <a href="https://datafusion.apache.org/library-user-guide/upgrading.html">Upgrade Guide</a> for details and migration snippets, and the <a href="https://github.com/apache/datafusion/blob/branch-54/dev/changelog/54.0.0.md">changelog</a> for the full list of changes.</p>
+<h2>About DataFusion</h2>
+<p>Apache DataFusion is an extensible query engine, written in Rust, that uses Apache Arrow as its in-memory format. DataFusion is used by developers to create new, fast, data-centric systems such as databases, dataframe libraries, and machine learning and streaming applications. While DataFusion's primary design goal is to accelerate the creation of other data-centric systems, it provides a reasonable experience directly out of the box as a dataframe library, Python library, and command-line SQL tool.</p>
+<h2>How to Get Involved</h2>
+<p>DataFusion is not a project built or driven by a single person, company, or foundation. Rather, our community of users and contributors works together to build a shared technology that none of us could have built alone.</p>
+<p>If you are interested in joining us, we would love to have you. You can try out DataFusion on some of your own data and projects and let us know how it goes, contribute suggestions, documentation, bug reports, or a PR with documentation, tests, or code.</p>

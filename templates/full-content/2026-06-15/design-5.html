@@ -1,0 +1,125 @@
+<h1>Every component in your design system is a promise</h1>
+<p>How the promises your system makes became the thing agents read first.</p>
+<p>In March, Ian Guisard from Uber's design systems team published a write-up of uSpec, an agentic system he built to automate component documentation. The numbers were striking: spec pages that previously took weeks now take minutes. An AI agent in Cursor connects to Figma via Southleft's open-source Figma Console MCP, crawls the actual component and sub-component structure, reads token mappings and variant axes, then generates finished spec pages directly into the Figma file from a single prompt.</p>
+<p>The response from the community made clear this wasn't just an Uber problem. Guisard wrote that after presenting the manual version of this process at a conference, design systems leads from across the industry reached out asking how to replicate it. The documentation bottleneck is universal.</p>
+<p>The detail that deserves more attention isn't the time saving, though. It's the condition that makes it possible. The system works because the Uber design system is structured well enough to be read programmatically. The agent reads the structure and does what the structure allows, without any interpretation of intent behind it. When the structure is explicit, the output is accurate. When it isn't, the agent either fails or invents.</p>
+<p>Most design systems aren't structured that way, and the reason comes down to a concept that rarely surfaces in design practice until something breaks: contracts.</p>
+<h2>A contract, not a guideline</h2>
+<p>In software, a contract is a formal description of what something does, what it accepts, and what happens when those conditions aren't met. Stripe's API is a useful reference point: when you call a payment endpoint with the wrong parameters, you get a meaningful error immediately. The system doesn't accommodate the mistake, it rejects it and tells you why. That precision is a feature. The contract is specific enough to distinguish a valid call from an invalid one, and everything downstream depends on that distinction holding.</p>
+<p>Design systems were built for human consumers. The naming conventions, the implicit logic, the documentation that assumes someone will ask a colleague when it doesn't make sense. Agents don't ask colleagues. They parse what's there and move on, and when there's no contract to read, they invent one. An invented contract is just confident guesswork expressed in code.</p>
+<p>Your design system makes the same kind of promises Stripe's API does. When a component exposes a <code>variant</code> prop, it's promising the component will behave differently based on that value. When a token is named <code>color-feedback-critical</code>, it's promising that colour is semantically tied to critical feedback. When a usage guideline says a component shouldn't appear inside a modal without the full-bleed variant, that's a promise about context. Those are all contracts. The question isn't whether you have them. It's whether they're written down in a form that survives interpretation by something that can't ask a clarifying question.</p>
+<h2>When description isn't enough</h2>
+<p>Documentation and contracts aren't the same thing, and this is a distinction that design system practice has never needed to make explicit until recently.</p>
+<p>Documentation describes. A contract specifies. Your Storybook page that explains when to use the warning variant instead of the critical variant is documentation. A prop definition that enforces <code>appearance: "warning" | "critical" | "info" | "success"</code> with no other valid inputs is a contract. The first communicates intent to a person who reads it. The second encodes intent in a structure that rejects anything outside its defined range.</p>
+<p>Both matter, and this is where teams often get stuck. Contracts without documentation leave teams unable to make good decisions about when and how to use the system. Documentation without contracts leaves the system dependent on human interpretation for every implementation. For a long time, the second trade-off was acceptable, because human interpretation was the only thing consuming the system. That changed.</p>
+<p>Here's what the difference looks like in practice, with a single component.</p>
+<h3>A button with documentation only:</h3>
+<p>The Storybook page says use the <code>destructive</code> variant when the action deletes data or can't be undone. The prop accepts a free-form string. A developer reads the documentation, uses <code>variant="destructive"</code> correctly. An agent working from the same codebase sees a <code>variant</code> prop that accepts a string and has no validation. It doesn't read Storybook. It infers from examples in the codebase. If those examples are inconsistent, the agent's output will be too.</p>
+<h3>The same button with a contract:</h3>
+<pre><code>type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'destructive';
+
+interface ButtonProps \{
+  /**
+   * Use 'destructive' only for irreversible actions: deleting data,
+   * removing access, cancelling orders. Not for warnings or errors.
+   */
+  variant: ButtonVariant;
+  children: React.ReactNode;
+  onClick: () =&gt; void;
+  disabled?: boolean;
+}</code></pre>
+<p>The TypeScript type is the contract. It enforces exactly four valid variants. The JSDoc comment sits directly above <code>variant</code>, carrying the usage guideline into the context an agent actually reads — the type definition, not the Storybook page. If someone passes <code>variant="danger"</code>, the system rejects it at compile time. The agent sees the type, reads the comment, and knows what's valid before it generates anything.</p>
+<p>That one addition, typing the prop and annotating the definition, changes the quality of every piece of agent-generated code that touches this component. It does the same for every team member who joins after the person who made the original decision has left.</p>
+<h2>Names as decisions</h2>
+<p>Tokens carry the same logic. Token naming is where most systems accumulate the most damage without noticing, because the problems are invisible until an agent or a new team member has to make a decision and has nothing concrete to go on.</p>
+<p>A token named <code>blue-600</code> is not a contract. It describes a value. Whether that value is the brand's primary action colour, a decorative element, a hover state, or a data visualisation colour is entirely context-dependent. The name communicates nothing about when or why to use it. A developer can make a reasonable guess. An agent will make a plausible one, which is not the same thing, and a plausible guess that compiles is harder to catch than an error.</p>
+<p>A token named <code>color-action-primary</code> is closer to a contract. It asserts purpose: this colour is for primary actions. A token named <code>color-feedback-critical</code> goes further, carrying not just category but semantic meaning, committing to a decision that any consumer of the system, human or machine, can act on without additional context. The DTCG specification, which reached its first stable version in October 2025, formalises exactly this three-level structure: primitive tokens carry the raw value, semantic tokens carry meaning, component tokens carry specific application. Each level is a progressively more specific commitment about where and how the value should be used.</p>
+<p>When a system is structured this way, an agent reading your token output has enough to reason correctly. It sees <code>--button-background-primary</code> referenced in a component file and understands it's a component-level token for a specific element, not a general-purpose colour to be reused freely. It sees <code>--color-feedback-critical</code> and understands it belongs in error and warning contexts. The naming has already committed to an answer, so the agent doesn't have to guess at one.</p>
+<p>When a system uses presentational names throughout, the agent pattern-matches against names that carry no semantic content. It reaches for <code>blue-600</code> where you intended <code>color-action-primary</code> because both look plausible from the available structure. The output looks right. The contract is wrong.</p>
+<h2>The composition problem</h2>
+<p>Component relationships are the third layer, and the most expensive one to leave undocumented, because unspecified relationships create cascading failures that look like implementation errors rather than contract failures.</p>
+<p>For a long time, the instinct was to keep adding configuration, another prop, another variant, another toggle, until the component covered enough ground. That approach has a ceiling, and most mature systems have hit it. The alternative, offering smaller composable parts that implementers assemble themselves, solves the configurability problem but creates a new one. When you hand someone a set of parts and say compose what you need, the contract on each part becomes the most reliable thing standing between a good assembly and a broken one. A monolithic component at least constrains the surface by its own shape. Parts don't. The more a system moves toward composition, the more each piece needs to say clearly what it is, what it expects, and what it won't tolerate.</p>
+<p>Consider a Modal. Your documentation says it should always contain a ModalFooter with at least one action button. Most experienced teams follow that. An agent building a modal from scratch, working from a codebase where the rule exists only in a documentation page it doesn't read, will omit the footer whenever the prompt doesn't explicitly request one. The resulting component passes tests. It fails an accessibility review three weeks later, when someone asks why there's no focusable action to close it.</p>
+<p>The fix isn't better documentation. It's encoding the relationship in the component's structure so it can't be violated accidentally. In React, a compound component pattern enables exactly this: <code>Dialog.Footer</code> can be written to only exist inside <code>Dialog</code>, and a <code>Dialog</code> without a <code>Dialog.Footer</code> containing at least one child can be written to throw at runtime through explicit validation in the component. The constraint isn't in a document somewhere. It's in the API itself, and it can be made precise enough that missing it produces an immediate, visible error rather than a silent failure that surfaces in review.</p>
+<p>In Figma, component relationships are harder to enforce with the same precision, but they can be partially expressed through component properties, explicit nesting in auto-layout, and the layer structure of component sets. The most reliable approach is making sure that what's described in Figma and what's enforced in code describe the same contract, so the system communicates consistent rules in both environments.</p>
+<h2>What the structure actually looks like</h2>
+<p>All three layers together, expressed as a single file, are what a Figma plugin called Anova produces. It crawls a component and outputs a structured data file, deterministic and compact, describing everything the component is, has, and does. The output is designed to be fed directly into an agent's context window as a specification, replacing the raw Figma data that most MCP connections generate.</p>
+<p>The reason that substitution matters comes down to signal-to-noise. The raw Figma data for a moderately complex component can run to over a megabyte, 42,000-plus lines of JSON covering every property of every node across every variant, most of it describing bounding boxes, transform matrices, and paint object wrappers that say nothing about design intent. An agent receiving that as context has to process all of it to extract the handful of decisions that actually matter, and nothing is cached between sessions, so the next prompt starts from scratch.</p>
+<p>The Anova output for the same component is a few hundred lines describing only what varies and why.</p>
+<p>Take an Alert with four appearances and three sizes. In your Figma file, that's twenty-four variants. The anatomy section of the Anova output describes what the component contains:</p>
+<pre><code>anatomy:
+  root:
+    type: container
+  icon:
+    type: instance
+    instanceOf: Icon
+  content:
+    type: container
+  label:
+    type: text
+  dismissButton:
+    type: instance
+    instanceOf: Icon Button</code></pre>
+<p>The props section describes what it accepts, with enums, defaults, and types made explicit:</p>
+<pre><code>props:
+  appearance:
+    type: string
+    default: info
+    enum:
+      - critical
+      - warning
+      - success
+      - info
+  size:
+    type: string
+    default: medium
+    enum:
+      - small
+      - medium
+      - large
+  dismissible:
+    type: boolean
+    default: false
+  label:
+    type: string
+    default: "\{Label}"</code></pre>
+<p>The variants section records only what changes from the default. When <code>appearance</code> is <code>critical</code>, only the fills and text colour differ from the info state. When <code>size</code> is <code>small</code>, only spacing tokens change. Anova evaluates every combination in depth and collapses those combinations into layered diffs rather than duplicating entire variant trees:</p>
+<pre><code>variants:
+  - configuration:
+      appearance: critical
+    elements:
+      root:
+        styles:
+          fills: Color/Alert/Critical/Background
+      label:
+        styles:
+          fills: Color/Text/Primary Inverse
+  - configuration:
+      size: small
+    elements:
+      root:
+        styles:
+          itemSpacing: Space/Component/XS
+          paddingLeft: Space/Padding/XS
+          paddingRight: Space/Padding/XS
+      label:
+        styles:
+          textStyle: Body/Small</code></pre>
+<p>An agent resolving <code>appearance: critical, size: small</code> layers those diffs in sequence: start from the default, apply the critical overrides, apply the small overrides. The correct resolved state falls out without inspecting all twenty-four variants independently.</p>
+<p>The invalid combinations section records which prop pairings can't coexist:</p>
+<pre><code>invalidConfigurations:
+  - dismissible: true
+    size: small</code></pre>
+<p>That line is a contract. Not a documentation note, not a comment in a Storybook story, but a machine-readable statement derived directly from how the component is built in Figma, with no LLM inference involved. The same input produces the same output every time.</p>
+<p>What Anova encodes in the <code>invalidConfigurations</code> block is the same principle expressed at the Figma layer. A typed container that only accepts specific children in code and a component that marks certain prop combinations as invalid in its spec are doing the same work in different environments, making the rules of composition legible without requiring someone to know them from memory.</p>
+<p>Read it all back and what you have is the complete structural anatomy of the component, its full prop surface with valid enums and defaults, the precise styling changes per variant expressed as semantic token references, and an explicit record of which configurations aren't possible. An agent receiving that context before generating code doesn't need to infer anything. The design decisions are the data.</p>
+<p>This is what the Uber pipeline depends on. This is what the Storybook MCP reads when it composes new components from existing pieces. The difference in quality of agent output between raw Figma data and a structured component spec is not incremental. It's the difference between a tool that guesses and a tool that knows.</p>
+<h2>Where to start</h2>
+<p>Most systems have contracts in some areas and documentation-only in others. Finding the seam between them is more useful than a comprehensive rebuild, and it's where the practical work actually starts.</p>
+<p>Look at the props that get implemented inconsistently across the codebase. Those are almost always free-form string props with no type enforcement, where the codebase is being pattern-matched from examples rather than read as a contract. Type them. Add a JSDoc comment that carries the usage guideline into the definition. That single change makes every agent session that touches those components more reliable, and does the same for every team member who joins after the original decision was made.</p>
+<p>Look at the tokens that regularly appear alongside raw hex values for the same colour. That's semantic ambiguity in practice: the token exists, but its purpose isn't clear enough that anyone, agent or human, reaches for it confidently. Rename toward intent rather than value, and the pattern resolves. <code>blue-600</code> becomes <code>color-action-primary</code>. The hex value stops appearing next to it because the token's purpose is now unambiguous enough to use without checking.</p>
+<p>Look at the component relationships that generate the most questions in your team Slack, the ones where someone always asks whether it's valid to use this component outside that container, or whether a particular child is optional or required. Those are undocumented compositional contracts. Some can be encoded in Figma through component properties and nesting structure. Some need to be enforced in code through the component API. The ones that exist only in people's heads are the most expensive, because they get violated the moment someone who wasn't in the original conversation touches the component.</p>
+<p>None of this is about making your system perfect before agents consume it. It's about making your existing decisions legible. An agent can read your types, your token names, your component structure, and your JSDoc comments. The closer those four things are to encoding what you actually decided, the less the agent has to invent.</p>
+<p>The reason Guisard's uSpec system works at Uber's scale isn't complicated. Someone, over time, made decisions about how components should be described and wrote them down in a form that could be read without a person in the loop.</p>
+<p>Your system is already making promises. The question is whether those promises are written down clearly enough that something other than you can read them and get the right answer.</p>
+<p>The difference shows up in the output. It always has, and it's just easier to see now.</p>

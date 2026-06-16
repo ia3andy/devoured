@@ -1,0 +1,177 @@
+<h1>The Hidden Cost of ai_parse_document in Production</h1>
+<p>This is not a benchmark and not a full production tutorial. It is an engineering evaluation of a Databricks-native document extraction pattern</p>
+<p>A colleague and I were exploring options for a healthcare project that had hit a familiar wall. The structured data was usable — dates, diagnoses, billing records — but the information people actually needed lived elsewhere: discharge summaries, referral letters, intake forms, nursing notes. All unstructured and inconsistent.</p>
+<p>We were weighing up OCR tools, custom parsers, third-party APIs — the usual trade-offs of cost, accuracy, and maintenance — when Databricks released a new Function, <code>ai_parse_document</code>, which seemed to cut straight through all of that.</p>
+<p>It was a few lines of SQL and messy PDFs came out the other side as structured JSON. The first time you see it work, it genuinely feels like magic — a proof of concept in an afternoon.</p>
+<p>That simplicity, though, is a bit deceptive. Because once you move beyond the demo, the problem changes. It is no longer just about extracting fields from a document. It is about running that extraction as a system: reliably, repeatedly, and at scale.</p>
+<p>That shift — from query to system design — is where certains problems start to surface. That is what this post is about.</p>
+<p>The examples use Databricks – specifically ai_parse_document and <code>ai_query</code> – in SQL or notebooks. You'll need Databricks Runtime 17.1+ and basic familiarity with Delta tables and the medallion architecture.</p>
+<blockquote>
+ <p>What this post cover: This is not a benchmark and not a full production tutorial. It is an engineering evaluation of a Databricks-native document extraction pattern: where it shines, where the hidden costs appear, and when a deterministic alternative is a better fit. The snippets run in a Databricks notebook and are simplified to highlight key patterns; the companion notebook has the complete runnable implementation. The examples use synthetic patient data.</p>
+</blockquote>
+<blockquote>
+ <p>What It doesn't cover: Fine-grained cost optimisation (Photon vs. serverless, token reduction strategies, model endpoint pricing) is a post of its own. So are production hardening topics like failure modes, exactly-once semantics, and Delta Expectations. Data residency, PII handling at the document level, and Unity Catalog lineage and governance are also out of scope here — each worth a dedicated treatment.</p>
+</blockquote>
+<p><strong>The Starting Point: ai_parse_document + ai_query</strong></p>
+<p>Before looking at the SQL, we need to establish quickly that not all PDFs are the same.</p>
+<p>Digitally-born PDFs have real, selectable text baked in – think of saving a Word document as a PDF. Scanned PDFs are photos of pages. The words are visible to a human, but to a computer the page is just an image until OCR (Optical Character Recognition) reconstructs the text. This distinction matters because extraction quality differs sharply between them.</p>
+<p>In the PoC below, we'll demonstrate what <code>ai_parse_document</code> and <code>ai_query</code> looks like in practice:</p>
+<pre><code>WITH text_extracted AS (
+    SELECT
+        substring_index(path, '/', -1) AS filename,
+        concat_ws('\n', transform(
+            ai_parse_document(content, map('version', '2.0')):document:elements,
+            element -&gt; element:content
+        )) AS full_text
+    FROM read_files('/path/to/pdfs/', format =&gt; 'binaryFile')
+)
+SELECT
+    filename,
+    ai_query(
+        'databricks-claude-sonnet-4',
+        concat('Extract as JSON: \{"patient_ref": "...", ...}', full_text)
+    ) AS extracted
+FROM text_extracted
+LIMIT 5;</code></pre>
+<p>Let's walk through what's happening in 2 steps:</p>
+<p><strong>Step 1 — Parse the document.</strong> The <code>text_extracted</code> CTE calls <code>ai_parse_document</code> on each binary file loaded by <code>read_files</code>. <code>ai_parse_document</code> handles both document types: for digitally-born PDFs it reads the embedded text directly and for scans it runs OCR to reconstruct it first.</p>
+<p>The result is a structured <code>document.elements</code> array — text blocks, tables, section headers. Since you usually just want the text, <code>transform</code> and <code>concat_ws</code> flatten everything into a single string, <code>full_text</code>.</p>
+<p><strong>Step 2 — Extract the fields.</strong> The outer <code>SELECT</code> passes that assembled text to <code>ai_query</code> with a prompt: "extract these five fields as JSON." The fields — <code>patient_ref</code>, <code>document_date</code>, <code>document_type</code>, <code>primary_diagnosis</code>, <code>follow_up_required</code> — are enough to build a queryable patient cohort and flag who needs a follow-up. It gets the structured fields right most of the time. When something is ambiguous or unstated, it infers — and does not tell you it did unless you look closely.</p>
+<p>Here is a single row from the query result, before any post-processing:</p>
+<pre><code>Filename: `admission_PT_2024_00502_digital.pdf`
+
+Here is the extracted data in JSON format:
+
+```json
+\{
+  "patient_ref": "PT-2024-00502",
+  "document_date": "2024-03-28",
+  "document_type": "admission_note",
+  "primary_diagnosis": "Subarachnoid haemorrhage",
+  "follow_up_required": true
+}
+```
+
+&gt; Note: The `follow_up_required` field is set to `true` based on the fact that the patient is being admitted to the hospital and a management plan is being put in place, which typically involves follow-up care. However, this field is not explicitly stated in the document, so this is an inference based on the context.</code></pre>
+<p>A few things to notice here. Because we’re using ai_query, the extracted column is not a JSON object - it is a plain text string. The model leads with a prose sentence, wraps the JSON in markdown code fences, and appends a “Note:” explaining its reasoning. All of that arrives as one continuous string and needs cleanup before the JSON inside can be parsed.</p>
+<p>It’s also important to note that this is inference, not extraction. The model made a judgement call on follow_up_required and volunteered an explanation - but it will not always do that, and it can be confidently wrong either way.</p>
+<h2>Where the Cracks Show</h2>
+<p>At this point in time, the query works, however, the first run is not the problem, the second is - and it surfaces four issues that don’t exist in a notebook:</p>
+<p><strong>Cost:</strong> Both functions charge on every run. Without a checkpoint, every run processes every document – and every prompt change re-runs everything. The problem is not the first bill. It is that every correction, prompt revision, and reprocessing cycle reopens the meter.</p>
+<p>In healthcare, documents arrive in irregular batches – end-of-month exports, legacy migrations, corrected records re-sent in bulk. At medium-complexity rates (~$4.20–$4.55 per 1,000 pages, using the pricing available at the time of writing), a single corpus of 30,000 pages costs $120 – $137 to parse. That is manageable once. But prompt iteration is not a one-time cost – every prompt refinement re-runsai_query across every document, and onboarding a new hospital’s format can trigger a full re-parse.</p>
+<p><strong>Duplicates:</strong> Hospitals send the same document more than once – a corrected discharge summary when the original had the wrong diagnosis code, a re-sent referral letter after a system migration. Nothing in the query above catches that. Both versions land in Silver: the same patient appears twice in your cohort query, and if the correction changed the diagnosis, both versions of it appear too.</p>
+<p><strong>Non-determinism:</strong> This is an uncomfortable part: your pipeline can be “correct” and still produce different answers on different days.</p>
+<p>A traditional rule-based parser always produces the same output for the same input. An LLM doesn’t. ai_query defaults to temperature 0, which makes it more predictable – but even temperature 0 doesn’t guarantee identical outputs. Floating-point rounding and GPU parallelism introduce subtle variation regardless.</p>
+<p>In practice, follow_up_required can flip between true and false for the same document on different runs - no error, no warning, just quietly different results. In a regulated environment, that breaks auditability: your reporting changes without any change in the underlying data.</p>
+<p>There are ways to mitigate this by running extraction multiple times and taking the most common result, or building a labelled test set to evaluate your prompt against known-good outputs. That second approach is especially worth the investment when you update the prompt to support a new document type or hospital format: without a test set, you have no way of knowing whether the change improved extraction for the new format without quietly breaking something for an existing one. Just note that running multiple passes per document multiplies your ai_query costs directly - non-determinism and cost are not separate problems here.</p>
+<p><strong>Input noise.</strong> Every page has “Confidential - Amsterdam UMC - Page 4 of 11”, for example, stamped on it, and that goes to the LLM too – consistent per hospital but meaningless for extraction. Because ai_parse_document handles the binary internally, noise arrives pre-baked into the text; you handle it in Silver rather than before the LLM sees it. Headers bleeding into free-text fields are the most common symptom – a primary_diagnosis that starts with the hospital letterhead instead of the actual diagnosis.</p>
+<p>None of these are fatal. But all of them require system design the demo hides.</p>
+<h2>Bronze: Where the LLM Stops</h2>
+<p>Once you stop treating the query as the product and start treating it as ingestion, streaming with checkpointing becomes the natural design.</p>
+<p>One thing worth flagging before going further. The actual PII concern here is the full document text: discharge summaries and clinical notes contain names, dates of birth, and diagnoses, and all of that content is sent to ai_query. Before running this on real patient data, you need to either strip identifying information from the text before it reaches the LLM, or confirm that your data processing agreements cover routing clinical content. As we mentioned at the beginning, this sits outside the scope of this discussion but it is worth being acutely aware of before you build.</p>
+<p><strong><em>Figure 2: From PDFs to queryable clinical data. cloudFiles streams new files automatically; ai_parse_document parses each binary into a structured elements array; the assembled text goes to ai_query for field extraction; Bronze stores the result with a streaming checkpoint; Silver unnests the struct into a flat, queryable table.</em></strong></p>
+<p>Our first instinct at this point is to stay in SQL: hash each file, track what’s been processed in a Delta table, and version by prompt. That works, but it's a boilerplate you write and maintain yourself.</p>
+<p><strong>Structured Streaming</strong> is a cleaner path. Spark manages state automatically via checkpoints - new files flow through, already-processed ones are skipped, and nothing re-runs the LLM unnecessarily. Less boilerplate, less to get wrong.</p>
+<p><strong>One practical note:</strong> patient_ref is one hospital’s local ID. The same patient will have a completely different ID at the next institution. Store the source hospital identifier alongside every patient_ref from the start. One line now, months of pain if you skip it.</p>
+<p>The pipeline splits into three streaming tasks, each writing to its own Delta table and maintaining its own checkpoint:</p>
+<pre><code># Task 1: Parse each PDF once – checkpoint prevents re-processing
+(
+    spark.readStream.format("cloudFiles")
+    .load("/path/to/pdfs/")
+    .select("path", ai_parse_document("content").alias("parsed"))
+    .writeStream.toTable("bronze_parsed_raw")
+)
+
+# Task 2: Assemble elements into full text
+(
+    spark.readStream.table("bronze_parsed_raw")
+    .select(
+        "path",
+        concat_ws("\n\n", col("parsed.document.elements.content")).alias("full_text")
+    )
+    .writeStream.toTable("bronze_documents_text")
+)
+
+# Task 3: Extract fields
+(
+    spark.readStream.table("bronze_documents_text")
+    .select(
+        "path",
+        ai_query("databricks-claude-sonnet-4", col("full_text")).alias("extracted"),
+        lit("v1").alias("prompt_version")
+    )
+    .writeStream.toTable("bronze_documents_structured")
+)</code></pre>
+<p><strong>One clarification on duplicates: </strong>cloudFiles tracks files by path. If the same file is re-sent under the same name, the checkpoint skips it automatically. But a corrected document arriving under a new filename is a different path, so it is processed as a new row alongside the original. In practice, that means deduplication belongs in Silver, where ROW_NUMBER() OVER (PARTITION BY patient_ref, document_date, document_typeORDER BY _commit_timestamp DESC) can keep only the most recent extraction per logical document.</p>
+<p>The three-task structure also helps with cost. Because parsing and extraction are separate tasks, you can update the prompt without reparsing the documents. ai_parse_document charges per page, so rerunning it on historical files every time you refine the extraction is wasted spend. If a new hospital uses “patiëntnummer” instead of “patient_ref”, or you decide to extract medications as well, you can reset only the Task 3 checkpoint and rerun ai_query against the already-parsed text in bronze_documents_text. The parse cost for existing files stays at zero.</p>
+<p>Stamp each run with a new prompt_version, and both generations can coexist in the table. That keeps the audit trail intact and makes prompt changes much easier to manage.</p>
+<p>Databricks publishes a Databricks Asset Bundle that implements this same three-task streaming pattern as a deployable reference. In production, the stages are typically orchestrated in a Databricks Workflow: parse, assemble text, extract fields, then rebuild Silver and run a quality check. If Bronze fails, nothing downstream runs.</p>
+<p>Here’s what a typical row looks like in bronze_documents_structured – the extracted column holds a parsed struct, queryable via dot notation in Silver:</p>
+<p><strong><em>Table 1: bronze_documents_structured Delta table.</em></strong></p>
+<h2>Silver: Mostly Just SQL</h2>
+<p>Bronze handles the hard work. Silver is mostly SQL.</p>
+<p>We have two tasks here, which are to: flatten the extracted struct into a queryable table and strip out the noise that arrived pre-baked in the text. As we mentioned above, because ai_parse_document processes the binary internally - hospital headers and footers, page stamps, etc. - end up in the parsed content alongside the actual clinical text. A SQL UDF in Silver keeps the cleanup reusable:</p>
+<pre><code>CREATE OR REPLACE FUNCTION strip_noise(text STRING)
+RETURNS STRING
+RETURN regexp_replace(
+    regexp_replace(
+        text,
+        'Hospital Header Pattern',
+        ''
+    ),
+    '\\n\{3,}',
+    '\\n\\n'
+);</code></pre>
+<p>Apply it to any free-text field where letterhead might bleed <em>in - strip_noise(extracted.primary_diagnosis</em>) in the SELECT below. Each hospital will have its own header pattern; build up a library as you onboard new institutions. The query itself is straightforward:</p>
+<pre><code>SELECT
+    extracted.patient_ref,
+    extracted.document_date,
+    extracted.document_type,
+    strip_noise(extracted.primary_diagnosis) AS primary_diagnosis,
+    extracted.follow_up_required,
+    datediff(current_date(), extracted.document_date) AS document_age_days,
+
+    -- Placeholder: assumes a 30-day follow-up window.
+    -- Extend the prompt to extract the actual follow-up date
+    -- from the document if your use case requires it.
+    date_add(extracted.document_date, 30) AS follow_up_due_date
+
+FROM bronze_documents_structured
+WHERE prompt_version = 'v1';
+</code></pre>
+<p><strong><em>Table 2: silver_documents – flat, queryable, ready for Gold. Note that follow_up_due_date is a placeholder using a fixed 30-day window – real follow-up intervals vary by diagnosis and should ideally come from the document itself.</em></strong></p>
+<p>The same principle applies here as in Bronze: do the expensive work once and don’t repeat it. Materialise Silver as a table rather than a view - you pay a small compute cost once per run, but everything downstream reads from a clean, pre-computed dataset. Analyst queries are faster, Bronze isn’t being hit repeatedly, and the LLM only ever runs during ingestion. When you update to a new prompt version, new rows land under the new prompt_version and you update the filter.</p>
+<p>At this point you have a clean, flat Silver layer - structured fields, noise stripped, prompt version tracked. What you build on top in Gold depends entirely on your use case, so we won’t dive into that here.</p>
+<p>But before you go ahead and build any of this, there is a question worth asking first.</p>
+<h2>Not Every Pipeline Needs an LLM</h2>
+<p>In many healthcare pipelines, a large share of documents follow predictable templates. Discharge summaries from the same institution look roughly the same. Referral letters follow a standard structure. Where that’s true, an LLM is the wrong tool - you’re paying for flexibility you don’t need and accepting non-determinism you can’t afford.</p>
+<p>OpenDataLoader PDF is one alternative worth knowing about. It’s open-source (Apache 2.0) and its local mode is fully deterministic, using the XY-Cut++ geometric algorithm for reading order and table detection - no model involved. Parsing cost drops to zero, and if you still need field extraction you can add ai_query on top. The limitation is template variance: if different hospitals label the same field differently (“Patiëntnummer” vs “Patient ID”), you’ll need an LLM to normalise them regardless. But where templates are consistent, deterministic parsing combined with regex is cheaper, faster, and fully reproducible.</p>
+<p>Other tools sit at different points on this spectrum - layout-aware ML parsers like Docling or MinerU in the middle, fully LLM-native approaches like LlamaParse at the other end. The trade-off holds across all of them: more convenience and flexibility, less determinism and cost control.</p>
+<h2>Which Approach Is Right?</h2>
+<p>The honest summary before you decide:</p>
+<pre><code>
+Scenario                                               Priority
+----------------------------------------------------------------------------
+Consistent templates, digitally-born PDFs              Reproducibility and auditability
+                                                       are non-negotiable
+
+Layout or labels vary across institutions              Cost control and reproducible
+                                                       extraction
+
+Mixed formats, variable document structure             Fast time-to-value over strict
+                                                       operational predictability
+
+</code></pre>
+<h2>When ai_parse_document <em>Is</em> a Good Fit</h2>
+<p>It’s worth being explicit: ai_parse_document is not a bad tool. It favours fast setup, broad document support, and flexible extraction over strict determinism and cost efficiency at scale.</p>
+<p>That makes it a good fit for:</p>
+<ul>
+ <li><strong>Proofs of concept.</strong> When you need to validate whether useful data can be extracted from a document set quickly – without building a custom parsing stack.</li>
+ <li><strong>Low-to-medium volume workflows.</strong> Where reprocessing cost is manageable and perfect reproducibility is not required.</li>
+ <li><strong>Human-in-the-loop processes.</strong> For example, pre-processing invoices, claims, or intake forms before review – where the output is verified downstream rather than trusted directly.</li>
+ <li><strong>RAG ingestion pipelines.</strong> Where layout-aware parsing (sections, tables, figures, bounding boxes) produces better chunks than plain text, and exact field-level consistency matters less than good retrieval.</li>
+ <li><strong>Mixed-format document collections.</strong> When dealing with PDFs, scans, DOCX, and images in a single pipeline without stitching together multiple parsers.</li>
+</ul>
+<p>In those scenarios, the convenience and flexibility can outweigh the trade-offs.</p>
+<p>The Databricks-native route is the most convenient starting point – and in some cases, the right end state – but not always where you land after a full production evaluation. If you can’t tolerate output drift, don’tstart with an LLM. Most teams don’t need smarter parsing - they need more predictable systems.</p>
+<p>I had a great time working on this and if you’re building something similar or want to discuss some points I missed – you can find me on LinkedIn.</p>

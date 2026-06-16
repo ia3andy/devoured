@@ -1,0 +1,59 @@
+<ul>
+ <li>Databricks Zerobus Ingest is a serverless streaming API that enables teams to instantly deploy petabyte-scale data pipelines without manual infrastructure management.</li>
+ <li>Zerobus’ architecture relies on dynamic partitioning to automatically scale compute resources, efficiently handling unpredictable data volumes without complex tuning.</li>
+ <li>This zero-setup framework easily processes massive workloads, demonstrating the ability to sustain over 12 GB/s throughput to a single table during 24-hour benchmarks.</li>
+</ul>
+<p>Telemetry data is everywhere. IoT sensors on factory floors. Satellite arrays scanning the atmosphere. Autonomous vehicles are logging thousands of events per second. Every one of these systems has the same underlying problem: a continuous, high-volume stream of time-series observations that needs to land somewhere queryable. It needs to be fast, reliable, and without an engineering team spending weeks tuning and maintaining infrastructure that is typical of Kafka based workloads.</p>
+<p>That's the problem Zerobus Ingest is built to solve. Zerobus is Databricks' fully managed, serverless streaming ingest service. It's a push-based API that accepts data from any producer and writes it directly into Delta tables, governed by Unity Catalog.</p>
+<ul>
+ <li>No infrastructure to provision.</li>
+ <li>No connector pipeline to maintain.</li>
+ <li>No partitions or broker decision-making.</li>
+</ul>
+<p>Instead, you create a table and push data. It lands in your lakehouse, ready to query in seconds. You no longer need to run Kafka as a pipe when your destination is the lakehouse.</p>
+<p>We used NASA’s NEOWISE dataset, representing 200 billion data points over 11 years, to benchmark Zerobus Ingest, ingesting 1 petabyte in under 24 hours, with zero pre-configuration and stable latency.</p>
+<p>By ingesting 1PB within 24 hours, we demonstrate Zerobus’s ability to maintain continuous throughput of 12 GB/s to a single table!</p>
+<p>This post walks through three of our design decisions that made this possible.</p>
+<ul>
+ <li>Designing a system that autoscales via dynamic partitioning.</li>
+ <li>Building our own zero-copy protobuf decoder.</li>
+ <li>Implementing a latency-optimized write-ahead log before data is published to the lakehouse.</li>
+</ul>
+<h2>Our key design decisions</h2>
+<p>Our aspiration was to build a streaming system that could support petabyte-scale and auto-scale to handle fluctuating ingestion patterns.</p>
+<p>Traditional streaming architectures require you to decide how many brokers and partitions a given workload needs. This requires knowledge of peak load and consumer ingestion constraints, as well as forecasting and an understanding of the end-to-end pipeline.</p>
+<p>By going back to first principles, we designed and built a system that scales to handle petabyte-sized workloads for data producers “magically.”</p>
+<h3>Autoscaling achieved through dynamic partitioning</h3>
+<p>The problem we were trying to solve was how to have efficient autoscaling to achieve elastic “limitness” scaling.</p>
+<p>Our thesis was that by moving away from static partitioning and toward the logical unit of a stream/connection, we could unlock <strong>true autoscaling</strong> and rebalancing while maintaining ordering guarantees, which are important for consumption workloads.</p>
+<h4>The static partition problem</h4>
+<p>In message bus architectures, <strong>partitions are the unit of both parallelism and ordering</strong>. This coupling creates a constraint that can be painful once you have consumers who depend on it.</p>
+<p>Ordering is typically a <em>per-partition</em> guarantee, not per-producer. The number of partitions and the distribution of data across them affect a consumer's ability to keep up with ingestion.</p>
+<h4>We moved the ordering guarantee to the stream connection</h4>
+<p>In traditional systems, <strong>ordering is a partition-level guarantee</strong>. In Zerobus Ingest, <strong>ordering is a stream connection-level guarantee</strong>.</p>
+<p>When a producer opens a stream with Zerobus (a connection to our server), they're registering a logical identity with the service. For the lifetime of that connection, their data arrives in order, regardless of which “partition” pod processes it.</p>
+<h4>Hot routing and true autoscaling</h4>
+<p>Internally, Zerobus Ingest distributes streams across a pool of pods. Routing is heuristic-based: if a pod is running hot, new incoming streams are routed to a different pod. The producer is unaware. Their ordering guarantee is unaffected.</p>
+<p>Ordering lives at the stream level, which means pods can be added when demand spikes and <strong>removed when demand drops</strong>. Existing streams then drain gracefully, and new streams stop routing there. The pool then shrinks, keeping compute utilization efficient.</p>
+<h3>Zero-copy high-performance data handling</h3>
+<p>Zerobus's main goal is to allow an efficient, row-by-row transfer of data streams of any volume. To achieve this, we needed to completely avoid any needless copying and memory allocations - from the input formats that clients send to Zerobus, to the internal formats that guarantee durability and open Delta formats.</p>
+<p>The result was that we built <strong>zeroparser</strong>: Bridging this gap by using single-pass parsing with zero memory allocations, enabling it to sustain throughputs of <strong>~1 GB/s protobuf parsing per CPU core</strong> even with dynamic descriptors and complex schemas.</p>
+<h3>Write Ahead Log</h3>
+<p>Streaming is not just about being able to handle high-throughput workloads. To be a true streaming service, you also need to support message handoff as quickly as possible. This low latency of handing off data is what truly distinguishes streaming workloads from batch.</p>
+<p>To support this low-latency handoff with a durability guarantee, Zerobus implements a latency-optimized write-ahead log (WAL). Once messages are durable, Zerobus sends an acknowledgement back to the client.</p>
+<h2>Proof: Ingesting the Milky Way</h2>
+<p>The key to benchmarking a system comes with the understanding of how it would be used in a production setting, and then emulating that behavior and usage.</p>
+<h3>Why Locust? The Fan-In Problem</h3>
+<p>Zerobus Ingest is built to aggregate streams from many independent producers into a single destination table. Its throughput scales with the number of concurrent open streams.</p>
+<h3>The results</h3>
+<p>Our test results showed Zerobus Ingest’s ability to sustain 12 GB/s to a single table over a 24-hour period from 2,048 concurrent workers to a single table. Over this period, Zerobus ingested over a trillion records.</p>
+<h2>What's next</h2>
+<p>Zerobus Ingest is now Generally Available on Databricks and ready for all your production workloads.</p>
+<p>On the roadmap:</p>
+<ul>
+ <li>Kafka Producer API support</li>
+ <li>MQTT API support</li>
+ <li>Rescue column</li>
+ <li>System metadata column</li>
+ <li>Avro support</li>
+</ul>

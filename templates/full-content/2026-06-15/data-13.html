@@ -1,0 +1,153 @@
+<h1>Feature Stores from Scratch: A Minimal Working Implementation</h1>
+<p>Build the five components every feature store needs, then see where AI changes the design.</p>
+<h2>Introduction</h2>
+<p>Most teams discover they need a <strong>feature store</strong> the hard way. A fraud model works in the notebook and quietly breaks in production. A support agent gives a generic answer because it has no idea who the user is. A recommender pipeline duplicates the same "30-day spend" calculation across three jobs, and two of them disagree.</p>
+<p>A feature store is the piece of <strong>infrastructure</strong> that fixes those problems. It defines features once, stores them in two shapes (one for training, one for serving), and keeps both in sync. We are going to build a minimal one from scratch in <strong>Python</strong>, using <strong>DuckDB</strong>, <strong>Parquet</strong>, <strong>Redis</strong>, and <strong>FastAPI</strong>. Then we will look at how AI applications change what we actually use it for.</p>
+<p>The full code is short enough that we will walk through every component.</p>
+<h2>What a Feature Store Actually Solves</h2>
+<p>The classic pitch is training-serving skew: the SQL that built your training set is not the same code path that runs at inference, so the values drift. That problem is real, and the offline plus online split is the standard fix.</p>
+<p>The modern pitch is broader. Large language model (LLM) agents and retrieval-augmented generation (RAG) pipelines need structured user context at inference time, on every request, in under 10ms. An LLM has no memory of who the user is. If we want personalized output, we have to inject the user's plan tier, recent activity, and account state into the prompt, and we need a system that can return those values fast and consistently. That is exactly what a feature store's online store and retrieval API give us.</p>
+<p>So we build for both. The same five components handle the predictive machine learning use case and the LLM context use case.</p>
+<h2>The Five Components</h2>
+<ul>
+ <li>A feature registry that defines features as code.</li>
+ <li>An offline store on Parquet, queried with DuckDB, for training and backfills.</li>
+ <li>An online store on Redis for low-latency lookups at inference.</li>
+ <li>A materialization pipeline that pushes the latest values from offline to online.</li>
+ <li>A FastAPI service that exposes a typed retrieval API.</li>
+</ul>
+<h2>Running Example: A Personalized LLM Recommender</h2>
+<p>We are running a streaming service. When a user opens the app, an LLM generates a short, personalized "what to watch next" message. The LLM needs three things about the user:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Feature</th>
+   <th>Type</th>
+   <th>Freshness</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>user_segment</code></td>
+   <td>string</td>
+   <td>daily</td>
+  </tr>
+  <tr>
+   <td><code>watch_count_30d</code></td>
+   <td>int</td>
+   <td>hourly</td>
+  </tr>
+  <tr>
+   <td><code>last_genre</code></td>
+   <td>string</td>
+   <td>per-event</td>
+  </tr>
+ </tbody>
+</table>
+<p>The entity is <code>user_id</code>. We will register these three features, materialize them, and serve them to the LLM at request time.</p>
+<h3>1. Defining the Feature Registry</h3>
+<p>A registry is just a place where features are declared once, with their entity, dtype, and source. We use a dataclass.</p>
+<pre><code>from dataclasses import dataclass
+from typing import Literal
+
+@dataclass(frozen=True)
+class Feature:
+    name: str
+    entity: str
+    dtype: Literal["int", "float", "str"]
+    source: str  # path to a Parquet file or a SQL view
+
+REGISTRY: dict[str, Feature] = \{
+    "user_segment": Feature("user_segment", "user_id", "str", "data/user_segment.parquet"),
+    "watch_count_30d": Feature("watch_count_30d", "user_id", "int", "data/watch_count_30d.parquet"),
+    "last_genre": Feature("last_genre", "user_id", "str", "data/last_genre.parquet"),
+}</code></pre>
+<p>When you run it, the output shows:</p>
+<pre><code>Registered features:
+user_segment  entity=user_id  dtype=str  source=data/user_segment.parquet
+watch_count_30d  entity=user_id  dtype=int  source=data/watch_count_30d.parquet
+last_genre  entity=user_id  dtype=str  source=data/last_genre.parquet</code></pre>
+<p>This is the contract. Every other component reads from <code>REGISTRY</code>, so renaming a feature, changing its dtype, or pointing it at a new source happens in one place. In production systems, this would be <strong>YAML</strong> or a Python module checked into a Git repo, with code review on every change.</p>
+<h3>2. Building the Offline Store with DuckDB and Parquet</h3>
+<p>The offline store holds the full history of every feature value. We use Parquet files as the storage layer and DuckDB as the query engine. DuckDB reads Parquet directly, which means no separate database to run.</p>
+<pre><code>import duckdb
+import pandas as pd
+
+def get_historical_features(
+    entity_df: pd.DataFrame, features: list[str]
+) -&gt; pd.DataFrame:
+    con = duckdb.connect()
+    con.register("entities", entity_df)
+    base = "SELECT * FROM entities"
+    for fname in features:
+        f = REGISTRY[fname]
+        src = f.source.replace("'", "''")
+        con.execute(f"CREATE VIEW \{fname}_src AS SELECT * FROM '\{src}'")
+        base = f"""
+            SELECT t.*, s.\{fname}
+            FROM (\{base}) t
+            ASOF LEFT JOIN \{fname}_src s
+              ON t.user_id = s.user_id
+             AND t.event_timestamp &gt;= s.event_timestamp
+        """
+    return con.execute(base).df()</code></pre>
+<p>The <strong>AsOf join</strong> is the point-in-time join. For every entity row, it picks the most recent feature value where the feature's timestamp is at or before the event timestamp. That is what prevents leakage — where a training row is built with a feature value that did not exist yet at the moment we are predicting for.</p>
+<h3>3. Setting Up the Online Store on Redis</h3>
+<p>The online store keeps only the latest value per entity. Redis is the standard choice because hash lookups are sub-millisecond.</p>
+<pre><code>import json
+import fakeredis  # use redis.Redis() against a real server in production
+
+r = fakeredis.FakeRedis(decode_responses=True)
+
+def write_online(entity: str, entity_id: str, values: dict) -&gt; None:
+    r.hset(
+        f"\{entity}:\{entity_id}",
+        mapping=\{k: json.dumps(v) for k, v in values.items()},
+    )
+
+def read_online(entity: str, entity_id: str, features: list[str]) -&gt; dict:
+    raw = r.hmget(f"\{entity}:\{entity_id}", features)
+    return \{f: json.loads(v) if v else None for f, v in zip(features, raw)}</code></pre>
+<h3>4. Running the Materialization Pipeline</h3>
+<p>Materialization moves values from offline to online. In a real system this runs on a schedule (Airflow, cron, a streaming job).</p>
+<pre><code>def materialize(features: list[str]) -&gt; None:
+    by_entity: dict[str, dict] = \{}
+    for fname in features:
+        f = REGISTRY[fname]
+        src = f.source.replace("'", "''")
+        df = duckdb.sql(f"""
+            SELECT \{f.entity}, \{fname}
+            FROM '\{src}'
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY \{f.entity}
+                ORDER BY event_timestamp DESC
+            ) = 1
+        """).df()
+        for _, row in df.iterrows():
+            by_entity.setdefault(row[f.entity], \{})[fname] = row[fname]
+    for entity_id, values in by_entity.items():
+        write_online("user_id", entity_id, values)</code></pre>
+<h3>5. Exposing the FastAPI Retrieval Service</h3>
+<p>The retrieval service is the production surface. It is what the LLM application calls.</p>
+<pre><code>f = resp.json()["features"]
+print("\nPrompt the LLM would receive:")
+print(
+    f"  System: You recommend shows for a streaming service.\n"
+    f"  User context: segment=\{f['user_segment']}, "
+    f"watched \{f['watch_count_30d']} titles in last 30 days, "
+    f"last genre watched: \{f['last_genre']}.\n"
+    f"  Task: suggest 3 titles in a friendly, short message."
+)</code></pre>
+<h2>Where the Feature Store Ends and the Vector Database Begins</h2>
+<p>A vector database is not a feature store, even though both sit in front of a model at inference. They solve different retrieval problems. A real LLM stack uses both. The vector database returns the three most similar past viewing sessions. The feature store returns the user's segment and recent counts. The prompt combines them.</p>
+<h2>Common Anti-Patterns</h2>
+<ul>
+ <li>Computing features inside the model service.</li>
+ <li>Treating the online store as the source of truth.</li>
+ <li>Skipping the registry.</li>
+ <li>Calling a vector database a feature store.</li>
+ <li>Backfilling without point-in-time joins.</li>
+</ul>
+<h2>Conclusion</h2>
+<p>A working feature store fits in five components: a registry, an offline store, an online store, a materialization step, and a retrieval API. Building it once teaches us why the production systems look the way they do. It also shows where the design changes for AI: the online retrieval path is the surface the LLM hits, point-in-time joins matter when we train or evaluate, and the vector database sits next to the feature store, not inside it.</p>
+<p>Once we have these pieces, swapping our minimal version for Feast, Tecton, or Databricks is mostly a migration of the registry. The shape of the system stays the same.</p>

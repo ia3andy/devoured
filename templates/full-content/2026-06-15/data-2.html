@@ -1,0 +1,51 @@
+<h1>How Feldera Works: A True Incremental View Maintenance Engine</h1>
+<p>Most streaming systems excel at event processing but struggle with relational queries involving joins or multi-stage aggregations. Feldera changes the game by treating streams as incremental relational views, using DBSP to propagate deltas efficiently and avoid recomputation. This article explores Feldera’s incremental execution model and why it scales for complex analytics.</p>
+<h3>Challenges with Complex Relational Queries</h3>
+<p>Streaming SQL engines such as Apache Spark Structured Streaming and Apache Flink work well for simple workloads like filters and basic aggregations, where updates can be applied incrementally and the work scales roughly with the incoming data rate.</p>
+<p>However, real-world analytical pipelines often involve multi-stage transformations, joins with mutable dimensions, and nested aggregations. In such cases, even incremental updates can amplify intermediate changes, increasing computation and memory usage.</p>
+<p>Furthermore, their execution interface fails to deliver the core promise of SQL, its simplicity and ease of use.</p>
+<p>Relational queries operate on relations, not events. Efficient continuous query execution therefore requires a different abstraction: algebraic delta propagation.</p>
+<p>This is precisely where Feldera diverges.</p>
+<h3>Inside Feldera: DBSP and Algebraic Delta Propagation</h3>
+<p>Feldera is built on DBSP (Database Stream Processor), an execution engine for composing incremental computations. DBSP represents queries as circuits built from a small set of primitive operators that can express arbitrarily complex SQL pipelines.</p>
+<p>It basically combines the concepts from streaming engines and databases to give one simple solution like a live database.</p>
+<p>In Feldera, every update is represented as a relational delta:</p>
+<ul>
+ <li>Insert → +1 row</li>
+ <li>Delete → −1 row</li>
+ <li>Update → −1 old row, +1 new row</li>
+</ul>
+<p>This delta-based approach lets Feldera precisely capture all relational changes, including inserts, updates, deletes, corrections, and late-arriving data. Streams are not treated as append-only logs; instead, they are modeled as streams of relational differences, enabling full relational semantics in continuous pipelines.</p>
+<p>Feldera compiles SQL queries into DBSP operators by translating relational changes into streams of Z-sets, an algebraic representation of relational deltas. Each relational operator (projection, filter, join, union, aggregation, etc.) becomes a differentiable streaming operator that consumes and produces Z-sets, incrementally propagating changes through the circuit.</p>
+<p>Each operator maintains indexes over its input state, mapping keys to rows or partial aggregates. This allows operators to:</p>
+<ul>
+ <li>Quickly look up only the rows affected by a change (critical for joins, aggregations, and filters).</li>
+ <li>Apply inserts, deletes, and updates without scanning the entire operator state.</li>
+ <li>Produce Δ(output) efficiently for downstream operators.</li>
+</ul>
+<blockquote>
+ <p>Computation is driven entirely by <em>change propagation</em>, not by event arrival.</p>
+</blockquote>
+<blockquote>
+ <p>Feldera ensures that execution cost scales with the size of the change (O(Δ)), not with the total table size or query depth. This is a key reason why Feldera is extremely resource-efficient.</p>
+</blockquote>
+<p>At the algebraic level, each operator computes output deltas purely as a function of input deltas.</p>
+<pre><code>Δ(output) = f(Δ(inputs))</code></pre>
+<p>The same principle applies to joins and aggregations, e.g. algebraic join delta rule:</p>
+<pre><code>Δ(A ⋈ B) = (ΔA ⋈ B) ∪ (A ⋈ ΔB) ∪ (ΔA ⋈ ΔB)</code></pre>
+<p>If an aggregation feeds into a join, and that join feeds into another aggregation, each stage propagates only deltas. This allows arbitrarily deep relational pipelines to maintain:</p>
+<p><code>Total cost ∝ total delta propagation</code></p>
+<h3>Synchronous Streaming Execution</h3>
+<p>DBSP executes computations using a synchronous streaming model, where updates propagate through the circuit in deterministic steps. This ensures that query results remain consistent and reproducible, preserving the same semantics one would expect from batch SQL execution even as new data continuously arrives.</p>
+<p>This is particularly important for correctness-critical workloads such as financial processing, compliance analytics, and machine learning feature pipelines.</p>
+<h3>Computational Complexity</h3>
+<p>Feldera's asymptotics are guaranteed by the math, design and implementation.</p>
+<p>This means Feldera’s performance depends only on how much data changes. This keeps CPU usage low, reduces memory pressure, delivers predictable latency, and enables linear scalability; even for complex continuous workloads.</p>
+<h3>References</h3>
+<ul>
+ <li>DBSP: Automatic Incremental View Maintenance for Rich Query Language</li>
+ <li>Can your incremental compute engine do this?</li>
+ <li>Incremental Database Computations</li>
+ <li>A synchronous streaming model</li>
+ <li>Can Math simplify incremental compute?</li>
+</ul>
