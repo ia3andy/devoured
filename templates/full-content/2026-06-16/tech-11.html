@@ -1,0 +1,32 @@
+<h1>A backdoor in a LinkedIn job offer</h1>
+<p>Last week, I got a LinkedIn message from a recruiter at a small crypto startup. We exchanged a few messages over a couple of days, she described a broken proof-of-concept they needed a lead engineer for, and then sent me a public GitHub repo to review. Specifically, she asked me to “check out the deprecated Node modules issue.”</p>
+<p>It’s not uncommon to ask for a review of an existing codebase, but something felt off and raised an alarm in my head, so I decided to get a bit extra paranoid.</p>
+<p>Instead of cloning and installing dependencies, I spun up a throwaway VPS on Hetzner, cloned the repo there, and pointed Pi at it in read-only mode, with only file-reading tools enabled:</p>
+<pre><code>pi --tools read,grep,find,ls</code></pre>
+<p>I asked the agent to review the codebase and flag anything suspicious. It stopped almost immediately at <code>app/test/index.js</code>.</p>
+<h2>The backdoor</h2>
+<p>The repo felt like a React frontend with a Node backend. The trap was in <code>app/test/index.js</code>, about 250 lines disguised as a test suite. Inside, a URL is assembled from fragments:</p>
+<pre><code>const protocol = "https",
+  domain = "store",
+  separator = "://",
+  path = "/icons/",
+  token = "77",
+  subdomain = "rest-icon-handler",
+  bearrtoken = "logo";</code></pre>
+<p>These combine into <code>https://rest-icon-handler.store/icons/77</code>.</p>
+<p>Then, buried between walls of commented-out tests, the payload runs anything the server sends back to your machine.</p>
+<h2>How it triggers</h2>
+<p>The file doesn’t wait for the tests to run. <code>app/index.js</code> itself executes <code>const test = require('./test')</code>, which loads and runs <code>app/test/index.js</code>.</p>
+<p><code>package.json</code> wires <code>app/index.js</code> into startup:</p>
+<p>The <code>prepare</code> script is the important one. npm runs <a href="https://docs.npmjs.com/cli/v8/using-npm/scripts#life-cycle-scripts"><code>prepare</code></a> automatically after <code>npm install</code>, so just installing dependencies executes the backdoor.</p>
+<p>The instruction to “check out the deprecated Node modules issue” was bait to get me to run <code>npm install</code>.</p>
+<p>I could have let the payload run in the sandbox and watched what the server sent back as the second stage, but I stopped there. A repo that runs whatever a server hands it was enough evidence.</p>
+<h2>A borrowed identity</h2>
+<p>The commits in the repo were authored under the name and email of a real developer, a full-stack engineer with an ordinary LinkedIn profile, a personal website, and a GitHub account with a long history. I messaged him, pretending I’d inherited the codebase and had a few implementation questions, to see how he’d react.</p>
+<p>He told me he’d never worked for them. He’d been impersonated on GitHub before and had a repo taken down over it, and he had nothing to do with this one. He was reporting these repos too.</p>
+<h2>A second borrowed identity</h2>
+<p>The recruiter’s profile belonged to a real arts journalist, a well-known one I looked up later, with a long cultural background and nothing technical on it. When I played along and told her I couldn’t get the project to install, the journalist instantly turned into an expert on npm and Node versions. It was quite amusing, I’d say.</p>
+<h2>This can happen to anyone</h2>
+<p>I’ve heard of these attacks and read about them on HN, but when one came after me it still caught me a bit off guard. I suspected something from the first few messages, but on a more tired or rushed day, I could easily have run <code>npm install</code> before thinking it through. So, if you get a LinkedIn message asking you to review a repo, a bit of paranoia and good security hygiene never hurts.</p>
+<p>Another takeaway is that reviewing the code with a read-only agent turned out more productive than reading it myself. The backdoor was dressed up as sloppy beginner code, but the agent flagged it in seconds.</p>
+<p>I reported the repo to GitHub and the recruiter to LinkedIn. So far nothing has changed and the code is still up.</p>

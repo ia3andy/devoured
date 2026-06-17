@@ -1,0 +1,48 @@
+<p>Every time an LLM generates a response, two operations run in sequence on the same GPU. The first processes the input prompt and emits a single token. The second produces every token after that, one at a time.</p>
+<p>From the outside, they look like stages of one process. However, inside the hardware, they have opposite bottlenecks. One is limited by raw compute. The other is limited by how fast data moves through memory. Most of the engineering work that makes production AI systems fast exists because of this split, and the techniques used to handle it are what inference engineering is built around.</p>
+<p>Inference engineering is the discipline of running trained AI models in production efficiently. The work spans low-level GPU code, model serving frameworks, and the cloud infrastructure that ties them together. Engineers in this field optimize for some combination of latency, throughput, cost, and quality, with the specific mix depending on the product they support. A few years ago, this work happened almost entirely inside frontier AI labs. Today, it has become a broad specialty that any company running serious AI workloads invests in.</p>
+<p>In this article, we will walk through how inference works and why the field’s optimization techniques exist.</p>
+<h2>The Rise of Inference Engineering</h2>
+<p>Three years ago, inference engineering was a specialty practiced almost entirely inside frontier AI labs. The work concerned a small group of engineers building closed models that the rest of the industry consumed through APIs. That picture has shifted dramatically since 2024.</p>
+<p>Open models drove the change. Hugging Face, the public registry for AI models, now hosts well over two million open models, roughly 25 times what existed five years ago. Open releases like DeepSeek V3 have closed the capability gap with closed models, giving companies a real choice between paying for a closed API and running an open model themselves.</p>
+<p>Self-hosting open models brings three operational advantages over closed APIs:</p>
+<ul>
+ <li>Latency profiles can be tuned for the workload pattern of a specific product, where public APIs optimize for general throughput across many customers.</li>
+ <li>Uptime can reach four nines or better with dedicated deployments, comparing favorably to the two nines typical of public APIs.</li>
+ <li>Costs typically drop by around 80 percent at scale once volume justifies the engineering investment.</li>
+</ul>
+<p>The result is that companies across many categories now build serious inference stacks, including AI-native startups, established products integrating AI into existing workflows, and even traditionally cautious sectors like healthcare.</p>
+<h2>The Two Phases of LLM inference</h2>
+<p>Understanding why inference engineering looks the way it does starts with understanding what actually happens when a prompt arrives at an LLM. The process splits into two phases with very different physical demands on the GPU.</p>
+<p>A token is the atomic unit that an LLM works with. Roughly, it is a word or word fragment. The word “inference” might be one token, while “engineering” might break into two. Latency metrics that mention tokens per second are counted in this unit.</p>
+<p>The first phase is called prefill.</p>
+<p>The model takes the entire input prompt and runs it through every layer of weights in parallel. Two outputs come out of this burst, namely the first token of the response and the KV cache, which is a structure that stores intermediate values from the attention mechanism so they can be referenced as more tokens get generated.</p>
+<p>Prefill is compute-bound. The GPU’s math units are the limiting factor because every input token gets processed simultaneously through every layer of the model, and throwing more raw computational power at this phase makes it faster. The metric that captures prefill performance is time to first token, or TTFT. That brief pause between sending a prompt to ChatGPT and seeing the first tokens appear is prefill in action.</p>
+<p>The second phase is the decode phase. The model generates each subsequent token one at a time, running a full forward pass through every layer of weights for every token. Each new token depends on every token before it, which makes the process fundamentally sequential, and the GPU does this thousands of times for a long response.</p>
+<p>Decode is memory-bandwidth-bound. Math throughput sits mostly idle while the GPU spends its cycles reading model weights from memory for each forward pass, with the bottleneck living in data movement rather than arithmetic. The metric that captures decode performance is tokens per second, or TPS. The streaming pace of a long response is the decode phase at work.</p>
+<p>Since prefill and decode have opposite bottlenecks, a technique that accelerates one phase often has minimal impact on the other. This is why benchmarks report TTFT and TPS as separate numbers, with performance on each phase measured independently.</p>
+<h2>Optimization Techniques</h2>
+<p>With the prefill-decode split in mind, the major techniques in inference engineering become much easier to organize. Each one accelerates a specific phase, attacks both for different reasons, or restructures the system around the split itself.</p>
+<h3>Batching</h3>
+<p>Batching is the most basic way to scale a single GPU’s output. The inference engine weaves multiple requests together, token by token, so one GPU can serve many users at once. Throughput rises significantly because the GPU’s compute capacity gets fully utilized instead of sitting idle between requests.</p>
+<p>The cost is paid in per-user latency.</p>
+<h3>Prefix Caching</h3>
+<p>Prefix caching accelerates prefill by reusing KV cache values across requests. When two prompts share an opening segment, like a long system prompt that is identical across thousands of requests, the engine computes that prefix once and reads from cache thereafter. This is why API providers charge less for cached input tokens.</p>
+<h3>Quantization</h3>
+<p>Quantization helps both phases of inference, though for different reasons. The basic move is storing model weights in a lower-precision number format. Most modern models train in 16-bit floating-point, and quantization compresses those values down to 8-bit or 4-bit representations, which means smaller weights occupying less memory and requiring less data movement.</p>
+<h3>Speculative Decoding</h3>
+<p>Speculative decoding accelerates the decode process by exploiting an asymmetry. Generating a token from scratch is expensive, while verifying whether a candidate token matches what the main model would produce is much cheaper. In speculative decoding, a smaller draft model predicts the next several tokens, and the main model verifies all of them in a single forward pass, accepting the ones that match its own predictions and rejecting the rest.</p>
+<h3>Parallelism</h3>
+<p>Parallelism techniques let large models run across multiple GPUs when a single one falls short. Tensor parallelism splits each layer of the model across multiple GPUs, while expert parallelism applies specifically to mixture-of-experts models, where only a subset of the model’s parameters activate for each token.</p>
+<h3>Disaggregation</h3>
+<p>Disaggregation takes the prefill-decode split literally. The idea is to run prefill on one set of GPUs and decode on another, with the KV cache shipped between them over the network. Each set uses hardware tuned to its specific bottleneck, and each set scales independently based on its own traffic pattern.</p>
+<h2>When to Invest in Inference Engineering</h2>
+<p>Early in building an AI product, off-the-shelf APIs from established providers are almost always the right choice. Engineering effort at this stage is better spent shipping product, since the complexity of running a custom inference stack slows down iteration.</p>
+<p>Three signals usually indicate the equation has shifted:</p>
+<ul>
+ <li>API costs have grown into a meaningful expense line.</li>
+ <li>Latency requirements have moved past what closed APIs can deliver.</li>
+ <li>Reliability needs have started to exceed what vendor SLAs offer.</li>
+</ul>
+<h2>Conclusion</h2>
+<p>LLM inference is two operations with opposite physical constraints. Prefill is compute-bound and runs once per request. Decode is memory-bandwidth-bound and runs once per token. Most of the techniques in inference engineering exist because of this split, and grasping it makes the rest of the field much easier to navigate.</p>

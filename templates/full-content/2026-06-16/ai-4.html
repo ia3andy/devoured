@@ -1,0 +1,112 @@
+<h1>Building a 100x Cheaper Trace Judge with Fireworks</h1>
+<h2>Key Takeaways</h2>
+<ul>
+ <li>LangSmith processes billions of tokens a day across production traces. One of our core challenges is efficiently mining signals across these traces</li>
+ <li>We partnered with Fireworks to build an efficient Trace Judge. We fine-tuned a Qwen model to detect “Perceived Error” on every production trace. It matched or exceeded frontier model performance and runs up to <strong>100x cheaper.</strong></li>
+ <li>If you want to be an earlier tester of this “perceived error” model, please sign up <a href="https://airtable.com/appWdRBlSecNOgErA/pagAEfUlHu4F35opm/form">here</a></li>
+</ul>
+<p>Agents now produce a majority of the world’s data and power many applications we use today. As more agents move into production, traces will become more important as one of the richest sources of data to understand how agentic systems behave with real users.</p>
+<p><strong>Research question:</strong> how can we <strong>cost-effectively</strong> mine important signals from every single trace, while maintaining <strong>frontier performance</strong>?</p>
+<p>To answer this question, we partnered with Fireworks to fine-tune a Qwen judge model to detect “Perceived Error” from user interactions.</p>
+<p><strong>What is Perceived Error:</strong></p>
+<blockquote>
+ Perceived error is when the user thinks the assistant made a mistake or produced something that needed correction. Perceived Error is not judging objective correctness or user happiness. For example, an agent could give a correct answer but the user is frustrated by the information (not the agent).
+</blockquote>
+<p>We usually push for teams to build application specific evaluators, as often the logic to judge a trace needs to have context of that application. We believe, however, that “perceived error” is an example of an evaluator that can be general purpose. We believe the signals that it will look for are universal across applications.</p>
+<p>The generality of “perceived error” is a key question. Some of the experiments we run later on are specifically aimed at testing the generality of this metric.</p>
+<p>We infer perceived error from trace signals like user corrections, rejection of an agent action, repeated requests, and assistant acknowledgements of errors. The perceived error evaluator then enriches the trace with information in the format shown below:</p>
+<pre><code>\{"perceived_error": true, "reason": "The user corrects the meeting date the assistant used."}</code></pre>
+<h2>How we created a dataset</h2>
+<p>Agents applied on tasks are only as good as the data used to train them. We sourced data from two internal tracing datasets we use in production:</p>
+<p><strong>chat-langchain</strong></p>
+<p><em>Docs Q&amp;A agent that answers questions about LangChain’s libraries and products. Users may ask conceptual questions, debugging questions, or help building things. These exchanges are often technical and involve a good amount of detail</em></p>
+<p><strong>Fleet</strong></p>
+<p><em>A no-code tool for creating agents that do real work like writing documents and doing research. Users may use Fleet for a wide variety of tasks. They may invoke many different tools or skills.</em></p>
+<p>We selected a portion of traces from each tracing dataset as training and holdout sets. When filtering from the pool of traces, we selected multi-turn traces because judging “perceived error” requires a human response to the AI results (for example, correcting the assistant or repeating the request).</p>
+<table>
+ <thead>
+  <tr>
+   <th>Dataset</th>
+   <th>Total Examples</th>
+   <th>Train rows</th>
+   <th>Holdout rows</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>chat-langchain</td>
+   <td>885</td>
+   <td>707</td>
+   <td>178</td>
+  </tr>
+  <tr>
+   <td>Fleet</td>
+   <td>911</td>
+   <td>727</td>
+   <td>184</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Data Preparation</h3>
+<p>When preparing the data for training and prediction, we made the choice to only include Human and AI messages, ignoring all tool calls. We did this because we hypothesized that for the signals we were looking for the human and AI messages are the main source of information. This is a lever we intend to experiment with in the future.</p>
+<p>We also included all messages as is, with no trimming of long content. This is another lever we intend to experiment with in the future.</p>
+<h3>Labels</h3>
+<p>To generate labels, we used a mix of model-assisted labeling plus human review to create short JSON labels and rationales for each trace. Specifically, we first asked a panel of models to judge a trace. If they all agreed, we took that as a ground truth label. If they disagreed, we then took all their labels and rationales and passed them to another panel of models, asking them to judge who was right. If that panel agreed, we took that as ground truth. If they still disagreed, we human annotated them manually. Over the dataset, chat-langchain and Fleet had 24% and 18% of traces with a perceived error label respectively.</p>
+<h2>Fine-tuning setup</h2>
+<p>For training, we chose a <code>Qwen-3.5-35B</code> as our base model after running a few small scale experiments on testing other models. Much smaller models had high error rates and weren’t strong enough to reason over our multi-turn traces. With <code>Qwen-3.5-35B</code>, we had a strong, cheap open model with room to hit frontier performance via fine-tuning.</p>
+<p>We trained only on data from the chat-langchain dataset. The reason for only training on data from one dataset was to allow us to test whether it would transfer to a completely different domain.</p>
+<p>We also lightly optimized the input prompt after observing common failure modes from small-scale experiments on the base model. For training, we used managed SFT training on Fireworks with LoRA.</p>
+<h2>Experiments &amp; results</h2>
+<p>We organized experiments around three questions:</p>
+<ol>
+ <li>Does fine-tuning improve baseline judge quality up to frontier model performance?</li>
+ <li>Does a learned judge transfer across datasets?</li>
+ <li>Is serving a fine-tuned model cost-effective?</li>
+</ol>
+<p><strong>Fine-tuning open models can exceed or match frontier models</strong></p>
+<table>
+ <thead>
+  <tr>
+   <th>Model</th>
+   <th>chat-langchain accuracy</th>
+   <th>Fleet accuracy</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Base Qwen</td>
+   <td>90.5%</td>
+   <td>83.2%</td>
+  </tr>
+  <tr>
+   <td>Chat-langchain SFT</td>
+   <td>96.1%</td>
+   <td>90.8%</td>
+  </tr>
+  <tr>
+   <td>Fleet SFT</td>
+   <td>92.7%</td>
+   <td>91.3%</td>
+  </tr>
+  <tr>
+   <td>Claude Opus</td>
+   <td>91.6%</td>
+   <td>90.2%</td>
+  </tr>
+  <tr>
+   <td>GPT-5.5</td>
+   <td>98.9%</td>
+   <td>89.1%</td>
+  </tr>
+ </tbody>
+</table>
+<p>We found that base Qwen with good prompting was a strong out of the box model for perceived error classification, but trailed frontier model classification accuracy. On both datasets, running a LoRA SFT job lifted the base model to be close to or above frontier performance.</p>
+<h3>A fine-tuned judge transfers well to unseen data</h3>
+<p>Our initial results showed that Fleet was a more challenging dataset for all models. After fine-tuning on chat-langchain, we tested how well this model transferred to Fleet data without any Fleet specific training. The model trained on chat-langchain data outperformed all frontier models on Fleet data.</p>
+<p>We then experimented with training a model specifically on Fleet data. This resulted in a small improvement over our chat-langchain SFT’d model.</p>
+<h3>Fine-tuned models are much cheaper to run</h3>
+<p>Fine-tuned models match frontier accuracy and are much cheaper to run at scale - 10-100x depending on trace volume and model choice. As trace volumes grow, the cost savings from a fine-tuned model continue to grow. And on performance, the fine-tuned Qwen model outperforms all model sizes Haiku, Sonnet, and Opus (and gpt-5.5).</p>
+<h2>Future research on trace understanding</h2>
+<p>Solving Continual Learning will involve tackling large-scale data mining problems around trace understanding. In general, we’re excited to push forward recipes around building specialized, cost-effective models to better understand traces.</p>
+<h2>Try our perceived error model</h2>
+<p>We will be rolling out our fine-tuned perceived error model to a select number of customers over the next few weeks before a broader rollout in a month or two. If you are interested in testing this perceived error judge and providing feedback, please sign up <a href="https://airtable.com/appWdRBlSecNOgErA/pagAEfUlHu4F35opm/form">here</a></p>
