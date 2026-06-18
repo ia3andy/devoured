@@ -1,0 +1,94 @@
+<h3>less net work for networks</h3>
+<h2>What is iroh?</h2>
+<p>Iroh gives you an API for dialing by public key. You say “connect to that phone”, iroh will find &amp; maintain the fastest connection for you, regardless of where it is.</p>
+<h3>Hole-punching</h3>
+<p>The fastest route is a direct connection, so if necessary, iroh tries to hole-punch. Should this fail, it can fall back to an open ecosystem of public relay servers. To ensure these connections are as fast as possible, we <a href="https://perf.iroh.computer">continuously measure iroh</a>.</p>
+<h3>Built on <a href="https://en.wikipedia.org/wiki/QUIC">QUIC</a></h3>
+<p>Iroh uses <a href="https://github.com/n0-computer/noq">noq</a> to establish <a href="https://en.wikipedia.org/wiki/QUIC">QUIC</a> connections between endpoints. This way you get authenticated encryption, concurrent streams with stream priorities, a datagram transport and avoid head-of-line-blocking out of the box.</p>
+<h2>Compose Protocols</h2>
+<p>Use pre-existing protocols built on iroh instead of writing your own:</p>
+<ul>
+ <li><a href="https://github.com/n0-computer/iroh-blobs">iroh-blobs</a> for <a href="https://github.com/BLAKE3-team/BLAKE3">BLAKE3</a>-based content-addressed blob transfer scaling from kilobytes to terabytes</li>
+ <li><a href="https://github.com/n0-computer/iroh-gossip">iroh-gossip</a> for establishing publish-subscribe overlay networks that scale, requiring only resources that your average phone can handle</li>
+ <li><a href="https://github.com/n0-computer/iroh-docs">iroh-docs</a> for an eventually-consistent key-value store of <a href="https://github.com/n0-computer/iroh-blobs">iroh-blobs</a> blobs</li>
+</ul>
+<h2>Getting Started</h2>
+<h3>Rust Library</h3>
+<p>It's easiest to use iroh from rust. Install it using <code>cargo add iroh</code>, then on the connecting side:</p>
+<pre><code>const ALPN: &amp;[u8] = b"iroh-example/echo/0";
+
+let endpoint = Endpoint::bind().await?;
+
+// Open a connection to the accepting endpoint
+let conn = endpoint.connect(addr, ALPN).await?;
+
+// Open a bidirectional QUIC stream
+let (mut send, mut recv) = conn.open_bi().await?;
+
+// Send some data to be echoed
+send.write_all(b"Hello, world!").await?;
+send.finish()?;
+
+// Receive the echo
+let response = recv.read_to_end(1000).await?;
+assert_eq!(&amp;response, b"Hello, world!");
+
+// As the side receiving the last application data - say goodbye
+conn.close(0u32.into(), b"bye!");
+
+// Close the endpoint and all its connections
+endpoint.close().await;</code></pre>
+<p>And on the accepting side:</p>
+<pre><code>let endpoint = Endpoint::bind().await?;
+
+let router = Router::builder(endpoint)
+    .accept(ALPN.to_vec(), Arc::new(Echo))
+    .spawn()
+    .await?;
+
+// The protocol definition:
+#[derive(Debug, Clone)]
+struct Echo;
+
+impl ProtocolHandler for Echo \{
+    async fn accept(&amp;self, connection: Connection) -&gt; Result&lt;()&gt; \{
+        let (mut send, mut recv) = connection.accept_bi().await?;
+
+        // Echo any bytes received back directly.
+        let bytes_sent = tokio::io::copy(&amp;mut recv, &amp;mut send).await?;
+
+        send.finish()?;
+        connection.closed().await;
+
+        Ok(())
+    }
+}</code></pre>
+<p>The full example code with more comments can be found at <code>echo.rs</code>.</p>
+<p>Or use one of the pre-existing protocols, e.g. <a href="https://github.com/n0-computer/iroh-blobs">iroh-blobs</a> or <a href="https://github.com/n0-computer/iroh-gossip">iroh-gossip</a>.</p>
+<h3>Other Languages</h3>
+<p>If you want to use iroh from other languages, make sure to check out <a href="https://github.com/n0-computer/iroh-ffi">iroh-ffi</a>, the repository for FFI bindings.</p>
+<h3>Links</h3>
+<ul>
+ <li><a href="https://www.youtube.com/watch?v=RwAt36Xe3UI_">Introducing Iroh (video)</a></li>
+ <li><a href="https://docs.iroh.computer">Iroh Documentation</a></li>
+ <li><a href="https://github.com/n0-computer/iroh-examples">Iroh Examples</a></li>
+ <li><a href="https://github.com/n0-computer/iroh-experiments">Iroh Experiments</a></li>
+</ul>
+<h2>Repository Structure</h2>
+<p>This repository contains a workspace of crates:</p>
+<ul>
+ <li><code>iroh</code>: The core library for hole-punching &amp; communicating with relays.</li>
+ <li><code>iroh-relay</code>: The relay client and server implementation. This is the code we run in production for the public relays (and you can, too!).</li>
+ <li><code>iroh-base</code>: Common types like <code>EndpointId</code> or <code>RelayUrl</code>.</li>
+ <li><code>iroh-dns-server</code>: DNS server implementation powering the DNS/Pkarr address lookup for EndpointIds, running at dns.iroh.link.</li>
+</ul>
+<h2>License</h2>
+<p>Copyright 2025 N0, INC.</p>
+<p>This project is licensed under either of</p>
+<ul>
+ <li>Apache License, Version 2.0, (LICENSE-APACHE or <a href="http://www.apache.org/licenses/LICENSE-2.0">http://www.apache.org/licenses/LICENSE-2.0</a>)</li>
+ <li>MIT license (LICENSE-MIT or <a href="http://opensource.org/licenses/MIT">http://opensource.org/licenses/MIT</a>)</li>
+</ul>
+<p>at your option.</p>
+<h2>Contribution</h2>
+<p>Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.</p>

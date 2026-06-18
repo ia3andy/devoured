@@ -1,0 +1,229 @@
+<h1>never waste a token</h1>
+<p>durable inference: resumable streams, crash recovery, and why the LLM request shouldn't die with your process.</p>
+<p>tl;dr - put a durable buffer between your agent and the LLM provider. the provider connection now outlives your process, so a deploy in the middle of a stream doesn’t cost you the tokens you already paid for. and the same buffer that lets a disconnected browser catch back up is the thing that recovers a crashed turn. one log, two readers.</p>
+<p>I’ve spent the last few weeks stuck on one question: what happens to an agent when the process running it dies in the middle of a turn?</p>
+<p>it goes deep fast. tool calls that may or may not have fired. sub-agents. half-written streams waiting on a human. I’m writing all of that up separately (durable agent loops, coming soon). but one piece of it is small and self-contained enough to pull out on its own:</p>
+<p><strong>when your process dies mid-inference, you don’t just lose your place. you lose money.</strong></p>
+<h2>the problem that’s easy to miss</h2>
+<p>your agent opens a streaming request to a model, and the model starts generating. you’re billed for those output tokens the moment they’re generated. then your process gets replaced. maybe a deploy, maybe an eviction, maybe an OOM.</p>
+<p>the usual reassurance is “don’t worry, the state is durable.” and sure, your conversation history survived. but the <em>in-flight HTTP request to the provider</em> did not. it lived in the memory of the process that just died. so when you recover, your only option is to <strong>make the call again</strong>. you pay for those output tokens a second time.</p>
+<p>now make it an agent. a real one does multiple tool calls in a single turn:</p>
+<pre><code>user message
+  → stream some text
+  → tool call → tool result
+  → stream more text
+  → tool call → tool result
+  → stream the answer</code></pre>
+<p>every interruption throws away <em>all</em> the output tokens generated so far in that turn. and it scales with the model you actually want to use: output runs $30 per million tokens on <code>gpt-5.5</code> versus $2 on <code>gpt-5.5-mini</code>, so a flagship retry burns ~15x what a mini one does. the better the model, the more it hurts. deploys happen constantly, evictions happen constantly, and each one that lands on a live stream is money straight out the window.</p>
+<p>the happy path hides it. you only see it when you start counting tokens after an incident and the numbers don’t add up.</p>
+<h2>the move: stop tying the request to the process</h2>
+<p>the reason a crash wastes tokens is that the provider connection lives <em>inside the thing that crashed</em>. so move it out.</p>
+<p>put a buffer between the agent and the provider, and make it a <strong>separate deployment</strong>: its own Worker, its own Durable Object.</p>
+<p>when a request comes in, the buffer does three things in order. it resets its state for a fresh stream. it kicks off a background task that drains the provider connection into SQLite. and it immediately hands the caller back a stream that tails those same rows as they land:</p>
+<pre><code>async proxyAndBuffer(req: ProviderRequest): Promise&lt;Response&gt; \{
+  this.resetBuffer();                 // status = "streaming", chunkCount = 0
+  const reader = (await fetch(req.url, req)).body!.getReader();
+
+  // drain the provider in the background. deliberately NOT awaited - the
+  // response below returns right away while this keeps running.
+  this.keepAliveWhile(() =&gt; this.consumeProvider(reader));
+
+  // give the caller a stream that tails the rows as they're written.
+  return new Response(this.tailFrom(0), \{
+    headers: \{ "X-Buffer-Status": "streaming" }
+  });
+}
+
+private async consumeProvider(reader: Reader) \{
+  for (let i = 0; ; i++) \{
+    const \{ done, value } = await reader.read();
+    if (done) break;
+    this.sql`INSERT INTO buffer_chunks VALUES ($\{i}, $\{decode(value)})`;
+    this.notify();                    // wake any tailers (more below)
+  }
+  this.setStatus("completed");
+}</code></pre>
+<p>the load-bearing part is what <code>consumeProvider</code> is <em>not</em> attached to. it doesn’t run inside the agent. it runs here, in a separate deployment that wasn’t touched by the agent’s deploy. so when the agent gets evicted mid-stream and its tail connection is cancelled, the drain loop keeps reading. the tokens you paid for keep landing in SQLite, whether or not anyone’s listening.</p>
+<p><code>keepAliveWhile</code> is what holds the buffer open while it drains. a long generation has quiet stretches, and a Durable Object can be evicted for looking idle. <code>keepAliveWhile</code> heartbeats an alarm for the duration of the drain and drops it the moment the task finishes or throws, so the buffer survives those gaps without leaking a heartbeat afterwards.</p>
+<p>when the agent restarts, it calls <code>/resume?from=N</code> and gets the chunks it missed. no wasted tokens, no duplicate provider call.</p>
+<h2>one log, two readers</h2>
+<p>while building this I kept feeling like I’d already solved a piece of it before. and I had. it’s the same problem as <em>resumable streaming</em>. you know the one: a user is mid-response, closes their laptop, switches from wifi to cellular, comes back, and the stream just… continues. the way you do that is you persist every chunk to a durable log as it streams, and on reconnect the client reads stored chunks until it catches up to the live cursor.</p>
+<p>recovery is the <em>exact same log</em>. the buffer stores each chunk in SQLite keyed by index:</p>
+<pre><code>CREATE TABLE buffer_chunks (
+  chunk_index INTEGER PRIMARY KEY,
+  data TEXT NOT NULL
+)</code></pre>
+<p>reading it back is one function. the live proxy called <code>tailFrom(0)</code>; a resuming agent calls <code>tailFrom(N)</code> with the last chunk index it saw. the cursor is the only difference:</p>
+<pre><code>tailFrom(cursor: number): ReadableStream \{
+  return new ReadableStream(\{
+    pull: async (c) =&gt; \{
+      const rows = this.rowsFrom(cursor);   // everything stored since `cursor`
+      if (rows.length) \{ c.enqueue(rows); cursor += rows.length; return; }
+      if (this.isDone()) return c.close();  // completed / interrupted / error
+      await this.signal.promise;            // else wait for the next notify()
+    }
+  });
+}</code></pre>
+<p>so <code>/resume?from=N</code> is just <code>tailFrom(N)</code>. and there are only two situations it hits:</p>
+<ul>
+ <li><strong>the producer is still alive.</strong> more chunks are coming. it tails: serve what’s stored, wait for the next one, repeat, until the stream completes. this is a browser reconnecting.</li>
+ <li><strong>the producer is gone.</strong> it died with the old process, so the stream is <em>orphaned</em> and no more chunks are coming. instead of tailing toward a live cursor, you reconstruct whatever’s stored, finalize it, and continue the turn from there. this is crash recovery.</li>
+</ul>
+<p>same durable log. the <em>only</em> difference is whether a live producer is still attached. resumable streaming answers “a client reconnected: catch it up.” recovery answers “the producer died: finish what it was writing.” persisting chunks for reconnects buys you most of crash recovery for free.</p>
+<p>the buffer makes the distinction explicit in its state machine. on restart, if it finds its own status still marked <code>streaming</code>, it <em>knows</em> the previous incarnation died mid-flight, flips itself to <code>interrupted</code>, and callers know they’re getting partial data:</p>
+<pre><code>idle → streaming → completed → (ack / TTL) → idle
+            │
+            │ [DO evicted]
+            ▼
+       interrupted   ← "the producer is gone, here's what I have"</code></pre>
+<h2>tailing without polling</h2>
+<p>one detail worth keeping. the tail reader never polls SQLite. polling a database in a hot loop to see if a token landed feels fine in a demo and is miserable in production. instead, the drain loop’s <code>notify()</code> resolves a shared promise after each insert, and the tailer just <code>await</code>s it.</p>
+<p>it works because a Durable Object runs single-threaded: the insert and the notify happen in one synchronous block, so a tailer that wakes up always sees the new row already committed. no race, no poll interval to tune. the runtime does the hard part for you, which is most of the pitch for building agents on DOs.</p>
+<h2>replay without writing a single SSE parser</h2>
+<p>ok, you’ve got the run back. now you have to turn it into something your agent loop can continue from. the obvious approach is to parse the buffered SSE yourself. that’s a trap. you’d own a bespoke parser for OpenAI’s format, and Anthropic’s, and Google’s, forever, and chase every wire-format change they ship.</p>
+<p>so don’t. store <strong>raw bytes</strong> and reuse the provider’s <em>own</em> parser on the way back. that’s the model going into <code>workers-ai-provider</code>: one provider routes every model through AI Gateway, each plugin carries its native wire format, and resume is on by default.</p>
+<pre><code>import \{ createWorkersAI } from "workers-ai-provider";
+import \{ openai } from "workers-ai-provider/openai";
+import \{ anthropic } from "workers-ai-provider/anthropic";
+
+const workersai = createWorkersAI(\{
+  binding: env.AI,
+  providers: [openai, anthropic]     // each plugin brings its own SSE parser
+});
+
+const result = streamText(\{
+  model: workersai("openai/gpt-5.5", \{ resume: true })
+});
+// result.response.headers["cf-aig-run-id"] identifies the run to re-attach to.</code></pre>
+<p><code>streamText()</code> parses, runs the tool loop, handles reasoning, and renders the response natively, the same as a fresh call. zero custom SSE parsing anywhere, and a provider changing their format costs you nothing because you’re on <em>their</em> parser.</p>
+<p>the eviction case is the whole point. as the stream runs you persist <code>\{ runId, eventOffset }</code> (via <code>onDispatch</code> and <code>onProgress</code>); when the agent comes back, you re-attach to the same run instead of re-calling the model:</p>
+<pre><code>const stream = createResumableStream(\{
+  binding: env.AI,
+  gateway: "my-gateway",
+  runId,                             // saved from cf-aig-run-id
+  fromEvent: savedOffset,            // saved from onProgress
+  onResumeExpired: "accept-partial"  // once the ~5.5 min buffer TTL elapses
+});</code></pre>
+<p>no re-billing, no duplicate call, no parser to maintain.</p>
+<h2>wait, does anyone else do this?</h2>
+<p>I went and checked, because “never waste a token” seemed like something someone would have built already. turns out one provider has built almost exactly this (for their own API), and everyone else leaves it to you.</p>
+<p>the two questions that matter:</p>
+<ol>
+ <li>does the provider <strong>keep generating</strong> after your connection drops? (or are the tokens gone?)</li>
+ <li>can you <strong>resume the same stream by cursor</strong>, without re-billing what was already generated?</li>
+</ol>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>keeps generating after you drop?</th>
+   <th>resume by cursor, no re-bill?</th>
+   <th>how</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>OpenAI</strong> (Responses, background mode)</td>
+   <td>yes</td>
+   <td>yes</td>
+   <td><code>background: true</code> + <code>stream: true</code>, resume via <code>?starting_after=\{sequence_number}</code></td>
+  </tr>
+  <tr>
+   <td><strong>Anthropic</strong></td>
+   <td>no</td>
+   <td>no</td>
+   <td>re-prompt the model to “continue” - re-bills tokens, may drift</td>
+  </tr>
+  <tr>
+   <td><strong>Google Gemini</strong></td>
+   <td>no</td>
+   <td>no</td>
+   <td>same continue-from-here re-prompt hack</td>
+  </tr>
+  <tr>
+   <td><strong>OpenRouter</strong></td>
+   <td>partial (cancel stops billing)</td>
+   <td>no (whole-response cache only)</td>
+   <td>response caching + cancellation; build your own buffer</td>
+  </tr>
+  <tr>
+   <td><strong>Vercel AI SDK</strong> (<code>resumable-stream</code>)</td>
+   <td>yes (producer kept alive via <code>waitUntil</code>)</td>
+   <td>yes, but page-reload only</td>
+   <td>app-layer Redis buffer - same trick, narrower scope</td>
+  </tr>
+  <tr>
+   <td><strong>this / AI Gateway</strong></td>
+   <td>yes</td>
+   <td>yes</td>
+   <td>infra-layer durable buffer, provider-agnostic, survives <em>your deploy</em></td>
+  </tr>
+ </tbody>
+</table>
+<p>a few things jump out.</p>
+<p><strong>OpenAI already proved the idea.</strong> Background mode on the Responses API keeps the job running server-side even if you drop, and you resume by tracking a <code>sequence_number</code> cursor: <code>GET /v1/responses/\{id}?stream=true&amp;starting_after=\{n}</code>. this is durable inference, provider-native, shipping today. it’s just locked to OpenAI’s own API (needs <code>store: true</code>, and TTFT runs higher).</p>
+<p><strong>Anthropic and Gemini make you re-pay.</strong> neither supports server-side resume. the documented recovery is to capture the partial response and send a <em>new</em> request asking the model to continue from where it left off. that spends the output tokens again, and the continuation isn’t guaranteed to match. Anthropic’s docs even note that tool-use and thinking blocks can’t be partially recovered. this is exactly the tax from the top of this post.</p>
+<p><strong>Vercel’s <code>resumable-stream</code> is the closest cousin.</strong> it independently arrived at the same core trick: the producer completes the stream even if the original reader goes away, and a second consumer can follow along. but it’s app-layer, so you run the Redis, and the producer lives in <em>your</em> process - so it doesn’t survive you redeploying your code. that last case is the whole reason I needed a separate deployment.</p>
+<p>so it’s not that nobody does this. OpenAI showed it’s worth doing for one API. everyone else makes you re-prompt and re-pay. and nobody covers the case where <em>your own process</em> is the thing that died. that’s the gap.</p>
+<h2>the punchline: this is coming to AI Gateway</h2>
+<p>so where should this live? the comparison points right at it. OpenAI’s version works because it runs on infra you don’t deploy; Vercel’s falls short because it doesn’t. you want the buffer somewhere that’s already in the request path, already fronts every provider, and never gets redeployed when you ship your code. that’s AI Gateway.</p>
+<p>I prototyped it as a Durable Object, but it was always meant to live in managed infrastructure, not in your agent. put it in the gateway and you take OpenAI’s background-mode idea and hand it to <em>every</em> provider, including the ones that make you re-pay today.</p>
+<p>and the good news: durable resume is <strong>coming soon to Cloudflare AI Gateway</strong>. it’s not widely released yet, but I’ve been running real traffic through it. every run comes back with a <code>cf-aig-run-id</code>, and you can ask the gateway to replay from an event index. I ran six models through it, cut each stream at the midpoint, and asked for the tail:</p>
+<table>
+ <thead>
+  <tr>
+   <th>model</th>
+   <th>events</th>
+   <th>bytes</th>
+   <th>resume from mid → tail matches?</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>gpt-4o-mini</td>
+   <td>63</td>
+   <td>20,604</td>
+   <td>✅ byte-exact</td>
+  </tr>
+  <tr>
+   <td>gpt-5.4</td>
+   <td>25</td>
+   <td>7,350</td>
+   <td>✅ byte-exact</td>
+  </tr>
+  <tr>
+   <td>claude-haiku-4.5</td>
+   <td>11</td>
+   <td>1,924</td>
+   <td>✅ byte-exact</td>
+  </tr>
+  <tr>
+   <td>claude-sonnet-4.5</td>
+   <td>10</td>
+   <td>1,868</td>
+   <td>✅ byte-exact</td>
+  </tr>
+  <tr>
+   <td>gemini-3-flash</td>
+   <td>4</td>
+   <td>2,253</td>
+   <td>✅ byte-exact</td>
+  </tr>
+ </tbody>
+</table>
+<p>resume from event index 31 of the gpt-4o-mini run returned exactly the back half of the stream, byte-for-byte. (one wrinkle: <code>from</code> is an <em>event index</em>, not a byte offset. byte offsets didn’t resolve. worth knowing when it lands.)</p>
+<p>that’s the thing I want people to take away. you won’t have to hand-build this DO hack forever. the goal is to make it a first-class, opt-in feature - the shape we’re aiming for, coming soon to the chat agent base classes (<code>AIChatAgent</code> and <code>Think</code>), will be something like:</p>
+<pre><code>export class MyAgent extends Think&lt;Env&gt; \{
+  override durableBuffer = true; // route inference through a durable buffer (coming soon)
+}</code></pre>
+<p>flip one switch, and you never pay for the same token twice.</p>
+<h2>takeaways</h2>
+<ul>
+ <li><strong>you’re billed for output tokens the moment they’re generated.</strong> if a crash forces a retry, you pay again, and in an agentic loop that compounds across every tool call in the turn.</li>
+ <li><strong>don’t tie the provider connection to the process that opened it.</strong> a separate, never-redeployed buffer keeps the stream alive across your deploys, and <code>keepAliveWhile</code> holds the background drain open while it runs.</li>
+ <li><strong>resumable streaming and crash recovery are one mechanism.</strong> the same durable chunk log; the only question is whether a live producer is still attached.</li>
+ <li><strong>store raw bytes, replay through the real provider’s parser.</strong> don’t hand-roll SSE parsers; let each provider’s own plugin do the format conversion and re-attach to a run by id.</li>
+ <li><strong>this belongs in the gateway.</strong> managed infra that never redeploys is the right place for it, and durable resume is coming soon to Cloudflare AI Gateway.</li>
+</ul>
+<p>the bigger story is its own post: what to do with that recovered stream once you’ve got it, and the rest of the agent-loop recovery decision tree. this was the tangent. but it’s the one that saves you money on every deploy, so I figured it was worth pulling out on its own.</p>
+<p>never waste a token.</p>
