@@ -1,0 +1,129 @@
+<p>A <code>NOT IN</code> query can return the wrong answer without telling you. It is valid SQL, it runs without an error, and it hands back a perfectly well-formed result set that happens to be empty when it should not be. No warning, no hint, nothing in the logs: just zero rows where you expected hundreds, and a database that considers it correct.</p>
+<p>Almost always the cause is a single <code>NULL</code> sitting somewhere you forgot to look, combined with two keywords you have typed a thousand times: <code>NOT IN</code>. None of it is a Postgres bug. This is exactly what the SQL standard mandates, implemented faithfully. That is precisely what makes it so easy to walk into, and why the planner could not safely optimize around it for the better part of Postgres's history. It comes down to one <code>if</code> statement in the parser.</p>
+<h2>Sample schema</h2>
+<p>Nothing elaborate. A table of products, one of which has no category assigned yet, and a table of archived categories that happens to contain a <code>NULL</code>:</p>
+<pre><code>CREATE TABLE products (id int, category_id int);
+INSERT INTO products VALUES (1, 10), (2, 20), (3, NULL), (4, 10);
+
+CREATE TABLE archived (category_id int);
+INSERT INTO archived VALUES (20), (NULL);</code></pre>
+<p>The <code>NULL</code> in <code>archived</code> is not contrived. The moment a column is nullable (and most are, by default), a <code>NULL</code> can find its way into any subquery you point a <code>NOT IN</code> at. That is the whole point: this is not an exotic data condition, it is the ordinary one.</p>
+<h2>The query that returns nothing</h2>
+<p>Here is the request you have written a hundred times: give me the products whose category is <em>not</em> archived.</p>
+<pre><code>SELECT id, category_id FROM products
+WHERE category_id NOT IN (SELECT category_id FROM archived);</code></pre>
+<p>You expect products 1 and 4 (category 10, which is not in the archived set). What comes back is:</p>
+<pre><code> id | category_id
+----+-------------
+(0 rows)</code></pre>
+<p>Every row gone. Not a subset, not an off-by-one: all of them. Drop the <code>NULL</code> from <code>archived</code> and the same query behaves:</p>
+<pre><code>SELECT id, category_id FROM products
+WHERE category_id NOT IN (SELECT category_id FROM archived
+                          WHERE category_id IS NOT NULL);</code></pre>
+<pre><code> id | category_id
+----+-------------
+  1 |          10
+  4 |          10
+(2 rows)</code></pre>
+<p>To understand why a single <code>NULL</code> empties the entire result, we have to stop thinking of <code>NOT IN</code> as a single thing and watch the parser take it apart.</p>
+<h2>IN is an OR, NOT IN is an AND</h2>
+<p><code>IN</code> is not a primitive operator. It is shorthand that the parser rewrites into a chain of equality comparisons joined by <code>OR</code>:</p>
+<pre><code>x IN (a, b, c)
+-- becomes
+x = a OR x = b OR x = c</code></pre>
+<p><code>NOT IN</code> is the logical negation of that, and by De Morgan's law negating an <code>OR</code> of equalities gives you an <code>AND</code> of inequalities:</p>
+<pre><code>x NOT IN (a, b, c)
+-- becomes
+x &lt;&gt; a AND x &lt;&gt; b AND x &lt;&gt; c</code></pre>
+<p>This is not an analogy. It is literally the expression Postgres builds, and you can read it straight off an <code>EXPLAIN</code>. The literal-list forms collapse into array operators whose names give the whole game away:</p>
+<pre><code>EXPLAIN (COSTS OFF) SELECT * FROM products WHERE category_id IN (1, 2, 3);
+--  Filter: (category_id = ANY ('\{1,2,3}'::integer[]))
+
+EXPLAIN (COSTS OFF) SELECT * FROM products WHERE category_id NOT IN (1, 2, 3);
+--  Filter: (category_id &lt;&gt; ALL ('\{1,2,3}'::integer[]))</code></pre>
+<p><code>IN</code> is <code>= ANY</code>: equal to <em>any</em> element, an <code>OR</code>. <code>NOT IN</code> is <code>&lt;&gt; ALL</code>: different from <em>all</em> elements, an <code>AND</code>.</p>
+<h2>Three-valued logic does the rest</h2>
+<p>SQL does not have two truth values, it has three: <strong>true</strong>, <strong>false</strong>, and <strong>unknown</strong>. Any comparison against <code>NULL</code> yields <code>unknown</code>, because <code>NULL</code> means "no value here" and you cannot ask whether an absent value is different from 20.</p>
+<p><code>true AND unknown</code> is <code>unknown</code>, not <code>true</code>. A <code>WHERE</code> clause keeps a row only when its predicate evaluates to <strong>true</strong>. Both <code>false</code> and <code>unknown</code> cause the row to be discarded. So product 1 is dropped. Run the same arithmetic for product 4 and you land on <code>unknown</code> again.</p>
+<p><strong>The mechanism in one sentence:</strong> the instant a single <code>NULL</code> enters the right-hand side, the trailing <code>AND unknown</code> term can never be <code>true</code>, so the whole <code>NOT IN</code> can never be <code>true</code>, so <strong>every</strong> row is discarded, regardless of how many million rows you have or what they contain.</p>
+<h2>NULLs on the left side too</h2>
+<p>Keeping <code>NULL</code>s out of the subquery is not enough. The same <code>unknown</code> arises from <code>NULL</code>s on the <em>left</em>: product 3 (whose <code>category_id</code> is <code>NULL</code>) evaluates to <code>unknown AND unknown</code>, so it is dropped even against a spotless right-hand set. <code>IN</code> and <code>NOT IN</code> are not complements: a row can fail both tests simultaneously. There is a <code>NULL</code>-shaped gap between them that belongs to neither.</p>
+<h2>The seam, in the source</h2>
+<p>All of this reduces to one branch in one function. Open <code>src/backend/parser/parse_expr.c</code> and find <code>transformAExprIn</code>, the routine that turns both <code>IN</code> and <code>NOT IN</code> list expressions into something the planner can chew on.</p>
+<pre><code>/*
+ * If the operator is &lt;&gt;, combine with AND not OR.
+ */
+if (strcmp(strVal(linitial(a-&gt;name)), "&lt;&gt;") == 0)
+    useOr = false;
+else
+    useOr = true;</code></pre>
+<p>That is the entire fork. <code>IN</code> arrives carrying the operator <code>=</code> and gets <code>useOr = true</code>; <code>NOT IN</code> arrives carrying <code>&lt;&gt;</code> and gets <code>useOr = false</code>. There is no special-casing of <code>NULL</code> anywhere in this function, and there does not need to be: the three-valued behavior is an emergent property of having chosen <code>AND</code>.</p>
+<h3>A grammar asymmetry: list vs. subquery</h3>
+<p>A list and a subquery are built differently. The list form is the <code>&lt;&gt; ALL</code> chain of inequalities you just saw. The subquery form is not a <code>&lt;&gt; ALL</code> at all: it becomes <code>NOT (foo = ANY (subquery))</code>. Different shapes, same truth table, a <code>NULL</code> in the comparison makes the result <code>unknown</code>, and <code>unknown</code> loses.</p>
+<h2>Why the planner won't save you</h2>
+<p>The difference between query plans is structural. A <code>Hash Anti Join</code> builds one hash table from the inner relation and streams the outer relation through it exactly once. A <code>SubPlan</code> gives the planner none of that. It cannot be reordered during the global join search, it cannot have the outer query's join clauses pushed into it to drive an index scan, and it has no multi-batch spill logic to fall back on if the hashed set turns out larger than the estimate.</p>
+<p>The reason the planner is stuck with that shape is precisely the <code>NULL</code> semantics from earlier. An anti-join keeps a row when it finds <em>no match</em>. But <code>NOT IN</code> must <em>discard</em> a row when the comparison goes <code>unknown</code>, and "unknown" is not the same as "no match".</p>
+<h2>The fix is landing in PostgreSQL 19</h2>
+<p>A performance fix is landing in PostgreSQL 19 that converts <code>NOT IN</code> to an anti-join when it can prove that neither side of the comparison can yield <code>NULL</code> values. This removes a planner limitation that has stood since anti-joins were introduced, but it only applies when the planner can <em>prove</em> no <code>NULL</code> can reach the comparison. If your column is nullable, you are exactly where you have always been.</p>
+<h2>Decision matrix</h2>
+<table>
+ <thead>
+  <tr>
+   <th>You wrote</th>
+   <th>Internal shape</th>
+   <th>NULL on right →</th>
+   <th>NULL on left →</th>
+   <th>Planner (≤ PG 18)</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>IN (1,2,3)</code></td>
+   <td><code>= ANY</code>, an <code>OR</code></td>
+   <td>absorbed, no harm</td>
+   <td>row dropped (no match)</td>
+   <td><code>ScalarArrayOpExpr</code></td>
+  </tr>
+  <tr>
+   <td><code>NOT IN (1,2,3)</code></td>
+   <td><code>&lt;&gt; ALL</code>, an <code>AND</code></td>
+   <td><strong>all rows dropped</strong></td>
+   <td><strong>row dropped</strong></td>
+   <td><code>ScalarArrayOpExpr</code></td>
+  </tr>
+  <tr>
+   <td><code>IN (subquery)</code></td>
+   <td><code>= ANY</code> sublink</td>
+   <td>absorbed</td>
+   <td>row dropped</td>
+   <td><strong>Semi Join</strong></td>
+  </tr>
+  <tr>
+   <td><code>NOT IN (subquery)</code></td>
+   <td><code>NOT (= ANY)</code> sublink</td>
+   <td><strong>all rows dropped</strong></td>
+   <td><strong>row dropped</strong></td>
+   <td>opaque <code>SubPlan</code> filter ¹</td>
+  </tr>
+  <tr>
+   <td><code>NOT EXISTS (...)</code></td>
+   <td>anti-join sublink</td>
+   <td>row kept</td>
+   <td>row kept</td>
+   <td><strong>Anti Join</strong></td>
+  </tr>
+ </tbody>
+</table>
+<p>¹ PostgreSQL 19 promotes this to an Anti Join when both the outer expression and the subquery output column are provably <code>NOT NULL</code>.</p>
+<h2>What to do instead</h2>
+<p><strong>Default to <code>NOT EXISTS</code>.</strong> Make this the habit and you never hit the trap again. Same anti-join semantics and the same plan as the working <code>NOT IN</code> would have wanted, on every version, nullable columns or not:</p>
+<pre><code>SELECT id, category_id FROM products p
+WHERE NOT EXISTS (
+    SELECT 1 FROM archived a WHERE a.category_id = p.category_id
+);</code></pre>
+<p><strong>Filter the <code>NULL</code>s out of the subquery</strong> when you have to keep the <code>NOT IN</code>:</p>
+<pre><code>SELECT id FROM products
+WHERE category_id NOT IN (
+    SELECT category_id FROM archived WHERE category_id IS NOT NULL
+);</code></pre>
+<p><strong>Use <code>EXCEPT</code> for whole-set comparisons</strong>, but note that <code>EXCEPT</code> treats <code>NULL</code> as a value and will remove rows where the join column is <code>NULL</code>.</p>

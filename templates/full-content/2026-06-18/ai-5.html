@@ -1,0 +1,153 @@
+<p>Today, we are proud to introduce eve, an open-source agent framework for building, running, and scaling agents. eve is designed around the idea that building an agent should mean defining what it does without assembling all of the pieces that it needs to run in production. Instead, eve comes with production already built in:</p>
+<ul>
+ <li>Durable execution</li>
+ <li>Sandboxed compute</li>
+ <li>Human-in-the-loop approvals</li>
+ <li>Subagents</li>
+ <li>Evals</li>
+ <li>And more</li>
+</ul>
+<p>eve is the framework that we build and run our own agents on.</p>
+<p>Agents today are where the web was before frameworks, with everyone hand-rolling the same plumbing and nothing carrying over to the next one. Next.js ended this for the web, and eve is doing the same for agents.</p>
+<h2>An agent is a directory</h2>
+<p>This is an eve agent.</p>
+<pre><code>agent/
+  agent.ts                   # the model it runs on
+  instructions.md            # who it is
+  tools/
+    run_sql.ts               # what it can do
+    post_chart.ts
+  skills/
+    revenue-definitions.md   # what it knows
+  subagents/
+    investigator/            # who it delegates to
+  channels/
+    slack.ts                 # where it lives
+  schedules/
+    monday-summary.ts        # when it acts on its own</code></pre>
+<p>Each file describes one component of the agent, so at a glance, the tree tells you what an agent is, what it does, where it lives, and when it acts on its own.</p>
+<h3>Create an eve agent in minutes</h3>
+<p>Every agent starts with its definition.</p>
+<pre><code>import \{ defineAgent } from "eve";
+
+export default defineAgent(\{
+  model: "anthropic/claude-opus-4.8",
+});</code></pre>
+<p>The <code>agent.ts</code> file is where you configure the agent itself. You can define the model with one line, with provider fallbacks supported through AI Gateway, and compaction, model options, and other optional fields are there when you need them.</p>
+<p>Giving your agent a job and personality is as simple as creating an <code>instructions.md</code> file, which serves as the system prompt that eve puts in front of every model call.</p>
+<pre><code>You are a senior data analyst. You answer questions about the team's data.
+- Prefer exact numbers to hand-waving. If you can compute it, compute it.
+- State the assumptions behind any number you report (date range, filters, grain).
+- Use the tools available to you rather than guessing. If you cannot answer from the data, say so plainly.</code></pre>
+<p>You create files for what your agent does, like <code>post_chart.ts</code> and <code>revenue-definitions.md</code> for tools and skills, and eve wires them into a working agent without any boilerplate or plumbing to manage. You can just focus on what your agent does instead of how it does it.</p>
+<h2>Why we built eve</h2>
+<p>We had built agents for years at Vercel, v0 among them. But once coding agents made building one something anyone could do, everyone did. We shipped hundreds of agents and internal apps, and it looked like a productivity revolution.</p>
+<p>But underneath it, every team was building and rebuilding the same plumbing before their agent could do anything, and none of it carried over from one use case to the next. Each agent was designed for a different task, but they all had the same needs, and the same structure kept emerging to meet them. Agents have a shape.</p>
+<p>eve is that shape made into a framework. Every generation of software earns its abstractions once enough people have built the same thing the hard way, and agents are there now.</p>
+<h2>Batteries included</h2>
+<p>Everything an agent needs in production ships with the framework.</p>
+<h3>A durable session for every conversation</h3>
+<p>Agents wait on people, call slow systems, and run for hours, days, or weeks. In eve, every conversation is a durable workflow with each step checkpointed, so a session can pause, survive a crash or a deploy, and resume exactly where it stopped. This durability is built on the open-source Workflow SDK.</p>
+<h3>A sandbox for every agent</h3>
+<p>The code your agents write should be treated as untrusted, so eve keeps agent-generated code out of your application runtime entirely. Every agent gets its own sandbox, an isolated environment for shell commands, scripts, and file reads and writes, running in a separate security context from the harness that controls the agent. The backend behind this sandbox is an adapter. When deployed, it runs on Vercel Sandbox. Locally, it runs on Docker, microsandbox, or just-bash, and you can write an adapter for any other provider.</p>
+<h3>Human-in-the-loop approvals</h3>
+<p>Agents act on real systems, and some of those actions should require a person to approve them. Any action in eve can be configured to require approval, and the agent will pause there and wait, indefinitely if it has to, without consuming any compute. Once approved, eve continues the task right from where it left off.</p>
+<h3>Secure connections to tools, data, and services</h3>
+<p>Agents need to connect to your backends, data, and other third-party services. In eve, a connection is a file that points at an MCP server or any API with a compatible OpenAPI document.</p>
+<pre><code>import \{ defineMcpClientConnection } from "eve/connections";
+
+export default defineMcpClientConnection(\{
+  url: "https://mcp.linear.app/sse",
+  description: "Linear workspace: issues, projects, cycles, and comments.",
+  auth: \{
+    getToken: async () =&gt; (\{ token: process.env.LINEAR_API_TOKEN! }),
+  },
+});</code></pre>
+<p>eve discovers the remote tools, hands them to the model, and brokers the auth, and the model never sees the connection's URL or credentials. Vercel Connect handles interactive OAuth with consent and token refresh built in. At launch, eve agents can connect to Slack, GitHub, Snowflake, Salesforce, Notion, and Linear, plus anything else you can reach over OAuth, an API key, or an MCP server.</p>
+<h3>The same agent on every channel</h3>
+<p>Most agents live in exactly one place because every new surface is its own integration to build. In eve, the same agent serves every surface, and each channel is just a small adapter file. The HTTP API is on by default, with Slack, Discord, Teams, Telegram, Twilio, GitHub, and Linear included, and <code>defineChannel</code> covers custom channels. One channel can also hand off to another, so an incident webhook can open an investigation thread in Slack.</p>
+<h3>Tracing and evals built in</h3>
+<p>When an agent gets something wrong, the first question is what the agent actually did. In eve, every run produces a trace. Each model call and tool call appears in order with its inputs and outputs, down to the commands the agent ran in its sandbox, so you can replay the run instead of piecing it together from logs.</p>
+<pre><code>ai.eve.turn                      # one span per turn
+├── ai.streamText                # the model call
+│   └── ai.streamText.doStream
+└── ai.toolCall                  # run_sql, with inputs and outputs</code></pre>
+<p>The spans are standard OpenTelemetry and export to any tracing service you already run, whether that is Braintrust, Honeycomb, Datadog, or Jaeger. On Vercel, they surface in an Agent Runs tab under Observability, giving you one place to watch every session and drill into any run. Evals let you go further, with scored test suites you can run locally or wire into CI.</p>
+<h2>Extend an agent one file at a time</h2>
+<p>The most common way to give an agent capabilities is to give it tools, and to teach it how to do things with skills. Today that means building the tool, writing the skill, and then wiring both into whatever runs your agent loop. With eve, a tool is one TypeScript file and a skill is one markdown file.</p>
+<pre><code>import \{ defineTool } from "eve/tools";
+import \{ z } from "zod";
+import \{ runReadOnlySql } from "../lib/sample-db";
+
+export default defineTool(\{
+  description: "Run a read-only SQL query against the orders and customers tables.",
+  inputSchema: z.object(\{
+    sql: z.string().describe("A single read-only SELECT statement."),
+  }),
+  async execute(\{ sql }) \{
+    const \{ columns, rows } = await runReadOnlySql(sql);
+    return \{ columns, rows: rows.slice(0, 500), truncated: rows.length &gt; 500 };
+  },
+});</code></pre>
+<pre><code>---
+description: How this team defines revenue. Load before answering any revenue question.
+---
+
+Revenue is recognized net of refunds, over the subscription term.
+Weeks are Monday-anchored, in UTC.
+Exclude trial and internal accounts from every number.</code></pre>
+<p>Notice what is missing. Instead of writing all of the boilerplate to wire these up and register them with your agent, eve handles it for you.</p>
+<p>A file's name and place in the tree are its definition. eve picks up the tool and skill at build time, hands the model their descriptions, and the model takes it from there. Just as Next.js turns a folder into a route by owning the routing, eve turns a file into an ability by owning the agent loop.</p>
+<h3>Add human-in-the-loop approval</h3>
+<p>Requiring approval for an action is one field on the tool.</p>
+<pre><code>export default defineTool(\{
+  description: "Run a read-only SQL query against the warehouse.",
+  inputSchema: z.object(\{ sql: z.string() }),
+  needsApproval: (\{ toolInput }) =&gt; estimateScanGb(toolInput.sql) &gt; 50,
+  async execute(\{ sql }) \{
+    // unchanged
+  },
+});</code></pre>
+<h3>Let the agent write its own code</h3>
+<p>The tools you define aren't the ceiling. eve gives your agent a real computer with a shell, so it can run bash, grep, and anything else you'd run in a terminal. When a job calls for code that doesn't exist yet, the agent writes and runs it.</p>
+<h3>Delegate work to a subagent</h3>
+<p>An eve agent can also delegate. A subagent is the same shape one level down, a directory inside <code>subagents/</code> with its own instructions, tools, and sandbox. The parent calls it just like it calls a tool.</p>
+<h2>Start and interact with your agent</h2>
+<h3>Run the agent locally</h3>
+<p>To start an eve agent, you run its dev server: <code>eve dev</code></p>
+<h3>Test the agent with evals</h3>
+<p>Talking to the agent proves one run at a time. Evals test your agent the way you test the rest of your software, with scored checks written in files like everything else in the project.</p>
+<pre><code>import \{ defineEval } from "eve/evals";
+import \{ includes } from "eve/evals/expect";
+
+export default defineEval(\{
+  description: "The analyst answers revenue questions by the team's rules.",
+  async test(t) \{
+    await t.send("What was revenue last week?");
+    t.completed();
+    t.calledTool("run_sql");
+    t.check(t.reply, includes("net of refunds"));
+  },
+});</code></pre>
+<h2>Ship it</h2>
+<p>The agent has lived on your laptop long enough. Shipping it is normally the step where the agent work stops and the infrastructure work begins. With eve there is nothing to provision, because the agent is an ordinary Vercel project, and it deploys the way any other frontend or backend does. Use <code>vercel deploy</code>.</p>
+<h2>Introduce the agent to your team</h2>
+<p>Getting an agent into Slack used to mean building a Slack app first, including the app config, bot token, event subscriptions, webhook endpoint, and signing secret, all before the agent said a word. With eve, a channel is one command: <code>eve channels add slack</code>.</p>
+<h3>Put the agent on a schedule</h3>
+<p>The Monday revenue report should not wait for someone to ask. A schedule is one more file, a cron expression and a handler that starts the agent on its own clock.</p>
+<h2>Run the agent like the rest of your software</h2>
+<p>An agent your team depends on is production software, and a change to its instructions can break it as surely as a change to its code. Because an eve agent is files in a directory, it lives in Git like the rest of your code, and a new prompt, tool, or skill is a commit with a diff, a review, and a history.</p>
+<h2>How we run Vercel on eve</h2>
+<p>We run more than a hundred agents in production at Vercel, and they are part of how the company operates every day. Examples include:</p>
+<ul>
+ <li><strong>The data analyst:</strong> Handles more than 30,000 questions a month.</li>
+ <li><strong>The autonomous SDR:</strong> Works every new lead the moment it comes in.</li>
+ <li><strong>The sales cockpit:</strong> Answers pipeline and forecast questions from Snowflake and Salesforce.</li>
+ <li><strong>The support engineer:</strong> Solves 92% of tickets on its own.</li>
+ <li><strong>The content agent:</strong> Runs a full review pipeline for content.</li>
+ <li><strong>Routing agent:</strong> Routes tasks to the correct specialized agent.</li>
+</ul>
+<h2>Get started</h2>
+<p>A year ago, agents triggered less than 3% of the deployments on Vercel. Now, they trigger around 29%. The public preview is open today, and the CLI wizard walks you through your first agent in under a minute.</p>
+<pre><code>npx eve@latest init my-agent</code></pre>
+<p>Everything eve can do is at eve.dev/docs and development happens in the open at github.com/vercel/eve.</p>

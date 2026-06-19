@@ -1,0 +1,87 @@
+<p>Giving your agents access to your tools, data, and services is what makes them useful. As agents perform deeper work across systems, authenticating and authorizing that access becomes central to your application architecture.</p>
+<p>Today, agent access is usually granted through long-lived provider tokens stored in your environment variables, provisioned for everything your agent might need. These tokens are shared across every user, never expire, and give your agent full reach across every task, no matter how small the job.</p>
+<p>A vault makes that token harder to steal. It doesn't make it less dangerous. The problem is what happens when the token leaks: everything it can touch is now exposed.</p>
+<p>We built Vercel Connect to solve this problem. Now in Public Beta, Vercel Connect replaces the stored token with runtime credential exchange. You register a connector once. When your agent has work to do, your app proves its identity to Vercel Connect and gets back a short-lived credential, scoped to the task. Everything you used the token for still works. The agent just requests access each time instead of holding it.</p>
+<h2>Register a connector once, then reuse it across projects and environments</h2>
+<p>A connector is a reusable connection between your Vercel team and a provider like Slack or GitHub. You create it once from the dashboard or the CLI, then attach it to the projects and environments that need it, with project-level access controls.</p>
+<pre><code>vercel connect create slack --name mybot</code></pre>
+<p>The relationship with the provider becomes a single entity you can see and manage, not something scattered across a dozen environment variable panels where a rotation means hunting down every copy.</p>
+<p>Your coding agent can run this setup too. Install the vercel-connect skill with <code>npx skills add vercel/vercel-plugin --skill vercel-connect</code>, and it can create and attach connectors for you.</p>
+<h2>Request scoped tokens at runtime</h2>
+<p>With a connector in place, the agent asks for a credential only when it has work to do. The <code>@vercel/connect</code> SDK returns a token you use immediately against the provider API, and no provider secret lives in your app.</p>
+<pre><code>import \{ getToken } from '@vercel/connect';
+
+const token = await getToken('slack/mybot', \{
+  subject: \{ type: 'app' },
+});</code></pre>
+<p>Tokens are short-lived, with a lifetime that depends on the provider. The SDK refreshes them automatically, so you never rotate a secret by hand. That leaves one question. If your app holds no secret, what proves it's allowed to ask?</p>
+<h2>The app proves its identity with OIDC</h2>
+<p>The proof is an identity your app already has. Every deployment on Vercel gets an OIDC identity, and when your app or agent requests a token, the SDK presents that identity to Vercel Connect. Vercel Connect verifies it, checks that the project and environment are allowed to use the connector, and returns the provider credential. That round trip is the runtime credential exchange.</p>
+<p>The same identity is available during local development through <code>vercel link</code> and <code>vercel env pull</code>, and outside Vercel, the SDK accepts a Vercel access token. Either way, there is no provider secret in your app to leak, commit, or copy between environments.</p>
+<h2>Scope each token to exactly what the task needs</h2>
+<p>Not every task needs the same reach, even within a single agent. One step might read a repository while the next opens an issue. Each requests exactly the access it needs, and the request itself sets limits. A request can include:</p>
+<ul>
+ <li>Provider scopes</li>
+ <li>An installation ID</li>
+ <li>Resource restrictions</li>
+ <li>Provider-specific authorization details</li>
+</ul>
+<p>GitHub is the sharpest example because it can restrict a token to specific repositories and permissions.</p>
+<pre><code>import \{ getToken } from '@vercel/connect';
+
+const token = await getToken('github/mybot', \{
+  subject: \{ type: 'app' },
+  authorizationDetails: [
+    \{
+      type: 'github_app_installation',
+      repositories: ['myorg/repo1'], 
+      permissions: ['contents:read'], 
+    },
+  ],
+});</code></pre>
+<p>The deployment agent can read that one repository and do nothing else. A fine-grained GitHub App install can be narrow too, but an install is a standing grant, set up once and trusted from then on. This limit exists for one request, one task. Least privilege becomes the shape of the request.</p>
+<h2>Act on behalf of a specific user, with per-user token scoping</h2>
+<p>A shared bot token gives every user's request the same identity and reach. Vercel Connect lets you set that identity. Switch <code>subject</code> from the app to a named user, and the token acts on that user's behalf, scoped to what that user authorized.</p>
+<pre><code>import \{ getToken } from '@vercel/connect';
+
+const token = await getToken('linear/mybot', \{
+  subject: \{ type: 'user', id: 'user_123' },
+});</code></pre>
+<p>When a user first grants access, <code>startAuthorization</code> runs the consent flow through a callback URL, a webhook, or a device code. After that, the agent requests tokens as that user.</p>
+<h2>Contain access by environment, and revoke it when you need to</h2>
+<p>A connector is attached to the projects and environments you choose, so you can run a separate connector for development, preview, and production instead of pointing one at all three. When each environment has its own connector with an authorization grant and scopes, a credential compromised in development cannot be replayed against production.</p>
+<p>Separate connectors limit where a credential works, but they don't pull back access already issued. That's normally the painful part. With a stored token, that means a rotation. You mint a new secret, update every place the old one lived, and redeploy whatever depended on it. With Vercel Connect, you revoke the connector's tokens, either your own or all of them.</p>
+<pre><code># Revoke just your own tokens for a connector
+vercel connect revoke-tokens slack/mybot --my-tokens
+# Or revoke every token, across all users and installations
+vercel connect revoke-tokens slack/mybot --all-tokens</code></pre>
+<p>What revoking does depends on the provider. Where the provider supports revocation, Vercel Connect revokes the token at the provider. Where it does not, Vercel Connect stops issuing new tokens for that grant, and a token already issued stays valid at the provider until it expires.</p>
+<h2>Drive event-driven agents from verified Slack triggers</h2>
+<p>So far, your agent has been the one reaching out. It requests a token and calls a service when it has work to do. Triggers run the other way. A connected service sends an event to your app, and your agent responds.</p>
+<p>Vercel Connect receives the provider's webhook, verifies it, and forwards it to your project. Trigger forwarding is in beta and supports Slack, GitHub, and Linear today. A Slack connector can forward its verified webhooks to up to three of your projects, so a message in Slack can wake an agent that acts on it.</p>
+<p>The flow runs end to end without a provider secret in your app:</p>
+<ul>
+ <li>A user posts a message in Slack.</li>
+ <li>Slack sends the event to Vercel Connect.</li>
+ <li>Vercel Connect verifies the event against the Slack signing secret it holds, then forwards it to your Vercel app, re-attested with its OIDC identity.</li>
+ <li>Your app verifies that attestation, then requests a scoped runtime token.</li>
+ <li>The agent acts and responds.</li>
+</ul>
+<p>The Slack signing secret does not disappear. It moves server-side to Vercel Connect, which verifies the upstream webhook and re-signs the forwarded request with an identity your app can check.</p>
+<h2>Vercel Connect meets your code where it already is</h2>
+<p>Underneath everything is one call. Whether your agent is built on the AI SDK, runs as a background job, or is a loop you wrote yourself, it asks for a token the same way, with <code>getToken</code>. Around that call are adapters for the stack you already run.</p>
+<h2>Access becomes something you request, scoped to the task</h2>
+<p>An agent becomes more useful the more it can reach, which is exactly why access is the part to get right. Every system the agent can touch is a system someone could reach through a leaked token. With runtime credential exchange, nothing is provisioned for everything. Nothing is shared by every user. Nothing lasts forever. Nothing reaches past the task in front of it.</p>
+<h2>Frequently asked questions</h2>
+<p><strong>What is Vercel Connect?</strong><br>
+  Vercel Connect lets your agents and services access external systems on behalf of your users and teams. Instead of storing provider credentials in long-lived environment variables, you request user-authorized tokens at runtime with project-level access controls.</p>
+<p><strong>What problem does Vercel Connect solve?</strong><br>
+  It removes long-lived third-party secrets from your runtime while still letting agents act on external APIs. You register a connector for a provider, link it to projects and environments, and request provider tokens at runtime.</p>
+<p><strong>When should I use Vercel Connect instead of Integrations?</strong><br>
+  Use Vercel Integrations for marketplace-managed installs and provider-managed products in the Vercel Marketplace. Use Vercel Connect when you need delegated runtime credentials and user authorization for agent workflows.</p>
+<p><strong>Which connectors are available?</strong><br>
+  Vercel Connect supports generic OAuth and API key connectors, plus dedicated connectors for Slack, GitHub, Linear, Discord, Notion, Salesforce, Figma, and Snowflake.</p>
+<p><strong>How does pricing work?</strong><br>
+  Pricing is based on token requests. The Hobby plan includes 5K token requests per month at no additional cost. On Pro and Enterprise plans, token requests are billed at $3 per 10K token requests.</p>
+<p><strong>What are the current Beta limitations?</strong><br>
+  Trigger forwarding is limited to Slack, GitHub, and Linear, connector branding fields cannot be fully cleared after you set them, and token revocation, token lifetime, and scope granularity depend on provider support.</p>
