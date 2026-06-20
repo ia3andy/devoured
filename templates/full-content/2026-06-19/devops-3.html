@@ -1,0 +1,136 @@
+<h1>Amazon S3 annotations: attach rich, queryable context directly to your objects</h1>
+<p>Today, we’re announcing a new metadata capability for Amazon Simple Storage Service (Amazon S3) called annotations, enabling you to attach rich, large-scale business context directly to your objects. You can store up to 1,000 named annotations per object, each up to 1 MB in size, totaling up to 1 GB per object, in flexible formats like JSON, XML, YAML, or plain text. You can modify or delete an annotation at any time, without re-writing your objects, making it easy to keep your object context current.</p>
+<p>Organizations are building AI agents and autonomous workflows that need to find, understand, and act on data without human intervention. To support these agentic workflows, you need metadata that can evolve alongside the data, scale to petabytes of objects, and remain queryable without expensive retrieval.</p>
+<p>With S3 annotations, you can store context such as AI-generated transcripts, content ratings, or technical specifications directly alongside your objects. Your context moves automatically with the object during copy, replication, and cross-region transfers, and S3 removes it when you delete the object. When you enable S3 Metadata, annotations automatically flow into fully managed annotation tables that you can query with Amazon Athena and other analytics engines.</p>
+<h3>Common use cases</h3>
+<p>Annotations solve complex metadata challenges across industries:</p>
+<ul>
+ <li><strong>Media &amp; Entertainment</strong>: Track transcripts, content moderation results, subtitle files, and licensing metadata as separate annotations on video assets, eliminating the need to synchronize metadata across multiple media asset management systems.</li>
+ <li><strong>Financial Services</strong>: Attach AI-generated investment summaries and sentiment analysis to research documents, enabling autonomous research agents to discover relevant datasets through natural-language queries without maintaining separate metadata databases.</li>
+ <li><strong>Life Sciences</strong>: Annotate clinical trial data with regulatory status, patient cohort details, and approval chains, making compliance audits faster while keeping full context accessible for archived data in Amazon S3 Glacier storage classes without retrieval charges.</li>
+</ul>
+<h3>How annotations address metadata challenges</h3>
+<p>Amazon S3 already supports several ways to describe your objects. System-defined metadata captures properties like size and storage class. Object tags support operational tasks like access control and lifecycle management. User-defined metadata lets you add small amounts of custom information at upload time.</p>
+<p>While these capabilities work well for their intended purposes, they have limitations when you need to attach much richer context without building and maintaining separate metadata systems. Annotations address these needs by providing metadata capabilities at a fundamentally different scale and flexibility, offering mutable, queryable context per object compared to 10 immutable tags or 2 KB of headers.</p>
+<table>
+ <tbody>
+  <tr>
+   <td><strong>Capability</strong></td>
+   <td><strong>Max size</strong></td>
+   <td><strong>Mutable?</strong></td>
+   <td><strong>Best for</strong></td>
+  </tr>
+  <tr>
+   <td>System-defined metadata</td>
+   <td>Fixed</td>
+   <td>No</td>
+   <td>Object properties (size, storage class, creation time)</td>
+  </tr>
+  <tr>
+   <td>User-defined metadata</td>
+   <td>2 KB</td>
+   <td>No (set at upload)</td>
+   <td>Small custom key-value pairs</td>
+  </tr>
+  <tr>
+   <td>Object tags</td>
+   <td>10 tags, 128/256 characters per key/value</td>
+   <td>Yes</td>
+   <td>Access control, lifecycle rules, cost allocation</td>
+  </tr>
+  <tr>
+   <td><strong>Annotations</strong></td>
+   <td><strong>1 GB (1,000 × 1 MB)</strong></td>
+   <td><strong>Yes</strong></td>
+   <td><strong>Rich business context (JSON, XML, YAML, plain text)</strong></td>
+  </tr>
+ </tbody>
+</table>
+<p>Today, metadata describing S3 objects often lives in separate databases or sidecar files, requiring complex synchronization workflows that can exceed data storage costs. When you enable S3 Metadata annotation tables, this context becomes queryable at scale through Amazon Athena. AI agents can discover your data through natural language with the S3 Tables MCP server, which provides a standardized interface for AI models to query your annotations. You can query annotations for objects in any storage class, without restoring the objects or paying retrieval charges.</p>
+<h3>Getting started with annotations</h3>
+<p>To start using annotations, make sure your AWS Identity and Access Management (IAM) policy or bucket policy grants permissions for the <code>s3:PutObjectAnnotation</code> and <code>s3:GetObjectAnnotation</code> actions. You can then add annotations to any existing or new S3 object using the <code>PutObjectAnnotation</code> API.</p>
+<p>For example, a media company can attach technical specifications and AI-produced summaries to a video asset using the AWS Command Line Interface (AWS CLI):</p>
+<pre><code># Create a JSON file with technical metadata
+cat &gt; mediainfo.json &lt;&lt; 'EOF'
+\{"codec":"H.265","resolution":"3840x2160","audio_tracks":8,"frame_rate":29.97}
+EOF
+
+# Attach it as an annotation
+aws s3api put-object-annotation \
+  --bucket my-media-bucket \
+  --key videos/documentary-2026.mp4 \
+  --annotation-name mediainfo \
+  --annotation-payload ./mediainfo.json
+</code></pre>
+<pre><code># Attach a plain-text AI-generated summary as a separate annotation
+echo "A 90-minute nature documentary covering wildlife migration patterns across three continents, featuring aerial footage and underwater sequences. Languages: English, Spanish, Portuguese." &gt; ai_summary.txt
+
+aws s3api put-object-annotation \
+  --bucket my-media-bucket \
+  --key videos/documentary-2026.mp4 \
+  --annotation-name ai_summary \
+  --annotation-payload ./ai_summary.txt
+</code></pre>
+<p>These commands attach two separate annotations to the same video object. The <code>mediainfo</code> annotation stores structured technical specifications as JSON, while the <code>ai_summary</code> annotation stores a text description. Each annotation is identified by a unique name, and you can read and modify each one independently. With unique names for each annotation, you can use different annotations to support multiple concurrent enrichment workflows, for example, one team adding technical metadata while another team adds content classifications, without interfering with each other.</p>
+<p>Retrieve a specific annotation using the <code>GetObjectAnnotation</code> API:</p>
+<pre><code>aws s3api get-object-annotation \
+  --bucket my-media-bucket \
+  --key videos/documentary-2026.mp4 \
+  --annotation-name mediainfo \
+  ./mediainfo-output.json
+</code></pre>
+<p>To see all annotations attached to an object, use the <code>ListObjectAnnotations</code> API:</p>
+<pre><code>aws s3api list-object-annotations \
+  --bucket my-media-bucket \
+  --key videos/documentary-2026.mp4
+</code></pre>
+<p>When you no longer need a specific annotation, remove it using the <code>DeleteObjectAnnotation</code> API:</p>
+<pre><code>aws s3api delete-object-annotation \
+  --bucket my-media-bucket \
+  --key videos/documentary-2026.mp4 \
+  --annotation-name mediainfo
+</code></pre>
+<p>You can update an existing annotation at any time by calling <code>PutObjectAnnotation</code> again with the same annotation name. For large objects uploaded using multipart upload, attach annotations after completing the multipart upload using the <code>PutObjectAnnotation</code> API.</p>
+<h3>Querying annotations at scale with S3 Metadata tables</h3>
+<p>Attaching annotations to individual objects is useful, but the real power comes when you query across all your annotations at scale. When you enable S3 Metadata annotation tables on your bucket, S3 automatically indexes your annotations into a fully managed Apache Iceberg table, called an annotation table. You can query annotation tables with Amazon Athena or any Iceberg-compatible engine.</p>
+<p>To enable annotation tables, use the S3 console or the <code>CreateBucketMetadataConfiguration</code> API. The following example creates a new metadata configuration with annotation tables enabled while keeping journal tables for change tracking and disabling the live inventory table:</p>
+<pre><code>\{
+  "JournalTableConfiguration": \{
+    "RecordExpiration": \{ "Expiration": "DISABLED" }
+  },
+  "InventoryTableConfiguration": \{ "ConfigurationState": "DISABLED" },
+  "AnnotationTableConfiguration": \{
+    "ConfigurationState": "ENABLED",
+    "Role": "arn:aws:iam::123456789012:role/S3MetadataAnnotationRole"
+  }
+}
+</code></pre>
+<p>This configuration tells S3 to automatically capture all your annotations in a queryable table. Once applied, any annotation you attach to objects in this bucket will appear in the table within approximately one hour.</p>
+<p>If the bucket already has a metadata configuration, use the <code>UpdateBucketMetadataAnnotationTableConfiguration</code> API:</p>
+<pre><code>aws s3api update-bucket-metadata-annotation-table-configuration \
+  --bucket my-media-bucket \
+  --annotation-table-configuration '\{"ConfigurationState":"ENABLED","Role":"arn:aws:iam::123456789012:role/S3MetadataAnnotationRole"}'
+</code></pre>
+<p>Once enabled, your annotations automatically flow into the annotation table. Journal tables update in near real time, while annotation tables refresh within an hour. Unlike traditional metadata tables that require predefined schemas, annotation tables automatically adapt to any JSON, XML, or YAML structure you write. Each annotation becomes a row in the table with its content stored in a <code>text_value</code> column, letting you query across all annotations without schema migrations.</p>
+<p>If you enable annotation tables on a bucket that already has annotated objects, S3 automatically backfills existing annotations into the table. The backfill process runs in the background and can take several hours to days depending on the number of objects.</p>
+<p>For example, to find all video assets with more than 8 audio tracks across your entire bucket using Amazon Athena:</p>
+<pre><code>SELECT DISTINCT bucket, object_key
+FROM "s3tablescatalog/aws-s3"."b_my_media_bucket"."annotation"
+WHERE name = 'mediainfo'
+AND CAST(json_extract_scalar(text_value, '$.audio_tracks') AS INTEGER) &gt; 8
+</code></pre>
+<p>This query scans the annotation table for all annotations named <code>mediainfo</code>, extracts the <code>audio_tracks</code> field from the JSON content, and returns objects where the count exceeds 8.</p>
+<p>Or to find all objects that received new annotations in the last 24 hours through the journal table:</p>
+<pre><code>SELECT bucket, key, version_id, record_timestamp, annotation.name
+FROM "s3tablescatalog/aws-s3"."b_my_media_bucket"."journal"
+WHERE record_timestamp &gt;= (current_date - interval '1' day)
+AND annotation.name IS NOT NULL
+AND record_type IN ('CREATE_ANNOTATION', 'DELETE_ANNOTATION')
+</code></pre>
+<p>This query uses the journal table to track annotation changes in near real time, which is ideal for building event-driven workflows that respond to new or deleted annotations.</p>
+<p>You can also use natural language to search objects by their annotations using agents in Amazon SageMaker Unified Studio or any IDE with the S3 Tables MCP server. For example, asking “find all PG-rated movies with Spanish subtitles from 2023” returns results in seconds instead of the hours it would take querying multiple disconnected systems.</p>
+<h3>Get started today</h3>
+<p>You can start using Amazon S3 annotations today in all AWS Regions, including the AWS China Regions. Annotation tables are available in all AWS Regions where S3 Metadata is available.</p>
+<p>Whether you’re building AI agents that need to discover data autonomously, managing petabytes of media assets with complex metadata, or tracking compliance context for archived datasets, annotations give you the scale and flexibility to attach rich metadata directly to your objects without managing separate systems.</p>
+<p>Annotation storage is always billed at S3 Standard rates, even if the parent object is in S3 Glacier or another storage class. For full pricing details, visit the Amazon S3 pricing page.</p>
+<p>To learn more and get started, visit the Amazon S3 Metadata overview page and the Amazon S3 documentation. Send feedback to AWS re:Post for S3 or through your usual AWS Support contacts.</p>
