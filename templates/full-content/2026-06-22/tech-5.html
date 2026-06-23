@@ -1,0 +1,66 @@
+<h2>Don't rely on instructions, use Agent Hooks to enforce guardrails</h2>
+<p>This post is for developers who use AGENTS.md or CLAUDE.md to provide guardrails for agent-generated code, but find that the agent sometimes ignores rules. if you want a deterministic check that will work 100% of the time, read on about agent hooks.</p>
+<p>First, a clarification. Agent Hooks are different than <a href="https://git-scm.com/book/en/v2/Customizing-Git-Git-Hooks">git hooks</a> which many developers are familiar with. The most popular Git hook might be the pre-commit hook which is called before you try to commit everything and is a popular place to do perhaps a <code>git pull</code> or some code formatting (e.g., prettier or <code>mix format</code>) to ensure your code is formatted as per the language's standards. The limitation of a pre-commit hook is that it gets executed well after you have generated the code and just before you think you're done (i.e., commit time).</p>
+<p>Agent hooks are invoked when the agent (e.g., Claude Code) is doing work and allows developers to interject themselves into the agent's workflow, rather than after the work is done (e.g., code review). Here's a list of <a href="https://code.claude.com/docs/en/hooks">Claude Code Hooks</a> which we'll refer to. As a caution, not all agents have the same hooks. Unlike <a href="https://agentskills.io/home">Skills where standard exist</a>, Hooks are a bit of a mess so you'll have to see what hooks your agent makes available to you. I'm going to be doing two deterministic checks which have bit me in the past:</p>
+<ul>
+ <li>Ensure that the agent never uses a <code>&lt;input&gt;</code> tag directly because I want it to use the design components I have</li>
+ <li>Ensure that the agent never tells me it's done while my design-system ratchet test is failing</li>
+</ul>
+<p>These two fire at completely different points in the agent's lifecycle. The first runs <em>before</em> the agent executes a tool; the second runs when the agent thinks it's finished.</p>
+<p>Every hook gets a blob of JSON on stdin, and the shape of that blob depends on the event. That's what the <code>jq</code> calls below are digging into. I'll show you exactly what each hook receives so the paths the <code>jq</code> tool is using makes sense. I'm using <code>jq</code> but you could have written a Python script, a shell script or anything that the agent could call.</p>
+<h2>1. No raw <code>&lt;input&gt;</code> tags</h2>
+<p>This one is a <code>PreToolUse</code> hook. PreToolUse fires right before Claude Code runs a tool, and it's the one place where you can actually stop the tool from happening by exiting with an error code other than <code>1</code> or <code>2</code>. Whatever you wrote to stderr when exiting with exit code <code>2</code> will be seen by the agent as feedback. Exit <code>1</code> only logs a warning and lets the tool through.</p>
+<p>I want every form field to go through my own <code>&lt;.cinput&gt;</code> component, not a bare <code>&lt;input&gt;</code>. So I check the content the agent is about to write and block it if I see the tag. This goes in <code>.claude/settings.json</code>:</p>
+<pre><code>\{
+  "hooks": \{
+    "PreToolUse": [
+      \{
+        "matcher": "Write|Edit",
+        "hooks": [
+          \{
+            "type": "command",
+            "command": "jq -r '.tool_input.content // .tool_input.new_string // empty' | grep -q '&lt;input' &amp;&amp; \{ echo 'Use my &lt;.cinput&gt; design component, not a raw &lt;input&gt; tag.' &gt;&amp;2; exit 2; } || exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}</code></pre>
+<p>Here's what the hook actually sees on stdin when the agent goes to write a file:</p>
+<pre><code>\{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Write",
+  "tool_input": \{
+    "file_path": "lib/amplify_web/components/form.ex",
+    "content": "...the code the agent wants to write..."
+  },
+  "session_id": "…", "cwd": "…", "transcript_path": "…"
+}</code></pre>
+<p>That's why the <code>jq</code> pulls <code>.tool_input.content</code>. A <code>Write</code> puts the whole file under <code>content</code>, but an <code>Edit</code> puts it under <code>new_string</code> instead (with <code>old_string</code> alongside it), so I fall back to <code>.tool_input.new_string</code> to cover both. The agent never gets to put a raw <code>&lt;input&gt;</code> on disk as the write dies and my message tells it to go use the component instead.</p>
+<h2>2. Don't let it stop until the ratchet test passes</h2>
+<p>This one's a <code>Stop</code> hook, which fires the moment the agent decides it's finished. It's the inverse of PreToolUse as instead of blocking an action before it happens, it refuses to let the agent end the turn at all. Exit <code>2</code> here means "no, keep working," and the stderr message tells it why.</p>
+<p>I keep a ratchet test that locks in design-system decisions I've made at <code>test/amplify_web/design_system_ratchet_test.exs</code>. The thing that's bitten me most is the agent announcing it's done with that ratchet red. The agent may run tests it thinks it needs to verify it's work, but the ratchet test doesn't always get picked up as it's more of a "global" check rather than specific to a feature. So I gate the finish on exactly that test, not the whole suite (it's faster, and it's the decision I actually care about):</p>
+<pre><code>\{
+  "hooks": \{
+    "Stop": [
+      \{
+        "hooks": [
+          \{
+            "type": "command",
+            "command": "[ \"$(jq -r '.stop_hook_active')\" = true ] &amp;&amp; exit 0; mix test test/amplify_web/design_system_ratchet_test.exs &gt;/dev/null 2&gt;&amp;1 || \{ echo 'Design-system ratchet test is failing — fix it before you call it done.' &gt;&amp;2; exit 2; }"
+          }
+        ]
+      }
+    ]
+  }
+}</code></pre>
+<p>The stdin for a Stop hook is much thinner since there's no tool to inspect, just the fact that the agent wants to wrap up:</p>
+<pre><code>\{
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "session_id": "…", "cwd": "…", "transcript_path": "…"
+}</code></pre>
+<p>No <code>tool_input</code> here since there's no tool invocation happening. Stop hook runs my gate and decides whether the turn is allowed to end. So the <code>jq</code> only reaches for <code>.stop_hook_active</code>. Now the agent literally can't wrap up until the ratchet test is passing.</p>
+<p>One important point that tripped me up: that <code>stop_hook_active</code> check at the front is not optional. Once a Stop hook has forced a continuation, that flag comes back <code>true</code> on the next stop, and if you don't bail out when you see it, a permanently-red ratchet will trap the agent in an infinite "fix → stop → blocked → fix" loop until you kill the session, so we must check the flag and let it stop.</p>
+<p>One more trap that applies to both is if <code>jq</code> fails silently. Get a path wrong (<code>.tool_input.content</code>, <code>.stop_hook_active</code>) and jq returns <code>null</code>, your check matches nothing, and the gate quietly does nothing while looking like it works. Test each one against a real hook payload before you trust it.</p>
+<p>That's it. Two checks at two different points in the loop, both deterministic, both fire every single time and give you more confidence that the agent isn't going sideways by ignoring your MUST DO VERY IMPORTANT DON'T FORGET instructions in CLAUDE.md!</p>

@@ -1,0 +1,73 @@
+<p>What if your load balancer could stop attacks before your web application even sees them?</p>
+<p><a href="https://docs.cloud.google.com/service-extensions/docs/overview">Google Cloud Service Extensions</a> now enables real-time traffic inspection directly within the load balancer pipeline, and when combined with <a href="https://www.fastly.com/products/web-application-api-protection">Fastly's Next-Gen WAF</a>, organizations can achieve enterprise-grade security without sacrificing performance.</p>
+<p>In this post, we'll explore how this powerful integration works and why it matters for modern cloud architectures, and walk through a practical deployment that you can implement today.</p>
+<h2>Real-World Impact: Performance Meets Protection</h2>
+<p>Let's look at what this means in practice with a realistic scenario:</p>
+<p><strong>The Setup</strong>: An e-commerce platform running on Google Kubernetes Engine (GKE) serving 10,000 requests per second across multiple regions.</p>
+<p><strong>The Challenge</strong>: Protecting against credential stuffing attacks, SQL injection, and bot traffic while maintaining sub-200ms response times.</p>
+<p><strong>The Solution</strong>: Deploy the Next-Gen WAF as a Service Extension callout, enabling:</p>
+<ul>
+ <li><strong>Zero-latency security decisions</strong> at the load balancer level</li>
+ <li><strong>Automatic scaling </strong>with your existing GKE infrastructure</li>
+ <li><strong>Regional deployment</strong> for optimal performance</li>
+ <li><strong>Fail-open configuration</strong> to maintain availability during agent maintenance</li>
+</ul>
+<h2>How Fastly's Next-Gen WAF Works with Google Cloud Service Extensions</h2>
+<p>Google Cloud Service Extensions offers two ways to insert custom logic: plugins and callouts.</p>
+<p><em>Callouts</em> let you use Cloud Load Balancing to make Envoy gRPC calls to Google Cloud services and user-managed services during data processing.</p>
+<p>Fastly’s Next-Gen WAF can run as general-purpose gRPC server on user-managed compute VMs, on GKE Pods on GKE Multi-Cloud, or on on-premises environments.</p>
+<h2>Implementation Deep Dive: From Zero to Protected</h2>
+<p>The integration leverages Envoy's external processing protocol (ExtProc) via gRPC, enabling the WAF to inspect and act on traffic at critical stages:</p>
+<p>1. REQUEST_HEADERS: Analyze incoming request headers against threat intelligence</p>
+<p>2. REQUEST_BODY: Stream and inspect payload data for malicious content</p>
+<p>3. RESPONSE_HEADERS: Monitor outbound responses for data leakage</p>
+<p>This granular inspection capability means threats are identified and blocked before they ever reach your application backend.</p>
+<p>Deployment from scratch involves creating and configuring an application load balancer that supports extensions.</p>
+<p>To deploy a callout backend service using the Next-Gen WAF agent, one can use our ready made docker image. In the terminal snippets below, we’ll create a VM instance to house, configure and deploy the Next-Gen WAF agent in the load balancers network.</p>
+<p>More detailed information can be found on Fastly’s documentation <a href="https://www.fastly.com/documentation/guides/next-gen-waf/setup-and-configuration/paas/google-cloud-service-extensions/">site</a>.</p>
+<pre><code>gcloud compute instances create callouts-vm \
+ --zone=$ZONE \
+ --network=lb-network \
+ --subnet=backend-subnet \
+ --machine-type=e2-medium \
+ --image-family=cos-stable \
+ --image-project=cos-cloud \
+ --tags=allow-ssh,load-balanced-backend \
+ --metadata-from-file=startup-script=startup-script-tls.sh</code></pre>
+<pre><code>#!/bin/bash
+
+# Create certificate directory
+mkdir -p /etc/ssl/certs/sigsci
+
+# Generate self-signed certificates for the gRPC service
+openssl req -x509 -newkey rsa:4096 \
+ -keyout /etc/ssl/certs/sigsci/key.pem \
+ -out /etc/ssl/certs/sigsci/cert.pem \
+ -days 365 -nodes \
+ -subj "/C=US/ST=CA/L=SF/O=Fastly/CN=ext11.com"
+
+# Set proper permissions for the sigsci user inside the container
+chmod 644 /etc/ssl/certs/sigsci/key.pem
+chmod 644 /etc/ssl/certs/sigsci/cert.pem
+
+# Start Signal Sciences agent with TLS configuration
+docker run -d \
+ --name sigsci-agent \
+ --restart unless-stopped \
+ -p 443:443 \
+ -v /etc/ssl/certs/sigsci:/etc/ssl/certs/sigsci:ro \
+ -e SIGSCI_ACCESSKEYID=&lt;YOUR ACCESS KEY&gt; \
+ -e SIGSCI_SECRETACCESSKEY=&lt;YOUR SECRET KEY&gt; \
+ -e SIGSCI_ENVOY_GRPC_ADDRESS=0.0.0.0:443 \
+ -e SIGSCI_ENVOY_EXTPROC_ENABLED=true \
+ -e SIGSCI_ENVOY_GRPC_CERT=/etc/ssl/certs/sigsci/cert.pem \
+ -e SIGSCI_ENVOY_GRPC_KEY=/etc/ssl/certs/sigsci/key.pem \
+ -e SIGSCI_DEBUG_LOG_VERBOSITY=3 \
+  signalsciences/sigsci-agent:latest
+
+# Log startup completion
+echo "Signal Sciences agent with TLS started at $(date)" &gt;&gt; /var/log/startup.log</code></pre>
+<h2>Ready to Deploy?</h2>
+<p>The integration of Fastly's Next-Gen WAF with Google Cloud Service Extensions offers a compelling path forward for organizations serious about cloud security. The combination of real-time threat protection, cloud-native deployment, and enterprise-scale performance makes this architecture suitable for the most demanding production environments.</p>
+<p>The future of web application security is here, and it's deeply integrated with your cloud infrastructure. Time to make the move.</p>
+<p><strong>Want to learn more?</strong> Check out our <a href="https://www.fastly.com/documentation/guides/next-gen-waf/setup-and-configuration/paas/google-cloud-service-extensions">comprehensive setup guide</a> for detailed implementation steps and troubleshooting tips.</p>
