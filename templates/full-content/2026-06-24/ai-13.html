@@ -1,0 +1,240 @@
+<h1>Fluree DB - A graph database for data that matters.</h1>
+<p>Temporal, verifiable, standards-compliant, git-like branching and merging, and optimized for AI agents. Integrated vector, text and geo search, and fine-grained access control with no external dependencies.</p>
+<p>RDF 1.1 / 1.2, Open Cypher Preview, SPARQL and JSON-LD query (includes history query and other Fluree feature extensions).</p>
+<p>Billions of graph facts on commodity hardware. Over 2M facts/second bulk import. Benchmark leader, 10.4x faster than next database. On the full 21.5-billion-triple Wikidata dump, all 850/850 WGPB graph-pattern queries complete with a 43 ms geometric mean.</p>
+<p><strong>Fluree Memory</strong> — is part of the Fluree DB CLI. Persistent, searchable memory for AI coding assistants. Give Claude Code, Cursor, and other AI tools long-term project memory: facts, decisions, and preferences persist across sessions in a Fluree ledger you control — scoped per-repo or per-user, shareable via git.</p>
+<h2>Install</h2>
+<p><strong>Cloud / Serverless</strong> — Run in a dedicated serverless stack at no cost (usage limited), spin up dedicated servers on demand as needed. Interact seamlessly with local fluree CLI (install instructions below).</p>
+<p><strong>Docker</strong> — pre-configured HTTP server, ready to accept queries on port 8090. Best for trying out the API or running Fluree as a service.</p>
+<pre><code>docker run -p 8090:8090 fluree/server:latest</code></pre>
+<p><strong>Homebrew, shell installer, or Windows PowerShell</strong> — installs the <code>fluree</code> binary that bundles both the CLI and the embedded server (<code>fluree server run</code>).</p>
+<pre><code># Homebrew (macOS / Linux)
+brew install fluree/tap/fluree
+
+# Shell installer (macOS / Linux)
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.sh | sh</code></pre>
+<pre><code># Windows (PowerShell)
+irm https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.ps1 | iex</code></pre>
+<p>Pre-built binaries and the changelog for every release are on the GitHub Releases page.</p>
+<h2>Zero to graph in 60 seconds</h2>
+<pre><code>fluree init
+fluree create movies
+
+fluree insert '
+@prefix schema: &lt;http://schema.org/&gt; .
+@prefix ex:     &lt;http://example.org/&gt; .
+
+ex:blade-runner  a schema:Movie ;
+  schema:name        "Blade Runner" ;
+  schema:dateCreated "1982-06-25"^^&lt;http://www.w3.org/2001/XMLSchema#date&gt; ;
+  schema:director    ex:ridley-scott .
+
+ex:ridley-scott  a schema:Person ;
+  schema:name "Ridley Scott" .
+
+ex:alien  a schema:Movie ;
+  schema:name        "Alien" ;
+  schema:dateCreated "1979-05-25"^^&lt;http://www.w3.org/2001/XMLSchema#date&gt; ;
+  schema:director    ex:ridley-scott .
+'
+
+fluree query --format table 'SELECT ?title ?date WHERE \{
+  ?movie a &lt;http://schema.org/Movie&gt; ;
+         &lt;http://schema.org/name&gt; ?title ;
+         &lt;http://schema.org/dateCreated&gt; ?date .
+} ORDER BY ?date'</code></pre>
+<pre><code>┌──────────────┬────────────┐
+│ title        │ date       │
+├──────────────┼────────────┤
+│ Alien        │ 1979-05-25 │
+│ Blade Runner │ 1982-06-25 │
+└──────────────┴────────────┘
+</code></pre>
+<p>That's a SPARQL query. The same query in JSON-LD:</p>
+<pre><code>fluree query --jsonld '\{
+  "@context": \{ "schema": "http://schema.org/" },
+  "select": ["?title", "?date"],
+  "where": [
+    \{ "@id": "?movie", "@type": "schema:Movie",
+      "schema:name": "?title", "schema:dateCreated": "?date" }
+  ],
+  "orderBy": "?date"
+}'</code></pre>
+<p>Both languages access the same engine — same features, same performance.</p>
+<p>Now update the data and query the past:</p>
+<pre><code># Give every Ridley Scott movie a genre
+fluree update '
+PREFIX schema: &lt;http://schema.org/&gt;
+PREFIX ex:     &lt;http://example.org/&gt;
+INSERT \{ ?movie schema:genre "sci-fi" }
+WHERE  \{ ?movie schema:director ex:ridley-scott }
+'
+
+# What did the data look like before that update?
+fluree query --at 1 'SELECT ?title ?genre WHERE \{
+  ?movie a &lt;http://schema.org/Movie&gt; ;
+         &lt;http://schema.org/name&gt; ?title .
+  OPTIONAL \{ ?movie &lt;http://schema.org/genre&gt; ?genre }
+}'
+# → Blade Runner (no genre), Alien (no genre)
+
+# And now?
+fluree query 'SELECT ?title ?genre WHERE \{
+  ?movie a &lt;http://schema.org/Movie&gt; ;
+         &lt;http://schema.org/name&gt; ?title .
+  OPTIONAL \{ ?movie &lt;http://schema.org/genre&gt; ?genre }
+}'
+# → Blade Runner "sci-fi", Alien "sci-fi"</code></pre>
+<p>Every change is preserved. Query any point in history by transaction number, ISO timestamp, or commit ID.</p>
+<h2>What makes Fluree different</h2>
+<h3>Time travel</h3>
+<p>Every transaction is immutable. Query data as it existed at any point in time — by transaction number, ISO-8601 timestamp, or content-addressed commit ID. No special tables, no slowly-changing dimensions. It's built into the storage model.</p>
+<pre><code>fluree query --at 2024-06-15T00:00:00Z 'SELECT * WHERE \{ ?s ?p ?o }'</code></pre>
+<h3>Property graphs &amp; edge annotations</h3>
+<p>Attach properties to a <em>relationship</em>, not just a node — a <code>role</code> and <code>since</code> date on a <code>worksFor</code> edge, a <code>source</code> and <code>confidence</code> on a claim. Fluree implements the RDF 1.2 / SPARQL 1.2 annotation syntax, so you get labeled-property-graph edges, parallel relationships between the same two nodes, and RDF-star statement-level provenance on a single surface. Plain triple queries are left untouched — annotations only change cardinality when you ask for them.</p>
+<pre><code># Attach metadata to the edge itself, not to Alice or Acme
+INSERT DATA \{
+  ex:alice ex:worksFor ex:acme \{| ex:role "Engineer" ; ex:since 2024 |} .
+}
+
+# Match the edge and its metadata together
+SELECT ?role ?since WHERE \{
+  ex:alice ex:worksFor ex:acme \{| ex:role ?role ; ex:since ?since |} .
+}</code></pre>
+<h3>Integrated search</h3>
+<p>BM25 full-text search and HNSW vector similarity are built into the query engine — not bolted-on external services. Search results participate in joins, filters, and aggregations like any other graph pattern.</p>
+<pre><code>\{
+  "@context": \{ "ex": "http://example.org/" },
+  "from": "mydb:main",
+  "where": [
+    \{ "@id": "?doc", "ex:title": "?title" },
+    ["bind", "?score", "(fulltext ?title \"knowledge graph\")"]
+  ],
+  "select": ["?doc", "?title", "?score"],
+  "orderBy": [["desc", "?score"]],
+  "limit": 10
+}</code></pre>
+<h3>Git-like data management</h3>
+<p>Branch, rebase, merge, push, pull — the same workflow developers already use for code, applied to data. Fork a dataset to experiment without affecting production. Merge when ready. Rebase to catch up with upstream changes. Every branch has its own independent commit history.</p>
+<pre><code>fluree branch create experiment
+fluree use mydb:experiment
+# ... make changes safely ...
+fluree branch rebase experiment    # catch up with main
+fluree branch merge experiment     # fast-forward merge into main
+fluree branch drop experiment      # clean up</code></pre>
+<h3>Triple-level access control</h3>
+<p>Policies are data in the ledger, enforced at query and transaction time. Users see only what they're authorized to see — not rows, not tables, individual facts. No application-layer filtering required.</p>
+<h3>Reasoning and inference</h3>
+<p>RDFS subclass/subproperty reasoning, OWL 2 RL forward-chaining, and user-defined Datalog rules. The database infers facts you didn't explicitly store.</p>
+<h3>Standards-first</h3>
+<p>Full SPARQL 1.1 with zero compliance failures against the W3C test suite. Native JSON-LD for idiomatic JSON APIs. Both query languages access the same engine with the same capabilities — time travel, policies, graph sources, and all.</p>
+<h3>Also worth knowing</h3>
+<ul>
+ <li><strong>SHACL validation</strong> — declarative shape constraints enforced at transaction time, with violations reported per-target, per-property.</li>
+ <li><strong>OWL ontology imports</strong> — pull external vocabularies into a ledger via <code>f:schemaSource</code> + <code>owl:imports</code>, materialized at commit time.</li>
+ <li><strong>Apache Iceberg / R2RML</strong> — query Parquet warehouses and relational stores as first-class graph sources alongside native Fluree data.</li>
+</ul>
+<h2>Use it your way</h2>
+<p><strong>CLI</strong> — Explore data, script pipelines, manage ledgers from the terminal.</p>
+<pre><code>fluree query -f report.rq --format csv &gt; output.csv</code></pre>
+<p><strong>HTTP Server</strong> — Run <code>fluree server</code> for a production API with OIDC auth, content negotiation, and OpenTelemetry.</p>
+<pre><code>fluree server run
+curl -X POST http://localhost:8090/v1/fluree/query?ledger=mydb:main \
+  -H "Content-Type: application/sparql-query" \
+  -d 'SELECT ?s ?p ?o WHERE \{ ?s ?p ?o } LIMIT 10'</code></pre>
+<p><strong>Rust library</strong> — Embed Fluree directly in your application. No server process needed.</p>
+<pre><code>let fluree = FlureeBuilder::memory().build_memory();
+fluree.create_ledger("mydb").await?;
+
+let result = fluree.graph("mydb:main")
+    .query()
+    .sparql("SELECT ?s WHERE \{ ?s a &lt;http://schema.org/Person&gt; }")
+    .execute()
+    .await?;</code></pre>
+<p><strong>MCP server</strong> — Expose Fluree to AI assistants over the Model Context Protocol.</p>
+<pre><code>fluree mcp serve            # stdio transport for Claude Desktop, Cursor, etc.</code></pre>
+<h2>Capabilities</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Feature</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Query languages</strong></td>
+   <td>SPARQL 1.1, JSON-LD Query</td>
+  </tr>
+  <tr>
+   <td><strong>Data formats</strong></td>
+   <td>JSON-LD, Turtle, TriG, N-Triples, N-Quads</td>
+  </tr>
+  <tr>
+   <td><strong>Edge annotations</strong></td>
+   <td>Property-graph edges &amp; statement-level metadata (RDF 1.2 / SPARQL 1.2)</td>
+  </tr>
+  <tr>
+   <td><strong>Time travel</strong></td>
+   <td>Transaction number, ISO timestamp, commit ID</td>
+  </tr>
+  <tr>
+   <td><strong>Full-text search</strong></td>
+   <td>Integrated BM25 with Block-Max WAND</td>
+  </tr>
+  <tr>
+   <td><strong>Vector search</strong></td>
+   <td>Embedded HNSW or remote service</td>
+  </tr>
+  <tr>
+   <td><strong>Reasoning</strong></td>
+   <td>RDFS, OWL 2 QL, OWL 2 RL, Datalog rules</td>
+  </tr>
+  <tr>
+   <td><strong>Access control</strong></td>
+   <td>Triple-level policy enforcement</td>
+  </tr>
+  <tr>
+   <td><strong>Geospatial</strong></td>
+   <td>GeoSPARQL, S2 cell indexing</td>
+  </tr>
+  <tr>
+   <td><strong>Verifiability</strong></td>
+   <td>JWS-signed transactions, Verifiable Credentials</td>
+  </tr>
+  <tr>
+   <td><strong>Data sources</strong></td>
+   <td>Apache Iceberg, R2RML relational mappings</td>
+  </tr>
+  <tr>
+   <td><strong>Storage backends</strong></td>
+   <td>Memory, file, AWS S3 + DynamoDB, IPFS</td>
+  </tr>
+  <tr>
+   <td><strong>Replication</strong></td>
+   <td>Clone, push, pull between instances</td>
+  </tr>
+  <tr>
+   <td><strong>Branching</strong></td>
+   <td>Fork ledgers, independent commit histories</td>
+  </tr>
+  <tr>
+   <td><strong>Observability</strong></td>
+   <td>OpenTelemetry tracing, structured logging</td>
+  </tr>
+  <tr>
+   <td><strong>Validation</strong></td>
+   <td>SHACL shape constraints</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Documentation</h2>
+<p>For documentation and more information, visit labs.flur.ee/docs.</p>
+<h3>For AI agents</h3>
+<p>The published docs are available as LLM-readable text following the <code>llms.txt</code> convention:</p>
+<ul>
+ <li>Curated index: https://fluree.github.io/db/llms.txt</li>
+ <li>Full corpus: https://fluree.github.io/db/llms-full.txt</li>
+</ul>
+<h2>License</h2>
+<p>Licensed under the Business Source License 1.1, with a Change Date to Apache License 2.0 as specified in that file.</p>

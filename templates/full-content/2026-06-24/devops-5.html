@@ -1,0 +1,255 @@
+<h2>Build and Deploy a Remote MCP Server to GKE in 30 Minutes</h2>
+<p>Integrating context from tools and data sources into LLMs can be challenging, which impacts the ease of development for AI agents. To address this challenge, Anthropic introduced the <a href="https://modelcontextprotocol.io/introduction">Model Context Protocol (MCP)</a>, which standardizes how applications provide context to these models. Developers often want to build an MCP server for their APIs to make them available to fellow developers, allowing them to use it as context in their own applications. Google Kubernetes Engine (GKE) provides a scalable, reliable, and secure environment to deploy these remote MCP servers.</p>
+<p>This guide shows the straightforward process of setting up a secure remote MCP server on GKE.</p>
+<h2>MCP transports</h2>
+<p>The Model Context Protocol follows a client-server architecture. It initially only supported running the server locally using the <code>stdio</code> transport. The protocol has since evolved and now supports remote access transports, specifically <a href="https://modelcontextprotocol.io/specification/latest/basic/transports#streamable-http">Streamable HTTP</a>.</p>
+<p>With Streamable HTTP, the server operates as an independent process that can handle multiple client connections. This transport uses HTTP POST and GET requests. The server must provide a single HTTP endpoint path that supports both POST and GET methods, such as <code>https://example.com/mcp</code>. You can learn more about the different transports in the <a href="https://modelcontextprotocol.io/docs/concepts/architecture#transport-layer">official documentation</a>.</p>
+<h2>Benefits of running an MCP server on GKE</h2>
+<p>Running an MCP server remotely on GKE provides several architecture benefits:</p>
+<ul>
+ <li><strong>Scalability:</strong> GKE Autopilot is built to handle highly variable traffic. Since MCP Servers are stateless, GKE can scale horizontally to handle spikes in demand efficiently.</li>
+ <li><strong>Centralized access:</strong> Teams can share access to a centralized MCP server, allowing developers to connect from local machines, Agents or pipelines instead of running redundant local servers. Updates to the central server immediately benefit everyone.</li>
+ <li><strong>Enhanced security:</strong> The Kubernetes Gateway API combined with SSL certificates provides an easy way to force secure, encrypted traffic. This allows only secure connections to the MCP server, preventing unauthorized access.</li>
+</ul>
+<h2>Prerequisites</h2>
+<p>Before starting, ensure the following tools are installed:</p>
+<ul>
+ <li>python 3.10 or higher</li>
+ <li>uv (for package and project management, see the <a href="https://docs.astral.sh/uv/getting-started/installation/">installation documentation</a>)</li>
+ <li>Google Cloud SDK (<code>gcloud</code>)</li>
+ <li><code>kubectl</code> command-line tool</li>
+</ul>
+<h2>Installation</h2>
+<p>Prepare environment variables</p>
+<pre><code>export PROJECT_ID=$(gcloud config get-value project) 
+export REGION=us-central1</code></pre>
+<p>Create a folder, <code>mcp-on-gke</code>, to store the code for the server and deployment.</p>
+<pre><code>mkdir mcp-on-gke &amp;&amp; cd mcp-on-gke</code></pre>
+<p>Now configure the Google Cloud credentials and set the active project.</p>
+<pre><code>gcloud auth login 
+gcloud config set project $PROJECT_ID</code></pre>
+<p>Initiate the GKE Autopilot cluster creation in the background.</p>
+<pre><code>gcloud container clusters create-auto mcp-cluster \
+ --region $REGION \
+ --release-channel rapid \
+ --async</code></pre>
+<p>Use <code>uv</code> to create a project, which will generate a <code>pyproject.toml</code> file.</p>
+<pre><code>uv init</code></pre>
+<h2>Math MCP server</h2>
+<p>Large language models are excellent at non-deterministic tasks, such as generating text, summarizing ideas, and reasoning about concepts. However, they can be unreliable for deterministic tasks like math operations. To solve this, developers can create tools that provide valuable context. Using <a href="https://gofastmcp.com/getting-started/welcome">FastMCP</a>, a framework for building MCP servers in Python, it is possible to create a simple math server with two tools: add and subtract.</p>
+<p>First, add FastMCP as a dependency.</p>
+<pre><code>uv add fastmcp 
+uv add asyncio</code></pre>
+<p>Copy the following code into <code>server.py</code> to create the server.</p>
+<pre><code>from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
+import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
+
+mcp_port=3000
+
+# Initialize the FastMCP server
+server = FastMCP(
+    "Math Server",
+)
+
+@server.tool()
+def add(a: int, b: int) -&gt; int:
+    """Add two numbers together."""
+    return a + b
+
+@server.tool()
+def subtract(a: int, b: int) -&gt; int:
+    """Subtract the second number from the first."""
+    return a - b
+
+@server.custom_route("/healthz", methods=["GET"])
+async def health_check(request: Request) -&gt; PlainTextResponse:
+    """Simple health check endpoint that returns a 200 OK response"""
+    return PlainTextResponse("OK")
+
+if __name__ == "__main__":
+    logger.info(f" MCP server started on port \{mcp_port}")
+    asyncio.run(
+        server.run_async(
+            transport="streamable-http",
+            host="0.0.0.0",
+            port=mcp_port
+        )
+    )</code></pre>
+<h2>Testing the MCP server locally</h2>
+<p>Create the <code>test_mcp_server.py</code> script to connect to test the MCP Server.</p>
+<pre><code>from fastmcp import Client, FastMCP
+import asyncio
+import logging
+
+# Connect to the remote MCP server
+client = Client("https://localhost:3000/mcp")
+
+async def test_remote_server():
+    async with client:
+        # Basic server interaction
+        await client.ping()
+        # List available operations
+        tools = await client.list_tools()
+        print(f"Available tools: \{tools} \n")
+        # Execute add operation
+        result = await client.call_tool("add", \{"a": 5, "b": 3})
+        print(f"Result of addition: \{result} \n")
+        # Execute subtract operation
+        result = await client.call_tool("subtract", \{"a": 5, "b": 3})
+        print(f"Result of subtraction: \{result} \n")
+
+if __name__ == "__main__":
+    asyncio.run(test_remote_server())</code></pre>
+<p>Run the MCP server locally to test the connection:</p>
+<pre><code>uv run server.py</code></pre>
+<h2>Building the container image</h2>
+<p>First, prepare the <code>Dockerfile</code>:</p>
+<pre><code>FROM python:3.10-slim
+COPY --from=ghcr.io/astral-sh/uv:0.4.15 /uv /bin/uv
+WORKDIR /app
+COPY pyproject.toml .
+COPY server.py .
+RUN uv sync
+CMD ["uv", "run", "server.py"]</code></pre>
+<h2>Set up Artifact Registry</h2>
+<pre><code>gcloud artifacts repositories create mcp-repo --repository-format=docker --location=$REGION</code></pre>
+<h2>Build and push the image in parallel</h2>
+<pre><code>gcloud builds submit --tag $REGION-docker.pkg.dev/$PROJECT_ID/mcp-repo/math-mcp-server:latest</code></pre>
+<h2>Deploying to GKE with Gateway API and SSL</h2>
+<p>Create a <code>deployment.yaml</code> file to define the Kubernetes Deployment and Service.</p>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mcp-server
+  template:
+    metadata:
+      labels:
+        app: mcp-server
+    spec:
+      containers:
+      - name: mcp-server
+        image: $REGION-docker.pkg.dev/$PROJECT_ID/mcp-repo/math-mcp-server:latest
+        ports:
+        - containerPort: 3000
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 3000
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-service
+spec:
+  selector:
+    app: mcp-server
+  ports:
+  - port: 80
+    targetPort: 3000</code></pre>
+<p>Apply this configuration to the cluster:</p>
+<pre><code>kubectl apply -f deployment.yaml</code></pre>
+<p>To secure the connection, use a Google-managed SSL certificate and attach it to a Gateway API resource. First, reserve a static IP address for your load balancer:</p>
+<pre><code>gcloud compute addresses create mcp-server-ip --global 
+export MCP_SERVER_IP=$(gcloud compute addresses describe mcp-server-ip --global --format="value(address)")</code></pre>
+<p>Create a Google-Managed Certificate.</p>
+<pre><code>gcloud compute ssl-certificates create mcp-cert --domains mcp.yourdomain.com --global</code></pre>
+<p>Create a <code>gateway.yaml</code> file to provision the load balancer and configure Transport Layer Security (TLS) termination.</p>
+<pre><code>apiVersion: gateway.networking.k8s.io/v1beta1
+kind: Gateway
+metadata:
+  name: mcp-gateway
+spec:
+  gatewayClassName: gke-l7-global-external-managed
+  listeners:
+  - name: https
+    protocol: HTTPS
+    port: 443
+    tls:
+      mode: Terminate
+      options:
+        networking.gke.io/pre-shared-certs: mcp-cert
+    addresses:
+    - type: NamedAddress
+      value: mcp-server-ip
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mcp-route
+spec:
+  parentRefs:
+  - name: mcp-gateway
+  hostnames:
+  - "mcp.yourdomain.com"
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /mcp
+    backendRefs:
+    - name: mcp-service
+      port: 80
+---
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: mcp-backend-policy
+spec:
+  default:
+    sessionAffinity:
+      type: CLIENT_IP
+  targetRef:
+    group: ""
+    kind: Service
+    name: mcp-service
+---
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: mcp-health
+  namespace: default
+spec:
+  default:
+    checkIntervalSec: 15
+    timeoutSec: 5
+    healthyThreshold: 1
+    unhealthyThreshold: 2
+    logConfig:
+      enabled: false
+    config:
+      type: HTTP
+      httpHealthCheck:
+        port: 3000
+        requestPath: /healthz
+  targetRef:
+    group: ""
+    kind: Service
+    name: mcp-service</code></pre>
+<p>Deploying this configuration creates the infrastructure required to route external traffic securely to the MCP server.</p>
+<pre><code>kubectl apply -f gateway.yaml</code></pre>

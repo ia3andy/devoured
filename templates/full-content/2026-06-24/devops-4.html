@@ -1,0 +1,166 @@
+<h1>Analyzing Claude Code usage with CloudWatch and OpenTelemetry</h1>
+<p>If your engineering organization uses AI coding agents like Claude Code, usage is likely growing faster than your ability to track it. Token consumption, cost per team, and developer productivity are questions that existing dashboards don’t answer, because the telemetry never made it to your observability backend.</p>
+<p>With Amazon CloudWatch OpenTelemetry Protocol (OTLP) in General Availability, metrics ingestion is now possible with bearer token authentication. This means, tools that emit OTLP can typically ship metrics directly to CloudWatch with a single authorization header. No collectors, no sidecars, no IAM credential wiring on developer machines. Connect the signals in minutes and get per-developer cost attribution, team-level usage analytics, and operational alerting, all queryable with Prometheus Query Language (PromQL).</p>
+<p>This post walks through the end-to-end setup for Claude Code. Although the focus here is Claude Code, comprehensive guidance for OpenAI Codex and GitHub Copilot is available on the AWS Observability best practices. This post focuses on bearer token authentication for its simplicity on developer machines. For organizations that require SSO (Single Sign-On) or OIDC (OpenID Connect) for developer authentication, see the guidance repository for federated identity patterns and token refresh helpers.</p>
+<h2>Bearer token authentication</h2>
+<p>Bearer tokens (or CloudWatch metrics API key) allow tools running outside AWS (like Claude Code on developer laptops) to send metrics to CloudWatch without requiring the AWS SDK or IAM credential chains. Each token is tied to an AWS IAM user scoped exclusively to the CloudWatchAPIKeyAccess managed policy.</p>
+<blockquote>
+ <p><strong>Important:</strong> Bearer tokens are long-term credentials. This post uses bearer tokens because AI coding agents run on developer laptops outside of AWS. SigV4 authentication would require either a central collector or running a collector process on every developer machine. Both approaches add operational complexity. Bearer tokens eliminate that infrastructure requirement entirely. For workloads running inside AWS where SigV4 with short-term credentials is feasible, prefer that approach for a stronger security posture. The CloudWatch OTLP endpoint requires HTTPS; requests over plain HTTP are rejected. For more information, see CloudWatch OTLP Metrics Bearer Token Auth.</p>
+</blockquote>
+<h2>Granularity strategy</h2>
+<p>Organizations control how granular their telemetry attribution is based on how they provision bearer tokens. At the finest level, each developer gets their own IAM user and bearer token, so attribution is inherent to the token itself. At a coarser level, a single token can be shared across a team or an entire organization, with identity attribution handled through client-side resource attributes instead.</p>
+<p>All three approaches produce identical dashboards and PromQL queries because attribution is driven by resource attributes, not the token itself. Start with a single shared token to validate the pipeline, then split to per-team or per-developer tokens as your security posture demands. Per-developer tokens are recommended when compliance requires credentials traceable to a named individual or when clean offboarding (revoking a single IAM user) is a hard requirement.</p>
+<h2>Prerequisites</h2>
+<ul>
+ <li>An AWS account with permissions to create CloudWatch resources</li>
+ <li>AWS CLI v2 installed and configured</li>
+ <li>Latest Claude Code version</li>
+ <li>A CloudWatch metrics API key (generated below)</li>
+</ul>
+<h2>Create a bearer token via the console</h2>
+<p>In the CloudWatch console, navigate to <strong>Settings</strong> under the <strong>Setup</strong> section.</p>
+<ol>
+ <li>Scroll to <strong>API Keys.</strong></li>
+ <li>Choose <strong>Create.</strong></li>
+ <li>Select an <strong>API key expiration.</strong></li>
+</ol>
+<p>CloudWatch creates the associated IAM user on your behalf with the <code>CloudWatchAPIKeyAccess</code> policy attached.</p>
+<h2>Create a bearer token via the CLI</h2>
+<p>Alternatively, create a token with the CLI using the following commands:</p>
+<pre><code># Create an IAM user for CloudWatch metrics ingestion
+aws iam create-user --user-name cloudwatch-metrics-api-key-user
+
+# Attach the CloudWatchAPIKeyAccess managed policy
+aws iam attach-user-policy \
+    --user-name cloudwatch-metrics-api-key-user \
+    --policy-arn arn:aws:iam::aws:policy/CloudWatchAPIKeyAccess
+
+# Create a service-specific credential for CloudWatch metrics ingestion
+aws iam create-service-specific-credential \
+    --user-name cloudwatch-metrics-api-key-user \
+    --service-name cloudwatch.amazonaws.com</code></pre>
+<p>The response includes the <code>ServiceCredentialSecret</code> field, which is the bearer token value. Store it securely in AWS Secrets Manager or your organization’s vault solution. A reminder that you should never commit the token to version control. For automated key rotation, use AWS Secrets Manager rotation with a Lambda function.</p>
+<h2>Client-side configuration</h2>
+<p>With the bearer token set up, you can now configure Claude Code to export metrics. This approach uses client-side resource attributes set by each developer (or distributed via profile management).</p>
+<pre><code># Retrieve token from Secrets Manager
+BEARER_TOKEN=$(aws secretsmanager get-secret-value \
+ --secret-id cloudwatch-otlp-bearer-token \
+ --query SecretString \
+ --output text)
+
+export CLAUDE_CODE_ENABLE_TELEMETRY=1
+export OTEL_METRICS_EXPORTER=otlp
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+export OTEL_EXPORTER_OTLP_ENDPOINT="https://monitoring.&lt;AWS_REGION&gt;.amazonaws.com"
+export OTEL_RESOURCE_ATTRIBUTES="user.id=$(whoami),user.email=$\{USER_EMAIL},team.id=$\{TEAM:-engineering},cost_center=$\{COST_CENTER:-default},department=$\{DEPARTMENT:-engineering},environment=$\{ENV:-dev}"
+
+# Security Note: Environment variables can be exposed through process listings and shell history.
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer $\{BEARER_TOKEN}"
+
+# control export frequency (2s, for testing)
+export OTEL_METRIC_EXPORT_INTERVAL=2000</code></pre>
+<p>Replace <code>&lt;AWS_REGION&gt;</code> with your target Region (for example, <code>us-east-1</code>, <code>eu-west-1</code>).</p>
+<p>The <code>OTEL_RESOURCE_ATTRIBUTES</code> line attaches identity dimensions to every metric. Developers set these attributes directly. They become the PromQL labels for filtering and grouping in dashboards and alerts. Use whatever attributes your organization needs. The key requirement is consistency across your fleet so aggregations work.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Attribute</th>
+   <th>PromQL label</th>
+   <th>Purpose</th>
+   <th>Example</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>user.id</code></td>
+   <td><code>@resource.user.id</code></td>
+   <td>Per-developer attribution</td>
+   <td><code>jdoe</code></td>
+  </tr>
+  <tr>
+   <td><code>user.email</code></td>
+   <td><code>@resource.user.email</code></td>
+   <td>Per-developer attribution (email)</td>
+   <td><code>jdoe@acme.com</code></td>
+  </tr>
+  <tr>
+   <td><code>team.id</code></td>
+   <td><code>@resource.team.id</code></td>
+   <td>Team-level aggregation</td>
+   <td><code>platform-eng</code></td>
+  </tr>
+  <tr>
+   <td><code>cost_center</code></td>
+   <td><code>@resource.cost_center</code></td>
+   <td>Finance/chargeback grouping</td>
+   <td><code>CC-4200</code></td>
+  </tr>
+  <tr>
+   <td><code>department</code></td>
+   <td><code>@resource.department</code></td>
+   <td>Org-level rollup</td>
+   <td><code>engineering</code></td>
+  </tr>
+  <tr>
+   <td><code>environment</code></td>
+   <td><code>@resource.environment</code></td>
+   <td>Distinguish dev/staging/prod usage</td>
+   <td><code>production</code></td>
+  </tr>
+ </tbody>
+</table>
+<h2>Verify metrics are flowing</h2>
+<p>After setting the environment variables, run a short Claude Code session:</p>
+<pre><code># Start a brief session
+claude -p "Let's conquer the world" --max-turns 1</code></pre>
+<p>To verify metrics are flowing, open CloudWatch Query Studio and enter <code>claude_</code>. You will see a few metrics such as <code>claude_code.token.usage</code> which tracks the number of tokens used.</p>
+<h2>Sample usage dashboard</h2>
+<p>Regardless of the granularity strategy described previously, a CloudWatch dashboard is available that uses PromQL to query Claude Code telemetry data. As long as your resource attributes follow the semantic conventions described in the client-side configuration section, all values appear in the dashboard automatically.</p>
+<p>Deploy the pre-built dashboard:</p>
+<pre><code># Download the dashboard definition
+curl -o claude-code-dashboard.json https://raw.githubusercontent.com/aws-observability/aws-observability-accelerator/main/artifacts/cloudwatch-dashboards/claude-code/claude-code.json
+
+aws cloudwatch put-dashboard \
+  --dashboard-name claude-code-usage \
+  --dashboard-body file://claude-code-dashboard.json \
+  --output off \
+  --region &lt;AWS_REGION&gt;</code></pre>
+<h2>Alerting</h2>
+<p>Every panel in the dashboard is backed by a PromQL query. To create an alarm from any panel:</p>
+<ol>
+ <li>Open the panel you are interested in (for example, token usage by user).</li>
+ <li>To open the underlying query, choose <strong>View in Query Studio</strong>.</li>
+ <li>Choose <strong>Create alarm</strong> directly from Query Studio.</li>
+ <li>Adjust the query or thresholds as needed.</li>
+</ol>
+<h2>Cost estimate</h2>
+<p>For a 200-developer organization where each developer runs ~20 sessions per day, each emitting ~7 metric data points with resource attributes, and developers are active ~22 days/month:</p>
+<p>A typical OTLP data point with 10-15 attributes is 300-600 bytes. Using 450 bytes as a midpoint:</p>
+<pre><code>200 developers × 20 sessions/day × 7 metrics × 450 bytes = 12.6 MB/day
+12.6 MB/day × 22 days = ~277 MB/month ≈ 0.27 GB/month</code></pre>
+<p>At <strong>$0.50/GB</strong> ingestion, that is <strong>~$0.14/month</strong> for the base case. Even with high-cardinality metrics (100x volume), total ingestion stays under <strong>$14/month</strong>. PromQL queries in the CloudWatch console are <strong>free</strong>.</p>
+<p>The total cost for 200 developers, in this example, would be <strong>under $15/month</strong>.</p>
+<h2>Cleanup</h2>
+<blockquote>
+ <p><strong>Important:</strong> CloudWatch retains metrics up to 15 months at no charge. Delete alarms and IAM resources to avoid ongoing costs and security exposure.</p>
+</blockquote>
+<p>Follow these commands to remove all the resources you have created:</p>
+<pre><code># Delete Dashboard
+aws cloudwatch delete-dashboards --dashboard-names claude-code-usage --region &lt;AWS_REGION&gt;
+
+# Delete CloudWatch Alarms
+aws cloudwatch delete-alarms --alarm-names &lt;alarm-name&gt; --region &lt;AWS_REGION&gt;
+
+# Delete service-specific credential
+aws iam delete-service-specific-credential --user-name cloudwatch-metrics-api-key-user --service-specific-credential-id &lt;credential-id&gt;
+
+# Detach policy from IAM user
+aws iam detach-user-policy --user-name cloudwatch-metrics-api-key-user --policy-arn arn:aws:iam::aws:policy/CloudWatchAPIKeyAccess
+
+# Delete IAM user
+aws iam delete-user --user-name cloudwatch-metrics-api-key-user
+
+# If using Secrets Manager, delete the secret
+aws secretsmanager delete-secret --secret-id &lt;secret-name&gt; --region &lt;AWS_REGION&gt;</code></pre>
+<h2>Conclusion</h2>
+<p>In this post, you configured Claude Code to export OpenTelemetry metrics to Amazon CloudWatch using bearer token authentication, deployed a PromQL-powered dashboard for cost and usage visibility, and set up alerting for spend anomalies and adoption regression.</p>
