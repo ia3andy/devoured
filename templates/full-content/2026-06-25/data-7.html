@@ -1,0 +1,112 @@
+<p><em>The lines between transactional systems, analytical systems, hybrid systems, and shared storage architectures are getting blurry. This post proposes a small taxonomy for describing the different ways systems, workloads, storage tiers, visibility, and durable copies relate to each other.</em></p>
+<h2>OLTP, OLAP, HTAP, and now LTAP?</h2>
+<p>We can think of the first two as two types of workload which have specialized query engines and storage systems to support them. OLTP such as the RDBMS like Postgres and MySQL use row-based storage engines. OLAP, such as Clickhouse, cloud data warehouse and the lakehouse use column-based storage.</p>
+<p>HTAP is a hybrid workload system: one system -&gt; both transactional and analytical workloads. The HTAP system therefore has specialized storage and specialized query engine to stitch together the row-based and columnar data.</p>
+<p>So far, we’re dealing with a single system. A Postgres (OLTP), a Clickhouse (OLAP), a SingleStore or TiDB (HTAP).</p>
+<p>So what is the recent Databricks’ LTAP announcement? LTAP is the two workloads (OLTP and OLAP) but also two systems (e.g. Postgres and lakehouse/Spark) and some blend of two different storage systems.</p>
+<p>As well single single vs multi-system, single vs multi-workload, there are other relevant concepts such as tiering and materialization:</p>
+<ul>
+ <li>Tiering 
+  <ul>
+   <li>A single system can tier (move) data from hot to cold storage (for cost efficiency). One system, one copy, two tiers.</li>
+   <li>Hot and cold might be the same storage format (both row-based or both columnar), or might be different formats (hot is row-based, cold is columnar).</li>
+   <li>We can have two systems share the same storage tier. System A tiers (move) hot data to the storage of System B. Two systems, one copy, though System B doesn’t see the newest data yet which only exists on A.</li>
+  </ul></li>
+ <li>Materializing 
+  <ul>
+   <li>One system can materialize (copy) data into another system. Two systems, two copies.</li>
+  </ul></li>
+</ul>
+<p>Note when I say “copy of the data”, I mean durable copy, so caching doesn’t count. If the number of copies really matters to you as a metric, then maybe caching does count, depending on how much cached data you need to make it work? If only life were simpler.</p>
+<p>It would be nice to have some shared vocabulary around this, so we can talk about system architecture more easily. So I defined some terms last year for this, and expanded it as seen below.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Type</th>
+   <th>Systems</th>
+   <th>Workloads</th>
+   <th>Vis</th>
+   <th>Copies</th>
+   <th>Example</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Single Tier</td>
+   <td>1</td>
+   <td>1</td>
+   <td>N/A</td>
+   <td>1</td>
+   <td>Postgres using SSD</td>
+  </tr>
+  <tr>
+   <td>Internal Tiering</td>
+   <td>1</td>
+   <td>1</td>
+   <td>N/A</td>
+   <td>1</td>
+   <td>Kafka tiered storage</td>
+  </tr>
+  <tr>
+   <td>Hybrid-Sync</td>
+   <td>1</td>
+   <td>2</td>
+   <td>Sync</td>
+   <td>1</td>
+   <td>Single Store, TiDB</td>
+  </tr>
+  <tr>
+   <td>Hybrid-Async</td>
+   <td>1</td>
+   <td>2</td>
+   <td>Async</td>
+   <td>1</td>
+   <td>Snowflake Hybrid tbales</td>
+  </tr>
+  <tr>
+   <td>Materializing</td>
+   <td>2</td>
+   <td>2</td>
+   <td>Async</td>
+   <td>2</td>
+   <td>ETL/Connectors</td>
+  </tr>
+  <tr>
+   <td>Shared Tiering</td>
+   <td>2</td>
+   <td>2</td>
+   <td>Async</td>
+   <td>1</td>
+   <td>LTAP, Fluss</td>
+  </tr>
+ </tbody>
+</table>
+<p><em>Vis means Visibility (when is data available in the other workload).</em></p>
+<p>The broad classification scheme:</p>
+<ul>
+ <li><strong>Single tier, </strong>one system, one workload. <em>Example: Postgres with SSD, single tier CockroachDB, standard Kafka cluster.</em></li>
+ <li><strong>Internal Tiering, </strong>one system,<strong> </strong>one workload, commonly tiers from hot to cold storage for cost efficiency, e.g. hot=SSD, cold=S3. Though tiering could also serve other purposes than cost. <em>Example: Apache Kafka tiered storage, ClickHouse MergeTree tiered storage.</em></li>
+ <li><strong>Hybrid (HTAP), </strong>One system,<strong> </strong>two workloads, dual-format possibly with different tiers, e.g. hot row-based data on SSD, long-term columnar data on S3. Two sub-categories<strong>: </strong>
+  <ul>
+   <li><strong>Freshness-by-composition</strong>: In order for consistency across OLTP/OLAP workloads, either data is written to both formats synchronously (allowing OLAP queries to hit column-store alone), or data is asynchronously replicated to the column-store and merge-on-read is used to present a consistent view. <em>Example: SingleStore, Snowflake Hybrid tables, SAP Hana Column Store.</em></li>
+   <li><strong>Freshness-by-catchup: </strong>OLAP queries routed to columnar-store which is replicated to asynchronously from the row-store. Consistency is a dial, where stronger consistency requires a “freshness by catch-up” approach, where the query is only served once the columnar store has reached the query LSN. <em>Example: PolarDB-IMCI with Intelligent Routing, TiDB/TiFlash.</em></li>
+  </ul></li>
+ <li><strong>Materializing</strong>, two workloads, two systems, two copies. System A copies data to System B. Each system is dedicated to one workload, with specialized query engine and storage. <em>Example: ETL in general, many Kafka-compatible services have automatic Iceberg materialization of topics e.g. Confluent Tableflow, Databricks Synced tables asynchronously materialize from lakehouse to lakebase (Postgres).</em></li>
+ <li><strong>Shared Tiering</strong>, two workloads, two systems. one copy across hot tier + shared colder tier (e.g. hot row-based data on SSD for System A, colder columnar data on S3 for System A + B). Example: Apache Fluss tiers hot data (Fluss servers) to lakehouse (lakehouse is a shared tier), LTAP.</li>
+</ul>
+<p><em>Potentially, additional categories could hypothetically exist: Shared-Sync-RR and Shared-Sync-MM. Two systems, two workloads, one synchronous storage (each write is immediately visible in the other system). Read-replica (RR) variant has one master system and one read-only system (e.g. writes to Postgres are </em><strong><em>immediately</em></strong><em> visible for reads in lakehouse). Multi-master (MM) allows both systems to write (hard!!).</em></p>
+<p>At the time of writing the details on LTAP are scarce, but it seems like LTAP will fall into Shared Tiering. The thing that differentiates HTAP from LTAP is that HTAP is a single hybrid system which makes data visible to both transactional and analytical queries at the same time. LTAP is a way of unifying the data of two different systems (each targeting a different workload) and sharing the colder data such that there is no (durable) data copy required. It is fundamentally asynchronous: hottest data is only in System A and the remaining colder data is stored in System B but made available to System A (as it’s cold tier).</p>
+<p>Of course LTAP could potentially move towards the hypothetical category <em>Shared-Sync-RR</em>, given both systems exist in the same platform, then it gets murky again because its one platform, its veering towards HTAP (Hybrid).</p>
+<p>One thing that the marketing material of unified OLTP-OLAP system commonly glosses over are the different data models used in each, such as Third Normal Form (3NF) common in OLTP and Kimball (star and snowflake schema) common in analytics. This adds another dimension, on top of query engine, storage layout and storage substrate. If you want 3NF for OLTP and Kimball for analytics, then it’s probably going to be Materialization (as star schema is not viable as a cold tier for 3NF).</p>
+<p><em>UPDATES:</em></p>
+<ul>
+ <li><em>Switched from Hybrid-Sync and Hybrid-Async to Hybrid with two sub-categories of “freshness by composition” and “freshness by catch-up”.</em></li>
+</ul>
+<p>ps, some thoughts on data copies…</p>
+<p>With Shared Tiering, you can think of the data-copy question as a dial:</p>
+<ul>
+ <li>Dial it to no-copies-at-all means evicting data as soon as it has been tiered. Lower storage cost, but maybe it would be good to hang onto to the hot data a little longer for performance.</li>
+ <li>Dial it to lots-of-data-overlap means aggressively tiering to System B but hanging onto the data in System A for the better performance profile, at the additional storage cost. And technically it would now count as cached data which might not count as a data copy, depending on how you define that.</li>
+</ul>
+<p>However, the data-copy question is also murky with Materialization. Because we have two (or more) independent systems, each can potentially use independent data expiration policies. For example, in Kafka, it might store 7 days, but in the lakehouse, it might store 7 years. In that case, while theoretically it is a two-copy system, the total duplication would only be 0.0027%.</p>
+<p>I generally dislike the whole “zero-copy” or “one-copy” thing, it’s too much marketing. Focusing on how many copies you have is just weird as a primary design point when you’re building data systems, the real world is more nuanced.</p>

@@ -1,0 +1,116 @@
+<h1>What I’m Finding About LLM Code Style and Token Costs</h1>
+<h2>Where This Started</h2>
+<p>I’ve been working through creating and reviewing features with Claude the past year. It’s been remarkable seeing the tension in token consumption and legacy patterns. Right when I think something is complete, a problem surfaces—regression, edge case, whatever. All the while watching the slow, steady and natural march toward eventual full-price rates. Alongside this phenomenon, my accumulated push to stay at the pragmatic edge of modern Web work. The sweet spot where nearly ubiquitous features remove lines of code and improve quality—the place where I keep wondering: why did I get that output? Why did that line of code appear instead of what’s been available for years? I usually dismiss it with the observable fact that Claude is effectively junior level at best, and a useful approximation of the encyclopedic knowledge asked in interviews.</p>
+<p>In trying to make progress on something I am finding myself reviewing my practice and looking at where that outrageous token usage is coming from. Every one of those is output tokens, the ones that cost <strong>several times more</strong> (3x to 5x!!!) than input tokens in API pricing. Patterns that are longer, more fragile, more insecure, and solving problems the platform already solved–often years ago.</p>
+<p>It’s enough to start imagining there’s some conspiracy to take the entire web platform backward, right when Ryan Dahl and separately Alex Russell, Dimitri Glazkov (and many others) made Web Components, etc. They literally made the entire Web platform great again. All to eke out some return on the tokens. So for the sake of conspiracy, this is what I’m finding.</p>
+<p>Because my background as human being, who uses language, designed typography, programmed early on, alongside drawing and many other eclectic oddities, I actually consider things like tabs as a remarkable innovation. I can literally reduce indentation to 1 character, not some abstraction I have to go ask someone how to define or get permission to use. (I guess I’m just far too egalitarian to appreciate the exclusionary attitude of the entire software community.) I care about humans, and want things to work within some parsimonious baseline. And multiplying stuff by 4 or some arbitrary number just really doesn’t make sense–to me. I could go on, but maybe this grounds the orientation—someone who’s worked with actual language on actual media and has opinions about when something works and when it doesn’t. That part tends to speak for itself.</p>
+<p>I mention this because it colors what I looked into from a purely pragmatic standpoint. I’m not arguing for a specific position where everyone uses tabs (despite that speaking for itself). I’m disclosing background that shaped opinions I’d been sitting on—there was always an economic argument I kept to myself, and it’s now showing up in real API costs. My opinions on convention are not the article. The token usage optimizations are what I came here to share. So you can benefit too. If you want to keep using multiple spaces, I’ll remind myself that the literature said it seemed ok and the LLM doesn’t know any better.</p>
+<h2>The Easiest Token Optimization on the Planet Is Already in the Runtime</h2>
+<p>Deno and runtimes like Cloudflare Workers implement the Web API surface natively—<code>URL</code>, <code>URLSearchParams</code>, <code>fetch</code>, <code>FormData</code>, <code>Headers</code>, <code>Request</code>, <code>Response</code>, <code>AbortController</code>, <code>ReadableStream</code>, <code>crypto</code>, and more—the same objects that run in the browser. This is the architectural choice that Deno made deliberately, and that WinterCG has been formalizing as a minimum common API surface across runtimes and it has a significant practical consequence: <strong>the same API surface covers both browser and server-side code</strong>. No translation layer, no shims, no adaptation cost. The platform has already solved a large category of problems, correctly, securely, and without dependencies. Deno is particularly notable for including a standard library where something may be missing and needs cross-platform solutions.</p>
+<p>The LLM doesn’t know this about your environment unless you say so. Its training corpus is dominated by Node.js code from before these APIs were universal—<code>require('url')</code>, <code>querystring.parse()</code>, <code>express</code> middleware patterns, <code>axios</code> with custom timeout wrappers, <code>multer</code> for form parsing. Those patterns are statistically dominant in what the model learned from. They’re what it reaches.</p>
+<p><strong>The gap between what the model defaults to and what the platform already provides is where most of the output token cost lives.</strong></p>
+<h2>The Magnitude, by Pattern</h2>
+<p>I’ve been estimating the token economics of this as I go. These are approximate—based on the actual length of the patterns, not from a formal study—but the ratios are consistent enough to be useful.</p>
+<h3>Query parameter parsing</h3>
+<pre><code>// model default—manual parsing (~140 tokens)
+const parts = rawUrl.split('?');
+const pairs = parts[1] ? parts[1].split('&amp;') : [];
+const params = \{};
+pairs.forEach(p =&gt; \{
+	const [k, v] = p.split('=');
+	params[decodeURIComponent(k)] = decodeURIComponent(v);
+});
+
+// Web API (~12 tokens)
+const params = Object.fromEntries(new URL(rawUrl).searchParams);
+</code></pre>
+<h3>Form data</h3>
+<pre><code>// model default—per-field state (~200+ tokens for a 3-field form)
+const [name, setName] = useState('');
+const [email, setEmail] = useState('');
+const [role, setRole] = useState('');
+const handleChange = (e) =&gt;
+	setFields(\{ ...fields, [e.target.name]: e.target.value });
+
+// Web API (~14 tokens)
+const data = Object.fromEntries(new FormData(event.target));
+</code></pre>
+<h3>Fetch lifecycle and cancellation</h3>
+<pre><code>// model default (~90 tokens)
+let timer;
+const controller = new AbortController();
+timer = setTimeout(() =&gt; controller.abort(), 5000);
+try \{
+	const res = await fetch(url, \{ signal: controller.signal });
+} finally \{
+	clearTimeout(timer);
+}
+
+// Web API (~12 tokens)
+const res = await fetch(url, \{ signal: AbortSignal.timeout(5000) });
+</code></pre>
+<h3>Parallel async with failure isolation</h3>
+<pre><code>// model default (~100 tokens)
+let anyFailed = false;
+const results = await Promise.all(
+	tasks.map(t =&gt; t.catch(e =&gt; \{ anyFailed = true; return null; }))
+);
+if (anyFailed) \{ /* now what? */ }
+
+// Web API (~10 tokens)
+const results = await Promise.allSettled(tasks);
+</code></pre>
+<h3>UI components</h3>
+<pre><code>// model default—custom modal (~250 tokens of JS lifecycle management)
+const [isOpen, setIsOpen] = useState(false);
+useEffect(() =&gt; \{
+	if (isOpen) document.body.style.overflow = 'hidden';
+	return () =&gt; \{ document.body.style.overflow = ''; };
+}, [isOpen]);
+// ... aria attributes, keyboard trap, backdrop click handler ...
+
+// semantic HTML (~25 tokens)
+&lt;dialog ref=\{ref}&gt;...&lt;/dialog&gt;
+// browser handles focus trap, Escape key, accessibility tree, backdrop
+</code></pre>
+<h3>A complete Deno request handler</h3>
+<p>The compound effect is where this becomes substantial. A Deno handler that parses request params, reads a form body, queries a database, and returns a response—written in the model’s default style—runs to 400–600 output tokens for the boilerplate alone, before any application logic. The same handler written with native APIs runs to 60–90 tokens. That’s not a marginal improvement.</p>
+<pre><code>// native Web APIs throughout (~70 tokens of infrastructure)
+export async function handler(request) \{
+	const \{ searchParams } = new URL(request.url);
+	const tenantId = searchParams.get('tenant');
+	const data = Object.fromEntries(new FormData(await request.formData()));
+	const result = await db.query(`
+SELECT id, name
+FROM records
+WHERE tenant_id = ?
+AND active = 1
+`).bind(tenantId).first();
+	return Response.json(result);
+}
+</code></pre>
+<h2>Security and Reliability as Structural Outcomes</h2>
+<p>This is worth naming directly rather than leaving as a footnote. Moving to native APIs doesn’t just reduce token cost—it eliminates categories of bugs.</p>
+<p>Manual query string parsing with <code>params[key] = value</code> is a prototype pollution vector. Manual <code>decodeURIComponent</code> fails silently on <code>%</code> in certain positions. Custom <code>setTimeout</code>-based abort patterns leak when the cleanup path is skipped during refactoring. Custom form state tracking creates consistency bugs when a field is added but the handler isn’t updated. Homemade modal focus management routinely breaks keyboard navigation and screen readers.</p>
+<p>The native implementations are spec-compliant. They’ve been tested against every edge case that exists in real web traffic. The Web Platform Tests suite runs tens of thousands of interoperability tests against each browser and runtime. <code>URLSearchParams</code> handles <code>+</code> encoding, repeated parameters, empty values, and UTF-8 edge cases correctly because it was written to the spec that defines what correct means. The model’s hand-rolled equivalent handles whatever the author thought of that day.</p>
+<p><strong>This is not a minor reliability improvement. It’s the difference between code that was implemented once by the person who wrote the spec versus code that was written from memory by a pattern-matching system trained on a corpus full of implementations that got it partly wrong.</strong></p>
+<h2>What Comments Are Actually Doing</h2>
+<p>I’d thought of comments as documentation—useful for humans, neutral for LLMs. Research from MITRE published in June 2025 changed that. Comments aren’t neutral. <strong>Models follow comment intent even when it contradicts the code.</strong> Inaccurate comments—comments that describe what the code used to do before a refactor—actively degraded LLM comprehension below the no-comment baseline. Worse than silence.</p>
+<p>A stale comment isn’t harmless. It’s misinformation with authority. When a model keeps returning to a pattern I’ve moved away from, a stale comment near that code is a real candidate for why.</p>
+<p>What comments are worth—what actually carries useful information—is design intent. Constraints. Why this function doesn’t catch its own errors. Why the SQL filters at the database level instead of in application code. What must not change when this is refactored. The reason for a non-obvious choice. That’s signal. “Loop over items” above <code>items.forEach()</code> is noise, and adds tokens with no return.</p>
+<h2>The Formatting Question, Correctly Weighted</h2>
+<p>There is a real finding here. “The Hidden Cost of Readability,” August 2025 measured input token overhead from formatting across tens of thousands of source files. Removing indentation, blank lines, and alignment whitespace reduced input token counts by an average of 24.5% with essentially no accuracy change for Claude or GPT-4.</p>
+<p>That’s the input side, and it’s real. The tractable individual choices—no alignment whitespace, SQL ex-dented to the left margin, no blank lines inside function bodies—aggregate to roughly 5–10% input savings under typical JS conditions.</p>
+<p>But input tokens cost one-third to one-fifth what output tokens cost. And the output savings from native APIs are not 5–10%—they’re 85–92% per pattern, compounding across every occurrence. The formatting work is worth doing. It is not the main event.</p>
+<h2>What I’m Putting in Prompts [And Working Through]</h2>
+<p>The mechanism that actually changes model output is an explicit directive named at the start of the session. General style guidance produces marginal improvement. What works better is naming specific APIs explicitly, making the correct answer available before the model reaches for its training-data default.</p>
+<p>Here’s what I’m actively working on. Note the regular use of DO THIS and NOT THAT–these work best together. (This works by constraining the probability space before generation, and is a recurring suggestion you can see across the examples described here.)</p>
+<p><code>use Web APIs natively: URL, URLSearchParams, FormData, AbortController, fetch, Headers, Request, Response, Promise.allSettled(), Promise.any() use semantic HTML: &lt;dialog&gt;, &lt;details&gt;, &lt;form&gt; with native constraint validation. Do not implement in JavaScript what the browser or Deno runtime provides natively</code></p>
+<p>Combined with comment discipline:</p>
+<p><code>Comments state design constraints, invariants, and why. Not what the code does. Do not write comments that restate what the next line does.</code></p>
+<p>The native API directive is the one that produces the most visible difference in output quality and cost.</p>
+<h2>Where This Lands</h2>
+<p>The core finding is structural, not a tip. Deno made the choice to implement the Web API surface natively, creating a single consistent set of abstractions that work identically in the browser and on the server. That surface solves—correctly, securely, and for free—a large category of problems that LLMs are currently solving again from scratch, badly, every generation, at 85–92% more token cost than necessary.</p>
+<p>The comment findings matter because the model treats them as authoritative input, not metadata. Stale comments produce actively wrong output. Accurate design-intent comments constrain generation in useful directions.</p>
+<p>The formatting findings are real and worth applying. They are secondary to the API question.</p>
+<p>What’s striking to me is that the biggest lever here—the one that produces 7–10× output token reduction on infrastructure code and eliminates whole categories of security and reliability issues simultaneously—is not a new coding technique. It’s using what the platform already built. The friction is that the model doesn’t know to use it unless you say so. Once you do, it’s consistent about it. The model doesn't know what your runtime already ships. Someone has to—and that's the entire reason you hire professionals instead of just running the model.</p>

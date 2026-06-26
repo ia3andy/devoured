@@ -1,0 +1,117 @@
+<p>In this article, you will learn how to build a text clustering pipeline by combining large language model embeddings with HDBSCAN, a density-based clustering algorithm, to automatically discover topics in unlabeled text data.</p>
+<p>Topics we will cover include:</p>
+<ul>
+ <li>How to generate text embeddings for raw documents using a pre-trained sentence-transformers model.</li>
+ <li>How to reduce the dimensionality of those embeddings with UMAP to prepare them for clustering.</li>
+ <li>How to apply HDBSCAN to automatically discover topic clusters and visualize the results.</li>
+</ul>
+<h2>Introduction</h2>
+<p>The current era of <strong>Generative AI</strong> seems to primarily focus on chat interfaces and prompts, but the range of applications of <strong>large language models</strong>, or LLMs for short, is not limited to just that. Indeed, one of their most powerful downstream abilities consists of turning raw, messy, unstructured text into semantically rich mathematical representations called <strong>embeddings</strong>. Once that’s done, we can use these text representations for a variety of machine learning use cases, with clustering being no exception.</p>
+<p>In particular, embeddings can be combined with advanced, density-based <strong>clustering techniques</strong> like <strong>HDBSCAN</strong>, allowing as a result for the discovery of hidden topics, patterns, or categories in your collection of text documents: all without the need for prior labeling.</p>
+<p>This article shows how to construct a text-based clustering pipeline from scratch. We will use a freely available dataset containing text instances, as well as an open-source LLM that has been trained for generating embeddings — i.e. a so-called embedding model. The icing on the cake: we’ll use free and handy, modern Python libraries providing implementations of clustering algorithms like HDBSCAN.</p>
+<h2>Step-by-Step Walkthrough</h2>
+<p>First, let’s start by installing the key Python libraries we will need:</p>
+<ul>
+ <li><strong>Sentence transformers</strong>, to load a pre-trained LLM for embedding generation from Hugging Face — you’ll need a Hugging Face API key, also called an access token, to be able to load the model.</li>
+ <li><strong>Umap-learn</strong>, to apply an algorithm to reduce the dimensionality of embeddings.</li>
+</ul>
+<p>Likewise, if you are working on a local IDE instead of a cloud notebook environment and don’t have <strong>scikit-learn</strong> and <strong>pandas</strong>, you may need to install them too.</p>
+<pre><code>!pip install sentence-transformers umap-learn</code></pre>
+<p>Now we start the coding part by getting some fresh data. The <code>fetch_20newsgroups</code> function, which fetches a dataset containing texts from categorized news articles, will do. Note that even though the dataset contains labels, we will omit them, as we are pretending not to know this information for the sake of clustering these data instances into groups based on similarity. Also, we sample down the dataset to 150 instances, which will be representative enough for our example.</p>
+<pre><code>import pandas as pd 
+from sklearn.datasets import fetch_20newsgroups 
+
+# Fetching a highly targeted subset of data (~150-200 docs) 
+categories = ['sci.space', 'sci.med', 'rec.autos'] 
+newsgroups = fetch_20newsgroups(subset='train', categories=categories, remove=('headers', 'footers', 'quotes')) 
+
+# Sampling down into a representative, illustrative subset 
+df = pd.DataFrame(\{'text': newsgroups.data, 'true_label': newsgroups.target}) 
+df = df[df['text'].str.strip().str.len() &gt; 100].sample(150, random_state=42).reset_index(drop=True) 
+
+print(f"Loaded \{len(df)} text documents.") 
+print("\nSample document:") 
+print(df['text'].iloc[0][:150] + "...")</code></pre>
+<p>The next step is to obtain the embeddings from raw texts. To do this, we load <code>all-MiniLM-L6-v2</code> from Hugging Face’s sentence-transformers library. This is a lightweight yet effective model to obtain embeddings quickly.</p>
+<pre><code>from sentence_transformers import SentenceTransformer 
+
+# Loading the free, open-source model 
+model = SentenceTransformer('all-MiniLM-L6-v2') 
+
+# Encoding text documents into dense vector embeddings 
+print("Generating embeddings...") 
+embeddings = model.encode(df['text'].tolist(), show_progress_bar=True) 
+print(f"Embedding matrix shape: \{embeddings.shape}")</code></pre>
+<p>Since the embedding dimension is originally too high for clustering purposes, we now apply a dimensionality reduction technique by using the UMAP algorithm from the namesake library installed earlier:</p>
+<pre><code>import umap 
+
+# Reducing embedding dimensions to 5, to retain enough density information for clustering 
+reducer = umap.UMAP(n_neighbors=15, n_components=5, min_dist=0.0, random_state=42) 
+reduced_embeddings = reducer.fit_transform(embeddings) 
+print(f"Reduced matrix shape: \{reduced_embeddings.shape}")</code></pre>
+<p>Now our numerical embedding vectors associated with news articles consist of five dimensions (attributes) only. Let’s see if this compact representation is meaningful enough to obtain insightful clustering by applying the HDBSCAN algorithm, which is a density-based clustering approach:</p>
+<pre><code>from sklearn.cluster import HDBSCAN 
+
+# Initializing HDBSCAN 
+# min_cluster_size=8: we specified that each cluster must have at least 8 documents 
+clusterer = HDBSCAN(min_cluster_size=8, min_samples=3, store_centers='centroid') 
+df['cluster'] = clusterer.fit_predict(reduced_embeddings) 
+
+# Counting instances per cluster 
+cluster_counts = df['cluster'].value_counts() 
+print("\nCluster Distribution:") 
+print(cluster_counts)</code></pre>
+<p><strong>Important</strong>: the clustering results are partly influenced by the hyperparameter settings we defined for HDBSCAN. I recommend you try out other configurations for the minimum cluster size and other hyperparameters to explore how this affects results.</p>
+<p>It looks like HDBSCAN detected two clusters associated with high-density regions in the data space. Would there also be noisy points that were not allocated to either of these two clusters? Let’s check:</p>
+<pre><code>for cluster_id in sorted(df['cluster'].unique()): 
+    if cluster_id == -1: 
+        print("\n=== CLUSTER: NOISE / UNCLASSIFIED ===") 
+    else: 
+        print(f"\n=== CLUSTER: Discovered Topic #\{cluster_id} ===") 
+    
+    # Getting up to 3 sample texts from this cluster 
+    samples = df[df['cluster'] == cluster_id]['text'].head(3).tolist() 
+    for i, sample in enumerate(samples, 1): 
+        clean_sample = " ".join(sample.split())[:120] 
+        print(f"  \{i}. \{clean_sample}...")</code></pre>
+<p>Seems like all data points in the sample of 150 were allocated to either one of the two clusters identified, thus hinting at the clue that the news articles might easily separable according to topic.</p>
+<p>For extra insight, we can show some cluster visualizations with the aid of the supplementary code provided below, which shows a scatterplot for every pairwise combination of the five existing components that describe each data point:</p>
+<pre><code>import matplotlib.pyplot as plt 
+import seaborn as sns 
+import itertools 
+
+# Creating a DataFrame for the 5 reduced embeddings and cluster labels 
+reduced_df = pd.DataFrame(reduced_embeddings, columns=[f'UMAP_D\{i+1}' for i in range(reduced_embeddings.shape[1])]) 
+reduced_df['cluster'] = df['cluster'] 
+
+# Getting all unique pairwise combinations of the 5 dimensions 
+dim_pairs = list(itertools.combinations(reduced_df.columns[:-1], 2)) 
+
+num_plots = len(dim_pairs) 
+num_cols = 3 
+num_rows = (num_plots + num_cols - 1) // num_cols 
+
+plt.figure(figsize=(num_cols * 5, num_rows * 4)) 
+
+for i, (dim1, dim2) in enumerate(dim_pairs): 
+    plt.subplot(num_rows, num_cols, i + 1) 
+    sns.scatterplot( 
+        x=dim1, 
+        y=dim2, 
+        hue='cluster', 
+        data=reduced_df, 
+        palette='viridis', 
+        s=70, 
+        alpha=0.7, 
+        legend='full' 
+    ) 
+    plt.title(f'\{dim1} vs \{dim2}') 
+    plt.xlabel(dim1) 
+    plt.ylabel(dim2) 
+    plt.grid(True, linestyle='--', alpha=0.6) 
+
+plt.tight_layout() 
+plt.show()</code></pre>
+<p>By trying different configurations for HDBSCAN, you may come across results in which the number of identified clusters could be different from two. Just give it a try!</p>
+<h2>Wrapping Up</h2>
+<p>Once we have gone through the process of building the text-based clustering pipeline, it is worth concluding by pointing out the key reasons why putting together LLM embeddings with HDBSCAN is worth it. These include the ability to retain and capture, to some extent, the true semantic meaning and linguistic nuances of the original text, thanks to the properties inherent to embeddings obtained through sentence-transformers. Moreover, HDBSCAN automatically determines an optimal number of clusters and is able to detect outlying points that might be noise or outliers that would distort group-level statistics.</p>
