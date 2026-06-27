@@ -1,0 +1,91 @@
+<p>I've worked on Crossplane for almost eight years, since the v0.1 release. In that time I've watched a lot of people use it to put cloud infrastructure behind an API. For the last few months I've been using it to put a particular, demanding kind of infrastructure behind an API: a fleet of GPUs running model inference.</p>
+<p>The project is called <a href="https://modelplane.ai">Modelplane</a>. It lets a platform team turn a pile of accelerators (across clouds, neoclouds, and on-premise) into one fleet. It also lets the ML teams they support deploy a model and get a stable, OpenAI-compatible endpoint without thinking about where it runs.</p>
+<p>Modelplane exists because open-weight models have moved inference out of the labs and hyperscalers and into everyone else: neoclouds, regulated enterprises keeping models inside their own walls, and companies trying to get their inference bills under control. The open source stack for serving a model on a single cluster is strong now: vLLM, SGLang, KEDA, Gateway API, <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/">DRA</a>. But inference almost never stays in one cluster. Capacity is scattered across hardware types, providers, and regions. The hard problems are now <em>above</em> the cluster: placing models across the capacity you have, provisioning more, routing by cost and locality, moving weights around. The labs and the hyperscalers all built systems to do this, but they built them privately. That's the gap Modelplane fills: an open control plane that sits above your clusters and operates them as one inference fleet.</p>
+<p>If the inference part interests you, the <a href="https://modelplane.ai">Modelplane docs</a> and <a href="https://www.modelplane.ai/blog/open-control-plane-for-inference">Bassam's introduction</a> are the place to go. This post is for the Crossplane crowd, because the part I think you'll find interesting is that Modelplane is, top to bottom, a Crossplane configuration. It has no bespoke controllers and no custom operators: it's compositions and composition functions. The same primitives you could use to compose an RDS instance, pushed a lot harder.</p>
+<p>I want to cover the problem we set out to solve with Crossplane, the parts of the framework we leaned on hardest, and the edges we hit and fixed upstream.</p>
+<h2>The problem, in Crossplane terms</h2>
+<p>Strip away the inference vocabulary and Modelplane's job is one Crossplane users will recognize: take a declarative description of what someone wants, and turn it into composed infrastructure spanning cloud accounts, many Kubernetes clusters, and the workloads on them. Provision an EKS or GKE cluster with the right GPUs. Install an inference stack onto it. Decide which cluster each model runs on, and how many copies. Keep it all converged as clusters come and go and people's inference needs change.</p>
+<p>Crossplane was built for that shape of problem. Providers gave us reach: we provision clusters and the infrastructure they need across different clouds, and install software onto them, without needing to write new controllers. Functions allowed us to focus on our business logic, the placement and the scheduling. We didn't have to write the controller plumbing by hand: the watches and requeues and finalizers and drift correction that Crossplane core already handles.</p>
+<p>Crossplane v2 helped here too. Modelplane has two clear personas. Platform teams describe the fleet. ML teams describe a model. That split maps onto a scope boundary: an <code>InferenceCluster</code> or <code>InferenceClass</code> is cluster-scoped, a <code>ModelDeployment</code> or <code>ModelService</code> is a plain namespaced composite resource the ML team owns. v2 namespaced composites let us express that directly, with no claim-and-XR duality to explain. That's useful, but it isn't what made the project buildable.</p>
+<h2>What made it buildable: Developer experience</h2>
+<p>What really unlocked this project was the new Crossplane CLI and the schemas it generates.</p>
+<p>Modelplane's functions are all written in Python. We chose Python because it's the lingua franca of the ML world. We hope it might help folks who aren't yet cloud native experts contribute to the project. Writing functions in Python used to mean giving up a lot of the tooling that makes a codebase feel like a proper project. The new <code>crossplane</code> CLI changed that. It scaffolds a project, generates an XRD from an example resource, and generates typed schema bindings for your APIs.</p>
+<p>Those generated models changed how we worked. Our functions read and write typed objects instead of poking at untyped dictionaries and hoping the field is spelled the way we remember. A typo or a wrong type now fails at author time. The models also sped up the coding agents we leaned on while building. A generated type tells the agent the exact shape, so it got field names and types right the first time.</p>
+<p>There was friction. We outgrew the CLI's built-in function builders early, and we needed schema generation for one language, not all four. Both of those turned into upstream contributions, which I'll come back to.</p>
+<h2>Designing the API</h2>
+<p>The hardest part of Modelplane was designing the API.</p>
+<p>People come up to me at conferences worried about how they'll make breaking changes to the APIs they build with Crossplane. My answer is usually that you almost never have to, if you really think the API through before you release it. That discipline pays off: reach for arrays and enums before you think you need them, use required fields sparingly, and leave room to grow without a breaking change.</p>
+<p>Take the <code>ModelDeployment</code>, arguably Modelplane's most important API. It's how an ML team describes a model to serve: its engines, what their pods need from a node, and how many replicas to run across the fleet.</p>
+<pre><code>apiVersion: modelplane.ai/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: qwen3-8b
+  namespace: ml-team
+spec:
+  replicas: 1
+  engines:
+  - name: qwen3-8b
+    members:
+    - role: Standalone
+      nodeSelector:
+        devices:
+        - name: gpu
+          count: 1
+          selectors:
+          - cel: device.capacity["gpu.nvidia.com"].memory.compareTo(quantity("20Gi")) &gt;= 0
+      template:
+        spec:
+          containers:
+          - name: engine
+            image: vllm/vllm-openai:v0.23.0
+            args:
+            - "--model=Qwen/Qwen3-8B"
+            - "--served-model-name=qwen"
+            # ... engine flags omitted for brevity</code></pre>
+<p>I got the <code>engines</code> array wrong at first, and only caught it about two weeks before we released v0.1. Until then a <code>ModelDeployment</code> had a <code>spec.topology</code> block where you'd write <code>tensor: 8</code> and <code>pipeline: 2</code>. Modelplane would derive engine-specific flags like <code>--tensor-parallel-size</code> and inject them. The problem was that this coupled Modelplane to engine specifics. We could only run the engines whose flags we knew how to inject. It also couldn't express the data and expert parallelism we knew was coming. I caught it only because I sat down to write worked examples for those topologies and found I couldn't. I replaced it with <em>shape</em>: an engine is an array of <code>Standalone</code>, <code>Leader</code>, or <code>Worker</code> members, and the parallelism lives entirely in the flags the user writes. My takeaway: don't rush API design. Work through it with your users and peers, let it sit if you can, and write enough worked examples to confirm you can model everything they need before you commit.</p>
+<h2>The functions do the work</h2>
+<p>One thing I really like about composition functions is that they scale with your problem. At the low end a function is a few Go templates or some KCL inlined in the Composition. At the high end it's a program that can do almost anything a traditional Go operator can. Python rides that whole range too, and Modelplane is what the far end looks like once the problem grows.</p>
+<p>Modelplane's business logic is all composition functions. Scheduling is an interesting example. I'll walk through it because it shows how far a composition function can be pushed.</p>
+<p>Modelplane runs a fleet scheduler in the control plane. Each cluster in the fleet is an <code>InferenceCluster</code>, and each of its node pools references an <code>InferenceClass</code> that declares the pool's hardware. When an ML team creates a <code>ModelDeployment</code>, the fleet scheduler places each replica against that <em>declared</em> node pool capacity, before any nodes necessarily exist. That's a different job from in-cluster DRA, which is a runtime allocator: its drivers publish <code>ResourceSlices</code> about real hardware on real nodes.</p>
+<p>Scheduling happens in two layers. The fleet scheduler picks the cluster and node pool; the cluster's own in-cluster scheduler and DRA then place pods on nodes and bind GPUs. That in-cluster scheduler is good at its layer (a single cluster supports up to 5,000 nodes), but a fleet isn't one cluster. It can't be: a cluster doesn't span clouds, and you wouldn't want one blast radius over your whole accelerator footprint even if it could.</p>
+<p>Modelplane borrows DRA's <em>vocabulary</em> and lifts it to the fleet layer. DRA's typed, domain-prefixed attribute model and CEL predicate language are a good fit, and they express cleanly in OpenAPI. A platform team's <code>InferenceClass</code> declares what a <em>pool's</em> hardware offers, the same shape DRA uses to describe a real device:</p>
+<pre><code>devices:
+- name: gpu
+  claim: DRA
+  driver: gpu.nvidia.com
+  deviceClassName: gpu.nvidia.com
+  attributes:
+    architecture: \{ string: Ada Lovelace }
+  capacity:
+    memory: \{ value: "23034Mi" } # the L4's real usable VRAM</code></pre>
+<p>A deployment's <code>nodeSelector</code> then asks for what it needs with a CEL expression:</p>
+<pre><code>selectors:
+- cel: device.capacity["gpu.nvidia.com"].memory.compareTo(quantity("20Gi")) &gt;= 0
+</code></pre>
+<p>Our scheduler evaluates that CEL against an <code>InferenceClass</code>'s declared attributes, and DRA evaluates the same expression against a real GPU when the pod binds. The same expression runs at both levels.</p>
+<p>A composition function is, by design, a pure function of its inputs. Crossplane hands it the observed composite, and the function returns the desired children. Our scheduler is exactly that, a pure function of observed state, which is what makes it safe to run on every reconcile. A scheduler can't decide placement from the deployment alone, though. It has to see the whole fleet: every <code>InferenceCluster</code> and its published capacity, and every <code>ModelReplica</code> that already exists, including those of <em>other</em> deployments, so it can account for capacity they've already consumed.</p>
+<p>That's <code>require_resources</code> (what some of you will know as extra resources), and we couldn't have built the scheduler without it. The function asks Crossplane for the resources it needs to reason over, and Crossplane fetches them and calls the function again with them in hand:</p>
+<pre><code># Every InferenceCluster: candidate clusters with their declared capacity.
+response.require_resources(
+ rsp, name="clusters",
+ api_version="modelplane.ai/v1alpha1", kind="InferenceCluster",
+ match_labels=clusters_match_labels,
+)
+# Every ModelReplica across all deployments: capacity already in use.
+response.require_resources(
+ rsp, name="all-replicas",
+ api_version="modelplane.ai/v1alpha1", kind="ModelReplica",
+)
+</code></pre>
+<p>That second call, asking for <em>every</em> resource of a kind with no name or label filter, is one of the things we had to fix upstream.</p>
+<h2>Where Modelplane pushed Crossplane, and we fixed it upstream</h2>
+<p>Build something this demanding on Crossplane and you find its rough spots. Modelplane found several. Rather than work around them, we sent fixes upstream, so your configurations get the benefit too.</p>
+<p>The first thing we hit was the build itself. The CLI's built-in function builders are great until you outgrow them, and we needed to coordinate function builds with Nix, the rest of our build system. We also only consume one of the four schema languages the CLI generates. We added an explicit <code>functions</code> list that loads pre-built image tarballs instead of building them, and a <code>schemas</code> block that restricts generation to the languages you actually use (<a href="https://github.com/crossplane/cli/pull/24"><code>crossplane/cli</code> #24</a>). Now our functions build with the same tooling as everything else, and we generate Python and nothing else.</p>
+<p>The DRA-style attribute model then walked us into a chain of three related bugs, all rooted in the same thing: a <code>DeviceAttribute</code> has fields named exactly <code>int</code>, <code>bool</code>, <code>string</code>, and <code>version</code>. Those are Python keywords and builtins, and they broke at every layer. First, schema generation emitted Python models that referenced undefined type aliases and wouldn't import at all (<a href="https://github.com/crossplane/cli/pull/64"><code>crossplane/cli</code> #64</a>); the fix was to bump the code generator to a version that sanitizes such names and preserves the wire name with a Pydantic alias. With the models importable, serialization was next: the SDK emitted <code>bool_: true</code> under the Python attribute name instead of <code>bool: true</code> under the wire alias, so the API server rejected it. Passing <code>by_alias=True</code>, and switching from <code>exclude_defaults</code> to <code>exclude_unset</code> so we serialize the fields the caller actually set rather than the fields that differ from a default, put both right (<a href="https://github.com/crossplane/function-sdk-python/pull/208"><code>function-sdk-python</code> #208</a>, with helpers in <a href="https://github.com/crossplane/function-sdk-python/pull/205">#205</a>).</p>
+<p>The fleet scheduler also needed something the framework couldn't yet express. It has to reason over <em>every</em> <code>InferenceCluster</code> and <em>every</em> <code>ModelReplica</code> in the control plane, not one resource by name or a set by a label match. A <code>require_resources</code> selector with no match field is the natural way to say "all resources of this kind," and the protobuf allows it, but Crossplane rejected it on both the wire and the SDK side. We taught the reconciler to treat an empty selector as match-all (<a href="https://github.com/crossplane/crossplane/pull/7241"><code>crossplane/crossplane</code> #7241</a>) and relaxed the SDK's validation to match (<a href="https://github.com/crossplane/function-sdk-python/pull/213"><code>function-sdk-python</code> #213</a>). That match-all call is now the first thing the scheduler does every reconcile.</p>
+<p>Testing functions this complex surfaced one more. <code>crossplane render</code> reimplements the XR reconciler's composition pipeline, and that parallel copy drifts from the real one, so a function can pass <code>render</code> and behave differently in a real control plane. We added a hidden render engine that runs the <em>actual</em> reconciler against an in-memory client, so tools can test against the real composition pipeline rather than a copy of it (<a href="https://github.com/crossplane/crossplane/pull/7280"><code>crossplane/crossplane</code> #7280</a>).</p>
+<p>Finally there's a one-pager up for function-controlled deletion (<a href="https://github.com/crossplane/crossplane/pull/7242">#7242</a>), which aims to make ordered deletion of composed resources <em>within one XR</em> easier and more expressive than using Usages.</p>
+<p>None of these are glamorous. But that's how a framework gets better: you build something hard on it and fix the friction.</p>
+<h2>What I took away</h2>
+<p>I went into Modelplane wanting to know whether you could build something this demanding entirely on Crossplane, without dropping to a hand-written controller when the going got hard. You can, though we had to fix the framework in a few places to get there. It's still compositions and functions any adopter can read and extend.</p>
+<p>Modelplane is Apache 2.0 and developed in the open. If you run accelerators of any kind, take a look at <a href="https://modelplane.ai">modelplane.ai</a>, and if you build hard things on Crossplane, find its edges and <a href="https://github.com/crossplane/crossplane/tree/main/contributing">help make them better</a>.</p>

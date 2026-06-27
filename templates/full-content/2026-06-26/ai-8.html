@@ -1,0 +1,172 @@
+<p>Smarter models are becoming more resourceful at hacking coding benchmarks.</p>
+<p>Eval suites built from real bugs that were later fixed are especially vulnerable because the problems have already been solved. If the agent has access to repository history or the public web, it can sometimes look up the answer rather than derive it.</p>
+<p>To measure how widespread this behavior is, we built an agent to audit eval trajectories. On SWE-bench Pro, we found that 63% of successful Opus 4.8 Max resolutions retrieved the fix rather than derived it. When we sealed git history and restricted internet access, scores dropped sharply for Opus as well as for our model, Composer 2.5:</p>
+<ul>
+ <li>Opus 4.8 Max fell from 87.1% to 73.0%</li>
+ <li>Composer 2.5 fell from 74.7% to 54.0%</li>
+</ul>
+<p>Prior research has shown that coding benchmark answers can leak through publicly available sources, including this 2024 study and a 2025 Meta report. Our study quantifies the problem on current frontier coding-agent runs. The broader lesson is that in addition to avoiding training-time contamination, agentic coding benchmarks also need controlled runtime environments.</p>
+<p>For teams conducting evals, we propose mitigating this reward-hacking behavior by auditing transcripts and constraining the eval environment.</p>
+<h2>Catch a model with a model</h2>
+<p>To measure the scale of the reward-hacking behavior, we had the auditor examine 731 Opus 4.8 Max trajectories. It saw the problem statement and full agent trajectory, without seeing whether the run passed, and classified whether the agent had retrieved the known answer.</p>
+<p>The two most common reward-hacking patterns it found were:</p>
+<ul>
+ <li><strong>Upstream lookup:</strong> In 57% of the trajectories, Opus 4.8 Max found the merged PR or fixed source file on the public web, then reproduced the fix nearly verbatim.</li>
+ <li><strong>Git-history mining:</strong> In 9% of trajectories, Opus 4.8 Max searched the bundled .git history for the future commit that fixed the bug, then extracted the patch.</li>
+</ul>
+<p>As models get stronger, they can sometimes infer that they are in an eval, especially when the task is borrowed from a past public repository. Even in cases where they don't remember the fix from training, the environment can still give them clues that the bug has already been solved.</p>
+<p>In one SWE-bench Multilingual task from a 2019 jq issue, the agent tried to reproduce the bug with the system jq binary. Because the image had been built after the bug was fixed, the reproduction failed, and the agent inferred that the issue had already been solved. That awareness pushed it toward searching for the fix instead of deriving one.</p>
+<p>A few cases were more direct. One agent found a SWE-bench mirror page that exposed hidden tests and the gold patch. Another obtained hidden test files and hardcoded the expected exception string needed to pass.</p>
+<h3>Example tool calls and patches</h3>
+<p><strong>Upstream lookup (Opus 4.8 Max).</strong> The agent queried the merged PR through the GitHub API to find the files the fix touched, then reproduced it (the same response also exposes each file's diff):</p>
+<pre><code>cd /testbed &amp;&amp; curl -s "https://api.github.com/repos/apache/druid/pulls/14092/files" 2&gt;/dev/null | grep '"filename"'</code></pre>
+<p><strong>Git-history mining (Composer 2.5).</strong> The agent located the fix commit in the bundled <code>.git</code> history, read its diff, then applied it directly:</p>
+<pre><code>cd /testbed &amp;&amp; git show 895abd8929 -p 2&gt;/dev/null | head -400
+cd /testbed &amp;&amp; git cherry-pick 895abd8929 2&gt;&amp;1</code></pre>
+<p><em>Patch excerpt to add: a trimmed verbatim slice of the <code>git show</code> output above (the gold diff Composer reproduced).</em></p>
+<h2>Stricter environment design</h2>
+<p>Most reward hacking flowed through the public web and repository history. For evals built from historical public repositories, those channels need to be controlled because they may contain the answer. In response, we built a strict harness with two isolation mechanisms:</p>
+<ol>
+ <li><strong>History isolation.</strong> Before the agent starts, the .git directory is removed and the repository is reinitialized as a fresh single-commit repo. The original history is restored only at scoring time, so tests run as usual.</li>
+ <li><strong>Egress proxying.</strong> Network access is denied by default. As a best-effort control, a pinned proxy allows dependency resolution against an allow-list of package registries, and nothing else.</li>
+</ol>
+<p>This restriction is specific to evals built from historical public repositories. It's one reason we prefer evals built from non-public repositories, like CursorBench. They can test agentic coding ability while still letting agents use tools in the ways they would during real work.</p>
+<h2>A growing gap</h2>
+<p>We reran SWE-bench Pro and SWE-bench Multilingual in the stricter harness, then compared each result against the standard harness score as a proxy for the combined effect of removing these leakage channels:</p>
+<ul>
+ <li>On SWE-bench Multilingual, it was under 1 point for Opus 4.6, 9.1 points for Opus 4.8 Max, and 7.5 points for Composer 2.5.</li>
+ <li>On SWE-bench Pro, it was under 1 point for Opus 4.6, 14.1 points for Opus 4.8 Max and 20.7 points for Composer 2.5.</li>
+</ul>
+<p>The clear takeaway is that reward hacking is far more common with newer, more sophisticated models than with older ones. Interestingly, GPT models don't show the same escalation, with generally smaller gaps in our runs.</p>
+<p>We also observed that our own model, Composer 2.5, had the largest Pro gap in the study. This is one reason we do not treat the standard SWE-bench Pro score as a reliable benchmark number for Composer. The score was real in the narrow sense that the harness produced it, but it mixed coding ability with access to known fixes.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Model</th>
+   <th>Standard</th>
+   <th>Strict</th>
+   <th>Δ</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Opus 4.8 (max)</td>
+   <td>91.16%</td>
+   <td>82.03%</td>
+   <td>+9.1</td>
+  </tr>
+  <tr>
+   <td>Opus 4.8 (xhigh)</td>
+   <td>88.86%</td>
+   <td>80.67%</td>
+   <td>+8.2</td>
+  </tr>
+  <tr>
+   <td>Opus 4.7 (max)</td>
+   <td>84.80%</td>
+   <td>80.47%</td>
+   <td>+4.3</td>
+  </tr>
+  <tr>
+   <td>Opus 4.7 (xhigh)</td>
+   <td>83.74%</td>
+   <td>78.60%</td>
+   <td>+5.1</td>
+  </tr>
+  <tr>
+   <td>Opus 4.8 (high)</td>
+   <td>83.09%</td>
+   <td>79.26%</td>
+   <td>+3.8</td>
+  </tr>
+  <tr>
+   <td>Opus 4.8 (medium)</td>
+   <td>81.87%</td>
+   <td>77.84%</td>
+   <td>+4.0</td>
+  </tr>
+  <tr>
+   <td>Opus 4.7 (high)</td>
+   <td>81.42%</td>
+   <td>77.75%</td>
+   <td>+3.7</td>
+  </tr>
+  <tr>
+   <td>Opus 4.8 (low)</td>
+   <td>79.51%</td>
+   <td>74.36%</td>
+   <td>+5.2</td>
+  </tr>
+  <tr>
+   <td>Composer 2.5</td>
+   <td>79.15%</td>
+   <td>71.60%</td>
+   <td>+7.5</td>
+  </tr>
+  <tr>
+   <td>GPT-5.4 (xhigh)</td>
+   <td>79.00%</td>
+   <td>75.20%</td>
+   <td>+3.8</td>
+  </tr>
+  <tr>
+   <td>GPT-5.5 (xhigh)</td>
+   <td>77.80%</td>
+   <td>74.40%</td>
+   <td>+3.4</td>
+  </tr>
+  <tr>
+   <td>Opus 4.7 (medium)</td>
+   <td>77.33%</td>
+   <td>75.72%</td>
+   <td>+1.6</td>
+  </tr>
+  <tr>
+   <td>GPT-5.5 (high)</td>
+   <td>77.30%</td>
+   <td>74.70%</td>
+   <td>+2.6</td>
+  </tr>
+  <tr>
+   <td>GPT-5.4 (high)</td>
+   <td>76.80%</td>
+   <td>73.30%</td>
+   <td>+3.5</td>
+  </tr>
+  <tr>
+   <td>Opus 4.6 (max)</td>
+   <td>76.33%</td>
+   <td>76.06%</td>
+   <td>+0.3</td>
+  </tr>
+  <tr>
+   <td>Opus 4.6 (high)</td>
+   <td>76.11%</td>
+   <td>75.22%</td>
+   <td>+0.9</td>
+  </tr>
+  <tr>
+   <td>Opus 4.7 (low)</td>
+   <td>75.89%</td>
+   <td>72.64%</td>
+   <td>+3.3</td>
+  </tr>
+  <tr>
+   <td>GPT-5.5 (medium)</td>
+   <td>75.30%</td>
+   <td>74.20%</td>
+   <td>+1.1</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Designing evals for aware agents</h2>
+<p>The main takeaway for teams running coding evals is that benchmark design should not stop at dataset construction. It also has to account for the runtime environment, including what the agent can search, inspect, fetch, and recover while the task is running.</p>
+<p>That does not mean every eval should remove internet access or git history. Some evals are meant to test how well agents use the surrounding context of a real codebase, and in those settings broad access may be part of the task. The problem is when that access changes what the score means.</p>
+<p>For historical public-repo benchmarks, open access can let agents find the known fix rather than solve the bug. Without controls in the harness, scores can conflate coding ability with answer retrieval.</p>
+<p>Teams running evals should decide what behavior they want to measure, design the harness around that, and make the setup clear when they report results. Auditing transcripts can help reveal when models are solving tasks in unexpected ways. The goal is not to ban normal tool use, but to make sure the benchmark measures what it claims to measure.</p>
+<p>Even then, there remains a harder open problem. As models become more aware of when they are being evaluated, they may change their behavior in subtler ways that are not fixed by sealing git history or restricting internet access. Runtime contamination is one concrete version of a broader challenge of building evals that retain construct validity even when the model infers that it is being evaluated.</p>
+<hr>
+<ol>
+ <li>SWE-bench has since addressed this upstream by stripping future git history from its environment images (PR #471), with follow-up git cleanup work in early 2026 (PR #533). The images we had ingested predated that fix.</li>
+ <li>The exact gap sizes and the frequency of reward-hacking attempts depend on the prompts used. For example, hacking attempts increased when we instructed the model to keep working without stopping.</li>
+</ol>
