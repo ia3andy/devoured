@@ -1,0 +1,84 @@
+<h1>Amazon EKS now supports control plane egress through your VPC</h1>
+<p>Today, we’re announcing customer-routed control plane egress, a new capability that you can use to route Kubernetes control plane traffic through your own Amazon Virtual Private Cloud (Amazon VPC). This includes admission webhook callbacks, OpenID Connect (OIDC) provider lookups, and aggregate API server requests. With this feature, you can apply the same VPC routing, security group, endpoint policy, and AWS Network Firewall controls that you use for your data plane to the Kubernetes API Server’s customer-controllable outbound traffic on Amazon Elastic Kubernetes Service (Amazon EKS) clusters.</p>
+<p>By default, traffic from the Kubernetes API Server leaves the cluster through that EKS-managed Control Plane. That traffic includes calls to validating and mutating admission webhooks, fetches of OIDC discovery documents, and proxied requests to aggregate API servers. Customers in regulated industries asked for a way to apply their own VPC egress controls to that path, so the policies that govern their workloads also govern the traffic that Kubernetes API Server initiates.</p>
+<p>Customer-routed control plane egress gives you that control. When you create or update an existing cluster with this feature enabled, the Kubernetes API Server’s egress flows through an Elastic Network Interface (ENI) in your VPC. You configure how that traffic reaches its destination using the routing, security groups, VPC endpoints, and AWS PrivateLink connections you already manage.</p>
+<h2>Who this is for and why it matters</h2>
+<p>Customer-routed control plane egress is built for organizations that need verifiable controls over how customer-driven control plane traffic routes through their network. This includes government agencies operating in regulated environments and highly regulated commercial organizations, such as financial services firms, healthcare providers, and enterprises that must demonstrate where their Kubernetes control plane traffic goes.</p>
+<p>During early development, customers told us they value two things most: complete control over where customer-driven Kubernetes control plane traffic routes through their VPC, and the ability to enforce that routing organization-wide through AWS Organizations Service Control Policies. The latter is accomplished using the eks:controlPlaneEgressMode condition key. With this feature, you can also use private OIDC identity providers within your network perimeter, capture complete audit trails for control plane communications through Amazon VPC Flow Logs, and apply data perimeter policies that support your compliance efforts. For many of these customers, keeping authentication traffic inside their private network perimeter is what makes it possible to migrate production workloads off self-managed Kubernetes while staying within their regulatory and audit requirements.</p>
+<p>Customer-routed control plane egress works with your existing EKS features, including EKS Auto Mode, managed node groups, EKS add-ons, AWS Fargate, and tools such as kubectl and Helm. Enabling it doesn’t change how any of these behave, and no configuration changes are required on your part. Note that the setting is permanent for the life of the cluster: after a cluster uses CUSTOMER_ROUTED, you can’t revert it to AWS_MANAGED. Some traffic doesn’t originate from the Kubernetes API Server and therefore doesn’t flow through your VPC. EKS Capabilities (ArgoCD, ACK, KRO) run in separate AWS-managed infrastructure, and AWS Security Token Service (AWS STS) calls from the AWS Identity and Access Management (IAM) Authenticator continue to use the EKS-managed path.</p>
+<h2>How it works</h2>
+<p>When you enable Customer-routed control plane egress on a cluster, EKS isolates the Kubernetes API Server on each control plane instance so that its customer-controllable egress is bound to a VPC ENI in the subnets you provide. EKS-managed control plane components continue to use the EKS-managed network path.</p>
+<p>Customer-controllable traffic, including admission webhook calls, OIDC discovery requests, aggregate API server requests, and the DNS that those calls resolve, leaves the Kubernetes API Server through your VPC ENI. From there, it follows the routes, security groups, and endpoints that you have configured. EKS-managed traffic continues over the existing EKS-managed path and is not affected by your VPC configuration.</p>
+<p>Webhook calls that previously originated from an EKS-managed egress, now originate from cross-account ENI IPs inside your VPC. You treat them like any other workload egress: route to in-VPC services directly, reach external endpoints through your own NAT Gateway or AWS PrivateLink, or reach on-premises services through AWS Direct Connect.</p>
+<h2>Layering with private cluster endpoints</h2>
+<p>Customer-routed control plane egress and the EKS private endpoint feature solve different parts of the same private-networking problem, and they work well together. The private endpoint feature (endpointPrivateAccess) governs inbound connectivity to the Kubernetes API server. It controls how your worker nodes and kubectl clients reach the API server, making the API server reachable over a private network path.</p>
+<p>Customer-routed control plane egress governs the opposite direction. It controls where the API server routes outbound customer-driven traffic, sending that traffic through your VPC.</p>
+<p>Use both features together for a comprehensive private-networking posture. Private endpoint access secures inbound connectivity to the API server, while customer-routed control plane egress routes outbound customer-controllable traffic through your VPC. The result is private inbound connectivity paired with customer-routed outbound traffic, giving you control over both directions of communication with the control plane.</p>
+<h2>Getting started with Amazon EKS customer-routed control plane egress</h2>
+<p>You enable customer-routed control plane egress by setting controlPlaneEgressMode to CUSTOMER_ROUTED in your cluster’s VPC configuration. You can set it when you create a cluster or by updating an existing cluster. The default value is AWS_MANAGED. After it’s enabled, the setting is immutable for that cluster’s lifetime.</p>
+<p>Create a new cluster with the feature enabled:</p>
+<pre><code>aws eks create-cluster \
+  --name my-cluster \
+  --kubernetes-version 1.36 \
+  --role-arn arn:aws:iam::111122223333:role/eks-cluster-role \
+  --resources-vpc-config subnetIds=subnet-aaa,subnet-bbb,securityGroupIds=sg-xxx,controlPlaneEgressMode=CUSTOMER_ROUTED</code></pre>
+<p>Or enable it on an existing cluster:</p>
+<pre><code>aws eks update-cluster-config \
+  --name my-cluster \
+  --resources-vpc-config controlPlaneEgressMode=CUSTOMER_ROUTED</code></pre>
+<p>Verify the setting:</p>
+<pre><code>aws eks describe-cluster --name my-cluster \
+  --query "cluster.resourcesVpcConfig.controlPlaneEgressMode"</code></pre>
+<h2>Enforcing customer-routed control plane egress across your organization</h2>
+<p>Customer-routed control plane egress introduces a new IAM condition key, eks:controlPlaneEgressMode, that applies to the eks:CreateCluster and eks:UpdateClusterConfig actions. Using AWS Organizations Service Control Policies (SCPs), you can require that every new or updated cluster sets controlPlaneEgressMode to CUSTOMER_ROUTED, automatically preventing the creation of clusters that don’t use this egress configuration across your accounts. The following SCP shows the policy:</p>
+<pre><code>\{
+    "Version": "2012-10-17",
+    "Statement": [
+        \{
+            "Sid": "RequireCustomerRoutedControlPlane",
+            "Effect": "Deny",
+            "Action": [
+                "eks:CreateCluster",
+                "eks:UpdateClusterConfig"
+            ],
+            "Resource": "*",
+            "Condition": \{
+                "StringNotEquals": \{
+                    "eks:controlPlaneEgressMode": "CUSTOMER_ROUTED"
+                }
+            }
+        }
+    ]
+}</code></pre>
+<h2>Example scenarios</h2>
+<p>The following two scenarios show how customer-routed control plane egress changes what’s possible for clusters that need to reach private webhooks or a private OIDC identity provider.</p>
+<h3>Scenario 1: Routing admission webhook traffic through your VPC</h3>
+<p>Admission webhooks let the Kubernetes API Server call out to a validating or mutating service on every matching request. Many teams want that service to live entirely inside their network, on a private endpoint with no public address, so that policy decisions never depend on a path that leaves their VPC. On a standard managed cluster that’s difficult because the API Server’s outbound calls leave through the EKS-managed path and can’t reach a private-only address in your VPC.</p>
+<p>Customer-routed control plane egress closes that gap. With the feature enabled, the API Server’s webhook calls flow through an ENI in your VPC, so it can reach a webhook fronted by an internal load balancer and resolved through a private DNS name. The endpoint stays unreachable from the internet, yet the control plane reaches it over your own network, following the routes, security groups, and endpoints you already manage.</p>
+<p>The result: a webhook that’s reachable only inside your VPC now works. Requests that it evaluates are admitted or rejected exactly as they would be for a public endpoint. The same path extends to any private dependency your webhooks rely on, including services reachable only over AWS Direct Connect or a private NAT path.</p>
+<h3>Scenario 2: Private reachability for an external OIDC identity provider</h3>
+<p>With EKS, you can associate an external OIDC identity provider so users authenticate to the Kubernetes API server with a signed JWT. The control plane must reach the issuer twice: at association time to fetch the discovery document and JSON Web Key Set (JWKS), and at token verification time to validate signatures. Previously both fetches used the EKS-managed egress path, which required the issuer to be reachable over the internet. With CUSTOMER_ROUTED, they leave through a customer VPC network interface. That is what makes a private, in-VPC issuer usable.</p>
+<p>A private issuer still has to present a TLS certificate the control plane will trust, and this shapes how you set it up. The control plane only trusts certificates that chain to a public certificate authority, and associate-identity-provider-config provides no field for a custom CA bundle, so self-signed and AWS Private Certificate Authority certificates aren’t accepted. The certificate must therefore chain to a public CA, such as one issued through AWS Certificate Manager (ACM). Trust and privacy come from two independent properties: trust from the public certificate chain, and privacy from fronting the issuer with an internal load balancer that has only private addresses. Using a publicly trusted certificate does not expose your private endpoint to public access.</p>
+<p>You can confirm the path with Amazon VPC Flow Logs on your cluster subnets. During association, the logs record connections from the EKS control plane network interfaces to the issuer’s internal load balancer on TCP port 443, the port the HTTPS OIDC fetch uses. Each connection has the ACCEPT action that marks an established, permitted connection. The source interfaces are the EKS control plane ENIs. The EKS service account owns them and names them Amazon EKS &lt;cluster-name&gt;, yet they live inside your VPC, because these are the customer-VPC egress interfaces the feature attaches to the control plane. The destination is the load balancer’s private address. Because both the source and destination addresses belong to your VPC, the connection stayed entirely within your network and never used a public or internet path.</p>
+<h2>Considerations</h2>
+<ul>
+ <li><strong>New and existing clusters.</strong> You can enable customer-routed control plane egress (controlPlaneEgressMode = CUSTOMER_ROUTED) at cluster creation or on an existing cluster with aws eks update-cluster-config. The setting can’t be changed after the cluster is created and cannot revert to AWS_MANAGED.</li>
+ <li><strong>VPC egress is your responsibility.</strong> With customer-routed control plane egress enabled, customer-controllable Kubernetes API Server traffic depends on your VPC’s routing, security groups, endpoint configuration, and DNS. EKS service-side operations aren’t affected by your VPC configuration, but customer-controllable calls (webhooks, OIDC discovery, aggregate API requests) fail if the corresponding endpoints are unreachable from the cluster subnets.</li>
+ <li><strong>EKS-managed traffic continues over the EKS-managed path.</strong> This release routes only customer-controllable Kubernetes API Server traffic through your VPC. The EKS-managed control plane networking remains in place for control plane components and AWS service traffic.</li>
+ <li><strong>EKS Capabilities and IAM Authenticator traffic are not covered.</strong> EKS Capabilities (ArgoCD, ACK, KRO) run in separate AWS-managed infrastructure, and AWS STS calls made by the IAM Authenticator continue to use the EKS-managed path. Neither routes through your VPC in this release.</li>
+ <li><strong>Performance.</strong> This feature isn’t expected to introduce a performance impact on your cluster operations or workloads. The effective latency of customer-controllable calls depends on the egress path you configure in your VPC rather than on the feature itself.</li>
+ <li><strong>Observability.</strong> You can use Amazon VPC Flow Logs on the cluster subnets to see customer-controllable control plane egress. Existing Amazon EKS control plane logging in Amazon CloudWatch Logs continues unchanged.</li>
+ <li><strong>DNS shifts to your VPC and required IAM permissions.</strong> With VPC-routed egress, the API server resolves customer-controllable hostnames, such as webhook and OIDC endpoints, through your VPC’s DNS resolvers. This lets it reach endpoints you host in private DNS zones inside your network perimeter. If those names resolve through Amazon Route 53 private hosted zones, Resolver endpoints, or on-premises DNS servers, verify that your cluster subnets can reach those resolvers.EKS learns your VPC’s DNS configuration by reading its DHCP options set, so the cluster IAM role must allow ec2:DescribeVpcs and ec2:DescribeDhcpOptions: 
+  <pre><code>\{
+    "Effect": "Allow",
+    "Action": [
+        "ec2:DescribeVpcs",
+        "ec2:DescribeDhcpOptions"
+    ],
+    "Resource": "*"
+}</code></pre>
+  <p>These actions are part of the standard cluster IAM role permissions.</p></li>
+</ul>
+<h2>Now available</h2>
+<p>Amazon EKS customer-routed control plane egress is available today in all AWS Regions where Amazon EKS is supported.</p>
+<p>There are no additional charges for using customer-routed control plane egress. Standard Amazon EKS, Amazon Elastic Compute Cloud (Amazon EC2), Amazon VPC, NAT gateway, and any cross-AZ data transfer or VPC endpoint charges associated with your VPC configuration apply as usual.</p>

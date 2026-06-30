@@ -1,0 +1,56 @@
+<p>Here at Octopus Deploy, I recently modernized our build and release processes for several static sites we refer to as microsites. The new process includes deploying an ephemeral environment for every Pull Request (PR) using Octopus Deploy and commenting on the PR with a link to the ephemeral environment. This provides the PR creator and any reviewers with a real, working environment to review the proposed changes.</p>
+<p>There are many things I like about ephemeral environments, and I think they add significant value to the software development lifecycle. However, I have recently been asked a few times whether ephemeral environments can be skipped as part of the PR process. Once was at NDC Sydney, where I gave a talk on Ephemeral Environments, and another was by a colleague who regularly works on these microsites internally.</p>
+<p>I sat down to think about this, and refactored the GitHub workflow to accommodate the request.</p>
+<h2>Why skip ephemeral environments?</h2>
+<p>Ephemeral environments are valuable, but as I learned through these recent conversations, they’re not always required. Our ephemeral environment process for microsites, which creates an Azure Storage account with Terraform and then deploys the website package to the target storage account, can take 5 to 9 minutes.</p>
+<p>Our GitHub repositories have protections on the <code>main</code> branch, and in addition to a required review, we have checks that must pass before the PR can be merged. Some of those checks check spelling and Markdown syntax, but another checks that the build process completed successfully. Part of that build triggers the ephemeral environment deployment in Octopus Deploy, so deploying the ephemeral environment can delay the build’s completion.</p>
+<p>Another reason that came up in a community discussion was the issue of busy repositories and the amount of infrastructure that may be provisioned when environments are spun up for each PR. Especially if those environments have high costs, there could be real cost implications at scale. Though I’d also argue that there are other factors to investigate, like the duration of opened PRs, to see if optimizations can be made elsewhere.</p>
+<p>The common thread across all these scenarios is that the decision to deploy an ephemeral environment is contextual; it depends on the nature of the change and the needs of the people reviewing it. Rather than removing ephemeral environments from the process entirely, what I needed was a way to make them optional on a per-PR basis, with minimal friction for the developer raising the PR.</p>
+<p>It turned out that GitHub’s PR labels were the perfect tool for the job.</p>
+<h2>Skipping ephemeral environments with a PR label</h2>
+<p>The original GitHub workflow file only had one job. All steps were within the single job, and the required checks for the GitHub repo were configured to verify a successful run of this single job before allowing the PR to be merged.</p>
+<p>While you can make steps in a workflow conditional, the more I looked at it, the more I realized it made sense to break the workflow into multiple jobs to achieve different outcomes.</p>
+<ul>
+ <li><strong><code>build</code></strong> — always runs on every PR. It installs dependencies, builds the site, runs tests, packages the artifact, and uploads it for use by subsequent jobs.</li>
+ <li><strong><code>deploy-ephemeral</code></strong> — picks up the artifact from the <code>build</code> job, pushes it to Octopus Deploy, creates the ephemeral environment, and deploys the release. This is the job we want to make optional.</li>
+ <li><strong><code>pr-ready</code></strong> — a lightweight gate job that acts as the required status check for the <code>main</code> branch. It verifies that <code>build</code> succeeded and that <code>deploy-ephemeral</code> either succeeded or was deliberately skipped.</li>
+</ul>
+<p>The key to making <code>deploy-ephemeral</code> optional is a single <code>if:</code> condition on the job:</p>
+<pre><code>deploy-ephemeral:
+  runs-on: ubuntu-latest
+  needs: build
+  if: $\{\{ !contains(github.event.pull_request.labels.*.name, 'skip-ephemeral') }}
+  ...</code></pre>
+<p>This checks whether the PR has a label named “skip-ephemeral”. If the label is present, the entire job is skipped. If it isn’t, the job runs as normal. Adding the label to a PR before opening it is all that’s needed to skip the deployment to the ephemeral environment.</p>
+<p>But by breaking the workflow into two jobs, I introduced another problem I needed to solve.</p>
+<h2>Using a gate job to keep branch protection intact</h2>
+<p>Previously, the required check on the main branch pointed directly at the single build job, and if it passed, the PR could be merged. With the refactored workflow, I couldn’t configure the required check to check the status of <code>deploy-ephemeral</code> anymore, because that job might be intentionally skipped. A skipped job registers as a failed required check in GitHub, which would block the PR from merging even when everything went exactly as intended.</p>
+<p>I needed a reliable way to signal whether the overall workflow succeeded or failed, regardless of whether the ephemeral deployment ran. That’s where the <code>pr-ready</code> gate job comes in.</p>
+<p>The <code>pr-ready</code> job runs after both <code>build</code> and <code>deploy-ephemeral</code>, and uses <code>if: always()</code> to ensure it runs regardless of what happened upstream. Inside the job, a single step checks two conditions:</p>
+<ul>
+ <li><code>build</code> must have succeeded, as there’s no scenario where a failed build should result in a mergeable PR</li>
+ <li><code>deploy-ephemeral</code> must have either succeeded or been deliberately skipped. A failure in the deployment job should still block the merge, but a skip should not</li>
+</ul>
+<p>If either of those conditions isn’t met, the step runs <code>exit 1</code>, which fails the job and blocks the PR from merging. The required check on <code>main</code> now checks the <code>pr-ready</code> job rather than either of the other two, so it always has a clear, predictable result to work with.</p>
+<pre><code>pr-ready:
+  runs-on: ubuntu-latest
+  needs: [build, deploy-ephemeral]
+  if: always()
+
+  steps:
+    - name: Verify required checks
+      run: exit 1
+      if: &gt;-
+        needs.build.result != 'success' ||
+        (needs.deploy-ephemeral.result != 'success' &amp;&amp;
+        needs.deploy-ephemeral.result != 'skipped')</code></pre>
+<h2>Making it simple to use</h2>
+<p>I wanted to make it as easy as possible for developers to skip an ephemeral environment, should they want to. When creating a PR, all they need to do is add the label <code>skip-ephemeral</code> to the PR. When the PR is opened, the GitHub workflow will start, read the labels assigned to the PR, and skip the <code>deploy-ephemeral</code> job. The build still runs as expected, and the <code>pr-ready</code> job will execute, which is the job being tracked by required checks for PRs.</p>
+<p>It’s worth noting that the label needs to be present before the workflow triggers. If you open a PR without the label and the workflow starts running, adding the label mid-run won’t affect that run. The label state is read from the event payload when the workflow was triggered. If you push a subsequent commit, the workflow will re-trigger and read the current label state at that point, so the skip will take effect from your next push onwards.</p>
+<h2>One change, every team benefits</h2>
+<p>One of the things I enjoy about working with a Platform Engineering mindset is that the improvements I make to shared infrastructure benefit everyone who relies on it. In this case, I was responding to a request from one of our application teams, but because our microsite build process is templated and shared across multiple teams, the change I made is immediately available to every team using the same workflow. At the same time, the platform team can also decline a feature request. If skipping ephemeral environments conflicted with the organization’s risk, compliance, or deployment policies, we could simply choose not to implement it, and every team consuming the shared workflow would remain compliant by default.</p>
+<p>This is the value of treating your pipelines as shared, versioned infrastructure rather than copies of a golden template. When every team has its own copy of a pipeline, improvements stay local to the team, making it harder for the platform team to push changes out. When teams consume a shared workflow, a single change propagates everywhere, everyone benefits, and the platform team can focus on building improvements rather than coordinating rollouts.</p>
+<h2>Wrapping up</h2>
+<p>Ephemeral environments are a powerful tool for reviewing changes in a real environment before they’re merged, but there are scenarios where developers may want to skip the ephemeral environment process. It’s not something I’d lean towards myself, and I definitely wouldn’t make that the default behavior.</p>
+<p>By breaking the workflow into separate jobs and using a simple-to-use PR label as a condition, it’s possible to make the ephemeral environment deployment optional without compromising the integrity of the build process or the branch protection rules that rely on it.</p>
+<p>Happy deployments!</p>

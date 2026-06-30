@@ -1,0 +1,75 @@
+<p>Linux provides powerful kernel-level security mechanisms, seccomp, SELinux, and AppArmor, that restrict what containerized workloads can do. Each uses profiles that define permitted behavior, but writing, distributing, and maintaining those profiles by hand is tedious and error-prone. The Security Profiles Operator (SPO) solves this by letting you manage security profiles as Kubernetes custom resources, record profiles from live workloads, and bind them to pods declaratively.</p>
+<p><strong>With v1.0.0, the Security Profiles Operator graduates all eight of its Custom Resource Definition (CRD) APIs to v1. This is the project’s first stable release, backed by a third-party security audit, a full cycle of hardening work, and a zero-downtime migration path from every previous API version.</strong></p>
+<h2>Six years of API evolution</h2>
+<p>SPO started in April 2020 as a seccomp-only operator. Over the following years, the project grew to cover SELinux (late 2020), AppArmor (late 2021), profile recording via audit logs and eBPF, OCI-based profile distribution, and more. Each feature introduced new CRDs, and those CRDs stayed at alpha or beta while the APIs matured through real-world use.</p>
+<p>Some of these APIs have been stable in practice for years: <code>SeccompProfile</code> shipped at <code>v1beta1</code> for over four years, <code>SPOD</code> at <code>v1alpha1</code> for over five. Downstream consumers needed a stable version label to commit to long-term support. The SPO has been available on OperatorHub since 2022 and has shipped as part of Red Hat OpenShift since version 4.12. The window before v1 was the last chance to make breaking changes, and the team used it.</p>
+<p>The cleanup involved many pull requests:</p>
+<ul>
+ <li><strong>Structural changes.</strong> All CRDs now share a common status type based on upstream Kubernetes conditions. The SPOD spec was reorganized from a flat list of 30+ fields into logical groups (SELinux, Enricher, Webhook, Scheduling, Security). Shared base types were extracted to avoid duplication across CRDs.</li>
+ <li><strong>Type corrections.</strong> Several field types were updated to follow Kubernetes API conventions, including replacing unsigned with signed integers. External types that created unnecessary import dependencies were internalized.</li>
+ <li><strong>Convention alignment.</strong> Enum values moved to PascalCase (e.g., <code>logs</code> to <code>Logs, RUNNING</code> to <code>Running</code>). Every field received +optional or +required markers. Validation markers were added across all types.</li>
+</ul>
+<p>The one deliberate exception: seccomp’s <code>SCMP_ACT_</code>* and <code>SCMP_CMP_*</code> constants keep their uppercase names to match the OCI runtime spec and Linux kernel headers verbatim.</p>
+<h2>Security audit and hardening</h2>
+<p>Before graduating to v1, SPO underwent a security code audit. The audit found zero critical vulnerabilities. It confirmed that file paths written to the host are derived from object metadata (not from user-controlled spec fields), that commands are constructed as argument arrays (no shell injection surface), and that RBAC defaults do not grant unnecessary privileges to non-admin users.</p>
+<p>The audit identified areas for hardening, especially around the boundary where a tenant’s custom resource gets translated into kernel-level LSM state. The v1.0.0 release addresses these findings:</p>
+<p><strong>RawSelinuxProfile: gating and validation.</strong> <code>RawSelinuxProfile</code> lets users write arbitrary SELinux CIL policy, which the operator installs on the node. The audit flagged this as the highest-risk path. In v1.0.0, a new <code>enableRawSelinuxProfiles</code> field on the SPOD configuration lets cluster admins disable raw SELinux profile support entirely. A validating admission webhook now rejects invalid raw policies instead of letting them fail at reconciliation.</p>
+<p><strong>SelinuxProfile: permissive mode control.</strong> The <code>permissive</code> boolean on <code>SelinuxProfile</code> was replaced with a <code>mode</code> enum (<code>Enforcing</code> or <code>Permissive</code>), removing the risk that an unset field could accidentally enable permissive mode.</p>
+<p><strong>AppArmor input sanitization.</strong> AppArmor profiles accept template inputs for profile names, executable paths, and capabilities. The audit noted that these inputs were loaded without content validation. SPO now applies strict regex validation on all of them and prevents overwriting profiles that are already loaded in the kernel.</p>
+<p><strong>Field size limits and validation markers.</strong> <code>RawSelinuxProfile</code>.<code>spec</code>.<code>policy</code> now carries a <code>maxLength</code> of 500 KB, limiting the input size before it reaches the SELinux CIL compiler on the node. Validation markers were added across all CRD types.</p>
+<h3>Additional hardening beyond the audit scope</h3>
+<ul>
+ <li><strong>Regex backtracking:</strong> Greedy regex operators in the seccomp, SELinux, and AppArmor log parsers were replaced with bounded patterns to prevent crafted audit log lines from causing excessive backtracking.</li>
+ <li><strong>Path restriction:</strong> <code>HostProcVolumePath</code> is now validated to match <code>/proc </code>only. The seccomp <code>ListenerPath</code> is restricted to the operator’s socket directory.</li>
+ <li><strong>eBPF recorder resource limits:</strong> The eBPF-based profile recorder now caps the number of recorded files and maximum path length, preventing OOM on workloads with high filesystem activity.</li>
+ <li><strong>Process cache accuracy:</strong> The process cache now keys on PID plus process start time, preventing stale cache hits after PID reuse.</li>
+ <li><strong>Recording annotation handling:</strong> The recording webhook correctly overwrites existing annotations instead of silently skipping already-annotated pods.</li>
+ <li><strong>Metrics cardinality:</strong> Unbounded labels were dropped from Prometheus counters to prevent high-cardinality metrics.</li>
+</ul>
+<h2>Zero-downtime migration</h2>
+<p>Upgrading to v1.0.0 requires no manual migration steps. Conversion webhooks handle translation between old and new API versions transparently:</p>
+<ul>
+ <li><strong>Old manifests still work:</strong> You can continue applying resources using <code>v1alpha1</code>, <code>v1alpha2</code>, or <code>v1beta1 </code>API<code> </code>versions. The conversion webhook translates them to v1 before storage.</li>
+ <li><strong>Old API versions are still served:</strong> <code>kubectl get</code> with an old API version returns resources with old-style enum values, even though v1 is the storage version.</li>
+ <li><strong>Enum values map bidirectionally:</strong> The conversion layer translates between old-style (<code>logs, RUNNING</code>) and new-style (<code>Logs, Running</code>) enum values in both directions.</li>
+</ul>
+<p>Here’s how a <code>ProfileRecording</code> looks before and after:</p>
+<pre><code># Before (v1alpha1)
+apiVersion: security-profiles-operator.x-k8s.io/v1alpha1
+kind: ProfileRecording
+metadata:
+  name: my-recording
+spec:
+  kind: SeccompProfile
+  recorder: logs
+  mergeStrategy: none
+  podSelector:
+    matchLabels:
+      app: my-app
+
+
+# After (v1)
+apiVersion: security-profiles-operator.x-k8s.io/v1
+kind: ProfileRecording
+metadata:
+  name: my-recording
+spec:
+  kind: SeccompProfile
+  recorder: Logs
+  mergeStrategy: None
+  podSelector:
+    matchLabels:
+      app: my-app</code></pre>
+<p>For CRDs without enum changes, only the <code>apiVersion</code> line changes. A full migration guide covers Go API consumer updates, enum constant changes, and scheme registration. Old API versions will remain available for backward compatibility and will be removed in a future release.</p>
+<h2>From operator to upstream Kubernetes</h2>
+<p>SPO has always been closely connected to upstream security profile work in Kubernetes. The project builds on the seccomp GA API surface (Kubernetes 1.19) and grew alongside related proposals like ConfigMap-based seccomp profiles and built-in seccomp profiles with complain mode.</p>
+<p>The latest example of this connection is <strong>KEP 6061: OCI Artifact-Based Security Profile Distribution</strong>, proposed for an upcoming Kubernetes release as alpha. SPO pioneered OCI-based profile distribution years ago, allowing users to push seccomp, SELinux, and AppArmor profiles to OCI registries and reference them directly from pod specs. KEP 6061 brings this concept into the kubelet natively, adding a <code>PullSecurityProfileArtifact</code> CRI API call so container runtimes can fetch profiles from OCI registries on demand.</p>
+<p>The KEP follows the same trust model as localhost profiles: a deny-by-default allowlist at the kubelet, with Pod Security Admission treating OCI profiles like localhost. SPO will continue to provide the higher-level features that the kubelet does not cover: profile recording from live workloads, structured SELinux policy authoring, profile binding to container images, and audit log enrichment.</p>
+<h2>What’s next</h2>
+<ul>
+ <li><strong>Removing old API versions</strong> after at least one release cycle.</li>
+ <li><strong>Continued hardening</strong>, including tighter RBAC scoping and safer path operations in privileged components.</li>
+ <li><strong>KEP 6061 integration</strong>, connecting SPO’s OCI distribution features with the native kubelet support as it matures through alpha and beta.</li>
+</ul>
+<p>Try v1.0.0, read the migration guide, and join the conversation in #security-profiles-operator on Kubernetes Slack.</p>
+<p>SPO is built by over 70 contributors across multiple organizations. Thanks to everyone who contributed code, filed issues, tested pre-releases, and participated in the security audit. v1 is yours as much as ours.</p>

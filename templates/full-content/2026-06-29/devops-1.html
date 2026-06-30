@@ -1,0 +1,62 @@
+<h1>From query to action: Introducing SQL alerting in Cloud Monitoring Observability Analytics</h1>
+<p>Traditional alerting systems often force a compromise: you can either alert immediately on simple, noisy log events, or monitor rigid, pre-configured metrics that fail when faced with data with many unique answers like user sessions or IP addresses. But the most critical system issues — like a 20% spike in error rates for a specific customer or a latency anomaly correlated with database timeouts — are hidden in the aggregates and relationships between these signals.</p>
+<p>Recently, we announced that you can now use SQL to query logs and traces in Observability Analytics (formerly Log Analytics). But the story gets better. You can also use SQL to create alerts in Observability Analytics. By bringing SQL directly to your alerting engine, you can write complex analytical queries over logs and traces and turn them into alerts. Whether you need to calculate error percentages, analyze high-cardinality dimensions, or JOIN logs and traces, SQL alerting helps you go from basic threshold monitoring to deep, contextual detection that goes beyond the capabilities of traditional alerting systems. SQL alerting is now in preview.</p>
+<h3>How SQL-based alerting works</h3>
+<p>SQL alerting in Observability Analytics is available as part of Cloud Monitoring. An alerting policy runs your SQL query on a schedule you define (for example, every 10 minutes). It automatically applies a "lookback window" to your query, so it only analyzes the log entries or trace spans it received since the last time it ran.</p>
+<p>If the results of your query meet the condition you set, Cloud Monitoring creates an incident and sends a notification to your chosen channels, like email, Slack, or PagerDuty.</p>
+<p>Please note that because SQL-based alerting uses BigQuery to process telemetry data, query executions are billed through BigQuery under your standard on-demand pricing or BigQuery reservations.</p>
+<h3>Two ways to trigger an alert</h3>
+<p>You can choose between two types of alert conditions.</p>
+<ol>
+ <li><strong>Row count threshold:</strong> This is the simplest option. The alert fires if your query returns a number of rows that is greater than, equal to, or less than a threshold you set. This is perfect for "alert me if more than 10 users have failed logins" scenarios.</li>
+ <li><strong>Boolean:</strong> This is the most powerful option. The alert fires if your query returns <em>any</em> row where a specific column you define has a value of true. This lets you build complex logic, like calculating percentages, directly in your SQL query.</li>
+</ol>
+<p><strong>Example 1: Alerting on payment gateway failures (row count)</strong></p>
+<p><strong>Scenario:</strong> Imagine that you’re an e-commerce operator, and you want to be alerted immediately if your payment gateway is experiencing systemic outages, while ignoring occasional, normal card declines (like an incorrect PIN).</p>
+<p>To do this, you can write a query to filter for log entries indicating gateway timeouts, and use a row count threshold to trigger the alert only if the volume of these errors spikes.</p>
+<pre><code>SELECT JSON_VALUE(json_payload.transaction_id) AS transaction_id, JSON_VALUE(json_payload.error_code) AS error_code FROM `my-project-id.my-dataset.my-log-view` WHERE JSON_VALUE(json_payload.status) = 'FAILED' -- Filter for systemic gateway issues, not user-input errors like WRONG_PIN AND JSON_VALUE(json_payload.failure_reason) = 'GATEWAY_TIMEOUT'</code></pre>
+<p><strong>Alert configuration:</strong></p>
+<ul>
+ <li>Condition type: Row count threshold</li>
+ <li>Trigger condition: Fired when row counts greater than (<code>&gt;</code>) 10</li>
+ <li>Evaluation window / lookback: 5 minutes (checks the last 5 minutes of data on your defined schedule)</li>
+</ul>
+<p><strong>Example 2: Alerting on agent latency (traces)</strong></p>
+<p><strong>Scenario: </strong>You’re an AI platform engineer, and you want to ensure your multi-step AI agents are responding within acceptable time limits. You want to monitor the 99th percentile (p99) latency of the orchestrator service and get alerted if performance degrades.</p>
+<p>To do this, you can write a SQL query against your trace data that calculates the p99 latency for all services and returns true if your agent-orchestrator exceeds 5 seconds (5000 milliseconds).</p>
+<pre><code>WITH latency_data AS ( SELECT APPROX_QUANTILES(duration_nano, 100)[OFFSET(99)] / 1000000 AS p99_ms FROM `my-project-id.us._Trace.Spans._AllSpans` WHERE -- Examine rows produced by the agent-orchestrator JSON_VALUE(resource.attributes, '$."service.name"') = 'agent-orchestrator' GROUP BY service_name ) SELECT "agent-orchestrator" AS service_name, p99_ms, -- Boolean logic: Alert if p99 exceeds 5000ms (p99_ms &gt; 5000) AS has_latency_spike FROM latency_data</code></pre>
+<p><strong>Alert configuration:</strong></p>
+<ul>
+ <li>Condition type: Boolean</li>
+ <li>Target column: has_latency_spike</li>
+ <li>Trigger condition: Fired when the query returns any row where this column evaluates to true.</li>
+ <li>Evaluation window / lookback: 10 minutes (or your preferred scheduling interval)</li>
+</ul>
+<h3>Before you begin</h3>
+<p>Before you can create a SQL-based alert, you need to set up a few things:</p>
+<ol>
+ <li><strong>Analytics enabled:</strong>
+  <ul>
+   <li>For <strong>logs</strong>: Upgrade your log bucket to use Observability Analytics (if not already updated).</li>
+   <li>For <strong>traces</strong>: Cloud Trace must be collected and stored in your project.</li>
+  </ul></li>
+ <li><strong>Linked BigQuery dataset:</strong> Create a linked BigQuery dataset for the telemetry source (either the log bucket or the trace dataset). SQL-based alerts query the data through this BigQuery link.</li>
+ <li><strong>IAM permissions:</strong>
+  <ul>
+   <li>Grant the IAM roles necessary to create an SQL-based alert policy: Monitoring AlertPolicy Editor and Logging SqlAlert Writer (applies to both log and trace alerts).</li>
+  </ul></li>
+ <li><strong>Notification channels:</strong> Configure the notification channels (like email or Slack) where you want to receive alerts.</li>
+</ol>
+<h3>How to create your alert</h3>
+<p>Creating a sql-based alert policy is straightforward:</p>
+<ol>
+ <li>Navigate to <strong>Observability Analytics</strong> in the Google Cloud console.</li>
+ <li>Compose and validate your SQL query.</li>
+ <li>Select the <strong>Run on BigQuery</strong> query engine in the UI.</li>
+ <li>Click the <strong>Create alert</strong> button from the results toolbar.</li>
+ <li>Define your condition (row count or boolean) and your evaluation schedule.</li>
+ <li>Add your notification channels, give your alert a clear name, and click <strong>Save</strong>.</li>
+</ol>
+<p>For Infrastructure as Code (IaC) pipelines, you can also configure alerts via the API and Terraform.</p>
+<h3>Get started</h3>
+<p>Ready to build more powerful, insightful alerts? Open the Observability Analytics page in the console and try writing your first SQL query today. You can find more details and advanced examples in the official documentation.</p>

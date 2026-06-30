@@ -1,0 +1,84 @@
+<p>In this post we’re going to see how <code>share.acquire.mode=record_limit</code> combined with:</p>
+<ul>
+ <li>fewer consumers than partitions</li>
+ <li>and various cases of “partition skew”</li>
+</ul>
+<p>…can result in subpar performance with share groups.</p>
+<p>I stumbled on these issues when running large sets of dimensional tests with Dimster’s explore-limits mode, which finds the highest sustainable throughput while staying within a target end-to-end latency target. There was a specific subset of the tests that explore-limits mode would consistently fail to complete, and they all happened to be with record_limit and a consumer count lower than the partition count. In this test, we’ll understand why Dimster had such a hard time with this combination.</p>
+<h2>Some background on share group internals</h2>
+<p>Kafka share groups have two methods of acquiring records:</p>
+<ul>
+ <li><code>share.acquire.mode=batch_optimized</code></li>
+ <li><code>share.acquire.mode=record_limit</code></li>
+</ul>
+<p>I already explained the difference in Kafka Share Groups and Parallelizing Consumption - Part 2: Producer Batches and share.acquire.mode but let’s just cover it again.</p>
+<p>Share consumers are assigned partitions as part of the share group protocol. It works similarly to the consumer group protocol, except that multiple consumers can be assigned to the same partition.</p>
+<p>With <code>batch_optimized</code>, share consumers acquire records in whole batches, using max.poll.records as a soft cap. Furthermore, a share consumer assigned multiple partitions across multiple brokers will send fetch requests to each of those brokers, concurrently.</p>
+<p>With <code>record_limit</code>, share consumers acquire records as slices of batches, where the size of the slice is determined by <code>max.poll.records</code> (now a strict cap). If you set <code>max.poll.records=10</code> but the relevant batch contains 32, then only a slice of 10 records is acquired (though the whole batch is transmitted over the wire). Furthermore, a share consumer assigned multiple partitions across multiple brokers will send fetch requests round-robin (one-at-a-time) across those brokers. Each time you call poll, it will fetch from the next broker.</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>max.poll.records</th>
+   <th>broker fetches</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>batch_optimized</td>
+   <td>soft cap</td>
+   <td>concurrent</td>
+  </tr>
+  <tr>
+   <td>record_limit</td>
+   <td>strict cap</td>
+   <td>round-robin</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Dimster’s failing tests</h2>
+<p>Dimster consistently did not complete explore-limits tests with <code>record_limit</code> and fewer consumers than partitions. The issue is that during various phases of an explore-limits test, lag can build very quickly if producers shoot past the capacity of the consumers. Dimster sees this and attempts to drain the lag before it resumes with a lower producer rate.</p>
+<p>The drain works by pausing the producers, temporarily removing any consumer processing time (if configured) and then resuming with a lower producer rate. However, with <code>record_limit</code> and fewer consumers than partitions, this lag drain would basically stall as the consumption rate would end up just a trickle (such that it would take hours to drain the backlog that had accumulated).</p>
+<p>So I ran some backlog drain tests to understand what was going on and discovered what I’ll refer to as <em>pathological fetch waits</em>.</p>
+<h2>Pathological fetch waits</h2>
+<p>Imagine one share consumer and a topic of 10 partitions spread across 3 brokers. Imagine if all the producers sent records to only one partition, leaving the other 9 consistently empty. What sub-optimal share consumer behavior might we see?</p>
+<p>Let’s go through it. Remember, with <code>record_limit</code>, fetches to brokers are round-robin if a consumer is assigned multiple partitions (on different brokers):</p>
+<ol>
+ <li>Consumer sends a fetch to <code>broker-0</code> (which hosts partitions 0, 3, 6, 9) and gets back some records for partition 0.</li>
+ <li>Poll is called again, triggering a fetch to <code>broker-1</code> (which hosts partitions 1, 4, 7), but there are no records.</li>
+ <li>Poll is called again, triggering a fetch to <code>broker-2</code> (which hosts partitions 3, 5, 8) but there are no records.</li>
+ <li>Poll is called again, triggering a fetch to <code>broker-0</code>, returning more records of partition 0.</li>
+</ol>
+<p>So what’s the problem? Can you see it yet?</p>
+<p>The problem is <code>fetch.max.wait.ms</code>. It defaults to 500. Yes that’s right, steps 2 and 3 took 1 second to complete and returned no records! 1 second where nothing is getting consumed, while partition 0 continues to receive records.</p>
+<p>Let’s run some benchmarks to understand how serious this issue can be.</p>
+<h2>Illustrating the record_limit fetch wait issue with Dimster</h2>
+<h3>Case 1 - Draining a giant backlog without producer load</h3>
+<p><em>Setup: 1 topic, 10 partitions, 5 consumers, max.poll.records=500 (the default), backlog size 400M records.</em></p>
+<p>By the time the test reached the short test timeout, consumption was about 3,900 records/s, from a high of 1.2M records/s (no simulated processing time was configured). 98% of the 400M backlog drained in around 8 minutes.</p>
+<p>The consumption slowdown started when lag was around 9M records. Extrapolating based on 3900 records/s, it should have taken 6 hours more to drain that 2% of the starting backlog.</p>
+<h3>Case 2 - Draining a skewed backlog</h3>
+<p><em>Setup: 1 topic, 12 partitions, 1 &amp; 6 consumers, max.poll.records=500 (the default), backlog size 20M records.</em></p>
+<p>Consumption starts strong but quickly drops to just shy of 2K records/s where it remained until the test reached the 20 minute drain timeout. Extrapolating, we can estimate a 2 hour drain time.</p>
+<h3>Case 3 - Skewed batch production workloads</h3>
+<p><em>Setup: 1 topic, 6 partitions, 1 consumer, max.poll.records=500 (the default), 6 brokers.</em></p>
+<p>The consumer can’t handle the batch instantly, it needs time to process it. The consumption rate of the heaviest partition tops out at 1.5K records/s, building lag on that partition. In each of the three producer dumps, once the producer rate dropped to 0 and the 5 lightest partitions got drained, the heavy partition consumption rate crashed due to the fetch wait issue. Each consecutive production-batch increased the lag on the heaviest partition.</p>
+<h3>Case 4 - Backlogs with producer load</h3>
+<p>So far we’ve focus on backlog draining without producer load. But if producers keep going during the drain then the fetch wait issue can be mitigated. The size of the mitigation depends on the magnitude of producer rate.</p>
+<h3>Case 5 - Heavy skew + one-record-at-a-time fetches</h3>
+<p>If we reduce <code>max.poll.records</code> to 1, plus we have fewer consumers than partitions, plus we have serious skew, we encounter a double-whammy. Round-robin fetching that returns only a single record cannot prioritize the heavier partitions, in fact, the heavier partitions are penalized as the lighter partitions cause the consumer to spend most time fetching from them.</p>
+<h2>Mitigating these fetch wait cases</h2>
+<p><strong>Primary mitigation</strong>: If you want to use <code>record_limit</code>, then the best mitigation is to use the <em>partition count as the floor for consumer count</em>. This completely side-steps the fetch wait problem and allows you to use <code>record_limit</code> without any risk of these weird performance issues under various types of skew.</p>
+<p>Secondary mitigations (less effective or with drawbacks):</p>
+<ul>
+ <li>Consider reducing <code>fetch.max.wait.ms</code>, if you have regular backlogs with no producer load (cases 1-3). The downside is if you get too aggressive, gone is long polling, instead you might hammer the Kafka brokers with a high frequency of fetch requests.</li>
+ <li>Consider increasing <code>max.poll.records</code> if you experience case 5, as it allows the consumer to make up for the long periods between fetches to the heaviest partitions.</li>
+ <li>Consider fixing your skew. However, even if your partitions are relatively balanced, if you accrue a very large backlog, then the lag can be skewed towards the end of the drain period.</li>
+</ul>
+<p>How might we mitigate these pathological-fetch-waits with a change in how the Apache Kafka clients work?</p>
+<ol>
+ <li>Have clients not wait the full timeout period if the last fetch to that broker returned empty.</li>
+ <li>No round-robin fetch requests. Have the client send concurrent fetches to all brokers of the assigned partitions.</li>
+ <li>Have an additional communication channel between brokers and clients, so brokers can share lag information with clients.</li>
+</ol>
+<p>I am sure this particular wrinkle with share groups will get worked out. In the mean time, the most sensible mitigation is to use the partition count as your floor for consumer count when using <code>record_limit</code>.</p>

@@ -1,0 +1,68 @@
+<h2>Apache Flink 2.3.0 Release Announcement</h2>
+<p>The Apache Flink PMC is pleased to announce the release of Apache Flink 2.3.0.</p>
+<p>This release significantly expands SQL capabilities with changelog conversion operators, enhances materialized table flexibility, introduces an experimental, high-performance native S3 filesystem, and delivers application management. Flink 2.3.0 brings together contributors from around the globe, implements full or core functionalities of 15 FLIPs (Flink Improvement Proposals), and resolves numerous issues and enhancements.</p>
+<p>Key improvements in this release include new SQL operators for changelog manipulation (<code>FROM_CHANGELOG</code> and <code>TO_CHANGELOG</code>), fine-grained control over materialized table refresh strategies, adaptive partition selection for optimized backpressure handling, and a completely redesigned S3 filesystem built on AWS SDK v2. The introduction of application-level lifecycle management provides better visibility and control for production deployments, while enhanced watermark alignment can dramatically improve backlog processing performance. A reworked SinkUpsertMaterializer brings much improved performance for some Flink SQL workloads.</p>
+<p>We extend our heartfelt thanks to all contributors for making this release possible!</p>
+<h2>Flink SQL Improvements</h2>
+<h3>FROM_CHANGELOG and TO_CHANGELOG: Bridging Append-only and Dynamic Changelog Tables</h3>
+<p>The DataStream API has long offered <code>toChangelogStream()</code> and <code>fromChangelogStream()</code> for working with changelog streams; Flink 2.3 brings equivalent functionality to SQL via two new built-in Process Table Functions:</p>
+<ul>
+ <li><code>FROM_CHANGELOG</code> converts an append-only stream that carries an operation column into a dynamic table. A configurable <code>op_mapping</code> makes it straightforward to plug in custom CDC formats and controls how rows with unmapped operation codes are treated.</li>
+ <li><code>TO_CHANGELOG</code> is the inverse: it materializes a dynamic table back into an append-only changelog stream. This is the first SQL-level operator that lets users convert retract or upsert streams into append form — useful for archival, audit, writing to append-only sinks, and working around pipelines that require an append-only table.</li>
+</ul>
+<p>The 2.3 release covers limited basic use cases for both. Future versions will extend both functions with <code>PARTITION BY</code>, <code>invalid_op_handling</code>, <code>produces_full_deletes</code> and more to make both features powerful and extensive.</p>
+<h3>Materialized Table Evolution: DDL Parity and Refresh Control</h3>
+<p>Flink 2.3 brings materialized tables to feature parity with regular tables through two major enhancements.</p>
+<p>First, <code>CREATE MATERIALIZED TABLE</code> now accepts explicit column definitions, including watermarks and primary keys, just like regular tables. <code>ALTER MATERIALIZED TABLE</code> gains full DDL capabilities—<code>ADD</code>, <code>MODIFY</code>, and <code>DROP</code> operations for metadata and computed columns, plus <code>RENAME TO</code>, allowing materialized tables to evolve through the same workflow already used for regular Flink tables.</p>
+<p>Second, Flink 2.3 introduces granular control over data reprocessing when a materialized table’s query changes. The new <code>START_MODE</code> clause lets you choose exactly where the refresh pipeline begins. There is also special support for attempting to resume processing from the exact source offsets where the previous job instance stopped.</p>
+<p>These enhancements eliminate the need to drop and recreate materialized tables when query definitions evolve, and prevent unnecessary reprocessing of historical data when iterating on pipeline logic.</p>
+<h3>SinkUpsertMaterializer: Explicit Conflict Handling</h3>
+<p>The SinkUpsertMaterializer is required when the upsert key (the unique identifier provided by the stream) is different from the primary key (the unique identifier in the target sink table). This happens in scenarios like multi-stage transformations, projections, or joins.</p>
+<p>By default, queries now fail at planning time when upsert and primary keys differ, requiring you to explicitly choose a conflict strategy. This is done with a new <code>ON CONFLICT</code> clause that makes the behavior explicit. You choose how to handle conflicts: <code>DO NOTHING</code> (silent skip), <code>DO ERROR</code> (fail the job), or <code>DO DEDUPLICATE</code> (materialize and deduplicate, similar to what Flink has done until now):</p>
+<pre><code>INSERT INTO target_table
+SELECT * FROM source
+ON CONFLICT DO DEDUPLICATE;</code></pre>
+<p>Second, watermark-based compaction reduces state size by cleaning up old changelog records that can no longer affect the final result. Two new configuration options control the compaction behavior:</p>
+<ul>
+ <li><code>table.exec.sink.upserts.compaction-mode</code> (default: <code>WATERMARK</code>) — <code>WATERMARK</code> or <code>CHECKPOINT</code>.</li>
+ <li><code>table.exec.sink.upserts.compaction-interval</code> — optional fallback interval for emitting watermarks when none arrive naturally.</li>
+</ul>
+<h3>Process Table Function Enhancements</h3>
+<p>Process Table Functions (PTFs), introduced in Flink 2.1, gain new capabilities that align them with the DataStream API:</p>
+<ul>
+ <li><strong>Late data handling</strong>: PTFs can now react to late records instead of silently dropping them, enabling custom late data strategies at the SQL level.</li>
+ <li><strong>Ordered table arguments</strong>: The new <code>ORDER BY</code> clause on table arguments ensures PTFs receive rows in deterministic temporal order within each partition:</li>
+</ul>
+<pre><code>SELECT * FROM 
+  MyTimestampedPtf(
+    input =&gt; TABLE events PARTITION BY user_id ORDER BY event_time
+  );</code></pre>
+<h3>ARTIFACT Keyword for User-Defined Functions</h3>
+<p>The <code>USING</code> clause of <code>CREATE FUNCTION</code> now accepts an <code>ARTIFACT</code> keyword as a future-proof alternative to <code>JAR</code>. This generic keyword prepares the syntax for future ecosystem assets like Python wheels, while remaining fully backward compatible.</p>
+<h3>Critical Bug Fix: MiniBatch Aggregation Record Loss</h3>
+<p>Flink 2.3 fixes a critical bug in <code>MiniBatchGroupAggFunction</code> that could silently drop records when mini-batch aggregation was enabled and the planner used a <code>ONE_PHASE</code> aggregation strategy.</p>
+<h2>Connectors</h2>
+<h3>Native S3 FileSystem</h3>
+<p>Flink 2.3 introduces a ground-up S3 Filesystem with <code>flink-s3-fs-native</code>, a new plugin built directly on AWS SDK v2. This Native S3 FileSystem is experimental in Flink 2.3. It is functionally complete, and replaces the Hadoop and Presto-based connectors with a modern implementation that delivers:</p>
+<ul>
+ <li><strong>Better performance</strong></li>
+ <li><strong>Native AWS integration</strong>: IAM Roles for Service Accounts (IRSA), modern credential providers, and direct SDK v2 integration</li>
+ <li><strong>Non-blocking I/O</strong>: Asynchronous operations for improved throughput</li>
+ <li><strong>Unified implementation</strong>: Single plugin provides both <code>FileSystem</code> and <code>RecoverableWriter</code></li>
+ <li><strong>Zero Hadoop dependencies</strong>: No dependency mess with smaller footprint</li>
+</ul>
+<h2>Runtime Improvements</h2>
+<h3>Support Adaptive Partition Selection</h3>
+<p>For the <code>RebalancePartitioner</code> and <code>RescalePartitioner</code> data partitioning modes, Flink 2.3 introduces an adaptive data partitioning feature based on downstream task load. It distributes data dynamically according to downstream workloads to balance traffic and improve job throughput.</p>
+<h3>AdaptiveScheduler Rescale History and Web UI</h3>
+<p>Streaming jobs using the adaptive scheduler now record a complete history of rescale events, including parallelism changes, slot allocations, scheduler state transitions, and termination reasons. This data is available through new REST endpoints and visualized in a dedicated “Rescales” tab in the Flink Web UI.</p>
+<h3>Watermark Alignment for Fast Backlog Processing</h3>
+<p>In Flink 2.3 the watermark alignment was redesigned to solve announcement delays by the introduction of a watermark alignment buffer. By default this buffer has a size of 3 and it delays the application of the watermark alignment algorithm by 3 update intervals.</p>
+<h3>Checkpointing During Recovery</h3>
+<p>Flink now supports triggering checkpoints while a job is still recovering from unaligned checkpoints. Previously, a checkpoint could only be triggered after all restored channel state had been fully consumed.</p>
+<h3>Application-Level Lifecycle Management</h3>
+<p>Flink 2.3 introduces a first-class <strong>application</strong> concept that unifies behavior across deployment modes. The cluster-job model is replaced by a cluster-application-job hierarchy, providing better visibility and control for production deployments.</p>
+<h3>Robust OpenTelemetry Metrics Export</h3>
+<p>Jobs with many tasks and operators can produce metric payloads large enough to be rejected by OTel gRPC backends, causing metric loss in production. Flink 2.3 adds two robustness features to the OTel exporter: gzip compression and batching.</p>
+<h2>Documentation</h2>
+<p>The Flink documentation has been reorganized to make navigation easier, with Flink SQL getting a dedicated top-level section, relational streaming concepts promoted to a top-level Concepts section, and Python documentation integrated into API sections.</p>

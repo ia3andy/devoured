@@ -1,0 +1,42 @@
+<h1>Hardwood 1.0: A Fast, Lightweight Apache Parquet Reader for the JVM</h1>
+<p>Hardwood is a new Parquet library for the JVM, written from scratch to do one thing well: read (and soon, write) Apache Parquet files fast, with no mandatory dependencies. It is performance-focused and multi-threaded at its core, fanning page decoding out across all your CPU cores by default.</p>
+<p>Today, <strong>Hardwood reaches 1.0</strong>. After five preview releases since the start of the year, we now consider Hardwood ready for production, and its public API will evolve with a strong focus on backwards compatibility going forward. Hardwood targets Java 21 or newer, is open-source (Apache License 2.0), and is available from Maven Central.</p>
+<h2>Why Hardwood</h2>
+<p>Working with the Apache Parquet columnar file format on the JVM has traditionally come with a fairly heavyweight stack: a large number of dependencies on the classpath and a single-threaded reader at the core. Hardwood explores a different set of tradeoffs. In a nutshell, the goals are:</p>
+<ul>
+ <li><strong>Implement a Parquet library without any mandatory dependencies:</strong> Parquet files which are either uncompressed or gzip-compressed don’t require any 3rd party libraries at all; for parsing files compressed with Snappy/Zstd/LZ4/Brotli you only need to provide the (typically single-JAR) codec of your choosing.</li>
+ <li><strong>Utilize modern multi-core CPUs as much as possible:</strong> unlike parquet-java, which is single-threaded at its core, Hardwood fans out the decoding of the individual pages of a Parquet file to multiple threads, resulting in significantly reduced wall clock parsing times.</li>
+ <li><strong>Be compatible:</strong> every file which can be parsed by parquet-java should also be parseable with Hardwood; if that’s not the case for a given file, we consider this a bug which needs fixing.</li>
+</ul>
+<h2>What’s in Hardwood 1.0</h2>
+<p>The 1.0 release implements all the key capabilities you’d expect from a Parquet reader: coverage of all the physical and logical Parquet column types, including VARIANT and a first cut of handling geo-spatial columns, support for all relevant column encodings and compression schemes, the ability to parse both local and remote files (on object storage such as S3), projections and predicate push-down, and much more.</p>
+<p>Hardwood comes with two distinct APIs which are at opposite ends of the ergonomics-vs-performance spectrum. The row reader API provides structured access to the records of a Parquet file, including nested and repeatable columns. It’s a great starting point for general-purpose access to Parquet:</p>
+<pre><code>try (ParquetFileReader fileReader = ParquetFileReader.open(
+        InputFile.of(path));
+
+    RowReader rowReader = fileReader.rowReader()) \{
+
+    while (rowReader.hasNext()) \{
+        rowReader.next();
+
+        long id = rowReader.getLong("id");
+        String name = rowReader.getString("name");
+        LocalDate birthDate = rowReader.getDate("birth_date");
+        Instant createdAt = rowReader.getTimestamp("created_at");
+    }
+}</code></pre>
+<p>The column reader API on the other hand exposes a batch-style API for accessing arrays of raw Parquet column values, with a layer scheme inspired by Apache Arrow for representing repeatable columns. It trades ergonomics for throughput: minimal per-value overhead, and batches of primitive arrays the caller can hand straight to a pool of worker threads or a vectorized loop. This makes the column reader the right foundation for analytical workloads over large numbers of values.</p>
+<h2>Performance</h2>
+<p>Speaking of performance, let’s take a look at some numbers. Below are the numbers from processing the taxi rides data with both Hardwood’s column reader and the column API in parquet-java (version 1.17.1). Using all 8 vCPUs, Hardwood achieves a throughput of 16.5M rows/sec. As measuring a multi-threaded engine against a single-threaded one is a bit apples-to-oranges, Hardwood has also been run on a single CPU core, achieving 3.9M rows/sec for this workload.</p>
+<p>As expected, Hardwood’s advantage here comes from using all the available CPU cores. Even when pinned to a single core (as in, say, a Kubernetes pod with a one-CPU allocation) it held a modest edge over parquet-java on this machine, which makes it a viable option in constrained deployments, too.</p>
+<p>Hardwood performs the selective scan in 12.9 ms on all cores vs. 53.8 ms when pinned to a single vCPU. The match-all scan finishes in 222 ms and 983 ms, respectively. For both Hardwood and parquet-java, execution times scale almost linearly with the ratio of matching results (~17-18x speed-up for returning a result set of 1/20th of the full size), with Hardwood having a substantial and consistent advantage in both cases, benefitting from its branchless, batch-at-a-time predicate evaluation.</p>
+<h2>The Hardwood CLI</h2>
+<p>Hardwood started life as a JVM library. But as we quickly realized, the same machinery also makes for a handy command-line tool, so we decided to ship it as one too. You can think of the Hardwood CLI as a Swiss-army knife for Parquet files.</p>
+<p>It lets you inspect file schemas and metadata such as indexes and dictionaries, you can drill into row groups and column chunks, take a glimpse at the records in a file, export its data to JSON, and much more. The CLI comes with both non-interactive commands, for instance useful for scripting use cases, and an interactive text-based UI (TUI) called hardwood dive, which lets you drill into a file very quickly and intuitively.</p>
+<h2>Building Open-Source With AI</h2>
+<p>It’s 2026, so you didn’t think we wouldn’t mention AI at least once in this post, did you? Hardwood is being built <em>with</em> AI, but not <em>by</em> AI. While I firmly believe we wouldn’t have made progress as quickly without coding agents like Claude Code, we’re generally not vibe coding: every larger change starts from a design doc, the architecture and invariants stay human-owned, and every diff gets read and reviewed before it lands.</p>
+<h2>A Big Thank You</h2>
+<p>Hardwood wouldn’t be anything without the people behind it. Since the project was started in January this year, more than 20 individuals have contributed to the project in the form of pull requests.</p>
+<h2>What’s Ahead</h2>
+<p>The 1.0 Final release is a major milestone for Hardwood; at the same time, we’re really just getting started, and you can look forward to subsequent releases later this year. Most importantly, for Hardwood 1.1, we’re planning to ship initial support for writing Parquet files. This will close a substantial gap, allowing projects with both read and write use cases to adopt Hardwood and benefit from its minimal dependency footprint and multi-threaded execution engine.</p>
+<p>We’re also going to work on a number of performance-related improvements: there’ll be support for Bloom filters as mentioned above, String reuse for dictionary-encoded columns, optimizations around IO when parsing remote files, etc. Other features on the roadmap include support for Parquet encryption, improvements to the TUI, full geo-spatial support, and much more.</p>
