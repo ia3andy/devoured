@@ -1,0 +1,56 @@
+<p>Neciu recently broke down some interesting use cases for service workers. I definitely felt ‘seen’ by this:</p>
+<blockquote>
+ <p>The two people in my survey who “tried one in 2019 and removed it” both told the same story with different details: a service worker with a bad cache strategy served a stale app to users, and the fix required shipping a killswitch worker and waiting days for clients to pick it up, because the broken worker controlled when updates were checked.</p>
+</blockquote>
+<p>Back when service workers launched, I was an early adopter, and quickly foot-gunned myself in a similar scenario.</p>
+<p>Let’s break down a few examples from the post (if you haven’t read it, please do so first!).</p>
+<h2>Use cases in the wild</h2>
+<h3>Slack’s instant boot</h3>
+<p>The most compelling example in the post is Slack’s: caching the full asset set and rehydrating Redux state so that the UI can render before a single network request resolves.</p>
+<p>The asset bit feels a touch overblown, though:</p>
+<blockquote>
+ <p>They observed that almost nothing in that asset set changes between boots.</p>
+ <p>The user who opens Slack on Tuesday morning downloads the same JavaScript they downloaded Monday morning.</p>
+</blockquote>
+<p>An HTTP cache should be enough to alleviate this, and is far simpler. For unchanged assets, content hashing plus <code>Cache-Control: public, max-age=31536000, immutable</code> means they should get served directly from the cache.</p>
+<p>What it won’t do is provide a network-free boot: you’d still need to fetch the HTML and any prerequisite data. I’d argue that this is more of a question of ‘do I need offline support?’ For Slack, sure, but for many apps, probably not.</p>
+<p>If all you’re looking to do is avoid repeated downloads of the same assets, just hash them and leverage the native caching.</p>
+<h3>Keeping dead chunks alive across deploys</h3>
+<p>This is an interesting one. Some vendors, like Vercel, have ‘skew protection’, but most of us have run into this in the past: an old bundle on the client results in a <code>404</code> when the referenced asset no longer exists.</p>
+<p>The more you ship, the more frequently this becomes a problem (if you practice true CI, you might be shipping hundreds of times a day).</p>
+<p>Neciu’s solution here is to use a service worker to cache the app locally. However, this implies caching <em>everything</em> in the background:</p>
+<pre><code>\{
+  "version": "2026.06.04-1412",
+  // Where does this end?
+  "assets": ["/assets/index-c91d44.js", "/assets/Settings-c91d44.js"]
+}</code></pre>
+<p>In my mind, this defeats the point of route/code splitting. Sure, you get a faster initial render, but it means every invalidation forces the client to refetch the <em>entire</em> app. For most apps I’ve worked on, this would result in a huge, mostly wasted payload. We can’t predict what components/pages the user will visit with any certainty, so in theory we’d need to pull down the contents of the entire manifest.</p>
+<p>What if, instead, we just kept static assets around (for a grace period)? Instead of outright deleting them, let them live on in a bucket. With content-hashed filenames, a deploy never overwrites anything: <code>Settings-a3f8b2.js</code> and <code>Settings-c91d44.js</code> can coexist.</p>
+<p>Since the service worker doesn’t run indefinitely in the background, the core refetching logic has to live in the main app anyway:</p>
+<blockquote>
+ <p>The page drives the polling instead, posting <code>CHECK_VERSION</code> on an interval and on <code>visibilitychange</code>, so a tab that comes back from a weekend in the background checks immediately.</p>
+</blockquote>
+<p>So this doesn’t need a service worker, either.</p>
+<h3>Mux’s manifest rewriting</h3>
+<p>This is neat, but feels like it shouldn’t live on the client. The bug mentioned in the article is actually a <em>symptom</em> of the logic living client-side:</p>
+<blockquote>
+ <p>A video player starts fetching the moment it mounts, before a same-page worker can take control, so they had to register the worker on an index page and link onward to the player page.</p>
+</blockquote>
+<p>Instead, move the rewrite server-side, where it’s more robust and easier to test. Only the manifest (a text file) needs rewriting, so there’s no concern about pulling a massive video through additional layers of infrastructure.</p>
+<p>It’s even called out in the article:</p>
+<blockquote>
+ <p>…because edge runtimes like Cloudflare Workers implement the same fetch event API, they deployed the stitching worker to Cloudflare unchanged and got a working URL.</p>
+</blockquote>
+<h3>Partytown</h3>
+<p>A good example, although worth noting that the service-worker version is actually the fallback:</p>
+<blockquote>
+ <p>Partytown will use Atomics and SharedArrayBuffer when they’re available by the browser.</p>
+</blockquote>
+<p><code>SharedArrayBuffer</code> unfortunately only works under cross-origin isolation, and those headers tend to break third-party embeds. So in practice the service worker fallback gets used more than you’d expect, but it’s still more of an escape hatch.</p>
+<h3>Mock Service Worker</h3>
+<p>This depends on what you’re building, but with the move to server-driven rendering strategies and data loading, you’re probably using <code>setupServer</code> instead (which patches Node internals).</p>
+<p>Only traditional SPAs will end up with a literal service worker, despite the library’s name.</p>
+<h2>So do you need a service worker?</h2>
+<p>There are a <em>lot</em> of cool things you can do with a service worker. There are also a few things only a service worker can do: offline support, push notifications, and background sync have no real alternative.</p>
+<p>But outside of those, I’ve yet to run into a problem where a service worker was truly the best solution.</p>
+<p>Have a great example? Let me know. I’ve been looking for a good excuse to revisit them.</p>

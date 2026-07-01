@@ -1,0 +1,52 @@
+<p>For the past 3 years, AI evals have been my professional focus. The most common objection I hear to evals is “our product is hard to eval”.</p>
+<p>This objection is a product smell. Artifacts that are hard for you to verify are often hard for users too. In the worst case, users have to redo the work from scratch to verify the output. More importantly, designing your product for ease of verification should come before building evals.</p>
+<p>In this post, I’ll walk through three products I advised on that faced this issue. I’ll also show before and after sketches to demonstrate design principles. After these examples, I’ll discuss how to apply this general pattern to your product.</p>
+<h2>Example 1: the AI data agent</h2>
+<p>Almost every company I’ve worked with builds an internal AI data agent. You ask it a business question, like what was net revenue for Product A last quarter, and it finds relevant data sources, runs the queries, and provides an answer. The goal of this agent is to reduce dependency on data analysts.</p>
+<p>A common mistake when building AI data agents is to make the answer the only output, as illustrated below.</p>
+<p>Since the only output is the answer, there is nothing here to check. In the sketch above, the user has no way to verify the answer beyond redoing work. A better design is to provide the user with checkable artifacts, informed by how a domain expert might validate the output. Here are techniques I use to validate metrics as a data scientist:</p>
+<ol>
+ <li>Compare the quantity and any intermediate calculations against a trusted source, like a vetted dashboard or report, or a similar analysis a colleague has already vetted.</li>
+ <li>Confirm the metric definition precisely. A number like net revenue can include or exclude things like returns and discounts.</li>
+ <li>Sanity-check a related quantity. If I can’t verify the number directly, I pull a related number that should move with it, like units sold or unique customers, and check if the combination is plausible.</li>
+ <li>Look at what is beneath the aggregate. A total can hide problems, so I break it down by dimensions like region or time period and sanity-check the distribution.</li>
+ <li>Read the query. For an important number I look at the SQL to confirm it does what I think, and I tweak it and rerun to test my assumptions.</li>
+ <li>Note anything I could not verify. If a step has no trusted reference to check it against, I flag it instead of presenting it as settled.</li>
+</ol>
+<p>Here’s what a better interface might look like. The agent surfaces the important details behind the answer. The chat reply surfaces the details worth seeing up front, and the notebook holds the full analysis behind the answer.</p>
+<p>This is the notebook the agent worked in while producing its answer. The notebook reads top to bottom: the assumptions the agent made, the queries it ran, and an explicit list of what it could not verify.</p>
+<p>There is a lot to unpack here. Here are notable changes:</p>
+<ul>
+ <li>The agent optionally performs retrieval from vetted analyses, and the interface shows which one was used along with who authored it.</li>
+ <li>There is progressive disclosure of details. The chat reply shows high value items like sources, assumptions, and issues. The user can optionally open an interactive notebook to see the full context.</li>
+ <li>The AI-generated notebook is organized to promote verification: it opens with the assumptions the agent made, then shows the queries it ran and the numbers they returned. It breaks the total down so you can sanity-check the distribution, and it closes with a list of what it could not verify, each item left as a cell you can run.</li>
+ <li>The AI agent is also available in the notebook to help with follow-ups. Finally, the user can publish the notebook back to a knowledge base, where it can be retrieved by future analyses, creating a virtuous cycle.</li>
+</ul>
+<p>This design sketch is far from perfect. The point is that the product should help the user verify the answer as a domain expert would. Compare it to the earlier approach, where the only output was the number.</p>
+<p>But what does this have to do with evals? If you design your product for verification, annotation becomes less expensive and evals will have better signals to draw from. More importantly, you’ll provide your users with a better product.</p>
+<h2>Example 2: the PE curriculum builder</h2>
+<p>A founder I advised was building an AI tool that writes physical education lesson plans for K-12 teachers. A teacher enters their constraints, like the grade they teach, how long the class is, whether it meets indoors or outdoors, and what equipment they have. The tool then writes a lesson plan for those constraints. The goal is to save teachers the time they spend planning and give them a plan that fits their class.</p>
+<p>The founder asked me how to eval the lesson plans. I turned the question around: <strong>what does a teacher care about?</strong></p>
+<p>The fastest way to trust a plan is to see that a teacher like them already uses it. Additionally, teachers value visibility into what others are doing so they can learn new approaches. Therefore, a better design might start from vetted lesson plans that are actively used in schools. When the tool generates a plan, it shows which vetted plan it started from, who uses that plan, and a diff of what it changed for this teacher’s constraints.</p>
+<p>Next, the teacher can check a small set of changes against a plan they already trust, instead of judging a whole plan from scratch. In this version, most of the plan is inherited from a vetted plan. The teacher’s review is scoped to a few edits, each with a reason explaining why the change was made. This is a more efficient way to review a plan because it reduces the cognitive load of judging a whole plan from scratch.</p>
+<p>Designing for this makes the product simpler to build. Instead of stuffing hundreds of examples into a prompt, the tool captures important dimensions, retrieves a close match, and adapts it. Automated evals now become tractable because there is less surface area to test. For example, you can verify that the plan retrieval picked a sensible anchor, and each edit honors the constraints.</p>
+<h2>Example 3: the workers-comp medical report</h2>
+<p>The last example comes from a workers’ compensation tool a founder asked me to help with. It reads a patient’s chart (intake forms, imaging reports, therapy notes, prior exams) and generates a long expert opinion report, often fifty pages or more. The only output is a fifty-page narrative. To trust it, the doctor has to re-read the whole chart and check every claim, which can take as long as writing the report from scratch.</p>
+<p>The problem is the same as the other examples, but the stakes are higher. The only output is the report, and the doctor is the one accountable for it. To trust it they have to go back through the chart and confirm the facts and inferences themselves. That can take as long as writing the report from scratch, which defeats the point of the tool.</p>
+<p>You might object that a fifty-page opinion is hard to verify. That is true, and the product should not pretend otherwise. Helping a doctor understand the evidence is arguably more valuable than the finished document. Therefore, I advised the founder to make the product work like a research assistant instead of a report generator.</p>
+<p>For example, the product could read every record and pull out relevant facts, with a link back to the page so the doctor can check each one. Where two exams disagree, or the chart leaves a question open, the product should surface that. The doctor can then resolve any contradictions and fill in the gaps. Finally, the product can assemble the final report from what they have already checked. The research assistant version of this product allows the doctor to build trust by verifying facts as they go. Similar to the other examples, this design is easier to build and evaluate. Now there are scoped units to grade, such as whether a contradiction is real or whether a citation supports a claim.</p>
+<h2>Generalizing the pattern</h2>
+<p>It is important to understand how users verify your product’s AI artifacts. Sometimes, this may require assembling supporting evidence. In other cases, it could mean refactoring the entire workflow so that the user is in the loop (like the workers’ comp example).</p>
+<p>Below are questions that can guide your product’s design for verification:</p>
+<ol>
+ <li>What does the user actually need to check?</li>
+ <li>What trusted thing can they compare it against?</li>
+ <li>Are there signals or heuristics that experts use to aid in verification?</li>
+ <li>What smaller units can they accept, edit, or reject?</li>
+</ol>
+<p>A common thread across these examples is provenance. The fastest way to make an output checkable is to show where each part came from, with links to see more detail. Additionally, you can use progressive disclosure so these sources don’t overwhelm the user.</p>
+<p>What needs verifying also changes as the user’s trust grows. Early on, the data agent should make provenance obvious, like where a metric definition came from. Once the user trusts the agent gets it right, that detail can collapse by default in the card. Good design meets users where they are instead of showing everything.</p>
+<h2>None of this is new</h2>
+<p>Evals thinking is aligned with good product design. Gathering supporting data and breaking down workflows into smaller units makes automated grading easier. However, I don’t want to pretend like any wisdom here is new.</p>
+<p>All of these ideas stem from well-established design principles. For example, watching an expert work to learn what they check before you build is called needfinding. In research-heavy work like the medical case, there is a design goal called sensemaking, which is the work of building a structured understanding of a body of evidence you can reason over. There are many other concepts, but I think you get the idea.</p>
+<p>Even though these ideas are well established, a reminder is due in the age of AI. Before AI, verification often happened incidentally during the process of creating work product. With AI, verification is the bottleneck. It is time to think about it more explicitly.</p>
