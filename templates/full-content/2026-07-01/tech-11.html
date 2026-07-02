@@ -1,0 +1,206 @@
+<h1>fenic: semantic DataFrames for humans and agents</h1>
+<p><strong>fenic turns AI-assisted exploration of structured and unstructured data into reusable, inspectable DataFrame pipelines.</strong></p>
+<p>It's a DataFrame query engine for semantic data processing, with AI operators — <code>extract</code>, <code>classify</code>, <code>summarize</code>, <code>embed</code>, semantic <code>join</code>, and more — built into the query model. Use it to turn documents, transcripts, logs, eval traces, tickets, tables, and APIs into typed rows and repeatable workflows.</p>
+<p>The point is a shift in what your data work <em>produces</em>. Humans and agents work on the same pipelines — both can author, inspect, and reuse them. The result isn't a one-off prompt or a brittle regex script that has to be reverse-engineered later — it's a durable artifact: typed, inspectable, rerunnable, and callable.</p>
+<blockquote>
+ <p><strong>From exploration to artifact.</strong></p>
+</blockquote>
+<pre><code>pip install fenic</code></pre>
+<blockquote>
+ <p><strong>Writing fenic with an AI coding agent?</strong> Run <code>fenic skill install</code> so Claude Code / Cursor / Codex write it correctly, and <code>fenic check</code> to lint it.</p>
+</blockquote>
+<h2>What is fenic?</h2>
+<p>fenic is a <strong>semantic DataFrame engine</strong>. You write the PySpark/SQL-style operations you already know — <code>select</code>, <code>filter</code>, <code>join</code>, <code>group_by</code>, <code>agg</code> — alongside <em>semantic operators</em> that call language models as a first-class part of the query. You configure models once on a <code>Session</code>, build a pipeline lazily, and fenic compiles and runs it on a query engine built for inference: automatic batching, rate limiting, retries, token/cost accounting, and response caching.</p>
+<p>Two ideas make it different from gluing an LLM onto pandas:</p>
+<ul>
+ <li><strong>Inference lives inside the query model.</strong> Extraction, classification, summarization, and embeddings are operators with schemas and types — not side calls you orchestrate by hand.</li>
+ <li><strong>The pipeline is the artifact.</strong> Because the work is expressed as typed operators, it's already inspectable (row-level lineage, <code>explain</code>, per-query metrics), rerunnable (lazy plans + caching), and promotable into a named table, view, or <strong>MCP tool</strong> an agent can call.</li>
+</ul>
+<h2>60 seconds: messy text → typed rows</h2>
+<p>Replace brittle parsing and one-off prompts with a typed, schema-bound operator. Define the shape you want as a Pydantic model; fenic returns structured columns you can query.</p>
+<pre><code>import fenic as fc
+from pydantic import BaseModel, Field
+
+class Ticket(BaseModel):
+    product: str = Field(description="The product the user is asking about")
+    sentiment: str = Field(description="positive, neutral, or negative")
+    issue: str = Field(description="One-line summary of the user's problem")
+
+session = fc.Session.get_or_create(
+    fc.SessionConfig(
+        app_name="quickstart",
+        semantic=fc.SemanticConfig(
+            language_models=\{
+                "mini": fc.OpenAILanguageModel(model_name="gpt-4o-mini", rpm=500, tpm=200_000)
+            },
+        ),
+    )
+)
+
+df = session.create_dataframe([
+    \{"id": 1, "text": "The CSV export in Reports keeps timing out since the last update."},
+    \{"id": 2, "text": "Love the new dashboard, but SSO login is broken on mobile."},
+])
+
+# Free text -&gt; typed, queryable rows
+tickets = (
+    df.select("id", fc.semantic.extract("text", Ticket).alias("t"))
+      .unnest("t")
+)
+tickets.show()</code></pre>
+<h2>Why fenic?</h2>
+<p><strong>Unstructured data is everywhere, and working with it is brittle.</strong> Teams reach for regex, one-off scripts, notebooks, and prompt chains to pull meaning out of documents, logs, tickets, transcripts, and traces. The results are hard to reproduce and hard to inspect.</p>
+<p><strong>Agents made exploration easy and introduced a new problem.</strong> An agent can dig through messy data and find something useful — but unless that discovery becomes code, data, or a pipeline, it dies as a chat transcript. The next person has to reverse-engineer what happened.</p>
+<p><strong>fenic gives semantic data work a DataFrame abstraction.</strong> Express the exploration as fenic operators and it's <em>already</em> the artifact.</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>Without fenic</th>
+   <th>With fenic</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Extraction</strong></td>
+   <td>regex + one-off prompts, re-derived each time</td>
+   <td><code>extract(Schema)</code> → typed columns, validated at plan time</td>
+  </tr>
+  <tr>
+   <td><strong>Reproducibility</strong></td>
+   <td>"what did the agent do?"</td>
+   <td>a lazy plan you can <code>explain()</code> and rerun</td>
+  </tr>
+  <tr>
+   <td><strong>Inspection</strong></td>
+   <td>scroll the transcript</td>
+   <td>row-level <code>lineage()</code>, typed rows, per-query cost/tokens</td>
+  </tr>
+  <tr>
+   <td><strong>Reuse</strong></td>
+   <td>copy/paste the script</td>
+   <td>promote to a table, view, or MCP tool</td>
+  </tr>
+  <tr>
+   <td><strong>Humans vs. agents</strong></td>
+   <td>separate, incompatible workflows</td>
+   <td>one shared pipeline both can read and run</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Featured workflow: from eval exploration to durable eval intelligence</h2>
+<pre><code>import fenic as fc
+from typing import Literal
+from pydantic import BaseModel, Field
+
+class FailureMode(BaseModel):
+    failed: bool = Field(description="Whether the agent failed the task")
+    category: Literal["tool_error", "instruction_following", "retrieval", "reasoning", "none"] = Field(
+        description="Primary failure category, or 'none' if the run succeeded"
+    )
+    evidence: str = Field(description="Short quote or summary justifying the classification")
+
+session = fc.Session.get_or_create(
+    fc.SessionConfig(
+        app_name="eval_triage",
+        semantic=fc.SemanticConfig(
+            language_models=\{
+                "mini": fc.OpenAILanguageModel(model_name="gpt-4o-mini", rpm=500, tpm=200_000)
+            },
+        ),
+    )
+)
+
+traces = session.read.docs("eval_runs/**/*.json", content_type="json", recursive=True)
+
+failures = (
+    traces
+    .with_column("analysis", fc.semantic.extract(fc.col("content").cast(fc.StringType), FailureMode))
+    .unnest("analysis")
+    .filter(fc.col("failed"))
+)
+
+failure_modes = failures.group_by("category").agg(
+    fc.count("*").alias("n"),
+    fc.semantic.reduce(
+        "Summarize the common root cause across these failures",
+        column=fc.col("evidence"),
+    ).alias("pattern"),
+)
+
+failure_modes.write.save_as_table("failure_modes", mode="overwrite")</code></pre>
+<h2>Query meaning and metadata together</h2>
+<pre><code># Match on meaning, not exact values
+matches = candidates.semantic.join(
+    roles,
+    predicate=(
+        "Candidate background: \{\{ left_on }}\n"
+        "Role requirements: \{\{ right_on }}\n"
+        "The candidate is a strong fit for the role."
+    ),
+    left_on=fc.col("resume"),
+    right_on=fc.col("job_description"),
+)
+
+# ...then group, aggregate, and rank with ordinary DataFrame ops
+ranked = (
+    matches.group_by("role_id")
+    .agg(fc.count("*").alias("n_candidates"))
+    .order_by(fc.desc("n_candidates"))
+)</code></pre>
+<h2>Make it an artifact your agents reuse</h2>
+<pre><code>from fenic import SystemToolConfig
+
+session.catalog.set_table_description(
+    "failure_modes", "Recurring agent failure modes with counts and root-cause summaries"
+)
+
+server = fc.create_mcp_server(
+    session,
+    "Eval Intelligence",
+    system_tools=SystemToolConfig(
+        table_names=["failure_modes"],
+        tool_namespace="evals",
+        max_result_rows=100,
+    ),
+)
+
+fc.run_mcp_server_sync(server, transport="http", port=8000)</code></pre>
+<h2>Semantic operators</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Operator</th>
+   <th>What it does</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>extract(col, Schema)</code></td>
+   <td>Unstructured text → a typed struct</td>
+  </tr>
+  <tr>
+   <td><code>classify(col, classes)</code></td>
+   <td>Label text into predefined classes</td>
+  </tr>
+  <tr>
+   <td><code>predicate(prompt, **cols)</code></td>
+   <td>Natural-language boolean filter</td>
+  </tr>
+  <tr>
+   <td><code>reduce(prompt, column)</code></td>
+   <td>Aggregate many rows in a group</td>
+  </tr>
+  <tr>
+   <td><code>embed(col)</code></td>
+   <td>Embeddings for similarity and search</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Inspect and operate</h2>
+<ul>
+ <li><code>df.explain()</code> — the logical/physical plan</li>
+ <li><code>df.lineage()</code> — trace specific rows forwards and backwards</li>
+ <li>Per-query metrics — tokens and cost</li>
+ <li>Caching — an LLM response cache plus <code>.cache()</code></li>
+</ul>

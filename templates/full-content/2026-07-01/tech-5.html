@@ -1,0 +1,182 @@
+<h1>Copybara</h1>
+<p><em>A tool for transforming and moving code between repositories.</em></p>
+<p>Copybara is a tool used internally at Google. It transforms and moves code between repositories.</p>
+<p>Often, source code needs to exist in multiple repositories, and Copybara allows you to transform and move source code between these repositories. A common case is a project that involves maintaining a confidential repository and a public repository in sync.</p>
+<p>Copybara requires you to choose one of the repositories to be the authoritative repository, so that there is always one source of truth. However, the tool allows contributions to any repository, and any repository can be used to cut a release.</p>
+<p>The most common use case involves repetitive movement of code from one repository to another. Copybara can also be used for moving code once to a new repository.</p>
+<p>Examples uses of Copybara include:</p>
+<ul>
+ <li>Importing sections of code from a confidential repository to a public repository.</li>
+ <li>Importing code from a public repository to a confidential repository.</li>
+ <li>Importing a change from a non-authoritative repository into the authoritative repository. When a change is made in the non-authoritative repository (for example, a contributor in the public repository), Copybara transforms and moves that change into the appropriate place in the authoritative repository. Any merge conflicts are dealt with in the same way as an out-of-date change within the authoritative repository.</li>
+</ul>
+<p>One of the main features of Copybara is that it is stateless, or more specifically, that it stores the state in the destination repository (As a label in the commit message). This allows several users (or a service) to use Copybara for the same config/repositories and get the same result.</p>
+<p>Currently, the only supported type of repository is Git. Copybara is also able to read from Mercurial repositories, but the feature is still experimental. The extensible architecture allows adding bespoke origins and destinations for almost any use case. Official support for other repositories types will be added in the future.</p>
+<h2>Example</h2>
+<pre><code>core.workflow(
+    name = "default",
+    origin = git.github_origin(
+      url = "https://github.com/google/copybara.git",
+      ref = "master",
+    ),
+    destination = git.destination(
+        url = "file:///tmp/foo",
+    ),
+
+    # Copy everything but don't remove a README_INTERNAL.txt file if it exists.
+    destination_files = glob(["third_party/copybara/**"], exclude = ["README_INTERNAL.txt"]),
+
+    authoring = authoring.pass_thru("Default email &lt;default@default.com&gt;"),
+    transformations = [
+        core.replace(
+                before = "//third_party/bazel/bashunit",
+                after = "//another/path:bashunit",
+                paths = glob(["**/BUILD"])),
+        core.move("", "third_party/copybara")
+    ],
+)</code></pre>
+<p>Run:</p>
+<pre><code>$ (mkdir /tmp/foo ; cd /tmp/foo ; git init --bare)
+$ copybara copy.bara.sky</code></pre>
+<h2>Getting Started using Copybara</h2>
+<p>The easiest way to start is with weekly "snapshot" releases, that include pre-built a binary. Note that these are released automatically without any manual testing, version compatibility or correctness guarantees.</p>
+<p>Choose a release from <a href="https://github.com/google/copybara/releases">https://github.com/google/copybara/releases</a>.</p>
+<h3>Building from Source</h3>
+<p>To use an unreleased version of copybara, so you need to compile from HEAD. In order to do that, you need to do the following:</p>
+<ul>
+ <li><a href="https://www.oracle.com/java/technologies/downloads/#java11">Install JDK 11</a>.</li>
+ <li><a href="https://bazel.build/install">Install Bazel</a>.</li>
+ <li>Clone the copybara source locally: 
+  <ul>
+   <li><code>git clone https://github.com/google/copybara.git</code></li>
+  </ul></li>
+ <li>Build: 
+  <ul>
+   <li><code>bazel build //java/com/google/copybara</code></li>
+   <li><code>bazel build //java/com/google/copybara:copybara_deploy.jar</code> to create an executable uberjar.</li>
+  </ul></li>
+ <li>Tests: <code>bazel test //...</code> if you want to ensure you are not using a broken version. Note that certain tests require the underlying tool to be installed(e.g. Mercurial, Quilt, etc.). It is fine to skip those tests if your Pull Request is unrelated to those modules (And our CI will run all the tests anyway).</li>
+</ul>
+<h3>System packages</h3>
+<p>These packages can be installed using the appropriate package manager for your system.</p>
+<h4>Arch Linux</h4>
+<ul>
+ <li><a href="https://aur.archlinux.org/packages/copybara-git"><code>aur/copybara-git</code></a></li>
+</ul>
+<h3>Using Intellij with Bazel plugin</h3>
+<p>If you use Intellij and the Bazel plugin, use this project configuration:</p>
+<pre><code>directories:
+  copybara/integration
+  java/com/google/copybara
+  javatests/com/google/copybara
+  third_party
+
+targets:
+  //copybara/integration/...
+  //java/com/google/copybara/...
+  //javatests/com/google/copybara/...
+  //third_party/...
+</code></pre>
+<p>Note: configuration files can be stored in any place, even in a local folder. We recommend using a VCS (like git) to store them; treat them as source code.</p>
+<h3>Using pre-built Copybara in Bazel</h3>
+<p>If using a weekly snapshot release, install Copybara as follows:</p>
+<ol>
+ <li>Copybara ships with class files with version 65.0, so it must be run with Java Runtime 21 or greater. Add to your <code>.bazelrc</code> file: <code>run --java_runtime_version=remotejdk_21</code></li>
+ <li>Use <code>http_jar</code> to download the release artifact. 
+  <ul>
+   <li>In WORKSPACE: <code>load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")</code></li>
+   <li>In MODULE.bazel: <code>http_jar = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")</code></li>
+  </ul></li>
+ <li>In WORKSPACE or MODULE.bazel, fill in the <code>[version]</code> placeholder: 
+  <pre><code>http_jar(
+    name = "com_github_google_copybara",
+    # Fill in from https://github.com/google/copybara/releases/download/[version]/copybara_deploy.jar.sha256
+    # sha256 = "",
+    urls = ["https://github.com/google/copybara/releases/download/[version]/copybara_deploy.jar"],
+)</code></pre></li>
+ <li>In any BUILD file (perhaps <code>/tools/BUILD.bazel</code>) declare the <code>java_binary</code>: 
+  <pre><code>load("@rules_java//java:java_binary.bzl", "java_binary")
+java_binary(
+   name = "copybara",
+   main_class = "com.google.copybara.Main",
+   runtime_deps = ["@com_github_google_copybara//jar"],
+)</code></pre></li>
+ <li>Use that target with <code>bazel run</code>, for example <code>bazel run //tools:copybara -- migrate copy.bara.sky</code></li>
+</ol>
+<h3>Building Copybara from Source as an external Bazel repository</h3>
+<p>There are convenience macros defined for all of Copybara's dependencies. Add the following code to your <code>WORKSPACE</code> file, replacing <code>\{\{ sha256sum }}</code> and <code>\{\{ commit }}</code> as necessary.</p>
+<pre><code>http_archive(
+  name = "com_github_google_copybara",
+  sha256 = "\{\{ sha256sum }}",
+  strip_prefix = "copybara-\{\{ commit }}",
+  url = "https://github.com/google/copybara/archive/\{\{ commit }}.zip",
+)
+
+load("@com_github_google_copybara//:repositories.bzl", "copybara_repositories")
+
+copybara_repositories()
+
+load("@com_github_google_copybara//:repositories.maven.bzl", "copybara_maven_repositories")
+
+copybara_maven_repositories()
+
+load("@com_github_google_copybara//:repositories.go.bzl", "copybara_go_repositories")
+
+copybara_go_repositories()</code></pre>
+<p>You can then build and run the Copybara tool from within your workspace:</p>
+<pre><code>bazel run @com_github_google_copybara//java/com/google/copybara -- &lt;args...&gt;</code></pre>
+<h3>Using Docker to build and run Copybara</h3>
+<p><em>NOTE: Docker use is currently experimental, and we encourage feedback or contributions.</em></p>
+<p>You can build copybara using Docker like so</p>
+<pre><code>docker build --rm -t copybara .</code></pre>
+<p>Once this has finished building, you can run the image like so from the root of the code you are trying to use Copybara on:</p>
+<pre><code>docker run -it -v "$(pwd)":/usr/src/app copybara help</code></pre>
+<h4>Environment variables</h4>
+<ul>
+ <li><code>COPYBARA_SUBCOMMAND=migrate</code>
+  <ul>
+   <li>allows you to change the command run, defaults to <code>migrate</code></li>
+  </ul></li>
+ <li><code>COPYBARA_CONFIG=copy.bara.sky</code>
+  <ul>
+   <li>allows you to specify a path to a config file, defaults to root <code>copy.bara.sky</code></li>
+  </ul></li>
+ <li><code>COPYBARA_WORKFLOW=default</code>
+  <ul>
+   <li>allows you to specify the workflow to run, defaults to <code>default</code></li>
+  </ul></li>
+ <li><code>COPYBARA_SOURCEREF=''</code>
+  <ul>
+   <li>allows you to specify the sourceref, defaults to none</li>
+  </ul></li>
+ <li><code>COPYBARA_OPTIONS=''</code>
+  <ul>
+   <li>allows you to specify options for copybara, defaults to none</li>
+  </ul></li>
+</ul>
+<pre><code>docker run \
+    -e COPYBARA_SUBCOMMAND='validate' \
+    -e COPYBARA_CONFIG='other.config.sky' \
+    -v "$(pwd)":/usr/src/app \
+    -it copybara</code></pre>
+<h4>Git Config and Credentials</h4>
+<p>There are a number of ways by which to share your git config and ssh credentials with the Docker container, an example is below:</p>
+<pre><code>docker run \
+    -v ~/.gitconfig:/root/.gitconfig:ro \
+    -v ~/.ssh:/root/.ssh \
+    -v $\{SSH_AUTH_SOCK}:$\{SSH_AUTH_SOCK} -e SSH_AUTH_SOCK
+    -v "$(pwd)":/usr/src/app \
+    -it copybara</code></pre>
+<h2>Documentation</h2>
+<ul>
+ <li>Reference documentation</li>
+ <li>Examples</li>
+ <li><a href="https://blog.kubesimplify.com/moving-code-between-git-repositories-with-copybara">Tutorial on how to get started</a></li>
+</ul>
+<h2>Contact us</h2>
+<p>If you have any questions about how Copybara works, please contact us at our <a href="https://groups.google.com/forum/#!forum/copybara-discuss">mailing list</a>.</p>
+<h2>Optional tips</h2>
+<ul>
+ <li>If you want to see the test errors in Bazel, instead of having to <code>cat</code> the logs, add this line to your <code>~/.bazelrc</code>: 
+  <pre><code>test --test_output=streamed</code></pre></li>
+</ul>

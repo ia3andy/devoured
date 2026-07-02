@@ -1,0 +1,86 @@
+<h2>TL;DR</h2>
+<p>Miles is RadixArk’s open source framework for large-scale LLM RL post-training. It composes SGLang for rollout, NVIDIA Megatron-LM for training, Ray orchestration, and PyTorch-native extensibility behind a small, pluggable trainer, with unified low-precision recipes, MoE-aware rollout/training alignment, fast NVIDIA NCCL/RDMA weight synchronization, observability, and fault tolerance built in — making frontier-scale LLM RL easier to build, reproduce, and operate.</p>
+<h2>Why Miles?</h2>
+<p>Reinforcement learning has become a central part of post-training large language models. But as models become larger, transition from dense to mixture-of-experts (MoE), and run across more distributed and specialized hardware (e.g. NVIDIA Blackwell and Hopper series), RL post-training is no longer just a training loop. It is a distributed systems problem.</p>
+<p>A modern LLM RL framework needs to coordinate several moving pieces:</p>
+<ul>
+ <li>Rollout workers must generate samples at high throughput.</li>
+ <li>Trainers must consume those samples efficiently and compute stable policy updates.</li>
+ <li>The rollout policy and training policy must stay synchronized.</li>
+ <li>Large MoE models introduce routing behavior that must remain aligned across rollout and training.</li>
+ <li>Low-precision recipes need to work consistently across the full pipeline.</li>
+ <li>Long-running jobs need observability, checkpointing, and fault tolerance from the start.</li>
+</ul>
+<p>Miles was built for this setting.</p>
+<p>Miles is RadixArk’s open source reinforcement learning framework for LLM post-training. It is built natively on SGLang for high-throughput rollout and integrates deeply with Megatron-LM for scalable training, uses Ray to orchestrate the distributed system, and keeps PyTorch as the common programming and numerical layer throughout the stack.</p>
+<p>The goal is simple: make large-scale LLM RL training more composable, reproducible, and easier to scale, while keeping the core trainer small enough for researchers and infrastructure teams to customize.</p>
+<h2>The Miles Architecture</h2>
+<p>Miles follows a small-core, many-edges philosophy.</p>
+<p>The core training loop is intentionally compact. The pieces that users most often want to change — rollout logic, reward computation, loss functions, sample filtering, metrics, and training-loop hooks — are attached at launch time through user-supplied Python modules. This lets teams adapt the system to new algorithms and production constraints without forking the framework.</p>
+<p>Underneath that small core, Miles composes four major systems:</p>
+<ul>
+ <li><strong>SGLang</strong> for high-throughput rollout generation.</li>
+ <li><strong>Megatron-LM</strong> for scalable distributed training.</li>
+ <li><strong>Ray</strong> for cluster orchestration, actor lifecycle, scheduling, and supervision.</li>
+ <li><strong>PyTorch</strong> for models, autograd, distributed primitives, dtype support, extensibility, and profiling.</li>
+</ul>
+<p>This composition is important. RL post-training requires generation and training to work together, but the two phases have very different performance profiles: rollout is memory-bandwidth-bound (KV-cache and parameter reads dominate during decoding), while training is compute-bound and communication-heavy. Weight synchronization, sample transfer, checkpoint conversion, routing consistency, and low-precision behavior all need to be handled carefully across the boundary.</p>
+<p>The rest of this post walks through how Miles handles each piece of that boundary — orchestration with Ray, scaling with Megatron-LM, extensibility with PyTorch, and what comes out of the box.</p>
+<h2>Ray: Orchestrating Long-Running RL Jobs</h2>
+<p>Miles is built directly on the Ray distributed runtime. In a Miles run, every long-lived process is represented as a Ray actor: trainer ranks, SGLang rollout servers, routing proxies, and asynchronous rollout workers all live inside Ray’s actor model.</p>
+<p>This gives Miles a natural foundation for cluster-scale RL workloads.</p>
+<h3>Placing workers on GPUs</h3>
+<p>Miles uses Ray’s GPU-aware scheduler and placement groups for actor placement, supporting <strong>disaggregated</strong> (rollout and training on separate nodes) and <strong>colocated</strong> (rollout and training on the same nodes) layouts via launch-time Ray placement specs. Process placement must be rack-aware to facilitate careful colocation, reserving spare nodes, and key for error isolation, since isolating problems within a rack (e.g., distinguishing a bad GPU from a full rack issue) is not always straightforward.</p>
+<h3>Moving data across the RL pipeline</h3>
+<p>Prompts, samples, and updated weights cycle continuously between rollout actors and trainer ranks, and Miles uses Ray actors and tasks to coordinate that flow. For bulk weight transfer, Ray handles the control path while the tensor bytes move over dedicated NCCL/RDMA channels, giving Miles both Ray-level programmability and a fast path for large data.</p>
+<h3>Supervising long-running jobs</h3>
+<p>Because a Miles run is a Ray job end-to-end, it inherits Ray’s operator surface — job submission, worker supervision, log aggregation, and dashboard visibility — without bolt-on infrastructure. With fault tolerance enabled, Miles can recover failed ranks and keep week-long workloads moving on top of the same Ray substrate.</p>
+<h3>Supporting fully asynchronous RL</h3>
+<p>Because Ray actors are persistent, hold their own state, and are scheduled independently, Miles can run a fully asynchronous mode in which rollout and training no longer block on each other — rollout actors continuously stream samples into a queue that the trainer drains at its own pace.</p>
+<h2>Megatron-LM: Scaling the Training Backend</h2>
+<p>Miles uses Megatron-LM as its production training backend, plugging directly into Megatron’s argument parser, model-construction pipeline, training loop, parallelism primitives, and distributed checkpoint format rather than wrapping it as a black-box library. That gives Miles the infrastructure needed for frontier-scale dense and MoE training while preserving a clean user-facing workflow.</p>
+<h3>One argument surface</h3>
+<p>Megatron-LM already exposes a large distributed-training configuration surface — sequence length, rotary embeddings, grouped GEMM, all flavors of parallelism, optimizer settings, activation checkpointing, and more — and Miles reuses it directly rather than wrapping or re-declaring it. Users configure a Miles run through one launch script that combines Miles-specific options with standard Megatron options, avoiding duplicated configuration layers and keeping the training setup close to upstream Megatron behavior.</p>
+<h3>Model specs instead of long-lived forks</h3>
+<p>Frontier architectures change quickly, with new attention blocks, routing mechanisms, and expert layouts arriving across model families, so Miles handles them through plug-in <strong>model specs</strong> — small spec files that insert custom PyTorch components (for example, a gated attention-output module, a Gated-Delta-Net block, or a model-specific MoE router) directly into Megatron’s model pipeline. This lets Miles support new architectures — for example DeepSeek-V3/V4, GLM-4.7, and Qwen3 MoE variants — without maintaining a long-lived Megatron fork that constantly diverges from upstream.</p>
+<h3>Parallelism-aware checkpointing</h3>
+<p>Miles uses Megatron’s parallelism-aware distributed checkpoint format, so a model can be converted from Hugging Face once and then loaded across different tensor / pipeline / context / expert parallel configurations without re-converting weights from scratch. For teams operating large training jobs, this means checkpoint conversion and parallelism changes don’t become a separate engineering project every time the model or cluster shape changes.</p>
+<h3>Extending training without patching the backend</h3>
+<p>Miles exposes hooks at well-defined points in the training loop — after model initialization, before log-probability computation, and before each training step — so users can add auxiliary losses, custom metrics, sample-level diagnostics, clipping rules, or algorithm-specific behavior without editing Megatron internals. The design goal is simple: keep the backend powerful, but keep user customization outside it.</p>
+<h2>PyTorch: The Common Layer for Models, Numerics, and Extensibility</h2>
+<p>PyTorch is the common programming model inside Miles: model components are regular <code>torch.nn.Modules</code>, losses are standard autograd graphs, and mixed precision, gradient checkpointing, distributed primitives, and profiling all stay inside familiar PyTorch workflows. This matters because LLM RL post-training changes fast — teams need to add new rewards, losses, routers, model modules, and debugging tools without learning a new abstraction each time.</p>
+<h3>PyTorch-native model extensibility</h3>
+<p>Miles’ plug-in model-spec mechanism is built around <code>torch.nn.Modules</code>, so supporting a new architecture means writing the new component as ordinary PyTorch code and connecting it into Megatron’s model pipeline — autograd, mixed precision, gradient checkpointing, and module lifecycle all keep working the way PyTorch users expect. Teams don’t have to translate the model into a separate intermediate abstraction to get it running on Miles.</p>
+<h3>PyTorch-native RL customization</h3>
+<p>The same principle applies to RL algorithms: rollout functions, rewards, loss functions, sample filters, metrics, and training-loop hooks are all customized through Python modules provided at launch time, using standard PyTorch operations that compose with the rest of the training graph. A team can start from an existing recipe and replace the reward, add an auxiliary loss, change sample filtering, or instrument new diagnostics without rewriting the trainer.</p>
+<h3>Low-precision recipes across the pipeline</h3>
+<p>Miles builds its low-precision pipeline on PyTorch’s dtype system, with BF16, FP8, MXFP8, and INT4-QAT recipes that span training and rollout rather than living as isolated backend-only features. This consistency matters for RL because the policy used to generate samples and the policy used to compute training log probabilities must stay aligned, and Miles is designed to make those numerical choices explicit and reproducible.</p>
+<h3>Profiling and debugging in familiar tools</h3>
+<p>Large-scale RL performance issues can surface anywhere — rollout latency, training compute, collective communication, data movement, weight synchronization, sample filtering, or scheduling — so Miles wires in the PyTorch profiler to capture Chrome traces of training phases for inspection in standard tooling. Combined with Megatron’s PyTorch-based backend and graph-compile paths where supported, this keeps debugging and performance work inside the familiar PyTorch ecosystem.</p>
+<h2>What Miles Provides Out of the Box</h2>
+<p>Miles is designed to provide the core systems features needed for large-scale LLM RL post-training:</p>
+<ul>
+ <li><strong>Rollout and training integration</strong> — Connects SGLang rollout with Megatron-LM training, with both disaggregated and colocated execution to fit different GPU budgets and utilization targets.</li>
+ <li><strong>Asynchronous execution</strong> — Fully async mode decouples rollout from training: rollout actors stream samples continuously into a queue that the trainer drains at its own pace, eliminating the per-iteration blocking between the two phases.</li>
+ <li><strong>Fast weight synchronization</strong> — After each training update, fresh weights flow to rollout workers over dedicated NCCL/RDMA channels, with Ray handling only the control path so bulk tensor bytes stay off the Python data path.</li>
+ <li><strong>MoE-aware rollout/training alignment</strong> — Rollout Routing Replay preserves routing decisions across the rollout/training boundary, reducing the trainer-vs-rollout routing mismatch that would otherwise destabilize MoE RL.</li>
+ <li><strong>Low-precision support</strong> — A unified BF16 / FP8 / MXFP8 / INT4-QAT pipeline designed as part of the end-to-end RL stack rather than as isolated training-only recipes.</li>
+ <li><strong>LoRA across rollout and training</strong> — LoRA is supported in both rollout and training paths, enabling parameter-efficient post-training that reduces cost and speeds up iteration on large base models.</li>
+ <li><strong>Fault tolerance and observability</strong> — Ray’s job and actor model provide supervision, log aggregation, and dashboard visibility, while rank-level fault tolerance keeps week-long training runs moving; PyTorch profiler integration covers the training-level view.</li>
+ <li><strong>Broad model and hardware support</strong> — Miles ships ready-to-run recipes for frontier and open-source models including DeepSeek-V4, Kimi K2.5 / K2.6, GLM-5 / 5.1, and Qwen3.5 / 3.6, with support for NVIDIA flagship Hopper / Blackwell GPUs.</li>
+</ul>
+<h2>A Small Core with Many Extension Points</h2>
+<p>One of Miles’ most important design choices is that the core trainer stays small.</p>
+<p>Instead of forcing users to fork the framework for every new algorithm or model family, Miles exposes explicit extension points:</p>
+<ul>
+ <li><strong>Rollout functions</strong> for custom generation behavior.</li>
+ <li><strong>Reward functions</strong> for task-specific supervision.</li>
+ <li><strong>Loss functions</strong> for new RL objectives.</li>
+ <li><strong>Sample filters</strong> for data selection and rejection.</li>
+ <li><strong>Training hooks</strong> for metrics, diagnostics, auxiliary losses, and custom update logic.</li>
+ <li><strong>Model specs</strong> for architecture-specific modules.</li>
+</ul>
+<p>These extension points make Miles useful across a range of post-training workflows: classic RLHF-style training, rule-based reward training, code and agentic tasks, MoE post-training, low-precision experiments, and production pipelines that need custom observability or safety checks.</p>
+<p>In short, Miles makes the systems-level decisions — placement, weight sync, fault tolerance, low-precision recipes — so that user code can focus on algorithm and product logic.</p>
+<h2>Looking Ahead</h2>
+<p>LLM post-training is moving quickly — larger models, longer contexts, more MoE, and more asynchronous, agentic, system-intensive RL pipelines — and Miles is built for that trajectory: by composing SGLang, Ray, Megatron-LM, and PyTorch behind a small pluggable trainer, it gives researchers and infrastructure teams a PyTorch-native path from algorithm experimentation to large-scale RL runs, which is why we are open-sourcing Miles to make frontier-scale LLM RL post-training easier to reproduce, extend, and operate.</p>
