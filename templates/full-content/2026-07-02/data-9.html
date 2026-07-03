@@ -1,0 +1,26 @@
+<h1>SedonaDB 0.4: GPU-Accelerated Spatial Joins</h1>
+<p>In SedonaDB 0.4, we taught this Rust database to run spatial joins on your $1,500 gaming GPU's ray tracing cores, and it beats an H100.</p>
+<p>The Apache Sedona community released SedonaDB 0.4.0, resolving 187 issues and adding 26 new functions from 15 contributors. SedonaDB is the first open-source, single-node analytical database that treats spatial data as a first-class citizen — the counterpart to the distributed Sedona engines for small-to-medium datasets running on a single machine.</p>
+<p>This is the first in a series of posts diving into what's new in SedonaDB 0.4. We'll be covering more of the release — the Python DataFrame API, the R dplyr interface, Geography support, GeoParquet write support, N-dimensional rasters and Zarr, and more — in the posts to come; for the full rundown, see the 0.4.0 release blog post. We're kicking things off with the feature we're most excited about: GPU-accelerated spatial joins.</p>
+<h2>GPU-Accelerated Spatial Joins</h2>
+<p>Gaming GPUs contain dedicated ray tracing cores designed for video game lighting — and they sit idle during database queries. Spatial joins are about finding intersecting geometries, which maps naturally onto ray tracing primitives. We built <strong>RayBooster</strong>, an extension that brings ray tracing core acceleration into SedonaDB.</p>
+<p>The accompanying research paper, <em>"RayBooster: A Ray Tracing Engine to Accelerate SedonaDB,"</em> was accepted to <strong>VLDB 2026</strong> (Industry Track), developed in collaboration with The Ohio State University.</p>
+<h3>How it works: four components</h3>
+<p><strong>1. GPU-friendly storage layout.</strong> Instead of the stream-oriented WKB format, RayBooster uses a Structure of Arrays organization that separates offsets, vertices, and types, enabling O(1) random access to any geometry.</p>
+<p><strong>2. A single monolithic index.</strong> Rather than building millions of tiny index trees, it uses <em>Z-stacking</em> — encoding each geometry's ID into the unused Z-axis of the ray tracing scene and building one global BVH for the entire batch.</p>
+<p><strong>3. A universal predicate engine.</strong> <code>RelateEngine</code> computes the DE-9IM matrix (a topological descriptor) on RT cores, giving one code path that resolves any geometry/predicate combination instead of hardcoding 500+ kernel variants.</p>
+<p><strong>4. Memory-aware execution.</strong> A scheduling and spilling layer keeps joins within GPU memory budgets on irregular real-world workloads, preventing out-of-memory failures.</p>
+<h2>Performance</h2>
+<p>Testing on SpatialBench:</p>
+<ul>
+ <li><strong>Up to 5.93x speedup</strong> on heavy joins, with a 59.02% cost reduction on AWS</li>
+ <li><strong>Q11 cross-zone trip join</strong>: 7.51s (CPU) → 1.61s on a consumer RTX 3090 — a 4.66x speedup</li>
+ <li><strong>10x scale</strong>: 53.34s reduced to under 7s</li>
+ <li><strong>Heavy joins at scale</strong>: 4.93x to 9.68x speedups across GPU models</li>
+ <li><strong>Consumer RTX 3090 vs. H100</strong>: on some queries the gaming card actually beat the H100 (1.26s vs 1.77s on Q10), despite the H100 lacking RT cores</li>
+</ul>
+<h2>Using it</h2>
+<p>On a machine with an NVIDIA GPU, pull the official Docker image and enable the feature with a single command:</p>
+<pre><code>ctx.sql("SET gpu.enable = true")</code></pre>
+<h2>Citation</h2>
+<p>Liang Geng, Rubao Lee, Dewey Dunnington, Feng Zhang, Jia Yu, and Xiaodong Zhang. "RayBooster: A Ray Tracing Engine to Accelerate SedonaDB." PVLDB, 2026 (Industry Track).</p>

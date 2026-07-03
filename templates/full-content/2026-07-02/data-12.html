@@ -1,0 +1,121 @@
+<h1>Data Residency Is Not a Legal Problem. It Is an Infrastructure Design Problem</h1>
+<blockquote>
+ <p><em>Why regulated companies can't solve data residency with policy documents alone, and what infrastructure teams need to design before compliance turns into a migration crisis.</em></p>
+</blockquote>
+<p>A data residency requirement usually shows up as a single sentence in a legal or compliance document: user data must be stored and processed inside a specific country or region. On paper it reads like a storage constraint. Move the database, restrict exports, update the policy, done.</p>
+<p>Real systems are rarely that tidy.</p>
+<p>Moving the database is not enough. Residency depends on the full lifecycle of data and computation: where data is stored, where code runs, where ML experiments execute, where logs get written, where backups are created, and who can reach the system across regional boundaries.</p>
+<p>That makes residency an infrastructure design problem. Legal can write the requirement, but platform and engineering teams are the ones who decide whether the system can actually meet it.</p>
+<h2>The requirement looks simple until you inspect the architecture</h2>
+<p>The first reaction is almost always about storage: "we need to move the data warehouse to the local region." That's necessary, but it's one layer out of many.</p>
+<p>Modern data and ML platforms are distributed by default. Data might be stored in one region, transformed in another, logged in a third, and inspected through a managed service whose control plane the application team never even sees. Dashboards, notebooks, feature pipelines, CI/CD runners, monitoring tools, exports, temporary files: any of them can turn into a residency surface.</p>
+<p>A team can migrate its primary tables and still leave sensitive data sitting in places nobody thought to check: query logs, notebook outputs, audit trails, snapshots, support exports, experiment artifacts, feature caches, error payloads.</p>
+<p>The useful question isn't "where is the database?" It's "where can user data appear during normal operation?"</p>
+<h2>The hidden list of residency surfaces</h2>
+<p>A real residency review covers more than storage. It should trace the full path from ingestion to deletion. At minimum, look at these layers:</p>
+<ul>
+ <li>Primary storage: operational databases, data warehouse datasets, object storage buckets, feature stores.</li>
+ <li>Compute: batch jobs, scheduled queries, notebooks, model training, inference workloads, serverless functions.</li>
+ <li>ML tooling: managed workbenches, experiment tracking, model registries, GPU jobs, notebook environments.</li>
+ <li>CI/CD: deployment runners, build logs, test data, temporary artifacts, environment variables.</li>
+ <li>Observability: application logs, audit logs, traces, metrics labels, error reports, profiling output.</li>
+ <li>Backups and disaster recovery: replicas, snapshots, archive buckets, restore procedures.</li>
+ <li>Access and identity: service accounts, admin access, break-glass procedures, cross-region support workflows.</li>
+ <li>External services: SaaS tools, analytics platforms, LLM APIs, ticketing systems, BI exports.</li>
+</ul>
+<p>If any of these layers touches sensitive data outside the allowed region, the architecture fails the intent of residency, even with the primary database sitting locally.</p>
+<h2>Managed services become a hidden dependency</h2>
+<p>Managed services are useful because they take operational work off your plate. They're risky for the same reason: they hide infrastructure decisions that later turn into compliance decisions.</p>
+<p>A managed ML workbench might be available in one region and missing in another. A logging product might keep part of its control plane somewhere else. A data transfer service might write operational metadata to a global location. A provider might offer a database in a new region but none of the surrounding tooling that makes the database worth using.</p>
+<p>This is the region parity trap: the business assumes cloud regions are interchangeable, while the actual service catalog is not.</p>
+<p>Cost is the obvious downside of a managed service. The one that hurts during a migration is that the service may simply not exist where you're legally required to run.</p>
+<p>When that happens, the options are all bad: wait for the provider, run cross-region workloads, bring in a second cloud, or hack together a workaround. None of them is comfortable in the middle of a compliance-driven migration.</p>
+<h2>Region-aware platform design</h2>
+<p>Residency gets manageable when the platform is region aware from the start. That doesn't mean duplicating every service everywhere. It means the platform knows which parts are portable, which parts are tied to a region, and which dependencies would block a migration.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Layer</th>
+   <th>Residency question</th>
+   <th>Common failure mode</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Storage</td>
+   <td>Where is user data physically stored?</td>
+   <td>Primary tables are local, but replicas or exports are not.</td>
+  </tr>
+  <tr>
+   <td>Compute</td>
+   <td>Where does code execute against that data?</td>
+   <td>Jobs read local data but run in a different region.</td>
+  </tr>
+  <tr>
+   <td>ML workloads</td>
+   <td>Where do notebooks, GPU jobs, and experiments run?</td>
+   <td>The managed ML platform isn't available in the compliant region.</td>
+  </tr>
+  <tr>
+   <td>Logs</td>
+   <td>Do logs contain sensitive data, and where are they stored?</td>
+   <td>Query text, payloads, or identifiers leak into global logs.</td>
+  </tr>
+  <tr>
+   <td>Access</td>
+   <td>Who can access data across regions?</td>
+   <td>Broad admin roles allow uncontrolled cross-region access.</td>
+  </tr>
+  <tr>
+   <td>CI/CD</td>
+   <td>Can the system be deployed reproducibly into the region?</td>
+   <td>Manual environments can't be recreated under compliance pressure.</td>
+  </tr>
+  <tr>
+   <td>Backups</td>
+   <td>Are snapshots and restore paths also local?</td>
+   <td>Disaster recovery silently violates residency.</td>
+  </tr>
+ </tbody>
+</table>
+<p>The table is simple, but it shifts the conversation. Instead of asking whether one database moved, the team asks whether the whole operating model can run inside the required boundary.</p>
+<h2>A better architecture pattern</h2>
+<p>The weak pattern usually accretes over time. Someone moves the data to the required region, but the notebooks stay in a managed service somewhere else. Access control runs on hand-maintained groups. Users spin up their own runtime environments. Logs flow into a global sink. People create scheduled jobs through the UI. Nobody can rebuild the system from scratch, because the real architecture lives in people's habits instead of in a repo.</p>
+<p>The stronger pattern looks like this:</p>
+<ul>
+ <li>Storage is region-local by default.</li>
+ <li>Compute and ML execution stay in the same compliant boundary.</li>
+ <li>Infrastructure lives in code, not click-ops.</li>
+ <li>Runtime images are standardized and versioned.</li>
+ <li>Access goes through SSO, RBAC, and audit trails.</li>
+ <li>Scheduled workflows are defined in Git and deployed through APIs.</li>
+ <li>Logs are classified, filtered, and stored by sensitivity.</li>
+ <li>Critical dependencies are documented with their region availability and an exit path.</li>
+</ul>
+<p>None of this is anti-cloud. It's about not letting compliance hang on abstractions you can't reproduce, inspect, or relocate. Managed services are fine; blind dependence on them is the problem.</p>
+<h2>Self-hosted isn't the same as unmanaged</h2>
+<p>When managed tooling isn't available in a regulated region, teams tend to fall into a false binary: use the managed platform, or accept a chaotic self-hosted mess. That framing is wrong.</p>
+<p>A self-hosted platform can be better governed than a managed one if you build it as a controlled internal layer. For ML experimentation that might mean Kubernetes-based execution, JupyterHub or a similar workbench, SSO, RBAC, user isolation, configurable GPU allocation, autoscaling node pools, approved Docker images, persistent storage policies, quotas, audit logs, and configuration managed through CI/CD.</p>
+<p>What separates the two is ownership. A self-hosted platform shouldn't be a pile of hand-built VMs. It should be a reproducible execution layer you can deploy, review, monitor, and audit.</p>
+<h2>What to do before regulation forces the issue</h2>
+<p>The worst time to find out your infrastructure isn't portable is in the middle of a mandatory regional migration. Mature teams treat portability as a design constraint long before it becomes a legal emergency.</p>
+<p>A practical checklist:</p>
+<ul>
+ <li>Map where sensitive data is stored, processed, logged, exported, and backed up.</li>
+ <li>List the managed services involved in data and ML workflows, then check regional availability for each one.</li>
+ <li>Document which systems can be redeployed from code and which depend on manual setup.</li>
+ <li>Standardize runtime environments before every team builds its own version.</li>
+ <li>Move recurring workflows out of UI configuration and into versioned specifications.</li>
+ <li>Apply least-privilege access and audit logging across all data-adjacent platforms.</li>
+ <li>Build migration runbooks, then test whether critical workflows can actually be replayed in another region.</li>
+ <li>Make vendor dependency explicit in architecture reviews.</li>
+</ul>
+<p>It all looks like ordinary platform hygiene, right up until regulatory pressure turns it into business continuity.</p>
+<h2>Residency as a maturity test</h2>
+<p>For a lot of companies, a residency requirement is the first real test of how mature their infrastructure is. Immature setups end up tied to a region without anyone choosing that on purpose. Mature ones treat region placement as an explicit decision.</p>
+<p>It also forces some uncomfortable questions. Can we stand this platform up again in another region? Do we actually know where our logs end up? Can we run ML workloads without a region-bound managed service? Can we prove who accessed what? Can we move recurring workflows without someone clicking through a UI at 2 a.m.?</p>
+<p>When the answer is no, compliance isn't really the problem. The infrastructure is.</p>
+<h2>Where responsibility actually sits</h2>
+<p>Residency isn't a legal checkbox that engineering ticks after the fact. It's a stress test for platform design. Companies that treat it as a storage migration tend to learn too late that compute, logs, ML tooling, identity, backups, and workflow automation count just as much.</p>
+<p>The mature move is to design platforms that are portable, auditable, reproducible, and region aware. That doesn't mean avoiding managed services. It means knowing exactly where a managed service ends and your own responsibility starts.</p>
+<p>Compliance documents define the boundary. Infrastructure decides whether the system can actually live inside it.</p>
