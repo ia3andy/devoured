@@ -1,0 +1,320 @@
+<h1>How ScyllaDB’s Trie-Based Index Delivers Up to 3X More Throughput</h1>
+<p><strong>By transitioning from separate summary and index files to a prefix tree, we optimized cache efficiency, reduced disk I/O, and reduced memory overhead</strong></p>
+<p>Trie-based SSTable index format was added in ScyllaDB 2025.4. Since then, it has evolved and matured to become the default index format in ScyllaDB 2026.2.</p>
+<p>In this post, we deep dive into the format change, present its pros and cons, and show our latest benchmark results of the legacy vs. Trie index formats.</p>
+<p>For benchmarking, we chose four different read workloads that would benefit from the Trie index format in different degrees. For all four, Trie indexes demonstrated better performance. They achieved <strong>20% to 230% higher throughput and 31% to 63% lower latency</strong> compared to legacy indexes. The impact of Trie index on the write path is negligible.</p>
+<p>Note that for use cases with either very low cache usage or 100% row-cache hit rate, the performance gain is expected to be lower. However, these use cases are unlikely in production.</p>
+<h2>Trie Index Usage in ScyllaDB</h2>
+<p>Before explaining the new format, we will cover the legacy index format and its challenges.</p>
+<h3>Legacy Three-Layer Lookup (me/md format)</h3>
+<p>Until ScyllaDB 2026.2 the default storage format was the SSTable version md and me.</p>
+<p>Every SSTable lookup in the me/md format traverses three or four structures:</p>
+<ul>
+ <li><code>Summary.db</code> (entirely in RAM)</li>
+ <li>Binary search in <code>Index.db</code></li>
+ <li>Sequential read in <code>Data.db</code></li>
+</ul>
+<p>Both the partition index and the clustering-row index are stored in <code>Index.db</code>. The partition index is partially represented in memory by the sampled <code>Summary.db</code>, while the clustering-row index exists as a promoted index for large partitions.</p>
+<pre><code>┌──────── MEMORY ──────────────────────────────┐
+│                                              │
+│  Summary.db  (entirely in RAM)               │
+│  ─────────────────────────────               │
+│  Sampled at ~1 byte per ~2000 bytes of       │
+│  Data.db                                     │
+│                                              │
+│  "aardvark" → Index.db byte        0         │
+│  "kangaroo" → Index.db byte  1,048,576       │
+│  "platypus" → Index.db byte  2,097,152       │
+│  "zebra"    → Index.db byte  3,145,728       │
+│                                              │
+└──────────────────┬───────────────────────────┘
+                   │
+       binary search → window in Index.db
+                   │
+                   ▼
+┌──────── DISK ────────────────────────────────┐
+│                                              │
+│  Index.db                                    │
+│  ─────────                                   │
+│  "kangaroo"   → Data.db: 4,096,000           │
+│  "koala"      → Data.db: 4,097,280           │
+│  "kookaburra" → Data.db: 4,098,560           │
+│  "lemur"      → Data.db: 4,099,840  ← found  │
+│  ... (up to ~800 entries per 1 MB scan)      │
+│                                              │
+└──────────────────┬───────────────────────────┘
+                   │
+       1 seek + sequential read
+                   │
+                   ▼
+┌──────── DISK ────────────────────────────────┐
+│  Data.db                                     │
+│  &lt;partition data&gt;                            │
+└──────────────────────────────────────────────┘</code></pre>
+<p>For partitions containing enough clustering rows, a fourth structure is involved:</p>
+<pre><code>Index.db entry for a large partition
+┌──────────────────────────────────────────┐
+│  partition key  → Data.db offset         │
+│  promoted_index (flat list of CK blocks) │
+│    block 0: ck_start="aaa", ck_end="azz" │
+│    block 1: ck_start="baa", ck_end="bzz" │
+│    ...                                   │
+│    block N: ck_start=...,  ck_end=...    │
+│    offsets[0..N]  ← binary search here   │
+└──────────────────────────────────────────┘</code></pre>
+<h3>The New Trie Index Format</h3>
+<p>The Trie index replaces <code>Summary.db</code> + <code>Index.db</code> with a single on-disk prefix tree. The storage format is compatible with Apache Cassandra’s BTI (Big Trie Index) format, implemented using ScyllaDB’s Seastar architecture.</p>
+<p>Trie indexes are used for both partition indexes and clustering key indexes.</p>
+<h3>What Is a Trie?</h3>
+<p>A trie (prefix tree) stores keys character-by-character. Shared prefixes occupy a single path, eliminating redundancy:</p>
+<pre><code>Keys: "kangaroo", "koala", "kookaburra", "lemur", "lion"
+
+            [root]
+            /    \
+          'k'    'l'
+           |      |
+          [k]    [l]
+          / \    / \
+        'a' 'o''e' 'i'
+         |   |  |   |
+        'n' [o]'m' 'i'
+         |  / \ |   |
+        'g''a' 'o''u' 'o'
+         |  |  |  |   |
+        'a''l' 'k''r' 'n'
+         |  |  |  *
+        'r''a' 'a'    * = leaf node
+         |  *  |       (payload: Data.db offset)
+        'o'   'b'
+         |     |
+        'o'   'u'
+         *     |
+              'r'
+               |
+              'r'
+               |
+              'a'
+               *
+
+"k", "ko", "koo" — shared prefixes stored ONCE</code></pre>
+<h3>New SSTable Files</h3>
+<p>The ms/mt format replaces <code>Summary.db</code> and <code>Index.db</code> with two purpose-built files:</p>
+<pre><code>SSTable (ms format)
+├── Data.db
+│     unchanged — partition and row data,
+│     same binary layout as me/md
+│
+├── Partitions.db                     ← NEW
+│     Trie index:
+│       partition key → Data.db offset
+│         (small partitions)
+│       partition key → Rows.db offset
+│         (large partitions)
+│
+│     ┌── Page 0 (4,096 bytes) ───────┐
+│     │  trie root node [1]           │
+│     │  + children (fan-out ≤ 256)   │
+│     │  + their children (packed)    │
+│     └───────────────────────────────┘
+│     ┌── Page 1 (4,096 bytes) ───────┐
+│     │  subtree for keys 'a'–'g'     │
+│     └───────────────────────────────┘
+│     ...
+│     ┌── Footer ─────────────────────┐
+│     │  first_key      (raw bytes)   │
+│     │  last_key       (raw bytes)   │
+│     │  partition_count (uint64)     │
+│     │  trie_root_pos  (uint64)      │
+│     └───────────────────────────────┘
+│
+├── Rows.db                            ← NEW
+│     Per-partition clustering-key
+│     tries, concatenated.
+│     Each sub-trie:
+│       clustering key → byte-offset
+│         within partition
+│     (replaces flat "promoted index"
+│      in Index.db)
+│
+├── Filter.db     bloom filter — unchanged
+├── Statistics.db statistics  — unchanged
+└── Scylla.db     ScyllaDB metadata — unchanged</code></pre>
+<p>[1] Parent nodes are always written after their child nodes. Parents point to children, so child positions must be known before parents are written.</p>
+<h3>How a Partition Lookup Works</h3>
+<pre><code>Query: SELECT * FROM orders
+       WHERE order_id = 'ORD-20240611-98765'
+
+┌─────────────────────────────────────────┐
+│  Step 1 — Key Translation               │
+│                                         │
+│  'ORD-20240611-98765'                   │
+│         ↓  bti_key_translation.cc       │
+│  comparable byte sequence               │
+│  (lexicographic order matches           │
+│   CQL semantic order)                   │
+└──────────────────┬──────────────────────┘
+                   │
+┌──────────────────▼──────────────────────┐
+│  Step 2 — Trie Traversal                │
+│           in Partitions.db              │
+│                                         │
+│  Read root page (4 KB)                  │
+│    ← usually in OS page cache           │
+│                                         │
+│  [root] ──'O'──&gt; [node]  (page 0)       │
+│  [node] ──'R'──&gt; [node]  (page 0)       │
+│  [node] ──'D'──&gt; [node]  (fetch page 1) │
+│  [node] ──'-'──&gt; [node]  (page 1)       │
+│  ...                                    │
+│  [leaf] payload = Data.db or            │
+│                   Rows.db pos 2,097,152 │
+│                                         │
+│  Typical: 2–6 page fetches.             │
+│  Top pages cached → often 0–1 disk I/Os │
+└──────────────────┬──────────────────────┘
+                   │
+┌──────────────────▼──────────────────────┐
+│  Step 3 — Read Data.db                  │
+│  Seek to offset 2,097,152               │
+│  → read partition header                │
+│  For large partitions: read Rows.db     │
+└──────────────────┬──────────────────────┘
+                   │  (range/clustering queries only)
+┌──────────────────▼──────────────────────┐
+│  Step 4 — Read Data.db at position      │
+│           returned from index           │
+└─────────────────────────────────────────┘</code></pre>
+<h3>Page Layout: Packing Parent and Children Together</h3>
+<p>The most critical write-time optimization is ensuring that a node and its children land on the <strong>same 4 KB page</strong>. This means an entire trie neighborhood is readable in a single I/O, even on the first (cold) access.</p>
+<pre><code>┌──────── 4,096-byte page ────────────────┐
+│                                         │
+│  [A] ──'p'──&gt; [B] ──'p'──&gt; [C]         │
+│         │                │              │
+│         └──'r'──&gt; [D]    ├──'l'──&gt;[E]* │
+│                          │              │
+│                          └──'y'──&gt;[F]* │
+│                                         │
+│  (* = leaf node with payload)           │
+│  (padding bytes to align next subtree         │
+│   to page boundary)                     │
+└─────────────────────────────────────────┘
+
+trie_writer algorithm (trie_writer.hh):
+
+  1. Maintain rightmost path root → current
+     node (_stack)
+  2. On each new key: branch off rightmost
+     path, add new nodes
+  3. Accumulate nodes until a finished
+     subtree exceeds a page
+  4. Flush child subtrees with padding so
+     each subtree fits within one page
+
+ScyllaDB vs. Cassandra reference impl:
+
+  Cassandra: one character per node
+  ScyllaDB:  characters grouped into
+             "chains" (up to 300 bytes)
+  → dramatically faster writes for long
+    keys, same read-side page structure</code></pre>
+<h3>Old vs. New: Side-by-Side Summary</h3>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>Legacy me/md</th>
+   <th>Trie ms/mt</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>On-disk files</strong></td>
+   <td><code>Summary.db</code> + <code>Index.db</code></td>
+   <td><code>Partitions.db</code> + <code>Rows.db</code></td>
+  </tr>
+  <tr>
+   <td><strong>In-memory component</strong></td>
+   <td>Summary (always loaded, never evicted)</td>
+   <td>None. Trie top-nodes live in OS page cache (evictable)</td>
+  </tr>
+  <tr>
+   <td><strong>Index structure</strong></td>
+   <td>Flat sorted list</td>
+   <td>Prefix tree</td>
+  </tr>
+  <tr>
+   <td><strong>Partition lookup (cold cache)</strong></td>
+   <td>Binary search in summary (RAM) + scan of Index.db window</td>
+   <td>Trie traversal byte-by-byte: O(key_length) page reads</td>
+  </tr>
+  <tr>
+   <td><strong>Key storage</strong></td>
+   <td>Full key per entry</td>
+   <td>Shared prefixes stored once</td>
+  </tr>
+  <tr>
+   <td><strong>Clustering key lookup</strong></td>
+   <td>Flat promoted-index list (binary search)</td>
+   <td>Sub-trie in <code>Rows.db</code> (trie traversal)</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Benchmark Results</h2>
+<p>The following table shows the key results, measured at client-side P99 ≤ 10 ms on a 3-node AWS production-class cluster. All tests were run on 3 × i8g.2xlarge instances, each on a different zone, with Replication Factor (RF) of 3.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Test case</th>
+   <th>Legacy (me) Throughput</th>
+   <th>Legacy (me) P99</th>
+   <th>Trie (ms) Throughput</th>
+   <th>Trie (ms) P99</th>
+   <th>Throughput gain</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Test 1: Typical (~20% row cache)</td>
+   <td>130k ops/s</td>
+   <td>5.1 ms</td>
+   <td>170k ops/s</td>
+   <td>1.9 ms</td>
+   <td><strong>+31%</strong></td>
+  </tr>
+  <tr>
+   <td>Test 2: Key / Value</td>
+   <td>90k ops/s</td>
+   <td>5.2 ms</td>
+   <td>300k ops/s</td>
+   <td>3.6 ms</td>
+   <td><strong>+233%</strong></td>
+  </tr>
+  <tr>
+   <td>Test 3: Large Partitions</td>
+   <td>23k ops/s</td>
+   <td>7.7 ms</td>
+   <td>37k ops/s</td>
+   <td>4.6 ms</td>
+   <td><strong>+61%</strong></td>
+  </tr>
+  <tr>
+   <td>Test 4: Long shared clustering key prefixes</td>
+   <td>22k ops/s</td>
+   <td>5.4 ms</td>
+   <td>38k ops/s</td>
+   <td>3.3 ms</td>
+   <td><strong>+73%</strong></td>
+  </tr>
+ </tbody>
+</table>
+<h2>Discussion: Why Trie Indexes Improve Performance, and When to Use Them</h2>
+<p>ScyllaDB CTO Avi Kivity has mentioned three reasons why Trie indexes improve performance:</p>
+<ul>
+ <li><strong>Improved cacheability:</strong> the index is denser, so it is more likely to fit in cache, requiring no I/O for the index itself.</li>
+ <li><strong>Fewer I/O operations after cache miss:</strong> if the index is not in cache, fewer I/O operations are required to fetch it since the index is more compact and shallower. This is especially true for large partitions, often seen in materialized view workloads.</li>
+ <li><strong>CPU efficiency:</strong> less CPU is needed to process the index during reads.</li>
+</ul>
+<p>A possible downside is that more CPU is needed to create the index during memtable flush and compaction. However, this is more than offset by the read-side advantages.</p>
+<h2>Summary</h2>
+<p>ScyllaDB 2026.2 has adopted a Trie-based index format as its new default, replacing the legacy index structure to significantly enhance read path performance. By transitioning from separate summary and index files to a prefix tree, this design optimizes cache efficiency, reduces disk I/O, and reduces memory overhead. Benchmarks indicate that this architectural change delivers throughput improvements ranging up to 3x across various workloads, offering a more scalable and efficient solution than the legacy index format.</p>
+<p><strong>As always, actual results depend on your workload. To evaluate the gain of Trie index, we highly recommend testing it yourself with the latest ScyllaDB releases.</strong></p>

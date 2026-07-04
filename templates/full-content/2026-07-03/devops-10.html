@@ -1,0 +1,191 @@
+<h1>Improving token efficiency for GitHub Copilot in VS Code</h1>
+<p>With the recent move to usage-based billing for GitHub Copilot, every token in an agentic session matters. They affect your credits, latency, and the context window an agent has left to finish the task. Each new model generation tends to consume more tokens per task than the last, as we've witnessed in our own data. This means that harness-level efficiencies are increasingly important to counter this trend. As agents take on longer, more autonomous work, an inefficient harness adds up fast.</p>
+<p>Making the GitHub Copilot agentic harness in VS Code more token-efficient is continuous work, and it's the best way to counter this trend. For most changes, we run A/B experiments in production and offline evaluations against task suites, confirming that task success rate holds or improves while token usage drops. It's rarely one big win, usually a steady stream of small ones. Below, we walk through recent gains, first for OpenAI models and then for Anthropic models.</p>
+<h2>How agentic requests spend tokens</h2>
+<p>Two costs sit at the heart of every agentic request, and two ideas help us reduce them. Both apply across OpenAI and Anthropic models, even though each provider exposes them differently.</p>
+<p><strong>The prompt prefix and caching.</strong> In an agentic coding session, a large share of every request repeats across turns: system instructions, tool definitions, repository context, and conversation history. This repeated beginning is the <strong>prompt prefix</strong>. When requests share the exact same prefix, the inference provider can reuse cached model state instead of recomputing it from scratch on each request. Despite the name, the cached artifact is not a human-readable copy of the prompt. It is the model state computed while processing that prefix, represented internally as key/value tensors. Reusing the prefix cuts both cost (cached tokens can be <strong>up to 10 times cheaper</strong>) and latency, which is why we work to keep the prompt cache hit-rate high.</p>
+<p><strong>Tool-definition overhead.</strong> Agents can pull in a large number of tools: those exposed by MCP servers, built-in tools, or extension-provided tools. Each tool is sent to the model with a full definition (a name, a description, and a complete JSON parameter schema), and historically every one was loaded into context on every request. Even when that data is cached, the context window overhead is fixed on each turn and grows as the toolset does.</p>
+<p><strong>Tool search.</strong> Tool search reduces that overhead by letting the model <strong>load tool definitions</strong> on demand instead of all at once. Upfront, the model sees only lightweight metadata, the name and description of each deferred tool, and the heavier parameter schemas stay out of context until the model searches for a tool and loads it. Because deferred tools are added at the end of the context window rather than the prefix, the cached prompt prefix stays reusable and the caching gains keep working across turns. The payoff is a leaner context window: the model spends fewer tokens on tools it never uses, leaving more room and budget for the actual task.</p>
+<h2>Efficiency wins for OpenAI models</h2>
+<p>For OpenAI models, our recent work focused on reducing usage costs and latency for Copilot users through improved token efficiency. We pursued that through three changes: retaining cached model state for longer, reducing tool-definition overhead, and replacing repeated HTTP requests with persistent WebSocket connections.</p>
+<h3>Extended prompt caching</h3>
+<p>OpenAI models cache the prompt prefix automatically: the provider infers the reusable prefix and reuses its model state across requests. That reuse has a direct cost benefit. For most OpenAI models that support cached input pricing, uncached input tokens cost <strong>10 times as much</strong> as cached input tokens.</p>
+<p>Caching the prefix happens on its own, but how long that cache survives is something we can configure. After careful evaluation, we enabled extended prompt caching for supported models through the <code>prompt_cache_retention</code> body parameter. By default, the cache lives in fast GPU memory, where it is dropped after about 5 to 10 minutes of inactivity (up to an hour in some cases) to make room for other work. Setting <code>"prompt_cache_retention": "24h"</code> moves the cache to slower but roomier GPU-local storage and keeps it for up to 24 hours.</p>
+<p>The benefit is simple. With the default cache, a pause of more than a few minutes throws the cache away, so your next request has to reprocess the whole prefix at the full, uncached price. Extended retention keeps the cache warm, so picking up where you left off is still fast and cheap, even after a long break.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Time between requests</th>
+   <th>GPT-5.2</th>
+   <th>GPT-5.3-Codex</th>
+   <th>GPT-5.4</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>10-20 min</td>
+   <td>+13%</td>
+   <td>+32%</td>
+   <td>+10%</td>
+  </tr>
+  <tr>
+   <td>20-30 min</td>
+   <td>+135%</td>
+   <td>+142%</td>
+   <td>+137%</td>
+  </tr>
+  <tr>
+   <td>30-40 min</td>
+   <td>+301%</td>
+   <td>+203%</td>
+   <td>+679%</td>
+  </tr>
+  <tr>
+   <td>40-60 min</td>
+   <td>+338%</td>
+   <td>+279%</td>
+   <td>+919%</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Tool search</h3>
+<p>To avoid sending all tool definitions on every request, tool search makes this on-demand. Available to models GPT-5.4 and newer, OpenAI's native tool search implements this deferral with a <code>defer_loading</code> flag.</p>
+<p>Upfront, the model only sees lightweight metadata: the name and description of each deferred function or, when deferred functions are grouped into a namespace, only the namespace's name and description.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Metric</th>
+   <th>Model</th>
+   <th>Delta</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>P50 Total tokens used per turn</td>
+   <td>GPT-5.4</td>
+   <td>-9.81%</td>
+  </tr>
+  <tr>
+   <td>P50 Total tokens used per turn</td>
+   <td>GPT-5.5</td>
+   <td>-8.61%</td>
+  </tr>
+  <tr>
+   <td>P50 Time to first token (TTFT)</td>
+   <td>GPT-5.4</td>
+   <td>-6.88%</td>
+  </tr>
+  <tr>
+   <td>P50 Time to first token (TTFT)</td>
+   <td>GPT-5.5</td>
+   <td>-7.34%</td>
+  </tr>
+  <tr>
+   <td>P50 Time to complete (TTC)</td>
+   <td>GPT-5.4</td>
+   <td>-5.31%</td>
+  </tr>
+  <tr>
+   <td>P50 Time to complete (TTC)</td>
+   <td>GPT-5.5</td>
+   <td>-5.42%</td>
+  </tr>
+ </tbody>
+</table>
+<h3>WebSockets</h3>
+<p>An agentic coding turn can involve many sequential requests to the inference provider; one for each step the model takes as it calls tools and works toward a solution. Responses API WebSocket mode keeps a persistent connection open and provides a lower-latency continuation path for those sequential requests.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Tracking metric</th>
+   <th>Percentile</th>
+   <th>GPT-5.3-Codex</th>
+   <th>GPT-5.4</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Time to first token (TTFT)</td>
+   <td>p50</td>
+   <td>-19.46%</td>
+   <td>-16.37%</td>
+  </tr>
+  <tr>
+   <td>Time to first token (TTFT)</td>
+   <td>p95</td>
+   <td>-12.92%</td>
+   <td>-15.78%</td>
+  </tr>
+  <tr>
+   <td>Time to complete (by turn)</td>
+   <td>p50</td>
+   <td>-13.55%</td>
+   <td>-11.74%</td>
+  </tr>
+  <tr>
+   <td>Time to complete (by turn)</td>
+   <td>p95</td>
+   <td>-7.86%</td>
+   <td>-6.26%</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Efficiency wins for Anthropic models</h2>
+<p>For Anthropic models, our recent work targeted the same two repeating costs: the prompt prefix we keep warm in cache, and the tool payload we send on every turn. We pursued that through two changes: spending our prompt-cache breakpoints more deliberately, and deferring tool definitions through tool search.</p>
+<h3>Smarter prompt caching</h3>
+<p>Anthropic's prompt caching works differently from the automatic prefix caching that OpenAI models use. Rather than the provider inferring the reusable prefix, the caller places explicit <code>cache_control</code> breakpoints, and the API caches everything up to each marker.</p>
+<ul>
+ <li>The <strong>end of the tool definitions</strong> and the <strong>end of the system prompt</strong>, the parts that change least between turns.</li>
+ <li>A pair of <strong>rolling anchors</strong> on the two most recent cacheable messages.</li>
+</ul>
+<h3>Tool search</h3>
+<p>Anthropic's tool search tool applies the same deferral idea. Tools are marked with <code>defer_loading: true</code>, and alongside the deferred catalog we keep a small, curated set of core tools loaded.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Metric</th>
+   <th>Percentile / scope</th>
+   <th>Delta</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Time to first chunk</td>
+   <td>p50 (by turn)</td>
+   <td>-2.45%</td>
+  </tr>
+  <tr>
+   <td>Total prompt tokens</td>
+   <td>p50 (by turn)</td>
+   <td>-11.30%</td>
+  </tr>
+  <tr>
+   <td>Total prompt tokens</td>
+   <td>p95 (by turn)</td>
+   <td>-8.85%</td>
+  </tr>
+  <tr>
+   <td>Total prompt tokens</td>
+   <td>p50 (by user)</td>
+   <td>-18.32%</td>
+  </tr>
+  <tr>
+   <td>Total tokens</td>
+   <td>p50 (by turn)</td>
+   <td>-11.09%</td>
+  </tr>
+  <tr>
+   <td>Total tokens</td>
+   <td>p95 (by turn)</td>
+   <td>-8.74%</td>
+  </tr>
+  <tr>
+   <td>Total tokens</td>
+   <td>p50 (by user)</td>
+   <td>-18.03%</td>
+  </tr>
+ </tbody>
+</table>
+<p>We moved the search itself client-side, backing it with the same tools-grouping system we built for VS Code's reduced toolset. The model still calls a <code>tool_search</code> tool, but instead of Anthropic matching against the deferred catalog, we run the search locally and return <code>tool_reference</code> blocks for the best matches.</p>
+<h2>What's next</h2>
+<p>The work above makes our agentic harness leaner: a higher cache hit rate, fewer tool definitions per request, and less transport overhead. The next step is to move whole classes of work off the main agent entirely. We're building specialized subagents, and exploring custom-trained ones, for narrow tasks like searching the workspace, running commands, and summarizing results. Each runs on the smallest, cheapest model that can do the job, instead of the main model paying for that work in its own context.</p>
