@@ -1,0 +1,108 @@
+<p>Rust is a reliable language that prioritizes correctness. However, during development, it can be a burden to account for every single error path immediately.</p>
+<p>This article presents a few techniques that defer handling correctness to that you can stay longer in the happy path, as well as a library I developed to make this process more convenient.</p>
+<blockquote>
+ <p>🌱 100% of this article has been handcrafted without using generative AI tooling, if somewhat hastily. Take my typoes and broken sentences as proof of that.</p>
+</blockquote>
+<p>What's worse for a Rust developer working on some elaborate logic than having <code>rustc</code> suddenly getting in the way? Be it because you didn't return a <code>Result</code> yet, or handle this error case, or implement that edge case, causes for compilation errors are numerous and can distract you from what you're attempting to achieve.</p>
+<p>When this happens you're usually presented with two options:</p>
+<ol>
+ <li>Go with the distraction and immediately implement perfect error handling. Typically you'll have to refactor it a number of times before the PR is ready, making the whole process much more heavy than what is necessary.</li>
+ <li>Slap some manner of <code>TODO later</code> label on the error, downgrading it to a warning, and move on with your work for now.</li>
+</ol>
+<p>This article covers some Rust techniques to achieve the latter option, downgrading an immediate error to a warning to be handled later.</p>
+<h2>Why do you want warnings?</h2>
+<p>Warnings occupy the perfect spot in the possible gamut of compilation interactions:</p>
+<ul>
+ <li>
+  <p>Errors block other compilation steps (lifetimes, etc), and testing, impeding the common workflow:</p>
+  <ol>
+   <li>Write WIP code</li>
+   <li>Test it</li>
+   <li>Turn WIP code to production code</li>
+  </ol>
+  <p>Any error prevents going from (1) to (2)</p></li>
+ <li>
+  <p>Completely suppressing any compilation message, on the other hand, runs the risk of forgetting about the issues and letting them sweep into production 😬</p></li>
+ <li>
+  <p>Warnings don't block development, but need to be cleaned before merging the PR.</p>
+  <p>At Meilisearch, we have a CI that runs the compiler with the <code>-D warning</code> flag, that will turn all warnings into errors at CI time, ensuring we don't ship WIP code accidentally.</p></li>
+</ul>
+<h2>Why don't you just read the f**king code???</h2>
+<p>Of course, <strong>I do</strong>. Reading code (yours, and the one from your colleagues) is an excellent barrier against bugs, and code reviews are a requirement to effectively share knowledge among your team.</p>
+<p>All the techniques discussed in the article come as an <em>additional</em> manner of creating incentives for correctness and stronger guardrails when producing code at a professional scale. They increase quality but don't replace the basic good practices.</p>
+<p>In my experience as a software engineer, anything that relies on humans never a mistake is deemed to fail eventually.</p>
+<p>Without further ado, here are some techniques you can use in vanilla Rust to implement error deferral strategies.</p>
+<h1>Techniques with standard Rust</h1>
+<h2><code>unwrap</code> everywhere</h2>
+<p>While it is important that Rust gives us the structure to correctly address errors, it doesn't mean we need to address them immediately.</p>
+<p>A common pattern for delaying the error handling is to simply <code>unwrap</code> your <code>Result</code> or <code>Option</code>, to get the value inside at the price of a panic on the error path.</p>
+<p>Then when the rest of the code is ready, you can go back to your changes and selectively remove the <code>unwrap</code> that were added as a temporary measure, replacing them with proper error handling.</p>
+<pre><code>fn does_not_return_result_yet(some_params: SomeType) -&gt; SomeReturnType \{
+  let converted = some_params.try_into().unwrap() // &lt;- fallible conversion, ignore for now
+  converted.try_foo().unwrap() // &lt;- fallible operation, ignore for now
+}</code></pre>
+<h2><code>clone</code> everywhere</h2>
+<p>Ownership is a similar issue, albeit slightly different and much less common than error handling. Properly maintaining ownership sometimes mandates design modifications, lest lifetime issues appear. In this case, a frequent mitigation option is to clone a value instead of moving it around.</p>
+<p>Delaying the fixes for this category of issues is a bit more delicate, as the fix can entail changing the architecture of the code in non-trivial ways. Still, with experience, it is possible to identify early cases where you'll be able to remove the clones later by passing the appropriate variables higher in the stack.</p>
+<h2>the <code>todo!</code> macro</h2>
+<p>The Rust standard library provides a <code>todo!()</code> macro, whose purpose is described as:</p>
+<blockquote>
+ <p>Indicates unfinished code.</p>
+ <p>This can be useful if you are prototyping and just want a placeholder to let your code pass type analysis.</p>
+</blockquote>
+<p>This is indeed extremely useful when shaping out an interface and needing to make some function definitions available, without actually having to provide a working implementation.</p>
+<p>Because <code>todo!</code> diverges (it panics), the compiler is able to use it as a placeholder expression for most types, hence the reference to type analysis in the docs. A liberal use of <code>todo</code> allows deferring some code paths (and not just errors) to be implemented at a later time.</p>
+<h3>Digression: not to be confused with <code>unimplemented!()</code></h3>
+<p>I saw at least once someone being wrong on the Internet about <code>todo!()</code>: they would state that it was meant to communicate to users of a program that some features were not yet implemented.</p>
+<p>Rust actually has a dedicated macro for this use case, and its name is <code>unimplemented!()</code>.</p>
+<p><code>todo!()</code> has a different audience: the author of the code and their reviewers. No <code>todo</code>s are meant to hit production, they are a WIP Rust amenity only.</p>
+<h2><code>mut</code>, unused variables, etc.</h2>
+<p>The default warnings provided by the compiler are very useful while developing. They will catch:</p>
+<ul>
+ <li>unused bindings</li>
+ <li>needlessly mutable bindings</li>
+ <li>unused results and options</li>
+</ul>
+<p>All of these tend to appear when code isn't finished developing. For instance, a function whose implementation consists solely of <code>todo!()</code> will typically have such warnings about their parameters.</p>
+<p>⚠️It is important to resist the urge to <strong>temporarily fix these warnings during development</strong>, by prefixing the bindings with <code>_</code> or other tricks. You risk handing over the unfinished code if you artifically fix the warnings. Ignoring warnings has its place, but it ain't that!</p>
+<h2>Leaving a memo: the doc comment trick</h2>
+<p>It often happens while I'm coding that I think of something that needs fixing or handling, like an edge case or some incomplete/broken logic. In contrast with explicit error handling, this kind of issues is not tracked in the type system, so I usually leave a comment with a reminder to fix the issue, if I don't want a distraction from the logic I'm currently implementing.</p>
+<p>This is fine and dandy, but I need to remember to actually go back there after the fact 😅</p>
+<p>As a means to do this, I often use a trick where such comments are actually prefixed with a triple slash, as if they were documentation comments.</p>
+<p>Rust warns about documentation comments that don't document anything, so putting a documentation comment above a statement generally achieve the goal of generating a warning associated with the issue described in the comment.</p>
+<h1>Where are my warnings? Limitations of vanilla Rust</h1>
+<p>These techniques served me well for years (I've been writing Rust for more than a decade now...), however I have my grievances with them.</p>
+<p>Generally, the most aggravating issue is that not all of these techniques reliably generate a warning associated with the issue that needs solving before sending the code into production.</p>
+<p>Forgetting to remove an <code>unwrap</code> and watching it burst into flames after the release is one of the worst feelings you can get as an engineer 😓</p>
+<p><code>todo!</code> is a frequent and weird offender in this category. As stated earlier, it often results in warnings, but these are indirect and caused by e.g. function parameters going unused or mutation not taking place when it should. Because of this, it can become a bit treacherous, as one is used to often have a warning when using <code>todo!</code> and rely on their absence to hit the merge button.</p>
+<p><code>unwrap</code> and <code>clone</code> are even worse, they never emit warnings, so you have to be extra careful in re-reading to remove them before the final PR.</p>
+<p>An additional issue with them is that some of them are <strong>meant to reach production</strong>. With the "unwrap liberally" strategy outlined in this article, we are conflating the normal use case of unwrap with its "WIP" use case.</p>
+<p>Lastly, "TODO doc strings" are kind of a hack, perhaps we could say it is a happy little accident? In this capacity, it has unintuitive failure modes, because doc comments are currently forbidden on expressions, so will cause a compilation error. Doesn't frequently happen, but we also run the risk of using the <code>///</code> in locations where they actually document something, which isn't exactly nice to ship and won't have the expected warning.</p>
+<h1>Introducing the <code>wip</code> crate</h1>
+<p>In response to all these small pains for writing WIP Rust, I decided to develop a crate called <code>wip</code> to make it easier to implement the "warnings for later" strategy.</p>
+<p>Mostly it consists of a collection of tools you can use in every context while you're developing Rust.</p>
+<h2>Using <code>wip</code></h2>
+<p>Add <code>wip</code> to your dependencies like you would for any other crate:</p>
+<pre><code>cargo add wip</code></pre>
+<p>Optionally, you can import the prelude provided by <code>wip</code> in the files where you want to use <code>wip</code>:</p>
+<pre><code>use wip::prelude::*;</code></pre>
+<p>As <code>wip</code> relies on the deprecation warnings of Rust, I suggest you disable the feature of your editor to strike calls to deprecated functions, otherwise it becomes visually invasive.</p>
+<h2><code>wip::wip!</code>, a warning-emitting <code>todo!</code></h2>
+<p>The first tool provided by <code>wip</code> is a <code>wip!</code> macro, that works exactly like <code>todo!</code>, but always emits a warning on use. Use it everywhere you'd use <code>todo!</code>, to mark code as unfinished.</p>
+<h3>Why not <code>todo!</code>?</h3>
+<p>Earlier versions of <code>wip</code> used the <code>todo</code> naming, however it would prevent us from using the prelude, as Rust doesn't like it when a dependency attempts to shadow an <code>std</code> macro...</p>
+<h2><code>unwrap_wip</code> and <code>clone_wip</code></h2>
+<p>These methods are implemented as extension traits on <code>Result</code> and <code>Option</code>. When in scope, they work exactly like the regular <code>unwrap</code> and <code>clone</code>, except that they emit a warning on usage.</p>
+<p>They also clearly signal that you don't mean for the unwrap/clone to stay in final code! Although, keep in mind it doesn't always end up happening that way...</p>
+<h2><code>wip::fixme!</code>, a non-panicking macro for memos</h2>
+<p>One of the tools I use the most from <code>wip</code> is the <code>fixme!</code> macro. It is a non-panicking variant of <code>wip!</code>, that doesn't stand for an expression. It works the same as TODO comments, sans the hackish part and with a reliable warning.</p>
+<h1>Embracing our WIP future</h1>
+<p>I have been using the <code>wip</code> crate for a few of the my latests PRs, including some of my more unreasonably large ones. Usually I add the <code>wip</code> dependency to crates in the workspace during development, and then remove it when rewriting history before review.</p>
+<p>It has been a liberating experience, squarely falling in the category of "I didn't expect to need it <em>that much</em>". It makes focusing on the happy path much more straightforward, while not forgetting things for later.</p>
+<p>What's not to love?</p>
+<p>Only drawbacks I can think of:</p>
+<ol>
+ <li>One needs to write enough context when adding a <code>fixme</code>, otherwise they can become hard to fix when coming back much later. This is usually not a problem, as <code>wip</code> are usually contained to (usually) short PRs by a single author (or pair programmed).</li>
+ <li>Sometimes the number of <code>wip</code>-induced warnings can become a bit discouraging, again especially on larger PRs. Perhaps avoid those 😅</li>
+</ol>
+<p>Still, I'm quite sure I'll keep using <code>wip</code>. How do you use warnings during development? What do you think would be some useful additions to the current API?</p>

@@ -1,0 +1,84 @@
+<h1>Closing the Verification Loop</h1>
+<p><em>How a branch proves itself ready: browser reality, persona eyes, and fixes that carry their own evidence.</em></p>
+<h2>1. The loop that must close</h2>
+<p>Agents made building cheap. The cost moved: the expensive question is no longer "can we ship this?" but "does anyone actually know it works?" A branch that compiles, passes review, and merges can still greet its first real user with a form that validates the wrong field and an email that links to the wrong thread.</p>
+<p>The verification loop is the distance between a claim and its proof:</p>
+<p>Most teams close this loop with humans: someone clicks around before the demo, someone eyeballs staging. That works until agents outrun the humans, which is what the agents were for. Compound engineering (CE, a plugin of skills for coding agents like Claude Code) answers that the loop itself is work an agent can do, end to end, with people pulled in where judgment belongs to them, and where the tooling genuinely cannot reach. The skill that embodies this is <code>/ce-dogfood</code>, and the rest of this piece walks through how it closes the loop, and the persona strategy that gives it eyes.</p>
+<h2>2. Dogfood in one pass</h2>
+<p><code>/ce-dogfood</code> acts as a QA engineer who dogfoods the active branch: understand every change, test every change in a real browser as a user would, and fix what breaks, autonomously, until the branch is ready. Two constraints define it:</p>
+<ul>
+ <li><strong>Diff-scoped, never whole-app.</strong> It tests what this branch changed versus the trunk, and it refuses to run on the trunk itself: no diff, nothing to dogfood.</li>
+ <li><strong>A real browser, one tool.</strong> All automation goes through the <code>agent-browser</code> CLI, a shell tool that drives the browser directly (a Rust binary, not a wrapper, not an MCP server): no exceptions.</li>
+</ul>
+<p>The workflow is seven phases with a loop in the middle:</p>
+<p>A few phase details that carry the philosophy:</p>
+<ul>
+ <li><strong>Scope</strong> pins the identity of the ref under test, so the diff is cut against the right base (a PR stays a PR; a fork's head can literally be named <code>main</code>), and offers worktree isolation via <code>ce-worktree</code> when testing someone else's ref, so your checkout is never disturbed.</li>
+ <li><strong>Serve</strong> is hands-off by design: detect the port (explicit flag, then project instructions, then <code>package.json</code>, then <code>.env</code>, then 3000), reuse a running server or start one, poll until it accepts connections. It does not stop to ask permission to start a dev server.</li>
+ <li><strong>Everything is resumable.</strong> The matrix (the scenario checklist phase 2 produces) lives twice: as a live task list in the session, and as a report document on disk at <code>docs/dogfood-reports/&lt;date&gt;-&lt;branch&gt;-dogfood.md</code>, created the moment the matrix exists and updated after every scenario and every fix. Kill the session mid-run and the report is the checkpoint a later run (or a teammate) resumes from.</li>
+</ul>
+<p><code>ce-dogfood</code> is also deliberately an orchestrator, not a soloist: root-causing a weird failure delegates to <code>ce-debug</code>, commits go through <code>ce-commit</code>, reusable lessons go to <code>ce-compound</code>.</p>
+<h2>3. Flows before matrix: the email rule</h2>
+<p>The most common way automated QA lies to you is by testing pages instead of journeys. Every page renders; the feature is still broken, because the breakage lives between the pages.</p>
+<p>So dogfood forbids jumping to a checklist. Phase 2 first maps every user-visible change as an explicit flow: entry point, each action, every branch (validation error, empty state, permission denied), every side effect, and the true end state. Only then does the matrix get derived, by walking each flow and turning every node and branch into scenarios.</p>
+<p>The canonical example is the email rule, aimed at exactly the wrong-thread email from the opening: "an email sends" is not a pass. Right recipient? Does the click-through land on the right thread and scroll to the right message? Does the content read sensibly? The flow map must carry the journey past the send.</p>
+<p>The matrix then covers both halves of quality, per the skill's test-matrix taxonomy: functional checks (forms validate, links go where they claim, data round-trips, <code>agent-browser errors</code> stays clean, permission boundaries hold), the edge, error, and empty states, and experiential checks, which need a different kind of judge.</p>
+<h2>4. Two judges: does it work, and does it feel right</h2>
+<p>Functional truth comes from the browser. Experiential truth needs eyes, and this is where the first kind of persona enters: the <strong>product persona</strong>. Phase 1 looks for who the product is actually for (<code>STRATEGY.md</code>'s "Who it's for", <code>VISION.md</code>, persona docs) and captures the one to three primary personas and what each cares about. If none exist, it infers one from the product and the diff, and says so in the report; the disclosure is the mitigation for judging against your own guess. No persona at all is worse: that is how you get software that works and pleases nobody.</p>
+<p>Every scenario then gets judged twice: once as a tester driving the browser, once as each persona re-reading the same run. The second pass is a change of eyes, not a second drive. The persona walk hunts <strong>paper cuts</strong>: friction too small to fail a functional test but real enough to degrade the experience. A confusing label. An extra click. A jump the eye doesn't expect. Copy that doesn't match how that persona thinks. Each paper cut gets recorded with who feels it and how badly.</p>
+<p>Quality is not a boolean, and the routing rule has teeth: a scenario can be functionally <code>Pass</code> and still carry paper cuts, and a <strong>sharp</strong> paper cut, one severe enough to fix now, enters the fix loop exactly like a failure.</p>
+<p>Note where each verdict comes from, though. The functional one is an instrument reading; the browser does not care what the agent hoped. The experiential one comes from the same agent, in the same session, grading a walk it imagined. Two judges, one head.</p>
+<h2>5. The fix loop and its governor</h2>
+<p>When something fails, the naive autonomous move is to fix everything. The dangerous autonomous move is also to fix everything. Dogfood's fix loop has a governor: <strong>judge the size of the fix before touching code.</strong></p>
+<p>Auto-fix territory is narrow on purpose: a clear bug, an obvious correct fix, a few files, no schema or architecture or product trade-off. Everything else gets escalated, not attempted; the report's "Decisions for a human" section receives what's broken, the options with trade-offs, and a recommendation.</p>
+<p>The auto-fix path pays for its autonomy up front:</p>
+<ul>
+ <li><strong>Every fix ships with a regression test designed to fail before and pass after.</strong> When a test is genuinely meaningless (a copy tweak, a spacing fix), the report must say why, and a documented browser-replay stands in. Hollow tests invented to satisfy the step are explicitly banned.</li>
+ <li><strong>One logical fix per commit</strong>, so the history reads as a sequence of provable claims.</li>
+ <li><strong>Re-run the scenario, then re-test adjacent journeys.</strong> Fixes regress neighbors; the loop assumes so.</li>
+ <li>Two states are terminal for the loop because they wait on people: <code>Blocked (human decision)</code> from the governor, and <code>Blocked (needs human verify)</code> from external legs the browser can't drive alone (OAuth, real email delivery, payments). The second is the email rule hitting its own wall: the flow's decisive legs, real delivery and the real inbox click-through, live outside localhost reality (dev server, dev data, dev email adapter), and the loop verifies the branch, not production. A Blocked row there is the point; the alternative is a pass the browser never saw.</li>
+</ul>
+<p>One caveat, made once: this is the design contract, not a post-mortem. The skill orders the red run but does not archive it; the trail records that red was claimed, not a capture of it.</p>
+<p>The exit gate: before declaring the branch ready, run the whole automated suite. <strong>A green matrix with a red suite is not "ready."</strong></p>
+<p>Red blocks even when the red looks flaky; the gate is conservative by design. Ready, stated affirmatively: a green matrix, a green suite, a report carrying a commit and a test for every fix, and a "Decisions for a human" section that is empty or explicitly handed off. All of it is slower than a smoke test. That is the trade.</p>
+<h2>6. The persona strategy: seeded specialists, not standing agents</h2>
+<p>By the end of the fix loop, one head has done everything: mapped the flows, driven the browser, written the fixes, declared them fixed. The second kind of persona is architectural, and it is the plugin's answer to that concentration: the same pattern that powers every CE skill that fans out work, <strong>specialist prompt assets</strong>. The plugin ships zero standalone agents. When a skill needs a specialist (a reviewer lens, a research scout, a profiler), it keeps a persona file inside its own directory (<code>references/agents/</code>, <code>references/personas/</code>) and seeds a <em>generic</em> subagent with that file's contents at dispatch time.</p>
+<p>Why this shape instead of registered agents:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Choice</th>
+   <th>What it buys</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Persona lives in the skill's own directory</td>
+   <td>Skills stay self-contained; the converter can ship them to any harness as one unit</td>
+  </tr>
+  <tr>
+   <td>Generic subagent, seeded at dispatch</td>
+   <td>Each run reads the current persona from disk; no stale registration, no cache surprises (harnesses load registered agents once, at session start)</td>
+  </tr>
+  <tr>
+   <td>Model tier chosen by the caller, never the persona</td>
+   <td>Extraction work runs cheap, judgment work runs on the session model (the same top-tier model the user's session runs on); cost policy lives in one place</td>
+  </tr>
+  <tr>
+   <td>Structured output contract per dispatch</td>
+   <td>Findings merge mechanically: dedup, cross-reviewer promotion, confidence gates</td>
+  </tr>
+ </tbody>
+</table>
+<p>The deeper principle is <strong>independence budgeting</strong>. A finding is only as trustworthy as the independence of whoever confirmed it. So the code-review skill's reviewer stack (<code>ce-code-review</code>) treats sameness as a defect: the orchestrator's own quick read (the fast pass) is capped at low confidence and can never corroborate anything, because it shares the session model's blind spots, and an agent agreeing with itself is one vote, not two; two personas agreeing promotes a finding one confidence step; per-finding validators get fresh context and no stake in the original claim; and the adversarial pass can shell out to a different model family entirely. Dogfood spends the same budget at the product level, unevenly and on purpose. The browser's independence is physical; it cannot be talked into agreeing. The persona walk's is simulated; it is a second lens, not a second judge, the same mind re-reading its own run. Dogfood buys independence in its instruments, not in its judgments; for the judgments, it buys a trail someone else can check.</p>
+<h2>7. One loop, every altitude</h2>
+<p>Dogfood is the most visible verification loop because it drives a browser, but it is one rung on a ladder that the pipeline climbs for every feature:</p>
+<p>Each rung has the same grammar, claim plus independent proof, at a different altitude. The bottom two rungs are section 5's story; the others each add something new:</p>
+<ul>
+ <li><code>ce-work</code> refuses to call a unit complete without <strong>verification evidence</strong>, captured by whoever witnessed it: the red observed before a fix cannot be reconstructed from the diff afterward.</li>
+ <li><code>ce-code-review</code> refuses high confidence without a quoted line (<code>file:line</code>) that makes the finding true; survivors still face fresh-context validators.</li>
+ <li>Prose skills (the skills themselves are markdown) get behavioral evals: fresh subagents run the scenario against the current text, because a skill invoked in its authoring session tests the stale cached copy.</li>
+ <li><code>lfg</code>, the end-to-end ship pipeline, watches CI and repairs, but stops after three attempts and writes the residue into the PR body instead of looping forever.</li>
+ <li>And whatever no loop could close becomes a durable residual: a <code>Blocked (human decision)</code> row, a filed issue, a report section. The loop never closes silently on an open question; it closes by making the question impossible to lose.</li>
+</ul>
+<p>Autonomous verification is not agents being confident; it is agents being <strong>auditable</strong>, down to the commit SHA per scenario in a dogfood report. The loop is closed when the proof is durable, and a human can walk in at any point, read the trail, and take over exactly where their judgment is needed.</p>

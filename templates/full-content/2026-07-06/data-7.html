@@ -1,0 +1,45 @@
+<h2>StreamFusion</h2>
+<p>Run Apache Flink SQL faster by executing supported operators natively (Rust + Apache Arrow/DataFusion over JNI) while Flink continues to own planning, coordination, and everything not yet supported. Substitution is transparent and conservative: a query is planned by Flink, the operators we can reproduce <strong>exactly</strong> are swapped for native ones, and anything else falls back to Flink with identical results.</p>
+<p>It is DataFusion Comet's idea — a native, columnar accelerator behind an unchanged SQL front end — applied to streaming instead of batch: stateful windowing, joins, aggregations, changelog processing, and columnar sources/sinks, not just stateless projection and filter.</p>
+<h2>What it accelerates</h2>
+<p>A query accelerates only when it forms <strong>one fully-columnar island</strong>: every operator except a rowwise source/sink runs natively, exchanging Arrow batches (the row↔Arrow transpose is paid once at the host edges, never between native operators). A single unsupported interior operator drags the whole query back to Flink.</p>
+<p>Native coverage is broad — most of the streaming SQL surface:</p>
+<ul>
+ <li><strong>Stateless:</strong> projection/<code>Calc</code>, filter, <code>UNION ALL</code>, <code>GROUPING SETS</code>/<code>CUBE</code>/<code>ROLLUP</code>, <code>UNNEST</code>.</li>
+ <li><strong>Windowed aggregates:</strong> <code>TUMBLE</code>/<code>HOP</code>/<code>SESSION</code>/<code>CUMULATE</code> (event-time and proctime, one- and two-phase), and <code>OVER</code> window functions.</li>
+ <li><strong>Joins:</strong> regular (updating) equi-joins, event-time/proctime interval and window joins, event-time temporal-table joins, and processing-time lookup joins (sync and async).</li>
+ <li><strong>Changelog:</strong> non-windowed <code>GROUP BY</code>, streaming Top-N / <code>LIMIT</code>, deduplication, changelog normalization — all consuming and emitting a retract changelog.</li>
+ <li><strong>Connectors:</strong> Parquet/ORC file sources and a Parquet sink (native Arrow scan/write); Kafka source decode for JSON/CSV/raw/Avro/protobuf and Debezium/OGG CDC — JSON/Avro/protobuf via a fully native rdkafka source (the default path; it also regenerates the table's watermark per partition, exactly as Flink's source does).</li>
+ <li><strong>UDFs:</strong> a Flink <code>ScalarFunction</code> the expression engine can't implement itself is invoked over Arrow columns by a native→JVM upcall (Comet's <code>JvmScalarUdfExpr</code> pattern), one JNI crossing per batch, so the pipeline stays native <em>through</em> the UDF and the result is byte-identical.</li>
+</ul>
+<p><strong>Determinism.</strong> Results are byte-identical to stock Flink for everything admitted. The one caveat is late-data dropping on out-of-order event-time streams, where Flink is itself non-deterministic (periodic watermarks); we match Flink's deterministic path, which governs in-order data and every benchmark.</p>
+<h2>Inspiration</h2>
+<p>StreamFusion is built by porting established engines rather than reinventing operators:</p>
+<ul>
+ <li><strong>DataFusion Comet</strong> — the model for the whole project (native columnar accelerator behind an unchanged SQL planner) and the reference for the JNI / Arrow C Data Interface bridge, off-heap memory accounting, the config surface, and fallback-reason reporting.</li>
+ <li><strong>Arroyo</strong> — the streaming-operator implementations we port (it already runs on DataFusion); the reference for join/window/changelog logic.</li>
+ <li><strong>Apache DataFusion</strong> — the native execution and expression engine underneath (hash joins, aggregates, Arrow kernels).</li>
+ <li><strong>RisingWave</strong> — the reference for changelog semantics and memcomparable arrow-row state encoding.</li>
+ <li><strong>Apache Flink</strong> — the <strong>parity target</strong>: every operator is a faithful port of Flink's own, verified for identical output by a parity harness.</li>
+</ul>
+<h2>Running and configuration</h2>
+<p>Install acceleration by hooking the planner once (<code>NativePlanner.install(env)</code>), then run Flink SQL as normal. Two things to set in a real deployment:</p>
+<p><strong>Deployment JVM flags</strong> — run the TaskManager JVM with Arrow's safety checks off (as Comet/Spark do); profiling showed ~1/3 of the transpose CPU was per-accessor bounds/refcount checks:</p>
+<pre><code>-Darrow.enable_unsafe_memory_access=true -Darrow.enable_null_check_for_get=false</code></pre>
+<p><strong>Configuration</strong> (JVM system properties, mirroring Comet's config surface):</p>
+<ul>
+ <li><code>-Dstreamfusion.native.enabled=false</code> — master switch; run entirely on Flink.</li>
+ <li><code>-Dstreamfusion.operator.&lt;name&gt;.enabled=false</code> — keep one operator on the host (e.g. leave a lone cheap <code>filter</code> on a row source, which can't earn back the transpose round-trip).</li>
+ <li><code>-Dstreamfusion.expression.&lt;NAME&gt;.allowIncompatible=true</code> — opt into the faster pure-Rust path for expressions that otherwise use a byte-exact JVM upcall or fall back (<code>UPPER</code>/<code>LOWER</code>/ <code>REGEXP_EXTRACT</code>, <code>ROUND</code> on float, transcendental math). Off by default (parity-first).</li>
+ <li><code>-Dstreamfusion.memory.accounting.enabled</code> (default on) — native stateful operators reserve an operator-scope share of the slot's managed memory from Flink's <code>MemoryManager</code> and bound their state by it, failing with a <code>NativeMemoryLimitException</code> naming the remedy rather than an unattributed OOM.</li>
+</ul>
+<h2>Related work</h2>
+<p>Three native Flink accelerators exist, all <strong>closed source</strong>:</p>
+<ul>
+ <li><strong>Flash</strong> (Alibaba Cloud) — a C++ native + SIMD vectorized engine with a custom state backend (ForStDB). Stateful, production-deployed at scale; claims 5–10× on streaming Nexmark, 3×+ on batch TPC-DS, and ~50% cost reduction across 100k+ compute units.</li>
+ <li><strong>Vera X</strong> (Ververica, the original Flink creators) — a proprietary native vectorized engine with a drop-in compatibility layer and a new state store. Stateful; claims 5–10× on Nexmark SQL and ~52% lower resource usage.</li>
+ <li><strong>Iron Vector</strong> (Irontools) — the same stack as us (Rust + Arrow + DataFusion over zero-copy JNI, Substrait plan serialization, transparent fallback), but <strong>stateless only</strong> today (projections, filters, expressions); windows, joins, and exactly-once are described as planned.</li>
+</ul>
+<p>Where StreamFusion differs: it is <strong>open source</strong>, and every substitution is gated and verified for identical results against stock Flink by a parity harness rather than asserted. It is already native on stateful windowing, joins, and changelog processing — the hard, closed part of the field — where Iron Vector is stateless-only.</p>
+<h2>License</h2>
+<p>Licensed under the Apache License, Version 2.0.</p>
