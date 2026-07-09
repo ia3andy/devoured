@@ -1,0 +1,134 @@
+<h2>Eliminating Go bound checks with unsafe</h2>
+<p>Bound checks elimination (BCE) is probably one of the most robust, most productive optimization techniques in the Go world. This is my go-to technique, I think, when I'm starting to optimize any Go hot path. Why is it so robust? Because it reduces number of instructions and number of branches in a hot path. This alone is excellent because it reduces number of wasted cycles, but there are additional benefits on top of that. If your code already experiences cache capacity and/or conflict misses lowering number of instructions can help with those significantly. We are talking about L1 icache, the uop cache and, maybe, frontend branch prediction caches. Also register pressure, BCE can help with that too. While being so robust, bound checks are easy to detect and sometimes relatively easy to eliminate. Long story short, BCE is usually a quick win worth trying first. However sometimes it's not easy to eliminate bound checks with conventional methods and that's where the unsafe techniques enter and this is what this post is about.</p>
+<p>First, what are the Bound Checks? Go is a safe language and provides some guarantees, e.g. the guarantee that you can't access out-of-range slice elements. To do that the compiler adds a bunch of assembly code that makes sure the runtime panics when the out-of-range index is accessed. Let me quickly illustrate it by this tiny example:</p>
+<pre><code>func load(src []byte, i int) byte \{
+	return src[i]
+}
+</code></pre>
+<p>If I compile it with the <code>-B</code> flag which disables bound checks it produces this concise assembly:</p>
+<pre><code>0x71d   MOVQ AX, 0x8(SP)	
+0x722   MOVZX 0(AX)(DI*1), AX	
+0x726   RET
+</code></pre>
+<p>Assembly with the <code>-B</code> flag removed shows the overhead caused by bound checks:</p>
+<pre><code>+ 0x796   PUSHQ BP		
++ 0x797   MOVQ SP, BP		
+  0x79a   MOVQ AX, 0x10(SP)	
++ 0x79f   CMPQ DI, BX		
++ 0x7a2   JAE 0x7aa		
+  0x7a4   MOVZX 0(AX)(DI*1), AX	
++ 0x7a8   POPQ BP			
+  0x7a9   RET			
++ 0x7aa   CALL 0x7af		[1:5]R_CALL:runtime.panicBounds
++ 0x7af   NOPL
+</code></pre>
+<p>Of course this assembly diff is over-dramatic. The function is tiny and it was a leaf but enabling BC made it acquire a CALL which caused addition of the <code>PUSHQ/POPQ BP</code> and <code>MOVQ SP, BP</code>. Any function that gets a CALL stops being a leaf and gets those prologue instructions regardless of bound checks. But even ignoring that, my point is that there is still an overhead. But actually, you know what? As I think about it, it's not over-dramatic. If you have tiny function and BCE converts it to leaf which removes the CALL overhead then it's a legit BCE-related optimization.</p>
+<p>By the way, you don't really need to search assembly to find bound checks. The compiler can list all the bound checks with this command:</p>
+<pre><code>go build -gcflags="-d=ssa/check_bce/debug=1" .
+</code></pre>
+<p>Before we switch to using unsafe let's take a look at a conventional way of dealing with BC. Go compiler often can eliminate bound checks if you "prove" that they are unnecessary. You prove it by accessing the upper/lower bound first before looping over the rest of the range. Here is an example from a real codebase:</p>
+<pre><code> func matchLen(a, b []byte, limit int) int \{
++       a = a[:limit]
++       b = b[:len(a)]
+        i := 0
+-       for ; limit &gt;= 8; limit -= 8 \{
++       for ; i &lt;= len(a)-8; i += 8 \{
+                xor := loadU64(a[i:]) ^ loadU64(b[i:])
+                if xor != 0 \{
+                        return i + bits.TrailingZeros64(xor)/8
+                }
+-               i += 8
+        }
+
+-       for ; limit &gt; 0 &amp;&amp; a[i] == b[i]; limit-- \{
+-               i++
++       for ; i &lt; len(a) &amp;&amp; a[i] == b[i]; i++ \{
+        }
+
+        return i
+ }
+</code></pre>
+<p>Using <code>i &lt;= len(a)-8</code> in the loop condition makes the compiler eliminate the bound check as it now can provably determine that all <code>a</code> accesses are within the range. <code>b = b[:len(a)]</code> eliminates <code>b</code>-related bound checks in the loop.</p>
+<p>With every Go version compiler becomes smarter and smarter about the bound checks elimination. There are often good ways to hint to the compiler about BCE but sometimes it's not possible to eliminate BC with conventional methods and that's where unsafe enters.</p>
+<p>⚠️ Note that we are talking here about the cases where the compiler can't determine that a bound check is unnecessary but the programmer can. If you can't prove that a bound check is unnecessary then don't eliminate it, the compiler inserts it for a good reason. I think this is obvious but needed to note it just in case.</p>
+<p>Ok, let's eliminate some bound checks with unsafe now, shall we? I'll use the best example I could find in my brotli library. There is one ubiquitous function used in there that unavoidably brings BC with itself. <code>binary.LittleEndian.Uint32</code>:</p>
+<pre><code>// Uint32 returns the uint32 representation of b[0:4].
+func (littleEndian) Uint32(b []byte) uint32 \{
+	_ = b[3] // bounds check hint to compiler; see golang.org/issue/14808
+	return uint32(b[0]) | uint32(b[1])&lt;&lt;8 | uint32(b[2])&lt;&lt;16 | uint32(b[3])&lt;&lt;24
+}
+</code></pre>
+<p>This function reads 4 bytes in little endian order from a slice and is useful wherever you store data bit-packed in byte slices. You see in the code that it already tries to eliminate bound checks by giving the compiler a hint: <code>_ = b[3]</code> which keeps one bound check for <code>b[3]</code> but eliminates bound checks for indexes 0-2. However, one bound check is left and any unnecessary code is waste in a hot path. Here is an unsafe example that eliminates all the bound checks (which also converts the load function into a leaf and removes the <code>CALL</code> overhead):</p>
+<pre><code>//go:build !purego &amp;&amp; (amd64 || 386 || arm64 || loong64 || ppc64le || wasm)
+
+package encoder
+
+import "unsafe"
+
+func loadU32LE(b []byte, i uint) uint32 \{
+        //       (4)         (3)          (2)             (1)
+	return *(*uint32)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(b)), i))
+}
+</code></pre>
+<p>Let's note that function signature has changed. You would call the stdlib variant like this: <code>binary.LittleEndian.Uint32(data[offset:])</code>. And the unsafe variant like this: <code>loadU32LE(data, offset)</code>. This is important because if you'd keep <code>(data[offset:])</code> you'd still have one bound check on the caller side which would make sure <code>data[offset]</code> is in bounds. Also note the <code>go:build</code> instruction. This trick works only on machines that put data into memory in little endian order in the first place. None of this is novel, by the way. Perf-critical libraries like klauspost/compress rely on the very same unsafe little-endian loads; it's just a niche technique that isn't widely known.</p>
+<p>Let's go through the example:</p>
+<ul>
+ <li><code>unsafe.SliceData(b)</code> returns exactly the same result as what <code>&amp;b[0]</code> would return - a pointer to the first element of the slice. If we used <code>b[0]</code> we'd introduce a bound check which we are trying to eliminate. The nice part of unsafe.SliceData is that, unlike <code>&amp;b[0]</code>, you can use it on empty slices.</li>
+ <li><code>unsafe.Pointer</code> converts <code>*byte</code> returned by <code>unsafe.SliceData</code> into <code>unsafe.Pointer</code> type needed for <code>unsafe.Add</code>.</li>
+ <li><code>unsafe.Add(ptr, i)</code> returns unsafe.Pointer representation of <code>&amp;b[i]</code>,</li>
+ <li>which is cast to <code>*uint32</code> and dereferenced in the end.</li>
+</ul>
+<p>You might say that I have introduced 3 function calls to eliminate a single bound check, but if we check the assembly we can see that the Go compiler eliminates all the bound checks and inlines all the calls:</p>
+<pre><code>MOVQ AX, 0x8(SP)	
+MOVL 0(AX)(DI*1), AX	
+RET
+</code></pre>
+<p>So what is the performance difference between stdlib LE loader and hand-rolled unsafe one? Let's benchmark it.</p>
+<pre><code>package bce
+
+import (
+	"encoding/binary"
+	"testing"
+	"unsafe"
+)
+
+func loadU32LE(b []byte, i uint) uint32 \{
+	return *(*uint32)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(b)), i))
+}
+
+var sink uint32
+
+func BenchmarkLoadU32LE(b *testing.B) \{
+	data := make([]byte, 4096)
+	b.SetBytes(int64(len(data)))
+	for b.Loop() \{
+ var acc uint32
+		for i := uint(0); i+4 &lt;= uint(len(data)); i += 4 \{ acc += loadU32LE(data, i) }
+		sink = acc
+	}
+}
+
+func BenchmarkStdUint32(b *testing.B) \{
+	data := make([]byte, 4096)
+	b.SetBytes(int64(len(data)))
+	for b.Loop() \{
+ var acc uint32
+		for i := 0; i+4 &lt;= len(data); i += 4 \{ acc += binary.LittleEndian.Uint32(data[i:]) }
+		sink = acc
+	}
+}
+</code></pre>
+<pre><code>goos: linux
+goarch: amd64
+pkg: bcetest
+cpu: 12th Gen Intel(R) Core(TM) i5-12500
+BenchmarkLoadU32LE   22644585   273.7 ns/op   14966.04 MB/s
+BenchmarkStdUint32    9922156   600.7 ns/op    6818.58 MB/s
+</code></pre>
+<p>The unsafe version is more than 2x faster. You might say that you can't really trust microbenchmarks, the situation is completely different when you surround the benchmarked code with a real codebase. Alright, fair enough. Here are the benchmarks of a real-world compression matchfinder doing real-world work on a production-like workload before and after replacing the stdlib LE loaders with unsafe ones:</p>
+<pre><code>pkg: github.com/andybalholm/brotli/matchfinder
+     │  before.txt  │              after.txt               │
+     │     B/s      │     B/s       vs base                │
+Trio   90.39Mi ± 0%   99.99Mi ± 0%  +10.62% (p=0.000 n=30)
+</code></pre>
+<p>The obvious downside: it's unsafe, d'oh. All the validations the compiler inserted for you now have to be proved by the programmer to be truly unnecessary. As I already complained I wish Go had the <code>nobounds</code> compiler hint but it doesn't, so the only viable option we are left with is using unsafe pointer arithmetic.</p>
