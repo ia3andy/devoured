@@ -1,0 +1,99 @@
+<p><em>This is the first in an ongoing ad-hoc series of posts on Apache Kafka performance. I have no general direction, I’ll just share interesting insights based on the performance testing I do on Apache Kafka.</em></p>
+<p>Recently I was curious to see if there was any general performance improvement since Kafka 3.X. So I ran a suite of benchmarks against 3.7.2 and 4.3.0. I saw two common patterns:</p>
+<p><strong>Pattern 1: </strong>Low load benchmarks showed that end-to-end latency was higher with Kafka 4.3 compared to 3.7.2. The following is a 45 minute no-record-key workload of 5000 record/s, 20 topics (120 partitions), fan-out 2 (240 consumers), full TLS, on 3 brokers each allocated 8 SMT CPUs in k8s (on my Threadripper 9980X).</p>
+<p><strong>Pattern 2: </strong>On more stressful loads, 3.7.2 would show much more spiky end-to-end latency compared to 4.3. The following is for the same workload at 100K records/s (200K out).</p>
+<p>It seemed that somewhere between 3.7.2 and now, big performance gains had occurred. Then my subconscious kicked in and reminded me that at some point in that period, the default <code>linger.ms</code> had been changed from 0 to 5 ms. This would correlate with the low-load end-to-end latency result.</p>
+<h2>Doing the math on linger.ms</h2>
+<p>The <code>linger.ms</code> producer config controls how long the producer is willing to wait before sending a non-full batch (controlled by <code>batch.size</code>). If a batch reaches <code>batch.size</code> first, it can be sent earlier. The point of <code>linger.ms</code> is simple: give more records a chance to accumulate into the same batch, because larger batches are more efficient than many tiny batches.</p>
+<p>The important quantity is the rate “per producer, per partition” (rather than the aggregate rate). Kafka producers build batches per partition, so a producer sending 1,000 records/s to one partition has very different batching behavior from a producer sending 1,000 records/s evenly across 100 partitions.</p>
+<p>A rough way to reason about it is:</p>
+<p><code>expected records per batch ≈ 1 (first record) + linger_seconds × records_per_second_per_producer_per_partition</code></p>
+<p>For example, <code>linger.ms=50</code> with a per-producer-per-partition rate of 100, we might expect 6 records per batch.</p>
+<p>This is only an approximation as it ignores arrival jitter, partition skew, batch.size config (default 16KB), compression, in-flight request limits, and broker backpressure. But it is good enough to build intuition.</p>
+<h3>The math and the 5K workload</h3>
+<p>In the 5K records/s workload, each producer was sending about 41 records/s:</p>
+<p><code>5000 records/s / 120 producers = ~41 records/s per producer</code></p>
+<p>That is one record every:</p>
+<p><code>1000 ms / 41 = ~24 ms</code></p>
+<p>This was also a no-record-key workload. With the default partitioning behavior, records from a producer tend to stick to one partition for a while before moving to another sticky partition. So, for batching purposes, the producer was usually sending roughly one record every 24 ms to its current sticky partition.</p>
+<p>That makes <code>linger.ms=5</code> unlikely to help. A 5 ms linger is much shorter than the ~24 ms average gap between records, so most batches still contain a single record. To reliably get more than one record into a batch, the linger would need to be on the order of the inter-arrival time (tens of milliseconds), not 5 ms.</p>
+<p>So the low-load result made sense: Kafka 4.3’s default <code>linger.ms=5</code> added a little extra waiting causing a higher end-to-end latency, but did not create meaningfully larger batches and its load was so low that larger batching wouldn't have helped anyway.</p>
+<h3>The math and the 100K workload</h3>
+<p>The 100K records/s workload was different. There, each producer was sending about 833 records/s:</p>
+<p><code>100000 records/s / 120 producers = ~833 records/s per producer</code></p>
+<p>That is one record every:</p>
+<p><code>1000 ms / 833 = ~1.2 ms</code></p>
+<p>At that rate, <code>linger.ms=5</code> can make a real difference. A producer has time to collect several records before sending a batch. In this workload, I saw the average batch size reach about 5 KB, or roughly five 1 KB records per batch.</p>
+<p>That reduced the number of small produce batches the cluster had to process. It also improved downstream efficiency for the brokers and consumers. The result was a large reduction in tail latency:</p>
+<ul>
+ <li>the 3.7.2 run, with the old default <code>linger.ms=0</code>, had periodic p99.9 spikes around 700 ms,</li>
+ <li>while the 4.3.0 run, with the new default <code>linger.ms=5</code>, had a much lower and more stable p99.9 around 8 ms.</li>
+</ul>
+<p>So the benchmark was not necessarily showing a deep Kafka 3.7.2 versus 4.3.0 performance difference. A large part of the effect could be explained by one client-side default changing: linger.ms moved from 0 to 5 ms in Kafka 4.0.</p>
+<h2>Running a linger.ms experiment on 3.7.2 and 4.3.0</h2>
+<p>I decided to run a similar benchmark again, explicitly setting linger rather than using defaults. This time I used half the producers (better for batching) but with record keys (much worse for batching).</p>
+<p>I ran Dimster on Kafka 3.7.2 (broker and clients) and 4.3.0 (broker and clients), with six test points across two scenarios:</p>
+<pre><code>runConfig:
+  testDurationMinutes: 60
+  warmupDurationMinutes: 5
+
+baseWorkload:
+  topics: 20
+  partitionsPerTopic: 6
+  messageSize: 1000
+  producersPerTopic: 3
+  messageDistributor: "KEY_ROUND_ROBIN"
+  consumerGroupsPerTopic: 2
+  consumersPerGroup: 6
+  consumerType: CONSUMER_GROUP
+  kafkaConfig:
+    replicationFactor: 3
+    topicConfig:
+      min.insync.replicas: 2
+    producerConfig:
+      acks: all
+      enable.idempotence: true
+    classicConsumerConfig:
+      auto.offset.reset: earliest
+      enable.auto.commit: false
+      dimster.commit.mode: CommitAsync
+
+scenarios:
+  - name: 5K/s
+    label: ["linger-0", "linger-5", "linger-20"]
+    producerRate: 5000
+    runConfig:
+      warmupDurationMinutes: 5
+    kafkaConfig:
+      producerConfig:
+        linger.ms: [0, 5, 20]
+
+  - name: 100K/s
+    label: ["linger-0", "linger-5", "linger-20"]
+    producerRate: 100000
+    runConfig:
+      warmupDurationMinutes: 30
+    kafkaConfig:
+      producerConfig:
+        linger.ms: [0, 5, 20]
+</code></pre>
+<h3>The 5K scenario</h3>
+<p>If we look purely at the batching behavior, none of the linger values helped in the 5K records/s tests as the per-producer rate coupled with record keys meant that linger was ineffective at creating larger batches due to the low per-producer-per-partition rate. The chart below shows Kafka 4.3.0 over the three test points with linger of 0, 5 and 20. Only a linger of 20 slightly moved the needle.</p>
+<p>The exact same pattern occurred with 3.7.2.</p>
+<p>This workload did not need larger batches: the latency distribution for linger.ms=0 was already good. There was no difference in performance between 3.7.2 and 4.3.0.</p>
+<h3>The 100K scenario</h3>
+<p>The place where linger mattered was the 100K records/s keyed test. In that workload, <code>linger.ms=20</code> showed a massive improvement over a linger of 0 and 5.</p>
+<p><code>linger.ms=5</code> did not help much at all and we can understand why by doing the math:</p>
+<p><code>100000 / 60 producers = 1666 records/s per producer.</code></p>
+<p>Due to record keys, <code>1666 / 6 partitions = 277 records/s per partition, per producer</code></p>
+<p><code>Send interval per partition = 1000 / 277 = 3.6 ms</code></p>
+<p>A simple estimate would predict about two records per batch at <code>linger.ms=5</code> and about six at <code>linger.ms=20</code>, which lines up with the observed producer batch-size metrics.</p>
+<p>The batching improvement with <code>linger.ms=20</code> was reflected in the end-to-end latencies, with p99.9 of only 23 ms, compared to over 700 ms for a linger of <code>linger.ms=5</code>.</p>
+<p>Noteworthy is that the results for 3.7.2 and 4.3.0 with <code>linger.ms=20</code> were essentially identical. 4.3.0 pulled ahead in the lower lingers, but there is often huge variance in the higher latencies, so from one run, this is inconclusive.</p>
+<h2>Recommendations</h2>
+<p>Don’t over-index on this one set of benchmarks. No benchmark is fully generalizable, and the right <code>linger.ms</code> value depends heavily on the workload. The main takeaway is simply this: pay attention to producer batch sizes.</p>
+<p>When producers are sending batches with only one record, Kafka can hit performance limits much sooner than you might expect. The broker has to process more produce requests, more record batches, more replication work, and more fetch-side batch metadata for the same logical throughput. A small amount of batching can make a large difference.</p>
+<p>The most important number to understand, with regard to likely batch sizes, is the per-producer-per-partition send rate. Total cluster throughput can be misleading. A workload doing 100K records/s may still produce tiny batches if each producer is spreading records across many partitions. Keyed workloads are especially prone to this, because the key determines the destination partition. If each producer writes to many keyed partitions, the effective rate into each producer-partition pair may be low.</p>
+<p>Under enough load, Kafka producers will often start batching more even with a low <code>linger.ms</code>, simply because the sender thread cannot drain records immediately. Broker latency, network saturation, throttling, or in-flight request limits can all cause records to accumulate in the producer. But relying on backpressure to create batching is not ideal. In some workloads, setting a higher <code>linger.ms</code> lets you get the batching benefit before the system is already under stress.</p>
+<p>The default <code>linger.ms</code> changed from 0 to 5 in Apache Kafka 4.0. That means some Kafka 4.x client upgrades may show performance improvements simply because the producer is now batching more by default. Conversely, if you are using Kafka 3.x clients, explicitly testing <code>linger.ms=5</code> is a low-risk experiment.</p>
+<p>As for Kafka 3.7.2 versus 4.3.0, anecdotally, I’ve seen improvements in Kafka 4.x, and I may do more benchmarking to isolate those changes.</p>

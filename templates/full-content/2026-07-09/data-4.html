@@ -1,0 +1,70 @@
+<h2>Where AI Agents Belong in Data Engineering: The Correctness Layer</h2>
+<p>With ever-changing models, new and better ones coming out every few months, it’s great if we don’t have to rely on them too heavily. The better your tooling, the less dependent you become on any single model. That’s also why the deterministic harness matters: a correctness layer that lets you reproduce outputs and trace lineage regardless of which model you’re running underneath. This is especially true during maintenance or extending the project, where verification is the real job.</p>
+<p>The danger isn’t only a crash or an error message, but a wrong number that didn’t break. It might be a clean query, but it introduces duplicated rows.</p>
+<p>In this article, we go through the three levels of AI agents in data engineering, how to structure projects so the AI delivers its best outcomes, and how dedicated agents with a deterministic core help us build higher-quality pipelines — ones we can actually trust. And we look at a practical example of how it works with a blast radius analysis.</p>
+<h2>The Three Levels of AI Agents in Data Engineering</h2>
+<p>Why should we use agents for data engineering? And at what levels can agents help us productively? As LLMs will always have some error tolerance, as humans do too, we need a way to be more confident in producing the code.</p>
+<h3>Chat-phase, Autonomous and Dedicated Tooling</h3>
+<p>There are different levels of confidence and levels on which the agents can help us.</p>
+<ol>
+ <li>The initial <strong>chat-phase</strong>: the development where we prompt Claude or ChatGPT. The model tries to understand the context based on what it has access to. It takes a decent amount of tokens, as it needs to scan everything from scratch.</li>
+ <li>The <strong>autonomous approach</strong>, where Claude Code or Codex also have access to the tools humans have, mostly the CLI on the terminal, making it possible to query Postgres with psql or read from S3 or Parquet with DuckDB to verify queries and data. A much higher quality outcome.</li>
+ <li><strong>Dedicated agents</strong> for the task at hand. E.g., for data, the tools know dbt or know how to transpile SQL code deterministically, meaning not from training data only, but with an actual tool that does it much faster and more reliably. Built-in checks and features a “general” agent can’t provide.</li>
+</ol>
+<h3>Where in the DE Lifecycle Each Level Actually Helps</h3>
+<p>BI Dashboards vs. Plumbing the Data Pipelines, or Creating Source Ingestions, or Maintaining? For data engineering, the question is not only if there is dedicated agent tooling, but also on what part of the data engineering lifecycle AI agents can help data engineers and analysts the most, and potentially even domain experts?</p>
+<p>The lifecycle contains the ingestion part, ETL, or understanding the business in great detail, or is it just to visualize the result? Or should it cover maintenance in case of overnight ETL errors, or the full data lifecycle?</p>
+<p>In general, before we go into more details later, agents can help us on the full cycle, but it always depends on who you are and what role you play. Building from scratch with <strong>no knowledge</strong> or <strong>seniority</strong> is dangerous. Why? Because they can’t verify if the produced code is correct. Okay for a side project or a proof of concept, but not for actual production.</p>
+<h3>What’s the Engineering Discipline for Working with AI?</h3>
+<p>There’s also a part that is less technical, a way of guiding the agents in the right direction. Especially if we want to safely use it in large projects or organizations, we can’t just let it run without guidance.</p>
+<p>For that we need:</p>
+<ol>
+ <li>clear <strong>project structure</strong> in which the agents can flourish. The more is given, the fewer tokens are used for this work, and it will be more aligned across the project. (Another reason a deterministic workflow such as <code>uv init</code> is best, because it will always be the same).</li>
+ <li>build with clear <strong>instructions</strong> on how the tools are used (basically providing CLIs and API documentation). This is the bulk of the work anyway. That’s the data architecture, the brainstorming with fellow humans before you build something, instead of missing a key insight in the beginning and then letting the agent run down the wrong path. Also, be realistic: prompting “be correct” or “use state-of-the-art” won’t make it more correct or more state-of-the-art than the model was trained on. So if it’s a rather new architecture, it’s a must that you provide these links and hints.</li>
+ <li><strong>set up</strong> the project in a modular fashion, so the agents cannot break the whole project if they make a small change, so you don’t end up in a scenario like dependency hell with everything dependent on each other.</li>
+ <li>use a <strong>declarative approach</strong>, with descriptive configuration that says the what and not the how, so that you can <strong>collaborate</strong> on these configs with the agents, version them, and easily revert or change something, as well as decouple the implementation logic from the actual business logic.</li>
+</ol>
+<p>With these steps, you can get the best out of the agents of today. I’d say the model matters less, but the structure does, and as Mario says, so does the workflow approach. For example, extensively plan (the process before writing a single line) and correct the model before any implementation that could lead down the wrong path is written.</p>
+<p>Also, don’t overthink it. But this is only the workflow and learning the <strong>soft skills and discipline of working with agents</strong>. How does that look in a real-world project?</p>
+<blockquote>
+ The key is to get use out of AI, not to get more work.
+</blockquote>
+<p>E.g., most developers used to think about the problem. Today, most drown in PRs. When the AI tooling gets better, AI can provide more quality code that is correct, that needs less review or fewer iterations, which means fewer PRs and less work for the developers to go through.</p>
+<h2>The Correctness Layer for Data Engineers</h2>
+<p>A key insight is that AI agents should support the “human in the loop” for <strong>correctness</strong>, or a correctness layer. And rather than making more work to verify more code, we should be confident in the process and know that the code it produces is verified and ultimately correct.</p>
+<p>But how do we get more “correct” work and a layer in which we can verify it? The biggest argument is a deterministic-validation architecture in full. E.g., Altimate Code splits the agent into a probabilistic layer on top and a deterministic Rust/TS layer underneath that does the actual SQL ops such as parsing, validating, and equivalence checks, so that the agent itself never has to be trusted on those questions.</p>
+<p>Altimate Code, for example, is built on a probabilistic agent, deterministic harness, and deterministic core. The <strong>probabilistic agent</strong> with the LLM does the creative work of reading intent, picking a strategy, drafting SQL, summarizing results, and recovering when something goes wrong.</p>
+<p>Below the boundary sits the <strong>deterministic harness</strong>, a TypeScript layer that intercepts every tool call: a dispatcher checks <code>hasNativeHandler</code> before the call runs, and routes it either to a native, deterministic handler or back to the model. Those handlers don’t reimplement logic themselves, they call into the <strong>deterministic core</strong>, a Rust engine (<code>altimate-core</code>) that exposes SQL operations as pure functions over ASTs and schemas, wired in via napi-rs bindings. Parsing, validating, transpiling, checking query equivalence, diffing schemas, extracting column lineage, diffing rows across warehouses — all of it runs sub-millisecond, and all of it returns the same answer on the same input, every time.</p>
+<p>Like a compiler, the agent never <em>decides</em> whether two queries are equivalent or a column exists upstream. Instead, it calls a function that proves it against the parsed AST and the schema, the same way a type-checker proves a program compiles rather than guessing.</p>
+<p>That’s the distinction that makes the output easier to review, as factual checks have been run and the output is either correct, or there’s a bug that it can fix directly. The rest a human can re-verify.</p>
+<blockquote>
+ There’s another factor, being wrong.
+</blockquote>
+<p>Bare agent use might be cheap, but only until they’re wrong, and then the cost is unbounded.</p>
+<h3>Improvements for Better Usage of Tokens</h3>
+<p>Altimate, or data engineering agents that have deterministic functions and integrated understanding of how to work, can help you save tokens and be token lean. Because in large enterprises, token costs are a real budget point.</p>
+<p>To slow down the tokens, an easy trick is to instruct the model to use fewer tokens and words itself. There’s a second, less obvious cost: the token itself isn’t a stable unit.</p>
+<p>Altimate makes the case that “cost-per-token is the wrong number to optimize”, since the meter itself can move with a vendor’s next model update, and what we should track instead is <strong>cost-per-task</strong>. I fully agree, and this is where deterministic function calls work around that volatility by not using a model/tokens for every task, making it less expensive.</p>
+<h2>Typical Use Cases</h2>
+<p>In this chapter we go through typical AI agent use cases for data engineering. There are many of them. You can use them to educate yourself or your team, build production data pipelines, build data apps, and visualize your data in new innovative ways. But in general, the use cases fit into these approaches:</p>
+<ol>
+ <li><strong>Start a new project from scratch example</strong>: Building a data landscape with more open source.</li>
+ <li><strong>Extending an existing project or data warehouse</strong>: Adding new data pipelines.</li>
+ <li><strong>Maintaining current setup</strong>: Update and verify it still works when changes come in.</li>
+ <li><strong>Migration</strong>: Migrate from one database or tooling to the next.</li>
+ <li><strong>Finding the Blind Spots</strong>: Two similar-sounding IDs might be wrongly used for a join, or missing data in a column that got missed in a nightly load, or anything in between. If agents can do these checks, that would be super beneficial. With more access to CLI, Model Context Layer, and deterministic tooling, these things are truly possible.</li>
+</ol>
+<h3>Showcases: Blast-Radius Example</h3>
+<p>A Blast-radius refers to the <strong>potential extent of damage</strong>. For example, before you knock down a wall in your house, you want to know if there’s plumbing behind it, electrical wiring within it, or if it’s holding up the floor above.</p>
+<p>The same is true for a data warehouse or a data project with lots of ETL. For example, if a data engineer cleans up the table <code>fct_orders</code> by joining <code>orders</code> to <code>order_items</code> and summing <code>order_total</code>. It compiles, the dbt tests pass, nothing errors. But the join changes the grain, so any order with several line items now gets counted once per item, and revenue quietly inflates.</p>
+<p>It’s best to know, before you <strong>rename a column</strong> or add a new join, the downstream (data that comes after the current task) dependencies to the dashboard — that’s what the blast-radius report does.</p>
+<p>With Altimate Code we can achieve this. Before any change goes through, it maps out the full impact automatically and produces a detailed blast-radius report with what will break, what’s safe, what needs someone to sign off, and also performs the changes.</p>
+<blockquote>
+ Connect a model to Altimate.
+</blockquote>
+<p>Make sure to connect to a model with <code>/connect</code> and choose an existing subscription with API credits, or any other subscription.</p>
+<h2>Correctness Over Confidence</h2>
+<p>I hope you got a better understanding of why AI agents can be genuinely useful, especially when provided with the right tools and applied with the right discipline.</p>
+<p>You’ve also seen how deterministic tooling, purpose-built for data engineering and analytics problems, gets you both better correctness and better token economics than general-purpose agents alone.</p>
+<p>Coming back to where we started: not every task needs a level-three agent. A quick chat-phase agent is fine for exploring a dataset or drafting a query you’ll review yourself. But the moment that output touches production or serious work, a dashboard, a nightly job, a number someone makes a decision on, you want the deterministic core underneath it, not just a model that sounds confident.</p>
+<p>That’s the gap Altimate Code is built to close. It runs on deterministic functions purpose-built for DE workloads, it’s open-source via the OpenCode TUI, and for teams wanting more, there’s Altimate Studio — a paid, multi-agent platform with extras like warehouse cost optimization, dbt development acceleration, and migration tooling.</p>

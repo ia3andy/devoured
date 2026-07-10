@@ -1,0 +1,75 @@
+<p>Semantic search plays a critical role in HubSpot operations and powers a wide variety of use cases, from agents and RAG (Retrieval Augmented Generation) to contact deduplication. Starting from the POC a few years back, it has grown to a scale of tens of billions of vectors, utilized by 38+ teams. With the growth of agent usage, semantic search capabilities have become even more important to ensure agents can quickly retrieve the information they need while maintaining retrieval quality. This article describes the journey of vector DB infrastructure, from a small POC to the tens of billions of entries powering hundreds of use cases across HubSpot.</p>
+<h2>What is VaaS?</h2>
+<p>VaaS (Vector as a Service) is HubSpot's centralized vector storage and search platform built on top of a vector database. It provides an API layer and features such as:</p>
+<ul>
+ <li>Access control</li>
+ <li>Embeddings generation based on the collection setup</li>
+ <li>Data versioning</li>
+ <li>Feedback collection</li>
+</ul>
+<p>It sits in front of the vectors database, in our case Qdrant, and is directly exposed to the consumers. It handles access control, basic validation, embeddings generation and then proxies requests to Qdrant. For read operations, requests are handled synchronously, whereas for write operations the flow is asynchronous with minimal consumer lag.</p>
+<h2>Why Qdrant?</h2>
+<p>HubSpot uses the Qdrant vector database for all semantic search operations. Qdrant is an open-source vector database that can be deployed on-premises and provides an extensive API covering most modern semantic search features, such as named vectors, hybrid search, multi-stage querying, and weighted reranking. It uses HNSW (Hierarchical Navigable Small World) as an ANN (Approximate Nearest Neighbor) algorithm, which provides very low latency at the trade-off of higher memory consumption.</p>
+<p>Qdrant also supports an extensive set of cost-efficiency optimizations, such as quantization, on-disk storage options for payloads and vectors, and configurable precision. This allows us to tune the setup to find a balance between providing the required level of retrieval quality and associated costs.</p>
+<h2>Why we need to run Qdrant in-house</h2>
+<p>HubSpot has a lot of expertise in running self-managed open-source database systems in-house, and over the years our infrastructure team has built numerous solutions, rules, and best practices that we want to take advantage of. Having such an extensive infrastructure layer lets us seamlessly integrate with and benefit from all of HubSpot’s internal tooling, including tracing, cost tracking, rate limiting, and scaling. Running Qdrant in-house enables us to easily fine-tune the infrastructure to our needs and control costs by utilizing our corporate AWS rates. Finally, running in-house gives us full control over customer data and infrastructure, and ensures all of HubSpot’s extensive security best practices are applied to this data store.</p>
+<h2>Current scale</h2>
+<p>The VaaS (Vector-as-a-Service) platform is currently used by <strong>38+ teams</strong> and has more than <strong>200 indexes</strong> that run on a fleet of <strong>140+ clusters</strong> across <strong>5 regions</strong> and <strong>2 environments.</strong> We isolate clusters by product teams to minimize the blast radius from failures affecting the entire platform. Collectively, the underlying vector database stores <strong>20+ billion</strong> vectors across different regions, with the largest index holding 9.5 billion vectors and an average index size of 95 million vectors.</p>
+<p>The platform handles 5,000+ RPS for writes, with spikes up to 100,000 RPS, and serves 1,000+ RPS for reads across all regions. The traffic can also be spiky, specifically in cases when large backfills run in parallel with the live traffic; therefore, the underlying infrastructure should be scalable and reliable to provide the best customer experience while supporting engineering use cases.</p>
+<h2>The Early Proof of Concept</h2>
+<p>Back in 2023, semantic search had just started to take off, and the internal POC was set up to run Qdrant alongside the required pipelines and an API layer on top of it. There was a limited number of consumers and a dozen Qdrant clusters that were relatively easy to operate. As a first solution, Helm was utilized to define per-cluster/environment setup and parameters such as number of replicas, disk space, RAM, CPU, etc., were adjusted manually. The cluster definition and related cluster artifacts (Kafka topics, workers, etc.) were defined in code and created manually. For a small fleet of clusters, it was a great solution that allowed us to iterate fast, utilize overprovisioning to handle traffic spikes, and keep the setup simple. All the clusters were defined as StatefulSets and shared the same namespace. At that time, Qdrant was already handling 2+ billion vectors across ~10 indexes.</p>
+<h2>Scaling Up the Infrastructure</h2>
+<p>With more and more features relying on semantic search, and VaaS being at the core of multiple AI capabilities, powering functionalities from RAG (Retrieval Augmented Generation) to agentic experiences, it became clear that it was time to transition from the POC to full production scale to address the growing demand.</p>
+<p>Alongside the rapid growth in demand for semantic search, our setup started to evolve in terms of complexity, with additional artifacts required for each cluster and a growing need for quick, consistent cluster setup. Helm is a powerful tool, but it’s purely a templating and deployment tool that cannot:</p>
+<ul>
+ <li>Make API calls</li>
+ <li>Auto-scale based on external metrics</li>
+ <li>Run custom logic for complex state-aware lifecycle management</li>
+</ul>
+<p>As a result, the decision was made to migrate from Helm to a Kubernetes Operator pattern to ensure reliability and scalability while reducing operational load on the team by automating standard operating procedures.</p>
+<h3>Onboarding to Kube-operators framework</h3>
+<p>HubSpot has an internal framework called `Kube-operators` that implements the pattern. The main idea is to automate the lifecycle management of systems running on K8s by using operators to track and maintain the system’s defined state. It provides a robust toolkit for building operators designed to meet the needs of HubSpot and our infrastructure teams. It also enables seamless integration with multiple HubSpot infrastructure tools, which makes it possible to use them in the Kubernetes Operator’s logic.</p>
+<p>Running Qdrant on Kube-operators allows us to instantiate and decommission clusters together with all related artifacts and subsystems. It also automates multiple workflows to reduce operational load on the team.</p>
+<p>The main components in the setup are Translator artifacts. Translators watch assigned CR, running in a loop, re-evaluating the state every 60s, applying the required updates, and ensuring that underlying resources are in sync with the defined state. This is an extensible architecture that allows adding/removing translators and therefore onboarding more features to the system. In addition, the translator contains all the logic required for rendering underlying artifacts; therefore, it can be extended with required automation.</p>
+<p>Our current setup has 3 translators:</p>
+<ul>
+ <li><strong>Cluster translator:</strong> responsible for instantiating the individual namespaces for clusters and downstream artifacts.</li>
+ <li><strong>Qdrant nodeset translator:</strong> responsible for instantiating Qdrant clusters. It instantiates all required K8s artifacts with the specified number of pods, memory, disk storage, parameters, etc.</li>
+ <li><strong>Indexer nodeset translator:</strong> indexers are the workers that handle incoming write traffic and index it into Qdrant. There are multiple indexers per cluster handling different traffic priorities, etc. This translator is primarily responsible for instantiating the required indexers and creating necessary Kafka topics.</li>
+</ul>
+<p>Migrating from the Helm setup, we also updated the K8s namespace strategy and moved towards a namespace-per-cluster approach instead of using a single namespace. This provides the following benefits:</p>
+<ul>
+ <li><strong>Isolation:</strong> provides higher reliability, since issues such as misconfigurations have a reduced blast radius.</li>
+ <li><strong>Namespace-specific configuration</strong>: we can set up namespace-specific resources, limits, etc.</li>
+ <li><strong>Simplified cost tracking:</strong> tracking costs per namespace is much easier, which is important for current scale.</li>
+</ul>
+<h3>Dynamic cluster definition</h3>
+<p>Together with onboarding to Kube-operators, we redefined the contract between VaaS (API layer + data pipelines) and the underlying infrastructure to ensure Qdrant clusters are self-discoverable and do not require any additional code changes when a new cluster is created. The important part is that cluster metadata is required for each search/ingest/delete request; therefore, cluster lookup should have minimal effect on end-to-end latency. As a solution, we decided to abstract cluster metadata into a K8s CRD (Custom Resource Definition) to ensure the latency overhead is minimal.</p>
+<h2>Automated Cluster Maintenance (Operations &amp; Scaling)</h2>
+<p>Before Kube-operators, cluster maintenance was very difficult. Open-source Qdrant does not support a lot of automated maintenance operations out of the box that other distributed data stores do. Qdrant provides APIs that serve as building blocks to perform actions like shard transfers, but leave it up to the user to implement the full workflow. In practice, this means that horizontal scaling can be very difficult or error-prone. To scale down a cluster horizontally prior to Kube-operators, we needed to:</p>
+<ol>
+ <li>Run an on-demand job to transfer shards off evicted peers and remove peers from consensus.</li>
+ <li>Update cluster Helm chart to lower pod count.</li>
+ <li>Apply the Helm chart.</li>
+ <li>Delete the PVCs for the removed pods.</li>
+</ol>
+<p>With Kube-operators, we baked all of the above into our Translator. All we have to do is update the number of replicas in the cluster config; the watching Translator daemon will reconcile, detect that the replica count has been lowered, and automatically run the eviction process - consolidating 4 operations into 1.</p>
+<h3>Safe eviction of shards from Peers</h3>
+<p>To scale down a cluster, we needed to transfer every shard off the pods being removed before we could safely remove them from consensus. The eviction process rejects the eviction upfront if the remaining pod count can't satisfy the replication factor, and validates that every shard on the evicted pods has a valid destination before issuing a single transfer.</p>
+<h3>Automated shard distribution balancing</h3>
+<p>Some of the clusters in our fleet host collections with billions of points. For performance reasons, we have to utilize custom user-defined sharding. With custom sharding, requests only need to hit a subset of shards defined by a shard key, whereas with auto sharding, requests need to fan out to every single shard. However, using custom sharding may result in shards that are unevenly distributed across the cluster. We designed an algorithm to greedily balance shards - by shard count and by point count - and baked detection of uneven distribution into our Kube-operators translators.</p>
+<h3>Recovering replication factor for shards</h3>
+<p>In production systems, we want a replication factor of 3 to tolerate AZ failures in the deployed region. The Kube-operators translator scans every shard per reconciliation loop, compares its current replica count against the target replication factor, and for each under-replicated shard, picks the peer with the fewest shards that doesn’t already host that shard and adds a replica there.</p>
+<h2>Results</h2>
+<ul>
+ <li>New cluster spin-up time dropped from hours to minutes.</li>
+ <li>Clusters are now provisioned from a single config, with all required artifacts created together.</li>
+ <li>Operational load no longer scales linearly with cluster count.</li>
+ <li>Lifecycle-aware automation is now unlocked, supporting operations like horizontal scaling, replication factor recovery, and shard rebalancing.</li>
+</ul>
+<h2>Lessons Learned</h2>
+<ul>
+ <li><strong>Manual operations don't survive growth.</strong> For any rapidly growing fleet, it is worth investing in lifecycle automation before manual operations become a bottleneck.</li>
+ <li><strong>Extensible automation beats one-off scripts.</strong> We add logic into the translators' reconciliation loop, where it runs automatically on every cycle.</li>
+ <li><strong>Even distribution is cost savings.</strong> Because Qdrant pre-loads all vectors into memory, the pod with the heaviest skew effectively determines the memory limit requirements of the entire cluster.</li>
+</ul>

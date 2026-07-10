@@ -1,0 +1,158 @@
+<h1>malloyyo</h1>
+<p>A <strong>natural-language interface to any corpus of data, however complex</strong> — accurate and consistent, served to any AI over MCP.</p>
+<p><strong>Problem:</strong> AI + document context + your analytical database = <strong>inconsistent</strong> results. Pointed at a raw database, an AI writes SQL from scratch — so the same question tomorrow yields a different query and different numbers, with wrong joins, invented columns, or fan-out double-counts that still <em>look</em> right.</p>
+<p><strong>Solution:</strong> AI + a Malloy <strong>semantic layer</strong> + your analytical database = <strong>consistent</strong> results. Measures, dimensions, and joins are defined once, correctly; the AI composes queries against the model instead of writing SQL, so numbers come back right by construction.</p>
+<p>Malloyyo is the thin layer that serves that model:</p>
+<ul>
+ <li><strong>Thin by design</strong> — it sits between the AI and your data, nothing more.</li>
+ <li><strong>Develop, then publish</strong> — build the model locally and <code>malloyyo publish</code> it (or point Malloyyo at a GitHub repo).</li>
+ <li><strong>Claude already knows Malloy</strong> — the same way it knows Python — so authoring is incredibly fast and assisted.</li>
+ <li><strong>Readable, full-featured queries</strong> — Malloy is a complete query language (join, nest, aggregate, filter) that stays legible: you can read a query and see at a glance it's doing the right thing.</li>
+ <li><strong>DuckDB built in</strong> — query Parquet over plain HTTP (S3, GCS, any web server) with <strong>no warehouse required</strong>, or attach your own (BigQuery, Snowflake, MotherDuck, Databricks, …).</li>
+ <li><strong>Tight control</strong> — the AI can only query what's in the semantic model; nothing outside it is reachable.</li>
+ <li><strong>A web interface, too</strong> — every query is logged, so you can browse, edit, favorite, re-run, and share them in the browser (ltool), and hand any one off to "Explore further with Claude." Because Malloy renders a whole dashboard as a single query, one saved query can be a full report.</li>
+ <li><strong>Deploy in minutes</strong> — one-click to Vercel, or self-host with Docker.</li>
+</ul>
+<p>Try the demo server and "Explore further with Claude" — sign in with any Google account.</p>
+<p><strong>Questions, or built something cool? We'd love to hear from you.</strong> Come say hi on Slack, and learn more about Malloy at malloydata.dev and in the documentation.</p>
+<h2>How it works</h2>
+<pre><code>   MCP client (claude.ai)            Browser (you)
+           │ OAuth 2.1                     │ Google sign-in
+   ┌───────▼──────────┐          ┌─────────▼─────────┐
+   │  MCP server /mcp │          │      Web UI       │
+   │ analytical tools │          │  datasets · ltool │
+   └───────┬──────────┘          └─────────┬─────────┘
+           └──────────────┬────────────────┘
+                          │  compile · run             ┌────────────────────┐
+                          │                            │  Authoring Models  │
+                          │                            │   • Malloyyo CLI   │
+                          │                            │   • Claude         │
+                          │                            └─────┬───────────┬──┘
+                          │                          push    │           │ develop
+   ┌──────────────────────▼───────────────────────┐  (deploy)|           │
+   │                   Malloyyo                   │◀────────┘           │
+   │        load · compile · store · serve        │                      │
+   └──────┬─────────────────────────────┬─────────┘                      │
+          │                             │                                │
+   ┌──────▼──────┐             ┌────────▼────────┐                       │
+   │    Neon     │             │  Analytical DB  │◀─────────────────────┘
+   │  Postgres   │             │  • BigQuery     │  direct (dev)
+   │  metadata   │             │  • MotherDuck   │
+   │             │             │  • Snowflake    │
+   │  datasets   │             │  • Databricks   │
+   │  malloy_    │             │   (or S3/GCS)   │
+   │    models   │             │                 │
+   │  users      │             │  your data      │
+   └─────────────┘             └─────────────────┘
+</code></pre>
+<h3>Adding a dataset</h3>
+<p>Develop your model in a repo with an <code>index.malloy</code> at its root, then <strong>publish it with the <code>malloyyo</code> CLI</strong>:</p>
+<pre><code>malloyyo login &lt;target&gt;     # one-time browser sign-in
+malloyyo publish &lt;target&gt;   # bundle *.malloy + malloy-config.json and push</code></pre>
+<p>The CLI records the git commit it published from; Malloyyo compiles and introspects the model and stores a new version. If it doesn't compile, the push is rejected and the live model is left unchanged.</p>
+<p>Alternatively, <strong>point Malloyyo at a GitHub repo</strong> and it pulls <code>index.malloy</code> (and any imports) directly — a webhook endpoint (<code>/api/datasets/&lt;id&gt;/webhook/github</code>) refreshes it on every push.</p>
+<h3>The two databases</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Database</th>
+   <th>What lives there</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Cloud database</strong> (BigQuery, Snowflake, MotherDuck, MySQL, Postgres, Presto, Trino) or <strong>S3/GCS</strong></td>
+   <td>Your analytical data</td>
+  </tr>
+  <tr>
+   <td><strong>Neon Postgres</strong></td>
+   <td>Metadata — <code>datasets</code>, <code>malloy_models</code>, <code>malloy_model_files</code>, <code>users</code>, <code>accounts</code>, <code>sessions</code>, OAuth clients and tokens</td>
+  </tr>
+ </tbody>
+</table>
+<h3>MCP tools served at <code>/mcp</code></h3>
+<table>
+ <thead>
+  <tr>
+   <th>Tool</th>
+   <th>What it does</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>list_sources</code></td>
+   <td>List the Malloy sources you can query on this endpoint</td>
+  </tr>
+  <tr>
+   <td><code>describe_source</code></td>
+   <td>A source's semantic model — measures, dimensions, views, joins</td>
+  </tr>
+  <tr>
+   <td><code>query</code></td>
+   <td>Run a Malloy query; returns rows + a shareable link (<code>execute: false</code> for SQL only)</td>
+  </tr>
+  <tr>
+   <td><code>open_share_link</code></td>
+   <td>Resolve a shared link back to its source, question, and Malloy</td>
+  </tr>
+ </tbody>
+</table>
+<p>The MCP endpoint speaks OAuth 2.1, so claude.ai's remote MCP integration can connect after a one-time authorization flow.</p>
+<h2>Developing Malloy models</h2>
+<p><strong>You don't have to know Malloy — or wire up the database by hand.</strong> Install the <code>malloyyo</code> CLI, register it with Claude, then ask Claude to do the rest: connect to your data, turn your existing SQL / dbt / Looker definitions into a Malloy model, and test it against real data before you publish. One tool for the whole loop.</p>
+<p><strong>1. Install and register the local test window.</strong></p>
+<pre><code>npm install -g @malloydata/malloyyo        # one tool for the whole loop
+claude mcp add malloyyo -- malloyyo mcp    # register it with Claude Code</code></pre>
+<p><code>malloyyo mcp</code> runs a local stdio MCP server over the Malloy model in the current directory — the <strong>same explore surface</strong> (<code>list_sources</code>, <code>describe_source</code>, <code>query</code>) the hosted instance serves, so what you test locally is exactly what consumers get. It also registers the <strong><code>writing-malloy-with-mcp</code> skill</strong> and <code>yo_help</code>, which teach Claude how to author Malloy, set up connections, and recover from compiler errors. (For Claude Desktop or another client, add the same <code>malloyyo mcp</code> command to its MCP config instead.)</p>
+<p><strong>2. Build your model with Claude.</strong> Start <code>claude</code> in your model directory and just describe what you have:</p>
+<pre><code>claude
+
+&gt; connect to my Postgres warehouse and build a Malloy model from these dbt sources
+&gt; add a "net revenue" measure and verify it against last quarter's numbers</code></pre>
+<p>Claude sets up the connection and writes the <code>.malloy</code> for you. It follows a compiler-in-the-loop discipline — validate against the compiler, run real queries through the test window, confirm the numbers — and you steer from the results. You rarely write Malloy by hand.</p>
+<p>The connection lives in <code>malloy-config.json</code> at the model root, and Claude knows how to write it. Two things worth knowing:</p>
+<ul>
+ <li><strong>DuckDB needs no config at all</strong> — with no <code>malloy-config.json</code>, an in-memory <code>duckdb</code> connection just works, so Claude can read your local CSV / Parquet files immediately. Other backends get a small <code>malloy-config.json</code> entry.</li>
+ <li><strong>Secrets stay out of the committed file</strong> — any value can be <code>\{ "env": "VAR_NAME" }</code> (e.g. <code>ANALYTICAL_DATABASE_SECRET</code>), resolved from the environment when the connection opens.</li>
+</ul>
+<p><strong>3. Publish.</strong> Once the model queries cleanly, sign in once and push:</p>
+<pre><code>malloyyo login &lt;your-instance&gt;     # one-time browser sign-in
+malloyyo publish &lt;your-instance&gt;   # bundle *.malloy + malloy-config.json and push</code></pre>
+<h2>Stack</h2>
+<ul>
+ <li><strong>Next.js 16</strong> App Router</li>
+ <li><strong>Your Analytical Database</strong></li>
+ <li><strong>Neon Postgres</strong> + <strong>DrizzleORM</strong></li>
+ <li><strong>Malloy</strong></li>
+ <li><strong>NextAuth v5</strong> + <strong>Google OAuth</strong></li>
+ <li><strong>OAuth 2.1 provider</strong></li>
+ <li><strong><code>malloyyo</code> CLI</strong></li>
+</ul>
+<h2>Deploy your own</h2>
+<p>The button forks the repo into your GitHub and creates a Vercel project. The schema <strong>self-initializes on first boot</strong> (<code>RUN_MIGRATIONS_ON_BOOT=1</code>), so you never run a migration.</p>
+<blockquote>
+ <p>Your model's <code>malloy-config.json</code> references your analytical database's secret from an env var (e.g. <code>ANALYTICAL_DATABASE_SECRET</code> — see <strong>Developing Malloy models</strong>). Set that var on the project so the server can connect. <code>GITHUB_TOKEN</code> is optional (private-repo model pulls).</p>
+</blockquote>
+<h3>Self-host with Docker</h3>
+<p>Prefer containers to Vercel? The repo ships a production <code>Dockerfile</code>. See <strong>Self-hosting with Docker</strong> for build and run instructions.</p>
+<h2>Running locally</h2>
+<p>Copy <code>.env.local.example</code> to <code>local/&lt;instance&gt;</code> and fill in the blanks:</p>
+<pre><code>DATABASE_URL=postgresql://...          # Neon (or any Postgres)
+APP_BASE_URL=http://localhost:3000
+APP_ADMIN_EMAILS=you@example.com
+AUTH_SECRET=...                        # openssl rand -base64 32
+AUTH_GOOGLE_ID=...                     # Google OAuth client ID
+AUTH_GOOGLE_SECRET=...                 # Google OAuth client secret</code></pre>
+<p><strong>Google sign-in</strong> needs a Google OAuth app. Add this <strong>Authorized redirect URI</strong>:</p>
+<pre><code>http://localhost:3000/api/auth/callback/google</code></pre>
+<pre><code>npm install
+npx dotenv-cli -e local/main -- npx drizzle-kit push   # first run only
+npx dotenv-cli -e local/main -- npm run dev</code></pre>
+<h2>Code map</h2>
+<ol>
+ <li><strong><code>packages/cli</code></strong> + <strong><code>src/app/api/datasets/[id]/model/push</code></strong> — the <code>malloyyo publish</code> path.</li>
+ <li><strong><code>src/lib/github.ts</code></strong> + <strong><code>src/lib/github-refresh.ts</code></strong> — the GitHub <em>pull</em> path.</li>
+ <li><strong><code>src/lib/malloy.ts</code></strong> — single-file and multi-file Malloy compilation and execution via <code>InMemoryURLReader</code>.</li>
+ <li><strong><code>src/lib/mcp-tools.ts</code></strong> + <strong><code>src/app/mcp/route.ts</code></strong> — the MCP server.</li>
+ <li><strong><code>src/db/schema.ts</code></strong> — Drizzle schema for all Postgres tables.</li>
+</ol>

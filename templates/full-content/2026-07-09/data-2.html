@@ -1,0 +1,100 @@
+<h2>TLDR;</h2>
+<p>I implemented a graph map-reduce using Apache DataFusion. Where possible, I offloaded everything to disk, and designed the algorithms to rely on bulk scans rather than random access. DataFusion handles spillover, sort-merge joins, aggregations, planning and execution, so my code is very lightweight. I tested it in strict mode by running it via <code>systemd-run</code> with a hard memory limit. It works. Of course, I have encountered some issues: for example, I frequently experience deadlocks from <code>FairSpillPool</code> in extreme scenarios, and I have not yet found a way to make SMJ use pre-sorting of the data on disk. But it works. I can compute PageRank on a directed graph with one billion edges (<code>graph500-26</code> from the Graphalytics dataset) using 5 GB of memory. Alternatively, I can identify all the weakly connected components in a graph with two billion edges (<code>twitter_mpi</code> from the same dataset collection) using 10 GB of memory. Neither NetworkX nor Igraph can do this; most existing graph algorithms require the graph to fit into memory. Previously, I thought you needed Apache Spark and GraphFrames for billion-scale graph analytics. Now, however, I think all you need is a laptop. I have completely changed my old opinion about using Apache DataFusion for graph analytics.</p>
+<h2>Setup</h2>
+<p>I tested two tasks.</p>
+<h3>PageRank</h3>
+<p>The task is to compute PageRank on <code>graph500-26</code> from Graphalytics dataset:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Key</th>
+   <th>Value</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Num nodes</td>
+   <td>32,804,978</td>
+  </tr>
+  <tr>
+   <td>Num edges</td>
+   <td>1,051,922,853</td>
+  </tr>
+  <tr>
+   <td>Directed</td>
+   <td>False</td>
+  </tr>
+  <tr>
+   <td>Memory Limit</td>
+   <td>5 GB</td>
+  </tr>
+  <tr>
+   <td>DataFusion Pool Size</td>
+   <td>4 GB</td>
+  </tr>
+ </tbody>
+</table>
+<p>PageRank is one of the most popular graph centrality algorithm and is used from search results ranking to anti-fraud scoring. My DataFusion implementation is classical Pregel: bulk-synchronous parallel algorithm (aka Map-Reduce) which I expressed using joins and aggregate. Very similar to what is in the core of Spark's GraphFrames library.</p>
+<h3>Weakly Connected Components</h3>
+<p>The task is to identify all the weakly connected components on <code>twitter_mpi</code> from the same dataset:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Key</th>
+   <th>Value</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Num nodes</td>
+   <td>52,579,682</td>
+  </tr>
+  <tr>
+   <td>Num edges</td>
+   <td>1,963,263,821</td>
+  </tr>
+  <tr>
+   <td>Directed</td>
+   <td>True</td>
+  </tr>
+  <tr>
+   <td>Memory Limit</td>
+   <td>10 GB</td>
+  </tr>
+  <tr>
+   <td>DataFusion Pool Size</td>
+   <td>8 GB</td>
+  </tr>
+ </tbody>
+</table>
+<p>WCC is the core part of any identity (entity) resolution problem. For example, when you need to do data deducplication from different system through transitive IDs you end up with WCC problem. My DataFusion implementation is based on the "In-database connected component analysis", Bögeholz et al., arXiv 1802.09478. I already implemented the same algorithm for the Spark's GraphFrames so it was an obvious choice.</p>
+<h2>Results</h2>
+<h3>PageRank</h3>
+<p>An easy part. I used SMJ just to proove the scalability but it is also possible to use HJ because vertices are small (32M) and PageRank state is trivial: one column <code>rank</code> (<code>f64</code>), one column <code>out-degree</code> (<code>i64</code>), on participation flag (<code>bool</code>). With HJ it is faster. PageRank works over directed edges so it deos not require to symmetrize the graph. Just offload edges to disk and iterate by updating state (and offload to disk as well to break the lineage) until converged.</p>
+<p>The compute time is long: around 30 minutes for 15 full iterations. But the setup is about memory, not speed. Give it some more realistic numbers for 1B graph analytics and it will work fast enough (I tested). I checked numbers against the ground truth: 100% match (with <code>0.0001</code> tolerance). A lot of optimizations can be done here as well: in theory it is possible to bucket edges by range or do kind of range-partitioing, so the SMJ does not need to sort again the biggest join-side (edges) on each iteration to get triplets. As well I'm not 100% parquet is the best choice here. Also would be interesting to try to fuse join+agg: each Pregel iterarion is like <code>edges &lt;-[join] nodes-state</code> -&gt; <code>group by + agg</code> -&gt; <code>[join] -&gt; nodes-state</code> -&gt; <code>update nodes-state</code>. If I can fuse together the first two stages it can be a huge win from the performance point of view. Meanwhile I do not know yet how to do it in DataFusion: a lot of thing to learn.</p>
+<h3>WCC</h3>
+<p>The hardest part. 2B edges twitter graph is already huge (its edges are 30 GB in CSV !!!). But for WCC we need to symmetrize edges (or do a union between <code>src, dst</code> and <code>dst AS src, src AS dst</code> + <code>distinct</code> on top), so at the peak we are crunching almost 4 billion of edges using only 8GB DataFusion pool. After the flow survives the first few iteration, contraction process reduce the amount of edges dramtically and algorithm ends in 10 minutes with low memory pressure.</p>
+<pre><code>sem@fedora:~/github/graphframes-rs$ systemd-run --user --scope \
+     -p MemoryMax=10G -p MemorySwapMax=0 \
+     -p AllowedCPUs=0-1 \
+     --setenv=RUST_LOG=graphframes_rs=info,datafusion=warn \
+     ./target/release/run-algorithm twitter_mpi-v.parquet twitter_mpi-e.parquet wcc 42 file:///var/home/sem/Downloads/gf_wcc_out 8G 2</code></pre>
+<p>Results are correct: Graphalytics provides ground truth and it is easy to check:</p>
+<pre><code>memory D SELECT column1, count(*) as cnt FROM read_csv('twitter_mpi-WCC', delim=' ') GROUP BY column1 ORDER BY cnt DESC LIMIT 5;
+memory D SELECT component, count(*) as cnt FROM results  GROUP BY component ORDER BY cnt DESC LIMIT 5;</code></pre>
+<h2>The code</h2>
+<p>The code is here: https://github.com/SemyonSinchenko/graphframes-rs</p>
+<p>I wrote most of the code by myself, not "Claude do it, make no mistakes", so there is no README and code comments can be outdated somewhere. I'm learning Rust and DataFsuion on this project, so no LLM usage in core parts.</p>
+<p>Graph representation is almost like in Spark's GraphFrames:</p>
+<pre><code>#[derive(Debug, Clone)]
+pub struct GraphFrame \{
+    pub(crate) vertices: DataFrame,
+    pub(crate) edges: DataFrame,
+}</code></pre>
+<p>Core parts:</p>
+<ul>
+ <li>Pregel main loop: pregel.rs</li>
+ <li>WCC implementation: connected_components.rs</li>
+</ul>
+<p>To understand the Pregel notation this can be very useful source: Lecture 8, CME 323: Distributed Algorithms and Optimization</p>
+<p>An example of PageRank using the API: pagerank.rs</p>

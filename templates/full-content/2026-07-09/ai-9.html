@@ -1,0 +1,92 @@
+<p>Today, we’re launching SWE-1.7, the most capable model we’ve trained so far. It reaches frontier-level intelligence at a much lower cost, advancing the cost-performance Pareto curve.</p>
+<p>SWE-1.7 is the result of broad improvements across our RL pipeline: better infrastructure, more stable training, higher-quality data, and new techniques for long-horizon tasks. Since SWE-1.7 was trained from a Kimi K2.7 base, which had already undergone extensive RL post-training, the large additional gains from our own training challenge the idea of a ‘post-training ceiling’ and suggest that RL can push capabilities much further than previously believed.</p>
+<p>At Cognition, we have been formulating and refining principles for good agentic software engineering both in evaluation, with FrontierCode, and now in training, with SWE-1.7. Our model is particularly optimized for longer-horizon asynchronous tasks, an important component of high-quality software engineering.</p>
+<p>SWE-1.7 is available today in Devin (Web, Desktop, and CLI) via Cerebras at 1000 TPS. We encourage you to try it for yourself!</p>
+<table>
+ <thead>
+  <tr>
+   <th>Benchmark</th>
+   <th>SWE-1.7</th>
+   <th>Kimi K2.7 Code</th>
+   <th>GPT-5.5</th>
+   <th>Opus 4.8</th>
+   <th>Opus 4.7</th>
+   <th>GLM-5.2</th>
+   <th>Composer 2.5</th>
+   <th>SWE-1.6</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <th>FrontierCode 1.1 Main</th>
+   <td>42.3%</td>
+   <td>30.1%</td>
+   <td>43.0%</td>
+   <td>46.5%</td>
+   <td>38.5%</td>
+   <td>24.5%</td>
+   <td>25.6%</td>
+   <td>9.4%</td>
+  </tr>
+  <tr>
+   <th>Terminal-Bench 2.1</th>
+   <td>81.5%</td>
+   <td>72.7%</td>
+   <td>84.2%</td>
+   <td>86.9%</td>
+   <td>83.0%</td>
+   <td>81.0%</td>
+   <td>76.0%</td>
+   <td>39.7%</td>
+  </tr>
+  <tr>
+   <th>SWE-Bench Multilingual</th>
+   <td>77.8%</td>
+   <td>73.5%</td>
+   <td>76.8%</td>
+   <td>84.4%</td>
+   <td>80.5%</td>
+   <td>74.5%</td>
+   <td>71.6%</td>
+   <td>58.3%</td>
+  </tr>
+ </tbody>
+</table>
+<p>The rest of this post covers how we trained SWE-1.7: the infrastructure, algorithms, and data work behind our model. We cover four important components that stand out.</p>
+<ul>
+ <li><strong>Preserving entropy and stabilizing training:</strong> Long RL runs face two challenging problems: entropy collapse, and instability due to numerical drift between training and inference. We hunted down and addressed causes of each, which enabled training to keep improving well past where earlier runs stalled.</li>
+ <li><strong>Multi-cluster training and fault tolerance:</strong> RL doesn’t need all of its inference compute in one cluster. We trained on clusters across three continents, shipped weight updates through object storage, and built fault tolerance so that hardware failures never stalled the run.</li>
+ <li><strong>Curating high-quality data:</strong> We built an extensive data-quality pipeline that runs each task through automated execution tests, filters out tasks with low learning signal, and hardens tasks to prevent reward-hacking.</li>
+ <li><strong>Self-compaction for long-horizon tasks:</strong> The model learns to summarize its working state and resume from the summary, extending task horizons past the raw context window. We use an alternating length penalty to incentivize concise output without sacrificing correctness.</li>
+</ul>
+<h2>Preserving Entropy and Stabilizing Training</h2>
+<p>We found training stability to be a key contributor to predictable improvement at scale.</p>
+<p>When training with asynchronous RL, one of the most problematic issues we encountered was the KL divergence mismatch between inference and training, since the trainer policy is usually different from the sampling policy.</p>
+<p>We find that top-p sampling contributes significantly to staving off entropy collapse, where a strong model stops exploring and reward plateaus within a few hundred steps.</p>
+<p>This entropy-preservation effect makes top-p sampling desirable in our rollouts. But naively implementing top-p clearly increases the training-inference mismatch — the trainer computes probabilities as a selection from all tokens, while rollouts sample from the top-p subset, so the distributions have higher divergence, leading to collapse after a small number of steps. Thus, we implement sampling distribution replay, where we record a kept-set of tokens available for sampling at rollout time, and renormalize probabilities with those masks in the trainer.</p>
+<h2>Multi-cluster Training</h2>
+<p>Cognition is a fast-growing research lab entering an established landscape that is heavily compute-constrained. We aim to train trillion-parameter models, but today, large clusters with 10-100k chips on a single network fabric are a scarce resource. In contrast, smaller clusters around the world are abundant, if used together correctly.</p>
+<p>In this setting, the structure of RL works in our favor. RL decomposes naturally across multiple clusters. Only the trainer must live on a single high-bandwidth cluster. The inference engines that generate rollouts are self-contained. They can run anywhere and need nothing but the current weights.</p>
+<p>We invested in infrastructure that makes use of this property. Our RL training spans four datacenters across three continents, combining our own GPUs across multiple clusters with additional compute from inference providers like Fireworks.</p>
+<p>The central challenge in this setup is keeping all inference engines up to date with the trainer weights after each optimizer step. We want these weight updates to be fast to reduce staleness of trajectories so we can train with more aggressive learning rates.</p>
+<p>Naively broadcasting the full model from one cluster to another would be slow and inefficient. Instead, every K gradient steps, we compute and send a <strong>compressed weight delta</strong> between the current and previous weights, reducing the size of each transfer by over 99%.</p>
+<h2>Fault Tolerance</h2>
+<p>At large scale, hardware failures occur continuously, and globally restarting on each failure makes long runs infeasible. Our architecture handles this differently depending on where the failure occurs — the inference engines or the trainer.</p>
+<p>Failures on the inference side are cheap by construction. Engines are self-contained and hold no state beyond the current weights, so a dead engine costs only its in-flight sessions. The trainer is the one place where a failure is expensive: it’s the single tightly-coupled component, where one dead node stalls the whole cluster. To make recovery fast, each node checkpoints asynchronously to local disk every step and replicates its shards to peers, so a dead node’s state is rebuilt from replicas in seconds.</p>
+<h2>Intelligent Self-Compaction for Long-Horizon Tasks</h2>
+<p>From the start, we built Devin for completing asynchronous, long-running tasks. SWE-1.7 is trained directly in the Devin harness, so naturally we want to train our own model on longer horizon tasks.</p>
+<ul>
+ <li>When an agent approaches the context limit, we ask it to summarize its working state, and we resume it from its self-authored summary. During training, the model simultaneously learns (1) to write more informative, succinct summaries, and (2) to better work from and leverage such summaries.</li>
+ <li>Rather than applying a length penalty uniformly throughout training, we use an alternating strategy. In <strong>unconstrained phases</strong>, the model optimizes only for task success. In <strong>budget phases</strong>, we penalize solutions that exceed a certain budget of our weighted cost function that includes tokens, turns and total time spent in tool calls.</li>
+</ul>
+<h2>Data Quality</h2>
+<ul>
+ <li><strong>Verifier quality:</strong> A task’s verifier can be wrong in two directions: accepting incorrect solutions (false positives) or rejecting valid ones (false negatives). We devised extensive quality-assurance pipelines to minimize observations of false positives and false negatives in our training.</li>
+ <li><strong>Difficulty:</strong> On tasks where the model always solves or always fails, we don’t observe any meaningful learning signal. Instead, we curated training data that the model only solves a low fraction of the time.</li>
+ <li><strong>Cheating detection and prevention:</strong> We employed a variety of defenses against different forms of cheating. For instance, we network-restricted our sandboxes and stripped them of git history and reference artifacts.</li>
+</ul>
+<h2>Results: Model Behaviors</h2>
+<p>Due to extensive RL, SWE-1.7 exhibits noticeably different behavior from Kimi K2.7 Code, its base model. Firstly, it is significantly more aligned and trustworthy than K2.7 or other frontier open-source models.</p>
+<p>One behavioral difference we noticed in SWE-1.7 is condensed chain-of-thought. Compared to Kimi-K2.7-Code, SWE-1.7’s first chain-of-thought has a much lower function-word ratio and nearly half the average number of words per sentence.</p>
+<p>The other major behavioral difference we observed is that SWE-1.7 explores the codebase much more thoroughly before acting, as you can see in the number of tool calls, file reads, and searches the model executes.</p>
+<p>SWE-1.7 is much more likely to investigate the root cause of the bug and consider edge cases, hypotheticals, adversarial inputs, and beyond-the-ask requirements than Kimi-K2.7-Code. Through its enhanced codebase exploration, SWE-1.7 also does a much better job understanding the exact design decisions that need to be made.</p>

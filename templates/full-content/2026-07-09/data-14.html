@@ -1,0 +1,65 @@
+<h1>RayTracer — a ray tracer in ClickHouse SQL</h1>
+<p>A path tracer written entirely as <strong>ClickHouse SQL queries</strong>, rendering straight to a PNG via ClickHouse's <code>PNG</code> output format. No UDFs and no external code — a single <code>SELECT</code> computes every pixel.</p>
+<p>It renders the word <strong>ClickHouse</strong> as glassy, chrome lettering — in the spirit of Andrew Kensler's famous Pixar business-card ray tracer — and, in the scene above, sets it floating over a procedurally generated landscape, reflecting the terrain and casting shadows on the hills.</p>
+<p>See also:</p>
+<ul>
+ <li>NoiSQL — Generating Music With SQL Queries</li>
+ <li>SQL Mandelbrot Benchmark</li>
+ <li>Click-V: A RISC-V emulator built with ClickHouse SQL</li>
+ <li>DOOMHouse is a "Doom-like" game engine that renders the 3D graphics entirely in ClickHouse SQL</li>
+</ul>
+<h2>How it works</h2>
+<p>The whole renderer lives in one query:</p>
+<ul>
+ <li><strong>Pixels are rows.</strong> <code>numbers_mt(width * height * samples)</code> produces one row per <code>(pixel, sample)</code>; samples are averaged with <code>GROUP BY pixel</code>, and the output columns <code>r, g, b</code> (in <code>[0, 1]</code>) plus explicit <code>x, y</code> coordinate columns (<code>pixel % width</code>, <code>intDiv(pixel, width)</code>) are written to the <code>PNG</code> output format. The explicit coordinates let the writer place each pixel by its position, so the rows need no <code>ORDER BY</code> and the heavy per-pixel work stays parallel across all cores.</li>
+ <li><strong>3D math on tuples.</strong> Vectors are <code>Tuple(Float64, Float64, Float64)</code>; <code>dotProduct</code>, <code>L2Normalize</code>, <code>tuplePlus</code>, <code>tupleMultiplyByNumber</code>, … do the linear algebra, wrapped in short lambda aliases (<code>va</code>, <code>vs</code>, <code>vm</code>, <code>vd</code>, <code>vn</code>, <code>vc</code>, <code>vref</code>).</li>
+ <li><strong>The bounce loop is <code>arrayFold</code>.</strong> Every ray is advanced exactly one mirror bounce per fold step over <code>range(maxDepth)</code> — a loop <em>inside each row</em>, so rows stay independent and the render parallelizes across all CPU cores. (The first version used a <code>WITH RECURSIVE</code> CTE instead — see the queries below.)</li>
+ <li><strong><code>let</code>-bindings via <code>arrayMap</code>.</strong> ClickHouse <code>WITH</code> lambdas are call-by-name, so passing a value as a parameter re-expands the expression and blows up the query tree. Intermediates are therefore bound <em>by value</em> with <code>arrayMap(x -&gt; body, [expr])[1]</code>, a one-element-array "let".</li>
+</ul>
+<h3>Geometry (Constructive Solid Geometry)</h3>
+<ul>
+ <li><strong>Cylinders</strong> — round rods with flat caps for the straight strokes (<code>l</code>, <code>i</code>, <code>k</code>, <code>H</code>, <code>u</code>, the bar of <code>e</code>).</li>
+ <li><strong>Tori</strong> — the round letters (<code>C</code>, <code>c</code>, <code>o</code>, <code>u</code>, <code>s</code>, <code>e</code>), ray-<strong>marched</strong> through their signed-distance field; the openings of <code>C</code>/<code>c</code>/<code>s</code>/<code>e</code> are a box subtracted from the ring.</li>
+ <li><strong>Spheres</strong> — the dot on <code>i</code>, plus a chrome "planet" that is a sphere <strong>minus</strong> a sphere.</li>
+ <li><strong>Oriented boxes / parallelepipeds</strong> — available for flat-faced strokes.</li>
+</ul>
+<p>So the scene exercises boxes, cylinders, tori and spheres, with CSG <strong>union</strong>, <strong>difference</strong> (the planet and the letter openings) and a <strong>ray-marched distance field</strong> (the tori).</p>
+<h3>Terrain</h3>
+<p>A height field <code>z = amp · fBm(x, y)</code>, where fBm sums several octaves of lattice value-noise. Camera rays are ray-marched against it — the march skips the empty air (it starts where the ray first drops to the terrain's maximum height) and linearly interpolates the surface crossing, so it is both fast and free of step-banding. It is shaded with a height color ramp (water → sand → grass → rock → snow), a warm sun plus cool sky-ambient model, marched shadows (terrain self-shadow <em>and</em> the letters' cast shadows), and distance fog into the sky.</p>
+<h2>Gallery</h2>
+<p><strong>ClickBulb</strong> — a desk lamp built entirely from spheres hops in, leaps behind the banner, rakes its light through the letter gaps, then pokes its head through to peer at you. Every frame is the same ClickHouse SQL query, run once per frame.</p>
+<table>
+ <tbody>
+  <tr>
+   <td><strong>Pixar homage</strong> — the letters as a union of sphere primitives, chrome over a checkerboard.</td>
+   <td><strong>CSG primitives</strong> — the letters carved from cylinders, tori and spheres.</td>
+  </tr>
+  <tr>
+   <td><strong>Perlin terrain</strong> — a standalone ray-marched height field.</td>
+   <td><strong>Combined</strong> — ClickHouse over the terrain (the hero image above).</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Running</h2>
+<p>Every file is complete and self-contained, and <strong>parameterized</strong>: the image size comes from ClickHouse's image-output settings (read in SQL with <code>getSetting</code>) and the samples per pixel from a <code>\{SAMPLES:UInt32}</code> query parameter — one query renders any resolution. Render one with:</p>
+<pre><code>clickhouse local --output_format_image_width 2560 --output_format_image_height 1200 \
+                 --param_SAMPLES 8 --queries-file queries/clickhouse_terrain.sql &gt; out.png</code></pre>
+<p>The queries are emitted by the Python generators; the scene and bounce depth are baked at generation time, while image size and samples per pixel stay runtime parameters of the emitted query. For example, to re-create the hero image:</p>
+<pre><code>python3 generators/gen_combined.py 2560 1200 8 2 &gt; scene.sql   # depth 2; W/H/samples are runtime
+clickhouse local --output_format_image_width 2560 --output_format_image_height 1200 \
+                 --param_SAMPLES 8 --queries-file scene.sql &gt; scene.png</code></pre>
+<h3>Rendering arbitrary text</h3>
+<p>The sphere-banner generators take an optional 5th argument: the text to render. It is laid out from the 7-row bitmap font (uppercase A–Z, digits, and common punctuation; the original mixed-case "ClickHouse" glyphs are preserved, so the default render is unchanged), and the camera, light, and chrome sphere are recentered on the banner automatically.</p>
+<pre><code>python3 generators/gen_fold.py 640 256 16 4 "HELLO SQL" &gt; hello.sql
+clickhouse local --output_format_image_width 640 --output_format_image_height 256 \
+                 --param_SAMPLES 16 --queries-file hello.sql &gt; hello.png</code></pre>
+<p>Preview a banner as ASCII art without rendering: <code>python3 generators/font.py "HELLO SQL"</code>.</p>
+<h2>Trying with other databases</h2>
+<ul>
+ <li>🐛 <strong>CedarDB</strong>: works, but 33 times slower and with bugs.</li>
+ <li>☠️ <strong>DuckDB</strong>: does not work, tried multiple ways - with arrays and recursive CTE, but it can't process even the smallest resolution image.</li>
+</ul>
+<h2>Credits</h2>
+<p>Inspired by Andrew Kensler's <em>business-card ray tracer</em> and Paul Heckbert's minimal ray tracers — re-imagined as pure ClickHouse SQL.</p>
+<h2>License</h2>
+<p>Creative Commons Attribution-NonCommercial-ShareAlike 4.0, the same license as ClickBench.</p>
