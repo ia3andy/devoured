@@ -1,0 +1,91 @@
+<h1>Announcing etcd v3.7.0</h1>
+<p>Today, SIG etcd is releasing <a href="https://github.com/etcd-io/etcd/releases/tag/v3.7.0">etcd v3.7.0</a>, the latest minor release of the popular distributed key-value store and core Kubernetes component. v3.7 ships the long-requested RangeStream feature, delivers several other performance improvements, removes the last remnants of the legacy v2store, and completes a major protobuf overhaul.</p>
+<p>You can download etcd v3.7.0 here:</p>
+<ul>
+ <li><a href="https://github.com/etcd-io/etcd/archive/refs/tags/v3.7.0.tar.gz">Source code</a></li>
+ <li><a href="https://github.com/etcd-io/etcd/releases/tag/v3.7.0">Binaries</a></li>
+ <li><a href="https://gcr.io/etcd-development/etcd">Official container images</a></li>
+</ul>
+<p>This release also includes new versions of the two core etcd dependencies, <a href="https://github.com/etcd-io/bbolt/releases/tag/v1.5.0">bbolt v1.5.0</a> and <a href="https://github.com/etcd-io/raft/releases/tag/v3.7.0">raft v3.7.0</a>.</p>
+<p>For instructions on installing etcd, see the <a href="https://etcd.io/docs/v3.7/install/">install documentation</a>. For the full list of changes, see the <a href="https://github.com/etcd-io/etcd/blob/main/CHANGELOG/CHANGELOG-3.7.md">etcd v3.7 changelog</a>.</p>
+<p>A heartfelt thank you to all the contributors who made this release possible!</p>
+<h2>Major features</h2>
+<p>The most significant changes in v3.7.0 include:</p>
+<ul>
+ <li><strong>RangeStream</strong> — stream large result sets in chunks instead of buffering the whole response.</li>
+ <li><strong>Keys-only range requests, faster and more reliable leases,</strong> and several other <strong>performance improvements</strong>.</li>
+ <li>etcd now boots entirely from v3store, eliminating a long-standing dependency on the legacy v2 store</li>
+ <li>A completed <strong>protobuf overhaul</strong>, replacing outdated protobuf libraries with fully supported ones.</li>
+ <li>etcd v3.7 ships with bbolt v1.5.1 and raft v3.7.0.</li>
+</ul>
+<h2>Features</h2>
+<h3>RangeStream</h3>
+<p>In etcd v3.6 and earlier, it is challenging to work with requests that return large result sets. The database would buffer the full result set before sending, leading to unpredictable latency and memory usage, both on the server and the client. <a href="https://github.com/kubernetes/enhancements/tree/master/keps/sig-etcd/5966-etcd-range-stream">The RangeStream RPC</a> lets calling applications accept result sets in chunks, reducing latency and making buffering memory usage more predictable.</p>
+<p>Instructions on how to use RangeStream <a href="https://etcd.io/docs/v3.7/learning/api/#rangestream">in gRPC calls</a> and <a href="https://etcd.io/docs/v3.7/dev-guide/interacting_v3/#read-keys">in etcdctl</a> can be found in the etcd documentation. Users should try it out for their own applications.</p>
+<p>In coordinated releases, the RangeStream feature will become available to users running the upcoming v1.37 of Kubernetes by enabling the <code>EtcdRangeStream</code> feature gate. This early and planned adoption is possible thanks to the merger of etcd and Kubernetes development in 2023.</p>
+<h3>Performance improvements</h3>
+<p>v3.7 delivers multiple specific performance improvements, both for the Kubernetes control plane and for other use cases. Kubernetes users should see a significant decrease in overall CPU usage by the etcd members, compared with v3.6.</p>
+<h4>Keys-only range optimization</h4>
+<p>etcd v3.7.0 includes a keys-only Range optimization (<a href="https://github.com/etcd-io/etcd/pull/21791">#21791: keys-only Range optimization</a>). When processing a keys_only Range request or <code>etcdctl get --keys-only</code>, etcd reads solely from its in-memory index. It returns the matched keys without loading all serialized values from bbolt as it did previously. The only exception where loading from bbolt is still required is when <code>keys_only</code> Range requests must be sorted by value (i.e., when SortTarget is set to VALUE).</p>
+<p>This reduces unnecessary backend reads and memory use for workloads that only need key names, making large keys-only range requests more efficient.</p>
+<h4>Faster, more reliable etcd leases</h4>
+<p>v3.7 improves lease expiration and renewal:</p>
+<ul>
+ <li>LeaseRevoke requests are now prioritized to ensure timely lease expiration during overload (<a href="https://github.com/etcd-io/etcd/pull/20492">#20492: stability enhancement during overload conditions</a>).</li>
+ <li>The new FastLeaseKeepAlive feature enables faster lease renewal by skipping the wait for the applied index (<a href="https://github.com/etcd-io/etcd/pull/20589">#20589: etcdserver: improve linearizable renew lease</a>).</li>
+</ul>
+<h4>Faster find() operations</h4>
+<p>etcd 3.7 improves the performance of concurrent watches on keys by making find() operations faster (<a href="https://github.com/etcd-io/etcd/pull/19768">#19768: adt: split interval tree by right endpoint on matched left endpoints</a>).</p>
+<h3>Other features</h3>
+<h4>Protobuf overhaul</h4>
+<p>v3.7 migrates and replaces multiple outdated protobuf libraries with fully supported dependencies. This includes replacing <code>github.com/golang/protobuf</code> and <code>github.com/gogo/protobuf</code> with the fully-supported <code>google.golang.org/protobuf</code> (<a href="https://github.com/etcd-io/etcd/issues/14533">#14533: Protobuf: cleanup both golang/protobuf and gogo/protobuf</a>), and migrating grpc-logging to grpc-middleware v2 (<a href="https://github.com/etcd-io/etcd/pull/20420">#20420: Migrate grpc-logging to grpc-middleware v2</a>).</p>
+<p>As well as improving security and maintainability, this refactor has been shown to reduce CPU usage by etcd components.</p>
+<p>While these changes are not expected to directly affect users running etcd via official binaries or container images, they may affect users who depend on etcd Go modules, such as the client SDK or packages under <code>api/</code> or <code>pkg/</code>. These consumers may need to update their code or dependencies due to protobuf and related API changes introduced in this release.</p>
+<h4>Unix socket support</h4>
+<p>etcd now supports Unix socket endpoints (<a href="https://github.com/etcd-io/etcd/pull/19760">#19760: Add Support for Unix Socket endpoints</a>), enabling local communication without a TCP port.</p>
+<h4>Bootstrap from v3store</h4>
+<p>One of the major changes in etcd v3.7 is that the server now bootstraps entirely from the v3 store (<a href="https://github.com/etcd-io/etcd/issues/20187">#20187 Bootstrap etcdserver from v3store</a>), eliminating its dependency on the legacy v2 store during startup.</p>
+<p>This milestone is the result of a long-term effort spanning multiple releases. It resolves a long-standing technical debt, significantly simplifies the bootstrap workflow, and lays the foundation for future improvements to etcd.</p>
+<p>To maintain backward compatibility, etcd v3.7 continues to generate v2 snapshots. As a result, the <code>--snapshot-count</code> flag is also retained in v3.7. This is the last remaining dependency on the legacy v2 store, and both the v2 snapshot generation and the <code>--snapshot-count</code> flag will be removed in v3.8.</p>
+<h4>etcdutl timeouts</h4>
+<p>All etcdutl commands now have a timeout command line argument (<a href="https://github.com/etcd-io/etcd/pull/20708">#20708: etcdutl: enable timeout functionality for all commands</a>), so offline utility commands no longer block indefinitely when holding a lock.</p>
+<h4>Setting the authentication token directly</h4>
+<p>Client v3 now allows users to set the JWT directly, offering more flexibility in authentication options (<a href="https://github.com/etcd-io/etcd/pull/16803">#16803: clientv3: allow setting JWT directly</a>, <a href="https://github.com/etcd-io/etcd/pull/20747">#20747: clientv3: disable auth retry when token is set</a>),</p>
+<h4>Retrieve AuthStatus without authenticating</h4>
+<p>Clients can check their AuthStatus without attempting to authenticate first, eliminating some application overhead (<a href="https://github.com/etcd-io/etcd/pull/20802">#20802: etcdserver: remove permission check on AuthStatus api</a>).</p>
+<h4>New watch metrics</h4>
+<p>v3.7 adds optional watch send-loop metrics (<a href="https://github.com/etcd-io/etcd/pull/21030">#21030: Instrument watchstream send loop</a>) for better observability of the watch path.</p>
+<h4>etcdctl command cleanup</h4>
+<p>etcdctl commands were reorganized for clarity (<a href="https://github.com/etcd-io/etcd/pull/20162">#20162: etcdctl: organize etcdctl subcommand</a>) and global command line arguments are now hidden to streamline help output (<a href="https://github.com/etcd-io/etcd/pull/20493">#20493: etcdctl: hide global flags</a>).</p>
+<h2>Upgrading</h2>
+<p>This release contains breaking changes, particularly around the removal of legacy v2 components. Users should review the <a href="https://etcd.io/docs/v3.7/upgrades/upgrade_3_7/">upgrade guide</a> before upgrading their nodes. As with all minor releases, perform a rolling upgrade one member at a time and confirm cluster health between steps.</p>
+<h3>Experimental flags removed</h3>
+<p>All deprecated experimental flags have been removed (<a href="https://github.com/etcd-io/etcd/pull/19959">#19959: Cleanup the deprecated experimental flags</a>). Features in etcd now follow the Kubernetes-style feature-gate lifecycle (Alpha → Beta → GA) introduced in v3.6, rather than the old <code>--experimental</code> prefix.</p>
+<h3>Legacy V2 API packages and code cleanup</h3>
+<p>To remove the dependencies on v2store, the following components have been removed:</p>
+<ul>
+ <li>v2 discovery packages</li>
+ <li>v2 request support</li>
+ <li>v2 client support</li>
+</ul>
+<h3>Non-blocking client creation</h3>
+<p>etcd no longer honors the deprecated <code>grpc.WithBlock</code> dial option ( <a href="https://github.com/etcd-io/etcd/pull/21942">#21942: Make the etcd client creation non-blocking</a>).</p>
+<h3>Multiarch container images only</h3>
+<p>For users relying on the official etcd container images, v3.7 will be distributed <strong>only</strong> as multiarch containers. Architecture-tagged images will not be available, so adjust deployments accordingly.</p>
+<h2>bbolt v1.5.1</h2>
+<p>etcd v3.7 depends on, and includes, <a href="https://github.com/etcd-io/bbolt/blob/main/CHANGELOG/CHANGELOG-1.5.md">v1.5.1</a> of the bbolt storage engine.</p>
+<ul>
+ <li><strong>Database file size limits</strong>: users may set, and bbolt will enforce, file size limits.</li>
+ <li><strong>Disable statistics for performance</strong>: users may set <code>NoStatistics</code> to limit overhead.</li>
+ <li><strong>More efficient hashmap processing</strong>: merge spans faster and with less overhead.</li>
+</ul>
+<h2>raft v3.7.0</h2>
+<p>etcd 3.7 depends on, and includes, v3.7.0 of the raft consensus engine.</p>
+<ul>
+ <li><strong>Update the bootstrap process</strong>: v3.7 now allows booting from partly initialized snapshots.</li>
+ <li><strong>Improve the ReadIndex flow to prevent stale reads</strong> by injecting a unique identifier into the heartbeat context for read-only operations.</li>
+</ul>
+<h2>Contributors</h2>
+<p>etcd v3.7.0 is the product of more than a hundred contributors across the community.</p>
+<h3>Leads</h3>
+<p>The SIG etcd leads for the v3.7 release are <a href="https://github.com/ivanvc">ivanvc</a>, <a href="https://github.com/serathius">serathius</a>, <a href="https://github.com/ahrtr">ahrtr</a>, <a href="https://github.com/fuweid">fuweid</a>, <a href="https://github.com/siyuanfoundation">siyuanfoundation</a>, and <a href="https://github.com/jberkus">jberkus</a>.</p>
