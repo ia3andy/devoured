@@ -1,0 +1,207 @@
+<h1>How Airflow is using AI to make data engineering more resilient, not more complex</h1>
+<p><em>Your pipeline failed at 2am. What if it could fix itself?</em></p>
+<p>A data engineer at a global asset management firm told me something recently that stuck with me. When pipelines fail before the market opens, it can take many people and many hours to diagnose the root cause across multiple systems. Portfolio managers need performance numbers at the start of the trading day. Every minute of delay has consequences.</p>
+<p>The current failure response is manual. The on-call engineer gets paged. They open the logs. They walk through a mental checklist: is this a transient network issue? A rate limit? An expired credential? A schema change upstream? Each failure category requires a different response. Retry with backoff, fail immediately and escalate, or fix the data and rerun. The checklist is tribal knowledge. The response time typically depends on who is on call.</p>
+<blockquote>
+ <strong>This is not an AI application problem</strong>. Nobody is building an agent here. This is a data engineering operations problem, and AI can make it dramatically better without changing how you build pipelines.
+</blockquote>
+<p>I have been thinking about this through the lens of three capabilities we are building into Apache Airflow’s Common AI provider and Airflow 3.3. Together, they form an autonomous pipeline health loop:</p>
+<ul>
+ <li><strong>Detect:</strong> Catch data drift before it breaks anything</li>
+ <li><strong>Resume:</strong> Pick up where you left off instead of having to restart</li>
+ <li><strong>Fix:</strong> Turn your 2am playbook into an automated retry policy</li>
+</ul>
+<p>Each one uses AI to solve a specific operational pain point that every data engineer recognizes.</p>
+<h2>Detect: Catch Data Drift Before It Breaks Anything</h2>
+<p>I wrote my first data pipeline almost three decades ago, and I faced my first data drift issue almost immediately. An upstream system changed a field format without telling anyone. My pipeline did not fail. It just started producing wrong numbers. I spent an embarrassing amount of time debugging my own code before realizing the input had changed underneath me.</p>
+<p>It is 2026, and data drift is still a bane for data engineers everywhere. The tools have gotten better. The data volumes have gotten larger. The fundamental problem has not changed.</p>
+<p>Industry estimates suggest that over 35% of unplanned data downtime originates from unexpected incoming schema or data drift.</p>
+<p>The insidious part is that schema drift often does not crash the pipeline. An upstream system renames <em>user_id</em> to <em>userId</em>. A column type changes from <em>INT</em> to <em>STRING</em>. A new nullable column appears. The pipeline runs, completes successfully, and loads NULL values, misaligned fields, or incomplete records into your analytics tables. Nobody gets paged. The executive dashboard just starts showing wrong numbers. By the time someone notices, bad data has propagated downstream for hours or days.</p>
+<p>The scenarios that do crash the pipeline are almost better, because at least you know something is wrong.</p>
+<p>Traditional schema validation uses rule-based checks: column counts, type matching, constraint verification. These catch the obvious cases. They miss the subtle ones. A <em>varchar(255)</em> in Postgres and a <em>STRING</em> in Snowflake are semantically identical but syntactically different. A rule-based check flags these as mismatches. A human looks at them and says “these are fine.” A column renamed from <em>user_id</em> to <em>customer_id</em> might be the same field after a refactor, or it might be a completely different concept. A rule-based check cannot tell the difference. A human can, but a human is not checking schemas at 4am before the nightly ETL runs.</p>
+<p>The <em>LLMSchemaCompareOperator</em> in Airflow’s Common AI provider uses an LLM to compare schemas across databases, file formats, and cloud storage with semantic understanding. It catches what rule-based checks miss, and it runs automatically before the pipeline touches any data. It is available today in <em>apache-airflow-providers-common-ai 0.4.0</em>.</p>
+<pre><code>@dag(tags=["schema-validation"])
+def nightly_etl_with_schema_gate():
+    @task.llm_schema_compare(
+        llm_conn_id="pydanticai_default",
+        db_conn_ids=["postgres_source", "snowflake_target"],
+        table_names=["customers"],
+        context_strategy="full",
+    )
+    def check_before_etl():
+        return (
+            "Compare schemas and flag any mismatches that would "
+            "break data loading. No migrations allowed - report only."
+        )
+
+    @task.branch
+    def decide(comparison_result):
+        if comparison_result["compatible"]:
+             return "run_etl"
+        return "notify_team"
+
+    comparison = check_before_etl()
+    decision = decide(comparison)
+
+    @task(task_id="run_etl")
+    def run_etl():
+        return "ETL completed"
+
+    @task(task_id="notify_team")
+    def notify_team():
+        return "Schema drift detected - team notified"
+
+decision &gt;&gt; [run_etl(), notify_team()]</code></pre>
+<p>The schema check runs as the first task in the DAG. If the source and target schemas are compatible, the pipeline proceeds. If the LLM detects drift that would break loading, the team gets notified before any data moves. No partial writes. No silent corruption. No downstream contamination.</p>
+<p>The LLM handles the semantic matching that rule-based checks cannot: type equivalences across databases (<em>varchar(n)</em> vs <em>STRING</em>, <em>timestamp</em> vs <em>timestamptz</em>), column renames that preserve meaning, and subtle structural differences like a field moving from required to nullable. The operator returns structured <em>SchemaMismatch</em> results with severity rankings, so you can gate your pipeline on critical mismatches while letting cosmetic differences pass through.</p>
+<p>This also works across storage formats. You can compare an S3 Parquet file against a Postgres table, or a CSV landing zone against a Snowflake staging schema:</p>
+<pre><code>s3_source = DataSourceConfig(
+    conn_id="aws_default",
+    table_name="customers",
+    uri="s3://data-lake/customers/",
+    format="parquet",
+)
+
+LLMSchemaCompareOperator(
+    task_id="compare_s3_vs_db",
+    prompt="Compare S3 Parquet schema against Postgres and flag breaking changes",
+    llm_conn_id="pydanticai_default",
+    db_conn_ids=["postgres_default"],
+    table_names=["customers"],
+    data_sources=[s3_source],
+)</code></pre>
+<p>For teams running cross-database ETL or ingesting data from external partners, this replaces a manual pre-flight check that most teams skip because it is too tedious to maintain. The operator runs automatically on every pipeline execution. Upstream application teams can deploy schema changes without notifying you, and your pipeline catches the drift before it matters.</p>
+<p>The connection to the rest of this post is direct: schema drift that gets caught here never becomes a 2am failure that the retry policy has to classify. Detection is cheaper than recovery.</p>
+<h2>Resume: Pick Up Where You Left Off</h2>
+<p>A gaming company I spoke with recently described a pain point that I hear constantly: long-running Databricks jobs that fail and restart from scratch. A Spark job processes millions of events, runs for 45 minutes, fails at minute 40, and then reruns the entire thing. The compute cost doubles. The SLA slips.</p>
+<p>This is not a new problem. It is one of the oldest problems in data engineering. What is new is a clean, general-purpose solution.</p>
+<p>Airflow 3.3 introduces the Task State Store, a persistent key-value store scoped to each task instance that survives across retries. The pattern is simple: before you submit a long-running external job, store the job handle. On retry, check if a handle exists. If it does, reattach to the running job instead of submitting a new one.</p>
+<pre><code>@task(retries=2, retry_delay=timedelta(seconds=5))
+def run_spark_job(task_state_store=None, ti=None):
+    job_id = task_state_store.get("job_id")
+    if job_id:
+        print(f"Try \{ti.try_number}: reattaching to existing job: \{job_id}")
+    else:
+        job_id = submit_spark_job()
+        task_state_store.set("job_id", job_id, retention=NEVER_EXPIRE)
+        print(f"Try \{ti.try_number}: submitted job: \{job_id}")
+
+    result = poll_until_complete(job_id)
+    task_state_store.set("status", "complete")
+    return result["rows_written"]</code></pre>
+<p>The <em>task_state_store</em> is injected into the task function automatically, just like <em>ti</em>. You read from it with <em>.get()</em>, write to it with <em>.set()</em>, and the state persists across retries without any external database or custom code. The <em>NEVER_EXPIRE</em> retention ensures the job handle survives for as long as retries are happening.</p>
+<p>This is not specific to Spark. The same pattern applies to any long-running external job: Databricks, EMR, Dataproc, Flink, or any system where you submit work and poll for completion. The first operator to adopt this pattern is the <em>SparkSubmitOperator</em>, which now automatically stores the external application ID (e.g. YARN application ID) and reattaches on retry instead of submitting a duplicate.</p>
+<p>For the asset management firm I mentioned earlier, this directly addresses their start-of-day SLA problem. A failed Spark job that reattaches in seconds instead of restarting for 45 minutes is the difference between hitting the market-open deadline and missing it.</p>
+<h2>Fix: Turn Your 2am Playbook Into a Retry Policy</h2>
+<p>This is the capability I am most excited about.</p>
+<p>Every data engineering team has a version of the same document. It might be a Confluence page, a Notion doc, a Slack bookmark, or just the tribal knowledge in a senior engineer’s head. It is the on-call runbook: the decision tree that the person who gets paged at 2am walks through to figure out what went wrong and what to do about it.</p>
+<p>The playbook typically looks something like this:</p>
+<p>Every data engineer recognizes this table. The categories are well understood. The actions are deterministic. And yet, every Airflow DAG handles all of these the same way: retries=3, retry_delay=timedelta(minutes=5). Wait five minutes, try again, hope it works. Three times.</p>
+<p>An expired API key does not fix itself after five minutes. A schema mismatch does not resolve on the third attempt. Meanwhile, a rate limit that would have cleared in 60 seconds waits 5 minutes for the first retry, because the DAG has no way to know that a shorter delay would have been sufficient.</p>
+<p>Airflow 3.3 introduces pluggable retry policies based on the Common AI provider. An LLMRetryPolicy that classifies errors using an LLM at failure time. The key insight: the instructions parameter is where your team’s runbook goes.</p>
+<pre><code>from airflow.providers.common.ai.policies.retry import LLMRetryPolicy
+from airflow.sdk.definitions.retry_policy import RetryAction, RetryRule
+
+# Your team's 2am playbook, encoded as instructions.
+ONCALL_PLAYBOOK = (
+    "You are the on-call error classifier for our nightly ETL pipelines. "
+    "Classify each error using our team's runbook:\n\n"
+    "- rate_limit: API throttling or quota exceeded. "
+    "  RETRY after 60s. These almost always resolve.\n"
+    "- auth: Credentials expired, revoked, or missing permissions. "
+    "  FAIL immediately. Retrying wastes 3 attempts and delays the real fix. "
+    "  Page the platform team.\n"
+    "- network: Connection refused, timeout, DNS failure. "
+    "  RETRY after 10s. Transient.\n"
+    "- data: Schema mismatch, type error, corrupt file, bad input. "
+    "  FAIL immediately. This is an upstream data problem, not infrastructure. "
+    "  Notify the data quality channel.\n"
+    "- resource: Table, bucket, or service not found. "
+    "  FAIL. The resource will not appear on its own.\n"
+    "- transient: Temporary issue not covered above. "
+    "  RETRY after 30s.\n"
+    "- permanent: Code bug, config error, or anything requiring a deploy to fix. "
+    "  FAIL. No amount of retrying helps.\n\n"
+    "When in doubt between transient and permanent, check if the error message "
+    "references a specific resource, credential, or schema. "
+    "If it does, it is probably not transient."
+)
+
+etl_retry_policy = LLMRetryPolicy(
+    llm_conn_id="pydanticai_default",
+    instructions=ONCALL_PLAYBOOK,
+    timeout=30.0,
+    fallback_rules=[
+        RetryRule(
+            exception=ConnectionError,
+            action=RetryAction.RETRY,
+            retry_delay=timedelta(seconds=10),
+        ),
+        RetryRule(
+            exception=PermissionError,
+            action=RetryAction.FAIL,
+        ),
+    ],
+)</code></pre>
+<p>That <em>ONCALL_PLAYBOOK</em> string is your team’s runbook. The same decision tree that a senior engineer carries in their head, now encoded as the system prompt for the retry policy. Different teams can have different playbooks. A team that runs financial reconciliation pipelines with strict SLAs might have different thresholds and escalation rules than a team running experimental ML training jobs.</p>
+<p>When a task fails, the <em>LLMRetryPolicy</em> sends the exception text to the LLM along with these instructions. The LLM returns a structured classification: error category, whether to retry, a suggested delay, and its reasoning. The policy acts on that classification automatically.</p>
+<p>The <em>fallback_rules</em> are the safety net. If the LLM itself is unavailable (its own network issue, rate limited, timeout), the policy falls back to deterministic exception matching. An <em>LLMRetryPolicy</em> with good fallback rules is strictly better than the default retry behavior, never worse.</p>
+<p>Here is what this looks like for three tasks using the same playbook:</p>
+<pre><code>@task(retries=3, retry_delay=timedelta(minutes=1), retry_policy=etl_retry_policy)
+def task_auth_error():
+    """LLM reads the playbook, classifies as auth -&gt; FAIL immediately."""
+    raise PermissionError(
+        "403 Forbidden: API key expired for service account analytics@proj.iam"
+    )
+
+@task(retries=3, retry_delay=timedelta(minutes=1), retry_policy=etl_retry_policy)
+def task_rate_limit():
+    """LLM reads the playbook, classifies as rate_limit -&gt; RETRY after 60s."""
+    raise RuntimeError(
+        "429 Too Many Requests: Rate limit exceeded. Retry after 60 seconds."
+    )
+
+@task(retries=3, retry_delay=timedelta(minutes=1), retry_policy=etl_retry_policy)
+def task_data_error():
+    """LLM reads the playbook, classifies as data -&gt; FAIL immediately."""
+    raise ValueError(
+        "Column 'user_id' expected type INT but got STRING in row 42."
+    )</code></pre>
+<p>The auth error fails immediately. No one gets woken up for three futile retries before the real escalation. The rate limit retries with the right delay on the first attempt instead of waiting through the default retry interval. The data error fails and surfaces as a data quality issue, not a generic pipeline failure.</p>
+<p>This is what changes the 2am experience. Instead of a data engineer getting paged and spending 20 minutes reading logs to figure out what kind of error it is, the retry policy classifies it in seconds and takes the right action. The engineer still gets notified for failures that require human intervention, but they get notified with context: “auth failure, API key expired for analytics@proj.iam, no retries attempted” is a fundamentally different alert than “task failed after 3 retries.”</p>
+<p>The playbook that used to live in a Confluence page that no one updated now lives in the code, versioned alongside the DAG, and executes automatically on every failure.</p>
+<blockquote>
+ <strong>A Note on AI Pipeline Failures</strong>
+ <p>This is not just about traditional ETL. Teams running AI and agentic workloads on Airflow are hitting the same retry problem, with one additional wrinkle: LLM provider rate limits.</p>
+ <p>An enterprise AI company I spoke with recently runs agentic workflows where a DAG fires for each incoming customer request. Their pipelines make dozens of LLM calls per run across multiple providers. Rate limiting from providers like Anthropic and OpenAI is a constant operational issue. Their team built custom LLM load balancing to swap between providers and round-robin across deployments of the same model.</p>
+ <p>The LLMRetryPolicy handles the first part of this natively. A 429 Too Many Requests from an LLM provider gets classified as rate_limit, and the policy retries with the appropriate delay instead of failing the entire DAG run. The playbook can encode provider-specific knowledge:</p>
+</blockquote>
+<pre><code>AI_PIPELINE_PLAYBOOK = (
+    "You are the error classifier for AI-powered document processing pipelines. "
+    "These pipelines make many LLM calls per run and interact with "
+    "external document stores.\n\n"
+    "- rate_limit: LLM provider throttling (429, quota exceeded, "
+    "  'rate limit' in message). RETRY after 60s. Very common, "
+    "  almost always resolves. Do NOT fail on first occurrence.\n"
+    "- auth: API key expired or revoked. FAIL immediately.\n"
+    "- data: Document parsing failure, corrupt PDF, missing required fields. "
+    "  FAIL. Notify the data team.\n"
+    "- resource: Model endpoint not found, deployment deleted. FAIL.\n"
+    "- transient: Timeout, connection reset. RETRY after 15s.\n"
+    "- permanent: Invalid prompt, context length exceeded, "
+    "  unsupported file type. FAIL.\n"
+)</code></pre>
+<h2>The Loop: Detect, Resume, Fix</h2>
+<p>These three capabilities work independently, but together they form a pipeline health loop that addresses the most common operational pain points in data engineering:</p>
+<p><strong>Detect</strong> upstream problems before they propagate. <strong>Resume</strong> efficiently when failures happen mid-pipeline. <strong>Fix</strong> failures intelligently based on what actually went wrong.</p>
+<p>None of these require you to build an AI application. You are not writing agents. You are not building RAG pipelines. You are adding a decorator, a parameter, or a policy to the pipelines you already run. The AI is embedded in the infrastructure, not in your application logic.</p>
+<p>That is the distinction I keep coming back to. There is a lot of conversation right now about data engineers building AI applications, orchestrating agents, and constructing LLM pipelines. All of that is real and important. But there is a quieter, more immediate opportunity: using AI to make the pipelines you already run more resilient, more self-healing, and less dependent on someone being awake at 2am to walk through a mental checklist.</p>
+<h2>Try It</h2>
+<p>Schema validation is available today:</p>
+<pre><code>pip install "apache-airflow-providers-common-ai&gt;=0.4.0"</code></pre>
+<p>Task State Store and LLM Retry Policy ship with Airflow 3.3, currently in beta:</p>
+<pre><code>pip install -U "apache-airflow==3.3.0b1"</code></pre>
+<p>Example DAGs for all three capabilities are in the Airflow repository. The LLM Retry Policy documentation is at <a href="https://airflow.apache.org/docs/apache-airflow-providers-common-ai/stable/retry_policies.html">airflow.apache.org</a>.</p>
+<p>If you are running Airflow today and want to try the schema validation operator, all you need is a <em>pydanticai_default</em> connection configured with your LLM provider of choice (OpenAI, Anthropic, Google, AWS Bedrock, Groq, Mistral, Ollama, or any of the 20+ supported providers).</p>
+<p>Questions, feedback, or ideas for other capabilities like these: the Airflow community Slack channel <strong>#airflow-ai</strong> is where these conversations happen.</p>
+<p><em>Vikram Koka is the Chief Strategy Officer at Astronomer and an Apache Airflow PMC member.</em></p>

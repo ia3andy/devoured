@@ -1,0 +1,284 @@
+<h1>Background Agents: Open-Inspect</h1>
+<p>An open-source background agents coding system inspired by Ramp's Inspect.</p>
+<h2>Overview</h2>
+<p>Open-Inspect provides a hosted background coding agent that can:</p>
+<ul>
+ <li>Work on tasks in the background while you focus on other things</li>
+ <li>Access full development environments (Node.js, Python, git, browser automation, VS Code)</li>
+ <li>Connect from anywhere — web UI, Slack, GitHub PRs, Linear issues, or webhooks</li>
+ <li>Enable multiplayer sessions where multiple people can collaborate in real time</li>
+ <li>Create PRs with proper commit attribution to the prompting user</li>
+ <li>Run on a schedule — cron jobs, Sentry alerts, and webhook-triggered automations</li>
+ <li>Spawn parallel sub-tasks that work in separate sandboxes simultaneously</li>
+ <li>Use your choice of AI model — Anthropic Claude, OpenAI Codex (via ChatGPT subscription), or OpenCode Zen</li>
+</ul>
+<h2>Security Model (Single-Tenant Only)</h2>
+<blockquote>
+ <p><strong>Important</strong>: This system is designed for <strong>single-tenant deployment only</strong>, where all users are trusted members of the same organization with access to the same repositories.</p>
+</blockquote>
+<h3>How It Works</h3>
+<p>The system uses a shared GitHub App installation for git operations (clone, fetch, push). The control plane mints short-lived installation tokens server-side and brokers them to sandboxes through the git credential helper on demand. This means:</p>
+<ul>
+ <li><strong>All users share the same GitHub App credentials</strong> - The GitHub App must be installed on your organization's repositories, and any user of the system can access any repo the App has access to</li>
+ <li><strong>No per-user repository access validation</strong> - The system does not verify that a user has permission to access a specific repository before creating a session</li>
+ <li><strong>GitHub users' OAuth tokens are used for PR creation</strong> - For GitHub logins, PRs are created using the user's GitHub OAuth token, ensuring proper attribution and that they can only create PRs on repos they have write access to. Users who sign in another way (e.g. Google) carry no SCM token, so their PRs fall back to the shared GitHub App bot</li>
+</ul>
+<h3>Token Architecture</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Token Type</th>
+   <th>Purpose</th>
+   <th>Scope</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>GitHub App Token</td>
+   <td>Brokered git clone/fetch/push auth</td>
+   <td>All repos where App is installed</td>
+  </tr>
+  <tr>
+   <td>User OAuth Token</td>
+   <td>Create PRs, user info</td>
+   <td>Repos user has access to</td>
+  </tr>
+  <tr>
+   <td>Sandbox Auth Token</td>
+   <td>Sandbox-to-control-plane session calls</td>
+   <td>Single session</td>
+  </tr>
+  <tr>
+   <td>WebSocket Token</td>
+   <td>Real-time session auth</td>
+   <td>Single session</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Why Single-Tenant Only</h3>
+<p>This architecture follows Ramp's Inspect design, which was built for internal use where all employees are trusted and have access to company repositories.</p>
+<p><strong>For multi-tenant deployment</strong>, you would need:</p>
+<ul>
+ <li>Per-tenant GitHub App installations</li>
+ <li>Access validation at session creation</li>
+ <li>Tenant isolation in the data model</li>
+</ul>
+<h3>Deployment Recommendations</h3>
+<ol>
+ <li><strong>Deploy behind your organization's SSO/VPN</strong> - Ensure only authorized employees can access the web interface</li>
+ <li><strong>Install GitHub App only on intended repositories</strong> - The App's installation scope defines what the system can access</li>
+ <li><strong>Restrict sign-in</strong> - Configure allowed GitHub users, email domains, or active GitHub organization membership (<code>ALLOWED_GITHUB_ORGS</code>)</li>
+ <li><strong>Use GitHub's repository selection</strong> - When installing the App, select specific repositories rather than "All repositories"</li>
+ <h2>Architecture</h2>
+ <pre><code>                                    ┌──────────────────┐
+                                    │     Clients      │
+                                    │ ┌──────────────┐ │
+                                    │ │  Web / Slack │ │
+                                    │ │ GitHub / Lin.│ │
+                                    │ │   Webhooks   │ │
+                                    │ └──────────────┘ │
+                                    └────────┬─────────┘
+                                             │
+                                             ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                     Control Plane (Cloudflare)                     │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                   Durable Objects (per session)              │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌───────────────┐    │  │
+│  │  │ SQLite  │  │WebSocket│  │  Event  │  │   GitHub      │    │  │
+│  │  │   DB    │  │   Hub   │  │ Stream  │  │ Integration   │    │  │
+│  │  └─────────┘  └─────────┘  └─────────┘  └───────────────┘    │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │              D1 Database (repo-scoped secrets)               │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────┬───────────────────────────────────┘
+                                 │
+                                 ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                 Data Plane (Sandbox Backend)                       │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                     Session Sandbox                          │  │
+│  │  ┌───────────┐  ┌───────────┐  ┌───────────┐                 │  │
+│  │  │ Supervisor│──│  OpenCode │──│   Bridge  │─────────────────┼──┼──▶ Control Plane
+│  │  └───────────┘  └───────────┘  └───────────┘                 │  │
+│  │                      │                                       │  │
+│  │              Full Dev Environment                            │  │
+│  │      (Node.js, Python, git, agent-browser)                   │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────┘
+</code></pre>
+ <h2>Packages</h2>
+ <table>
+  <thead>
+   <tr>
+    <th>Package</th>
+    <th>Description</th>
+   </tr>
+  </thead>
+  <tbody>
+   <tr>
+    <td>control-plane</td>
+    <td>Cloudflare Workers + Durable Objects</td>
+   </tr>
+   <tr>
+    <td>web</td>
+    <td>Next.js web client</td>
+   </tr>
+   <tr>
+    <td>sandbox-runtime</td>
+    <td>Shared in-sandbox agent runtime</td>
+   </tr>
+   <tr>
+    <td>modal-infra</td>
+    <td>Modal sandbox infrastructure</td>
+   </tr>
+   <tr>
+    <td>daytona-infra</td>
+    <td>Daytona snapshot infrastructure</td>
+   </tr>
+   <tr>
+    <td>opencomputer-infra</td>
+    <td>OpenComputer template infrastructure</td>
+   </tr>
+   <tr>
+    <td>slack-bot</td>
+    <td>Slack integration (sessions from messages)</td>
+   </tr>
+   <tr>
+    <td>github-bot</td>
+    <td>GitHub integration (auto-review, @mention)</td>
+   </tr>
+   <tr>
+    <td>linear-bot</td>
+    <td>Linear integration (issue → coding session)</td>
+   </tr>
+   <tr>
+    <td>shared</td>
+    <td>Shared types and utilities</td>
+   </tr>
+  </tbody>
+ </table>
+ <h2>Getting Started</h2>
+ <p>For a practical setup guide (local + contributor + deployment paths), start with <strong>docs/SETUP_GUIDE.md</strong>.</p>
+ <p>See <strong>docs/GETTING_STARTED.md</strong> for deployment instructions.</p>
+ <p>To understand the architecture and core concepts, read <strong>docs/HOW_IT_WORKS.md</strong>.</p>
+ <p>To set up recurring scheduled tasks, see <strong>docs/AUTOMATIONS.md</strong>.</p>
+ <h2>Key Features</h2>
+ <h3>Fast Startup</h3>
+ <p>Sessions start near-instantly through multiple layers of warming:</p>
+ <ul>
+  <li><strong>Filesystem snapshots</strong> — After each prompt, sandbox state is saved; follow-up sessions restore instead of re-cloning</li>
+  <li><strong>Pre-built images</strong> — Toggle per-repo (Settings &gt; Images) or per-environment (Settings &gt; Environments); rebuilt every 30 minutes with latest commits and dependencies</li>
+  <li><strong>Proactive warming</strong> — Sandbox begins spinning up as soon as you start typing, before you hit Enter</li>
+ </ul>
+ <h3>Multi-Repository Sessions &amp; Environments</h3>
+ <p>One session can work across several repositories in a single sandbox:</p>
+ <ul>
+  <li><strong>Ad-hoc sets</strong> — Pick up to 10 repositories in the new-session picker; each is cloned side by side and the agent can make coordinated changes and open a PR per repository</li>
+  <li><strong>Environments</strong> — Save a repository set as a named environment with its own secrets scope and optional prebuilt images, then launch it from the picker like any repository</li>
+ </ul>
+ <h3>Multiplayer Sessions</h3>
+ <p>Multiple users can collaborate in the same session:</p>
+ <ul>
+  <li>Presence indicators show who's active</li>
+  <li>Prompts are attributed to their authors in git commits</li>
+  <li>Real-time streaming to all connected clients</li>
+ </ul>
+ <h3>Commit Attribution</h3>
+ <p>Commits are attributed to the user who sent the prompt:</p>
+ <pre><code>// Configure git identity per prompt
+await configureGitIdentity(\{
+  name: author.scmName,
+  email: author.scmEmail,
+});</code></pre>
+ <h3>Multi-Provider Model Support</h3>
+ <p>Choose the AI model that fits your task, with per-session reasoning effort controls:</p>
+ <table>
+  <thead>
+   <tr>
+    <th>Provider</th>
+    <th>Models</th>
+   </tr>
+  </thead>
+  <tbody>
+   <tr>
+    <td>Anthropic</td>
+    <td>Claude Haiku 4.5, Sonnet 4.5/4.6, Opus 4.5/4.6/4.7/4.8, Fable 5</td>
+   </tr>
+   <tr>
+    <td>OpenAI</td>
+    <td>GPT 5.4, GPT 5.5, 5.3 Codex, 5.3 Codex Spark</td>
+   </tr>
+   <tr>
+    <td>OpenCode Zen</td>
+    <td>Kimi K2.5/K2.6, MiniMax M2.5, Qwen3.7 Max, GLM 5/5.1 (opt-in)</td>
+   </tr>
+   <tr>
+    <td>Z.AI Coding Plan</td>
+    <td>GLM 5.2 (opt-in)</td>
+   </tr>
+  </tbody>
+ </table>
+ <h3>Client Integrations</h3>
+ <p>Interact with agents from wherever your team already works:</p>
+ <ul>
+  <li><strong>Web UI</strong> — Full session management with real-time streaming, model/reasoning selectors, terminal panel, and multiplayer presence</li>
+  <li><strong>Slack Bot</strong> — @mention or DM to start a session; replies thread back with results. Per-user model and branch preferences via App Home</li>
+  <li><strong>GitHub Bot</strong> — Auto-review on PR open or respond to @mentions in PR comments. Configurable per-repo</li>
+  <li><strong>Linear Bot</strong> — Mention or assign the agent on an issue to start a coding session, post progress activities, and link the resulting PR</li>
+  <li><strong>Webhooks</strong> — Trigger sessions from any external system via authenticated HTTP POST</li>
+ </ul>
+ <h3>Automations</h3>
+ <p>Schedule recurring tasks or react to external events — no human in the loop:</p>
+ <ul>
+  <li><strong>Cron schedules</strong> — Hourly, daily, weekly, monthly, or custom 5-field cron with timezone support</li>
+  <li><strong>Sentry alerts</strong> — Auto-triage on new errors, regressions, or critical metric alerts</li>
+  <li><strong>Inbound webhooks</strong> — JSONPath condition filters to gate which payloads spawn sessions</li>
+  <li><strong>Multi-repo fan-out</strong> — One scheduled automation can run across up to 10 repositories, opening a separate session and pull request for each</li>
+  <li>Auto-pause after 3 consecutive failures, manual trigger button, full run history</li>
+ </ul>
+ <h3>Sandbox Environment</h3>
+ <p>Every session runs in an isolated sandbox backend with a full development environment:</p>
+ <ul>
+  <li><strong>Pre-installed:</strong> Node.js 22, Python 3.12, Bun, git, GitHub CLI, build-essential</li>
+  <li><strong>Browser automation:</strong> agent-browser CLI with headless Chromium for screenshots, visual diffs, and UI verification</li>
+  <li><strong>Code-server:</strong> Optional browser-based VS Code connected to the session workspace</li>
+  <li><strong>Web terminal:</strong> ttyd-powered terminal accessible from the session UI</li>
+  <li><strong>Port tunneling:</strong> Expose up to 10 dev server ports via encrypted tunnels</li>
+  <li><strong>Secrets:</strong> AES-256-GCM encrypted, scoped globally, per-repo, or per-environment, injected as env vars at spawn time.</li>
+ </ul>
+ <h3>Sub-Task Spawning</h3>
+ <p>Agents can decompose work into parallel child sessions:</p>
+ <ul>
+  <li><code>spawn-task</code> creates a child session in its own sandbox and returns immediately</li>
+  <li>Parent continues working while children run in parallel on separate branches</li>
+  <li><code>get-task-status</code> and <code>cancel-task</code> for coordination</li>
+ </ul>
+ <h3>Repository Lifecycle Scripts</h3>
+ <p>Repositories can define two optional startup scripts under <code>.openinspect/</code>:</p>
+ <pre><code># .openinspect/setup.sh (provisioning)
+#!/bin/bash
+npm install
+pip install -r requirements.txt</code></pre>
+ <pre><code># .openinspect/start.sh (runtime startup)
+#!/bin/bash
+docker compose up -d postgres redis</code></pre>
+ <ul>
+  <li><code>setup.sh</code> runs for image builds and fresh sessions</li>
+  <li><code>start.sh</code> runs for every non-build session startup (fresh, prebuilt-image, snapshot-restore)</li>
+ </ul>
+ <h2>License</h2>
+ <p>MIT</p>
+ <h2>Credits</h2>
+ <p>Inspired by Ramp's Inspect and built with:</p>
+ <ul>
+  <li>Modal - Cloud sandbox infrastructure</li>
+  <li>Daytona - Cloud development sandboxes</li>
+  <li>Vercel Sandbox - Cloud sandbox infrastructure</li>
+  <li>OpenComputer - Cloud sandbox infrastructure</li>
+  <li>Cloudflare Workers - Edge computing</li>
+  <li>OpenCode - Coding agent runtime</li>
+  <li>Next.js - Web framework</li>
+ </ul>
+</ol>

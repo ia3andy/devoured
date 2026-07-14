@@ -1,0 +1,83 @@
+<h1>Nginx vs Caddy vs Traefik in 2026 — I Ran All Three Under Real Production Load</h1>
+<h2>Same Kubernetes cluster, same microservices, same TLS requirements. One proxy broke during ingress-nginx migration week. Guess which.</h2>
+<p>I’ve terminated more TLS than I care to admit. Reverse proxies are the part of the stack everyone forgets until certificates expire, upstreams go silent, or — in March 2026 — your ingress controller hits end-of-life and compliance asks what your migration plan is.</p>
+<p>A logistics client ran ingress-nginx on EKS for four years. Fine until it wasn’t supported. They asked me to compare <strong>Nginx (F5 NIC)</strong>, <strong>Caddy</strong>, and <strong>Traefik</strong> on the same cluster before picking a path forward. Same twelve microservices. Same cert issuer. Same load tests. I ran each as the edge for <strong>six weeks</strong>.</p>
+<p>RKE2 v1.36 making Traefik the default ingress is not abstract news if you operate Rancher clusters. It is a migration ticket with a deadline.</p>
+<h2>The Test Bed: Production Shape, Controlled Variables</h2>
+<p>Cluster: EKS, <strong>12 services</strong>, <strong>~35,000 requests/minute</strong> average, <strong>~61,000</strong> peak during dispatch windows. Mix of REST JSON, WebSocket tracking, and one large CSV export (15–40 MB responses).</p>
+<p>Each proxy setup:</p>
+<ul>
+ <li>Automatic TLS (Let’s Encrypt / ACME)</li>
+ <li>HTTP/2 and HTTP/3 where supported</li>
+ <li>Rate limiting on public endpoints</li>
+ <li>Prometheus metrics scraped the same way</li>
+ <li>Same pod resource requests: 2 CPU / 2Gi per ingress controller replica</li>
+</ul>
+<p>I tracked: p50/p99 proxy latency, memory at idle and at 10k connections, config reload behavior, and <strong>operator time per new service route</strong>.</p>
+<h2>Throughput vs Operator Time — Pick Your Poison</h2>
+<p><strong>Nginx (F5 NIC ingress on Kubernetes):</strong></p>
+<ul>
+ <li>Proxy throughput: <strong>~46,000 req/s</strong> in our wrk suite (2 KB JSON upstream) — highest of the three</li>
+ <li>p99 proxy overhead: <strong>~0.9ms</strong> at median load</li>
+ <li>Idle memory: <strong>~35 MB</strong> per controller pod; <strong>~120 MB</strong> at 10k connections</li>
+ <li>New service route: <strong>manual Ingress YAML + annotation review</strong> — ~25 minutes including PR</li>
+ <li>Strength: raw performance, massive community knowledge, every senior SRE has scars here</li>
+</ul>
+<p><strong>Caddy 2.11 (standalone ingress on VMs + DaemonSet edge):</strong></p>
+<ul>
+ <li>Proxy throughput: <strong>~41,000 req/s</strong> — <strong>~11% behind</strong> Nginx on pure JSON proxying</li>
+ <li>p99 overhead: <strong>~1.2ms</strong> — TLS termination gap narrowed; automatic HTTPS is not a gimmick</li>
+ <li>Idle memory: <strong>~28 MB</strong>; <strong>~95 MB</strong> at 10k connections</li>
+ <li>New route: <strong>12-line Caddyfile block</strong> or JSON API push — ~8 minutes for a standard service</li>
+ <li>HTTP/3 on by default. ECH support mattered for a client with aggressive TLS inspection policies.</li>
+</ul>
+<p><strong>Traefik 3.7 (Kubernetes CRD + IngressRoute):</strong></p>
+<ul>
+ <li>Proxy throughput: <strong>~36,000 req/s</strong> — lowest raw number, still <strong>3x headroom</strong> over peak traffic</li>
+ <li>p99 overhead: <strong>~1.6ms</strong> under burst; token-bucket rate limiting smoother than Nginx leaky bucket for our spike pattern</li>
+ <li>Idle memory: <strong>~48 MB</strong>; <strong>~135 MB</strong> at 10k connections</li>
+ <li>New route: <strong>label on Deployment</strong> — often <strong>zero</strong> manual steps after conventions exist</li>
+ <li>ingress-nginx annotation compatibility layer saved <strong>two weeks</strong> on migration — <code>rewrite-target</code>, <code>proxy-body-size</code>, most of what they already had</li>
+</ul>
+<h2>TLS, Reloads, and the Config Formats You’ll Maintain at 2 AM</h2>
+<p><strong>Nginx:</strong> Cert rotation via cert-manager worked. Config reload via <code>nginx -s reload</code> is battle-tested. When we fat-fingered a <code>proxy_pass</code> typo, Nginx refused reload and kept the old config — annoying in CI, lifesaving in prod.</p>
+<p><strong>Caddy:</strong> Automatic HTTPS is the real product. Two lines, cert appears, HTTP/3 works. JSON API reload with zero downtime felt like cheating on a homelab. In Kubernetes we still needed to wire cert storage — not hard, but not literally zero config at scale.</p>
+<p><strong>Traefik:</strong> Watching Docker/K8s events and building routes dynamically is magic until it isn’t — a mislabeled pod got public traffic for <strong>eleven minutes</strong> before we caught it in access logs. Convention documentation became mandatory: label schema, entrypoint names, middleware chains.</p>
+<h2>The Migration Week Incident</h2>
+<p>Cutover Tuesday, <strong>09:40 local</strong> — dispatch managers start their morning export ritual. Traefik at 60% traffic, ingress-nginx still handling legacy annotations on two services. A deployment rolled out with a malformed <code>Ingress</code> annotation — <code>nginx.ingress.kubernetes.io/proxy-read-timeout</code> set to <code><strong>"30"</strong></code> (seconds) on an export service that needed <strong>300</strong>.</p>
+<p>Nginx ingress honored the low timeout. Traefik’s translated middleware did too — correctly, per config. Large CSV exports died at <strong>30 seconds</strong> flat. Users saw <strong>502 Bad Gateway</strong>. Error rate: <strong>0% → 8%</strong> in <strong>three minutes</strong>.</p>
+<p>We extended the timeout annotation, confirmed upstream p99 was <strong>42 seconds</strong> for huge exports, set <strong>300s</strong> with a async export fallback on the roadmap.</p>
+<p>For the node-level debugging — <code>journalctl</code>, connection tracking, file descriptor limits — turned out <code>nf_conntrack</code> table was <strong>92% full</strong> on two nodes from the export spike. Not a Traefik bug. A <strong>connection tracking</strong> budget we had never sized for long-lived downloads.</p>
+<h2>When I Would Choose Nginx</h2>
+<ul>
+ <li>You terminate <strong>massive</strong> traffic on dedicated edge nodes and need every req/s</li>
+ <li>Large-file streaming (GB-scale) where Nginx’s buffer tuning still wins</li>
+ <li>Team has a decade of Nginx config and F5 support contract</li>
+ <li>You are standardizing on F5 NIC post ingress-nginx EOL and want vendor continuity</li>
+</ul>
+<h2>When I Would Choose Caddy</h2>
+<ul>
+ <li>Small cluster or VM fleet — <strong>TLS just works</strong> with minimal config</li>
+ <li>Developer velocity over raw throughput; HTTP/3 and ECH matter</li>
+ <li>You hate maintaining Certbot sidecars and annotation archaeology</li>
+ <li><strong>&lt;10 services</strong>, mostly stable routes, homelab-to-production pipeline</li>
+</ul>
+<h2>When I Would Choose Traefik</h2>
+<ul>
+ <li>Kubernetes-native stack with <strong>frequent service churn</strong> — labels beat YAML surgery</li>
+ <li>Migrating off ingress-nginx in 2026 — annotation compatibility is real</li>
+ <li>RKE2 / Rancher shops where Traefik is already the default path</li>
+ <li>You want dynamic upstreams without reloading the world</li>
+</ul>
+<h2>Verdict</h2>
+<p>There is no “best” proxy — only the one that matches your <strong>operational model</strong>.</p>
+<p>For this client’s EKS fleet with weekly deploys and a migration deadline, <strong>Traefik won</strong> — not because it was fastest, but because <strong>operator time</strong> and ingress-nginx compatibility beat <strong>11% throughput</strong> we weren’t using. We kept <strong>Nginx</strong> on a dedicated edge VM for the CSV export CDN path where buffer tuning and raw streaming matter. <strong>Caddy</strong> runs my personal staging cluster because I refuse to maintain Certbot on a Saturday.</p>
+<h2>What You Should Do This Week</h2>
+<ol>
+ <li><strong>If you still run ingress-nginx</strong>, inventory annotations and test Traefik’s compatibility layer on a non-prod namespace. March 2026 EOL is not a surprise anymore — it’s a calendar event.</li>
+ <li><strong>Log </strong><code><strong>X-Forwarded-For</strong></code><strong> and upstream status</strong> on every 502. Half of "proxy broke" is timeout misconfig.</li>
+ <li><strong>Check </strong><code><strong>nf_conntrack</strong></code><strong> usage</strong> before blaming the ingress controller for connection drops on large downloads.</li>
+ <li><strong>Write a rate-limit test</strong> that hits the same endpoint from two IP paths — corporate LB misconfig shows up before customers complain.</li>
+ <li><strong>Document your label/schema conventions</strong> before Traefik auto-discovery becomes auto-misrouting.</li>
+</ol>
+<p>Proxies do not create outages. They reveal the config you did not test. Make sure you know what’s on the other side.</p>
