@@ -1,0 +1,64 @@
+<h1>WebMCP for Documentation</h1>
+<p>How WorkOS taught its docs to speak WebMCP, giving AI agents real tools instead of HTML to scrape</p>
+<p>When an AI agent reads your documentation today, it does what a scraper does: pull the rendered HTML and guess. It parses a wall of markup, tries to tell navigation from content, and hopes the page it landed on is the one the user actually needed. Every step is an interpretation, and every interpretation is a chance to be wrong.</p>
+<p>WebMCP closes that gap. It's a proposed web standard for building and exposing structured tools that AI agents can call directly, providing JavaScript and HTML form annotations so agents know exactly how to interact with a page instead of inferring it from markup. We put this exciting new tech on the WorkOS docs, and documentation turned out to be close to an ideal surface for it.</p>
+<h2>The problem with "just build an MCP server"</h2>
+<p>The default answer to "make my product AI-accessible" has been to stand up an MCP server. That's the right call for a lot of things — APIs, internal tools, database access. It's the wrong call for a documentation site.</p>
+<p>An MCP server is a separate process. It has its own deployment, its own auth story, its own hosting bill, its own tools, and its own drift problem: the moment your docs change, the server's view of them is stale unless you wire up a sync pipeline. You end up maintaining two representations of the same content — the site humans read, and the server agents read — and reconciling them forever.</p>
+<p>For docs, that's absurd. The docs <em>are</em> the interface. The content, the navigation, the search index, the code samples — they already exist, rendered, in the browser. What we actually need is a way to let an agent talk to the page the user is looking at, using the same DOM, the same search, the same state.</p>
+<p>That's what WebMCP is for.</p>
+<h2>What WebMCP actually does</h2>
+<p>The core idea is a shift in who declares intent. Instead of an agent inspecting a button or a field and guessing what it's for, the page declares each element's purpose so it gets used correctly — which is more reliable than actuation, where a multi-step interaction leaves each step open to the agent's interpretation.</p>
+<p>A page exposes tools through <code>document.modelContext</code> (or <code>navigator.modelContext</code>), and the standard covers three things: discovery, so pages register tools with agents in a standard way; JSON Schemas, so inputs and outputs are defined explicitly to cut down on hallucination; and state, so the agent shares an understanding of the current page context. Tools run on the page visibly, so a user can watch the work happen and trust the result, and the site keeps its own design for humans intact.</p>
+<p>There are two ways to author tools: an imperative API where you define them in standard JavaScript, and a declarative API where you annotate standard HTML forms.</p>
+<h2>Why documentation is the right surface</h2>
+<p>A docs site is read-mostly and navigation-heavy. The things an agent wants to do — find the right page, understand a section, move to it — map cleanly onto a small set of safe, well-defined tools. You don't need to model a shopping cart or guard a payment. You need search and movement.</p>
+<p>WebMCP lives on the page the human already visits. The tools are generated from the same build that produces the docs, so they can't describe a version of the site that no longer exists. The agent and the human see the same thing.</p>
+<h2>How we built it</h2>
+<p>The implementation is a single custom Astro integration, <code>integrations/webmcp.mjs</code>, wired into the docs <code>astro.config.mjs</code> integration list. It has two halves: a build step that generates a manifest, and a client script that registers tools at runtime.</p>
+<p>At build time, the integration reads each rendered page's <code>index.html</code>, pulls the <code>&lt;title&gt;</code> and the description meta tag, groups pages into collections by their first path segment, and writes <code>/_webmcp/manifest.json</code> with the entries and per-section counts. When the site finishes building, the manifest is also copied to the deploy root so the client's fetch to <code>/_webmcp/manifest.json</code> resolves</p>
+<p>On the client, an injected script registers four tools:</p>
+<ul>
+ <li><strong><code>search_content</code></strong>: keyword search over page titles and descriptions in the manifest, with an optional <code>collection</code> filter and a <code>limit</code>.</li>
+ <li><strong><code>list_sections</code></strong>: enumerates the top-level content sections with page counts, derived from the first path segment of each URL.</li>
+ <li><strong><code>go_to</code></strong>: navigates the browser to a page by slug or path. Matches against <code>slug</code>, <code>url</code>, or <code>/\{slug}/</code>, and falls back to a "use <code>search_content</code>" hint when nothing matches.</li>
+ <li><strong><code>get_page_info</code></strong>: returns the current page's title, meta description, <code>h1</code>/<code>h2</code>/<code>h3</code> headings, and pathname, read straight from the live DOM.</li>
+</ul>
+<p>Registration looks something like this.</p>
+<pre><code>
+mc.registerTool(\{
+      name: "search_content",
+      description: "Search documentation pages by keyword. Returns titles, URLs, and descriptions of matching results.",
+      annotations: \{
+        readOnlyHint: true,
+        untrustedContentHint: true
+      },
+      inputSchema: \{
+        type: "object",
+        properties: \{
+          query: \{
+            type: "string",
+            description: "Search term"
+          },
+          collection: \{
+            type: "string",
+            description: "Filter by content section (optional)"
+          },
+          limit: \{
+            type: "number",
+            description: "Max results (default 10, max 50)"
+          }
+        },
+        required: ["query"]
+      },
+      execute: async (args) =&gt; \{
+          const m = await loadManifest();
+          if (!m) return "Manifest unavailable.";
+      }
+});
+</code></pre>
+<p>The manifest is fetched once and cached through a <code>loadManifest</code> helper, so repeated searches don't refetch it.</p>
+<p>The injected script can run again on client-side navigations, like Astro's view transitions, where <code>document.modelContext</code> persists. A <code>document.__webmcpRegistered</code> flag guards registration so each tool is registered once instead of stacking duplicate handlers on every navigation. All tool output runs through a truncation helper capped at a <code>MAX_OUTPUT_LENGTH</code> of 4000 characters before it's serialized to JSON, so a broad search can't dump an unbounded blob into the agent's context.</p>
+<h2>Where this is headed</h2>
+<p>WebMCP is still early, but the potential is huge! You can make use of the technology now through a Chrome origin trial starting in Chrome 149, with a <code>chrome://flags/#enable-webmcp-testing</code> flag for local development.</p>
+<p>The spec is still moving, browser support is still landing, and the broader set of agent tools is still working out how to negotiate between page-declared tools and server-declared ones. The bet is straightforward: agents are going to read documentation whether or not we give them a good way to do it. Handing them real search and navigation tools, generated from the same build that ships the site, beats leaving them to scrape. The direction is clear though: the web is going to expose itself to agents through the same surface it exposes to humans, not through a parallel universe of servers that shadow every site.</p>
