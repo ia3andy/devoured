@@ -1,0 +1,130 @@
+<h2>6× faster binary search: from compiled code to mechanical sympathy</h2>
+<p>How do you speed up computational Python code? A common, and useful, starting point is:</p>
+<ol>
+ <li>Pick a good algorithm.</li>
+ <li>Use a compiled language to write a Python extension.</li>
+ <li>Maybe add parallelism so you can use multiple CPU cores.</li>
+</ol>
+<p>But what if you need more speed? Consider the following real problem, one of the steps in scikit-learn’s gradient histogram boosting algorithm:</p>
+<ul>
+ <li>You have a large array of floating point numbers.</li>
+ <li>You want to assign them to the integer range 0-254, spread out evenly.</li>
+</ul>
+<p>scikit-learn implements this by splitting up the full range of float values into 255 buckets, creating a sorted array of bucket boundaries, and then using binary search to choose the appropriate bucket for each value. The binary search is implemented in a compiled language, and it can run in parallel on multiple cores.</p>
+<p>Recently, as part of my work at Quansight, and inspired by two posts by Paul Khuong, I sped up this implementation significantly. How? By making sure the code wasn’t fighting against the CPU.</p>
+<p>In this article I’m going to walk you through that speed-up, demonstrated on a simplified example. Then I’m going to demonstrate a series of additional optimizations, with the final version running 6× faster than the original one.</p>
+<p>It’s worth knowing that I will be speeding through mentions of many different low-level hardware topics: instruction-level parallelism, branch (mis)prediction, memory caches, SIMD, and more. This is only one article, it can only briefly introduce you to what’s possible, it can’t function as an in-depth tutorial. So I’ll talk about how you can learn more about these topics at the end of the article.</p>
+<h2>The starting point: Standard binary search</h2>
+<p>The original scikit-learn code was implemented in Cython, but I’m going to use Rust for this article. Here’s a pretty standard implementation of binary search (based on the one in NumPy), designed for this use case of finding a bucket given an array of boundaries:</p>
+<pre><code>use std::cmp::Ordering;
+
+/// Rust doesn't let you compare floats with the normal &lt;
+/// operator (because NaN makes comparison results
+/// inconsistent), so implement a custom function to do so.
+fn less_than(a: f64, b: &amp;f64) -&gt; bool \{
+    a.total_cmp(b) == Ordering::Less
+}
+
+/// Convert floating points values into integer values by
+/// finding which bucket they fit in, given bucket
+/// boundaries.
+fn bucketize_classic_impl(
+    arr: &amp;[f64],
+    boundaries: &amp;[f64],
+) -&gt; Vec&lt;usize&gt; \{
+    // A Vec or vector is Rust's equivalent of a Python
+    // list. Here I create an empty Vec with enough memory
+    // allocated to store `arr.len()` values:
+    let mut result = Vec::with_capacity(arr.len());
+    for value in arr \{
+        // Standard binary search algorithm:
+        let mut min_idx = 0;
+        let mut max_idx = boundaries.len();
+        while min_idx &lt; max_idx \{
+            let middle = min_idx + ((max_idx - min_idx) / 2);
+            if less_than(boundaries[middle], value) \{
+                min_idx = middle + 1;
+            } else \{
+                max_idx = middle;
+            }
+        }
+        // This is equivalent to a_list.append() in Python:
+        result.push(min_idx);
+    }
+    // Return the result:
+    result
+}
+</code></pre>
+<h2>Branch mispredictions slow your code down</h2>
+<p>How can I speed up this implementation of binary search? It’s already using a scalable algorithm, and a compiled language. Parallelism is certainly an option, but I’m going to use a different approach: mechanical sympathy, a better understanding of how the CPU works. I’ll start with a very quick review of how modern CPUs run code in parallel <em>within a single core</em>.</p>
+<p>A reasonable mental model of Python code is that the code is executed one instruction at a time. Do twice as many arithmetic operations, and the code will run twice as slow. Once you switch to a compiled language, with operations sometimes mapping to one or two CPU instructions, that mental model is no longer correct. Modern CPUs can sometimes run multiple independent CPU instructions at once (“instruction-level parallelism”) on a single CPU core, resulting in faster execution.</p>
+<p>To ensure fast execution, the CPU has a branch predictor that heuristically chooses which branch to execute in parallel. If the guess is correct, your code is faster. If the guess is wrong, the CPU will eventually notice, undo the incorrect work, and then go execute the correct branch… which means your code is slower. In some cases, much slower.</p>
+<p>The binary search algorithm above is unfortunately very unpredictable given the input data. Recall that the bucket boundaries are chosen so that the input values are spread evenly across all buckets. That means that choosing whether to go left or right in the binary search is not at all predictable.</p>
+<h2>Switching to branchless execution</h2>
+<p>I’m going to get rid of both sources of unpredictable branches. As far as the number of <code>while</code> loop iterations, I’m instead going to iterate a fixed number of times, log2 of the number of buckets. For some value this might involve a bit more work, if previously the bucket would be found in an iteration or two, but the saving in speed from avoiding branch mispredictions will make it worth it.</p>
+<p>For the <code>if</code> expression, the current code sometimes set one variable, sometimes another. I’m going to replace that with code that always sets the same variable, even if it’s unchanged. Then, I’m going to use Rust’s <code>std::hint::select_unpredictable()</code>, which tells the compiler to avoid emitting branches, if possible. Often CPUs have special instructions for conditionally choosing between two values, without a branch.</p>
+<p>Here’s what the new, branchless version looks like:</p>
+<pre><code>use std::hint::select_unpredictable;
+
+fn bucketize_branchless_impl(
+    arr: &amp;[f64],
+    boundaries: &amp;[f64],
+) -&gt; Vec&lt;usize&gt; \{
+    let size = boundaries.len();
+    let n_iterations = (size as f64).log2().ceil() as usize;
+    let mut result = Vec::with_capacity(arr.len());
+
+    for value in arr \{
+        let mut left = 0;
+        let mut remaining_size = size;
+
+        // Branchless binary search: keep cutting the search
+        // area in half.
+        for _ in 0..n_iterations \{
+            let half = remaining_size / 2;
+            let middle = left + half;
+            // Conditional operation: if bool, then a, else
+            // b. Hopefully generated by the compiler
+            // without an actual branch.
+            left = select_unpredictable(
+                less_than(boundaries[middle], value),
+                middle,
+                left,
+            );
+            remaining_size -= half;
+        }
+
+        // Fix an off-by-one difference from the original
+        // algorithm.
+        left = select_unpredictable(
+            less_than(boundaries[left], value),
+            left + 1,
+            left,
+        );
+        result.push(left);
+    }
+    result
+}
+</code></pre>
+<h2>Getting rid of branches and wasted work</h2>
+<p>Having improved the code’s mechanical sympathy, I now have the opportunity to return to other sources of speed: tuning compilation, and making the code more algorithmically efficient by doing less work.</p>
+<p>First, the branchless code still has 19 branches per value in the input array. 7 or 8 of those are the <code>for _ in 0..n_iterations</code>: deciding if the <code>for</code> loop should continue or finish requires a branch, and <code>n_iterations</code> is log2 of 255 or so. But where are the rest coming from?</p>
+<p>These additional branches exist because the Rust compiler adds bounds checks to vector and array access. Every indexed read and write has a check to see if the index is out of bounds, in order to ensure memory safety: writing to index 100 of a vector of length 10 can lead to crashes or memory corruption. Bounds checks are good, insofar as they catch bugs, but they’re bad insofar as they add more computation. So I’m going to use Rust <code>unsafe</code> code to call APIs like <code>get_unchecked()</code> that bypass the bounds checks, meaning it’s now my responsibility to ensure that the code is still correct.</p>
+<h2>Auto-vectorization and SIMD</h2>
+<p>Finally, I will return to mechanical sympathy. It’s worth noticing that different values in the input array get basically the same operation done on them. In our original version, the number of inner iterations differed, but now the same number of iterations is happening for each.</p>
+<p>If the same operation is happening on multiple values in memory, specialized SIMD CPU instructions can help: “Same Instruction, Multiple Data” or SIMD for short, they are custom built to speed up your code by processing data in parallel. You can use them manually, or you can have the Rust compiler “auto-vectorize” your code, i.e.&nbsp;automatically generate SIMD instructions if it decides it’s useful.</p>
+<p>To achieve this I’m going to do two things.</p>
+<p>First, I tell Rust that it can generate CPU instructions that require modern hardware, x86-64 machines from the past 10 years or so. This mean access to a much wider range of SIMD CPU instructions, at the cost of preventing the resulting machine code from running on old computers. Specifically, I do:</p>
+<pre><code>$ export RUSTFLAGS="-C target-cpu=x86-64-v3"
+</code></pre>
+<p>Then, I restructure the code so the iteration over <code>halves</code> is an <em>outer</em> loop, and iterating over values in <code>arr</code> is an <em>inner</em> loop; previously it was the other way around. That way there are much more obviously identical operations happening on adjacent data, hopefully allowing the compiler to figure out some way to convert this code to SIMD instructions.</p>
+<h2>You can speed up your code too</h2>
+<p>There are more opportunities for speed here. First, and most significantly, I could use parallelism to take advantage of multiple CPU cores. And there are additional potential ways to speed up the single-threaded code too; I’ve successfully implemented one, just to see if it would work.</p>
+<p>But in the end this is just an article with some code examples. The real value here is not me demonstrating another 14% speedup, it’s you going and speeding up <em>your</em> code. This is something you can learn, just like I did: I can now write far faster software than I could when I started, even if there’s still plenty more for me to learn.</p>
+<p>Some books that can help you build mechanical sympathy include:</p>
+<ul>
+ <li><em>Computer Systems: A Programmer’s Perspective, 3rd edition</em>, by Bryant and O’Halloran. This textbook covers how CPUs work, but unlike most it focuses only on the parts that are relevant to programmers.</li>
+ <li><em>Performance Analysis and Tuning on Modern CPUs, 2nd Edition</em>, by Denis Bakhalov. This free book talks about critical tools for measuring performance, and how to interpret their results; I paid for the printed version. He also has a free online course.</li>
+ <li><em>Algorithms for Modern Hardware</em>, by Sergey Slotin, is a free online book.</li>
+</ul>
+<p>These books mostly focus on mechanical sympathy, rather than on other sources of performance. They assume you know some amount of C. And because these are general purpose books, you will need to translate what you’ve learned into the kind of code you’re writing.</p>

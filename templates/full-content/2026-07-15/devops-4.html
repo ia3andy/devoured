@@ -1,0 +1,105 @@
+<h1>Terraform MCP Server Explained: Setup and Use Cases</h1>
+<p>The popularity of agentic development extends to infrastructure as code. However, the lack of relevant context and up-to-date documentation and examples is problematic when using agents to author IaC with Terraform.</p>
+<p>The model-context protocol (MCP) can help with elements of these issues. It does this by exposing capabilities to your agents in the form of tools that it can call to perform read or write operations in external systems, as well as resources and prompts.</p>
+<p>In this blog post, we will explore the Terraform MCP server: what it is, how to configure and run it locally, examples of how it is used, and best practices.</p>
+<p>What we’ll cover:</p>
+<ol>
+ <li>What is an MCP server?</li>
+ <li>What is the Terraform MCP server?</li>
+ <li>How to use the Terraform MCP server</li>
+ <li>Terraform MCP server use cases</li>
+ <li>Best practices for using the Terraform MCP server</li>
+</ol>
+<p>TL;DR</p>
+<p>The Terraform MCP server gives your AI agent live access to the public Terraform registry, so it writes Terraform with accurate, version-specific docs for providers, modules, and policies instead of outdated guesses.</p>
+<ul>
+ <li>It runs locally, usually as a Docker container, so the token you give it never travels over the network.</li>
+ <li>It ships with 44 tools. Most of them target HCP Terraform and Terraform Enterprise.</li>
+ <li>Read-tools like <code>search_providers</code> are safe to run automatically. Action-tools like <code>create_run</code> can change or destroy infrastructure, so gate them behind a confirmation prompt.</li>
+ <li>Destructive operations are off by default. <code>ENABLE_TF_OPERATIONS</code> is <code>false</code> until you set it to <code>true</code>.</li>
+ <li>Scope the token to least privilege, and never hand the server credentials it doesn’t need.</li>
+</ul>
+<h2>What is an MCP server?</h2>
+<p>AI agents are based on <strong>large language models</strong> (LLMs). These models are trained on a huge amount of training data. This data represents a snapshot in time and does not include any new information that becomes available later.</p>
+<p>To combat this, we extend our AI agents with knowledge in a few different formats:</p>
+<ul>
+ <li><strong>Retrieval-Augmented Generation</strong> (RAG) extends an agent with factual knowledge from some type of knowledge bank (e.g., an API, a database, a wiki, etc) at runtime.</li>
+ <li><strong>Fine-tuning</strong> is the process of training a base model on additional data within a specific domain.</li>
+ <li><strong>Agent skills</strong> allow you to extend an agent with procedural knowledge.</li>
+ <li>The <strong>Model-Context Protocol</strong> (MCP) provides agents with knowledge in the form of tool access. This could be read-tools for reading up-to-date information or action-tools for performing operations on a remote system.</li>
+</ul>
+<p>MCP is made available to your agents using a traditional client-server architecture. The agent is the client that calls the tools and resources exposed by the MCP server.</p>
+<h2>What is the Terraform MCP server?</h2>
+<p>The Terraform MCP server gives your AI agent tools to access up-to-date documentation on providers, modules, and policies from the public Terraform registry. This ensures your agent can provide accurate suggestions when assisting you with Terraform configurations.</p>
+<p>The Terraform MCP server also provides your AI agent with tools to interact with your HCP Terraform organization to fetch information from your private registry and manage projects, workspaces, and runs.</p>
+<p>A huge advantage of using the Terraform MCP server over giving your agent access to generic web-search tools is that you can pinpoint specific provider versions and resources to reduce the risk of model hallucinations or version mismatches in the generated code.</p>
+<h2>How to use the Terraform MCP server</h2>
+<p>In this section, we will follow the required steps to get the Terraform MCP server running locally.</p>
+<h3>How to install the Terraform MCP server locally</h3>
+<h4>Generate a token to authenticate the Terraform MCP server</h4>
+<p>To interact with your HCP Terraform or Terraform Enterprise organization, you will need to provide the Terraform MCP server with a token. Sign in to your HCP Terraform or Terraform Enterprise organization, go to your user profile, and create a new user token.</p>
+<h4>Configure and run the Terraform MCP server locally</h4>
+<p>In this section, we will use the recommended option and host the Terraform MCP server locally using Docker.</p>
+<p>Create a new directory named <code>.vscode</code> and create a file named <code>mcp.json</code> within this directory.</p>
+<p>Add the following JSON configuration to <code>mcp.json</code>:</p>
+<pre><code>\{
+  "servers": \{
+    "terraform": \{
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "-e", "TFE_TOKEN=$\{input:tfe_token}",
+        "-e", "TFE_ADDRESS=$\{input:tfe_address}",
+        "-e", "ENABLE_TF_OPERATIONS=true",
+        "hashicorp/terraform-mcp-server"
+      ]
+    }
+  },
+  "inputs": [
+    \{
+      "type": "promptString",
+      "id": "tfe_token",
+      "description": "Terraform API Token",
+      "password": true
+    },
+    \{
+      "type": "promptString",
+      "id": "tfe_address",
+      "description": "Terraform Address",
+      "password": false
+    }
+  ]
+}</code></pre>
+<h3>Use case 1: Interacting with the public Terraform registry</h3>
+<p>When you use a foundation LLM model with no additional source of knowledge to generate a Terraform configuration, you commonly end up with older Terraform provider versions that do not have the latest features, resources, and behaviors. The Terraform MCP server can rectify this through tools that interact with the public Terraform registry.</p>
+<h3>Use case 2: Interacting with HCP Terraform or Terraform Enterprise</h3>
+<p>The Terraform MCP server can help during operations of Terraform configurations in your HCP Terraform or Terraform Enterprise environments. You can perform tasks like listing projects and workspaces, managing variables, or triggering <code>terraform plan</code> and <code>apply</code> operations via your agent.</p>
+<h2>Use cases for the Terraform MCP server</h2>
+<ul>
+ <li>Access Terraform registry documentation for providers, modules, and Sentinel policies.</li>
+ <li>Interact with your Terraform Enterprise (TFE) or HCP Terraform environment: 
+  <ul>
+   <li>List your organizations, projects and workspaces.</li>
+   <li>Manage workspaces (create, update, delete).</li>
+   <li>List, create, update and delete variables and variable sets.</li>
+   <li>Create and manage runs and monitor run status.</li>
+  </ul></li>
+ <li>Produce higher-quality Terraform configurations by giving your agent access to the Terraform style-guide and the module development guide.</li>
+</ul>
+<h2>Best practices for using the Terraform MCP server</h2>
+<ul>
+ <li><strong>Host your Terraform MCP server locally:</strong> Do not expose the server over a network unless you have specific requirements.</li>
+ <li><strong>Restrict token permissions (least privilege):</strong> Scope the token to the actions it must be able to perform. Use team tokens instead of user tokens if possible.</li>
+ <li><strong>Handle action-tools carefully:</strong> Do not allow the use of action-tools in production without confirmation. Keep <code>ENABLE_TF_OPERATIONS</code> as <code>false</code> unless needed.</li>
+ <li><strong>Do not expose sensitive data:</strong> Use OIDC workload identity federation for cloud authentication instead of passing static credentials to the MCP server.</li>
+ <li><strong>Monitor and logging:</strong> Use variables like <code>LOG_LEVEL</code> to track usage, especially for action-tools.</li>
+</ul>
+<h2>Frequently asked questions</h2>
+<ul>
+ <li><strong>Is there an MCP for Terraform?</strong> Yes, HashiCorp maintains the official Terraform MCP server.</li>
+ <li><strong>How does the Terraform MCP server work?</strong> It runs as a local or remote server that exposes Terraform Registry APIs and HCP Terraform operations through JSON-RPC 2.0.</li>
+ <li><strong>What are the benefits of using Terraform MCP?</strong> It provides real-time access to current provider schemas and manages HCP Terraform/Enterprise operations directly.</li>
+ <li><strong>Is the Terraform MCP server open source?</strong> Yes, under the Mozilla Public License 2.0.</li>
+</ul>
