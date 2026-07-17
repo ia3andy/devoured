@@ -1,0 +1,52 @@
+<p>I got tired of implementing my own backlog manually using claude code on my laptop. So I set up a loop, let the system triage it, decompose it if it's too big, implement it, run the tests, and open a PR. I do the merge from my phone. It's been running for 2 weeks: 27 merges, 1 failure, with $1.61 average per-issue.</p>
+<p>It's been running for 2 weeks. The number will likely change. Now I'm still actively collecting data. I'll update this post as the system matures. But the pattern seems to work well enough that I wanted to share it now rather than wait for a perfect dataset.</p>
+<h2>The cost</h2>
+<pre><code>$100.00/month  Claude Max 5x (triage + implementation via Claude Code CLI)
+$  9.99/month  VPS (Hostinger, 2 vCPU, 8GB RAM, Ubuntu)
+$  0.00/month  GitHub
+─────────
+$109.99/month  Total</code></pre>
+<h2>The config</h2>
+<p>The system is autoloop. One file that configures the loop:</p>
+<pre><code># autoloop.toml
+repo = "your-org/your-repo"
+triage_model = "sonnet"
+impl_model = "claude-opus-4-6"
+verify_cmd = "uv run pytest"
+max_retries = 3
+protected_paths = ["autoloop/", "autoloop.toml"]</code></pre>
+<p>Three systemd timers. No Kubernetes. No orchestration framework. No fancy queue service.</p>
+<pre><code>OnCalendar=*-*-* 00:00:00 UTC   # triage
+OnCalendar=*-*-* 02:00:00 UTC   # implement
+OnCalendar=*-*-* 04:00:00 UTC   # changelog</code></pre>
+<h2>What happens to an issue</h2>
+<p>A GitHub issue enters the queue. Unattended:</p>
+<p><strong>Triage</strong> (Sonnet, ~$0.10): Reads the issue, validates it, estimates the story points, and assigns priority. If the issue is too large, it decomposes into sub-issues with dependency ordering and triages each one. It recursively splits until every piece is buildable in one pass and generates a PR small enough for me to review on my phone.</p>
+<p><strong>Implement</strong> (Opus, ~$1.50): Picks the top ready issue with respect to dependency ordering, creates a branch, runs Claude with the issue spec and repo context, runs tests and lint, checks that test files were added, and opens a PR.</p>
+<p><strong>Verification gate</strong>: When tests fail or no test files were added, it retries up to 3 times, feeding the errors back to provide context for the next attempt. If all retries fail, it labels the issue <code>needs-human</code> and moves on.</p>
+<p>I review queued PRs on my phone and merge. That's my contribution to the loop. Can PR merge be done automatically? Yes, but it's a deliberate architecture decision for me to be the PR gate.</p>
+<h2>When it breaks</h2>
+<p><strong>Day 8</strong>. Issue #40 was a duplicate. It described the issue was already implemented. The system still tried 3 times to produce a change, found nothing to change, failed verification because there was no diff. It labeled the issue <code>needs-human</code> and moved on to the next item in the queue.</p>
+<p>I looked at the issue and read the failure explanation. I closed it. It was the right outcome. A human looks at it, realizes it's a duplicate, closes it. The system couldn't know at the time. It just knew it couldn't produce a valid PR. So it got out of the way.</p>
+<p><strong>Day 12</strong>. Issue #159 got decomposed into 3 sub-issues. The second sub-issue produced a PR that broke an import path the first PR had introduced. Merge conflict. I fixed it from my phone in the Claude Code remote session (tmux on the VPS). It took me only 4 minutes.</p>
+<p><strong>The pattern:</strong> when it fails, it's almost always because my issue description was ambiguous or assumed context the builder didn't have. Better issues → better PRs. The system exposed my sloppy specs faster than any code review would.</p>
+<h2>The constraint that makes it safe</h2>
+<p>The system cannot modify itself.</p>
+<pre><code>protected_paths = ["autoloop/", "autoloop.toml"]</code></pre>
+<p>If an issue targets files under <code>protected_paths</code>, triage routes it to <code>needs-human</code>. The builder never touches its own logic, pipeline, or configuration. This safety check is done at both triage (primary gate) and implementation (safety net).</p>
+<p><em>Self-improvement without self-modification.</em> It improves the <em>product</em>. It cannot improve the <em>process</em>. That boundary is what I believe makes it safe to run unattended.</p>
+<h2>What it built</h2>
+<p>Patina: 7,200 lines of Python, 9,200 lines of tests, 31 MCP tools.</p>
+<p>I built the initial core architecture interactively. Once the foundation was solid, autoloop took over the backlog. Of the last 40 merged PRs, 27 were autonomous.</p>
+<p>The pipeline itself is 3,500 lines. It was originally embedded in Patina's repo, then extracted into a standalone package that I can apply to my other repositories with one command:</p>
+<pre><code>autoloop init --repo your-org/your-repo --verify-cmd "pytest"
+autoloop triage
+autoloop implement</code></pre>
+<h2>Where it works and where it doesn't</h2>
+<p>I want to be honest about where this applies.</p>
+<p><strong>This works for:</strong> solo builders, small teams, repos where one person or one team can hold full context. Non-critical-path systems where a 24-hour fix cycle is acceptable.</p>
+<p><strong>This doesn't work (yet) for:</strong> regulated environments, multi-team codebases, customer-facing production with SLAs that need rollback mechanisms this setup doesn't provide (yet). The pattern applies at any scale but this implementation assumes one human at the gate.</p>
+<p>Two weeks isn't proof of anything long-term. I'll update this post again at 3 and 6 month mark. If it degrades, I'll share my findings. I'm just sharing the pattern, not declaring victory or claiming a solution that can fix all real world use cases.</p>
+<h2>What I learned</h2>
+<p>The bottleneck isn't the model or the infrastructure. It's the issue quality. Vague issues produce bad PRs. Specific issues with clear acceptance criteria and file path hints produce PRs that merge on first review.</p>
+<p>A year ago this required a team. I'm simply amazed today it only requires a VPS and taste in writing issues.</p>

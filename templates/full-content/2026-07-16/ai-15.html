@@ -1,0 +1,83 @@
+<p>ReactBench is an evaluation for coding agents on realistic React work. Today’s models can pass tests in benchmarks but still write React that fails in production. Tests verify behavior, but they miss React performance, accessibility, and quality issues.</p>
+<p>Here’s what ReactBench does differently:</p>
+<ul>
+ <li><strong>A higher bar than just passing tests</strong>: Every solution must pass both behavioral tests and React Doctor, our open-source, deterministic verifier for React code. Its 400+ rules scan the agent's code for broken effects, unnecessary renders, accessibility problems, and maintainability issues.</li>
+ <li><strong>Built by React experts</strong>: Our team built React Doctor, React Scan, and Million.js, used by engineers at GitHub, PayPal, Rippling, and Airbnb. We spent hundreds of hours curating tasks to measure real gaps in model capabilities.</li>
+ <li><strong>Real work in real codebases</strong>: ReactBench spans open-source repositories and realistic changes grounded in existing projects (not synthetic puzzles). Agents must implement, preserve behavior, and meet the React-specific quality checks.</li>
+</ul>
+<h2>Results</h2>
+<p>We evaluate two complementary capabilities: implementing new features and improving existing code.</p>
+<ul>
+ <li><strong>Write React</strong>: Implement a real feature or fix, pass held-out behavioral tests, and validate no new React Doctor issues were introduced.</li>
+ <li><strong>Fix React</strong>: Refactor React failures from existing code while preserving existing behavior without introducing new React Doctor issues.</li>
+</ul>
+<p>We report the average of the pass@1 across 5 trials.</p>
+<p>ReactBench remains unsaturated, even on leading models. GPT-5.6 Sol at XHigh has the highest observed aggregate score at 43.1%, while Claude Fable 5 at XHigh reaches 41.2%. Across evaluated configurations, Fable costs $7.97 per trial on average versus $1.37 for Sol, or 5.8× as much. At XHigh, Fable costs 6.3× as much as Sol. Even the best configurations solve fewer than half of benchmark task attempts.</p>
+<p>We also evaluated task discrimination across model configurations. In the 51-task panel, 36 tasks (70.6%) had a cross-configuration standard deviation above 0.10.</p>
+<p>In terms of balancing quality and cost, GPT-5.6 Terra at Medium reaches 38.0%, 5.1 percentage points behind GPT-5.6 Sol at XHigh, while using 10.8% fewer output tokens and costing 63.2% less per task. It retains most of the leading configuration’s performance at roughly one-third the cost, making it the strongest practical tradeoff for high-volume workloads.</p>
+<p>GPT-5.6 Sol at XHigh achieved the highest overall pass rate. However, the differences among the leading configurations are too small to identify a clear winner with confidence.</p>
+<p>Across 4,455 Write React trials, the evaluated models introduced 1,194 graded React Doctor issues. Bugs, including security findings, accounted for 925, or 77.5%. The most common issues involved list rendering and Hook correctness.</p>
+<p>The verifier-outcome taxonomy shows that Write and Fix tasks fail differently. Among 2,486 failed Write trials, 1,623 (65.3%) failed behavioral tests but passed React Doctor. Among 3,219 failed Fix trials, 1,956 (60.8%) passed behavior but failed React Doctor.</p>
+<p>Write tasks fail primarily on requested behavior, while Fix tasks fail primarily on unresolved React problems.</p>
+<h2>Why we built ReactBench</h2>
+<p>React is the dominant frontend framework and the most popular target for coding agents. Roughly 70% of websites built on a JavaScript framework choose React.</p>
+<p>We have seen the risks firsthand. React Doctor is our open source tool for scanning React issues used by engineers at PayPal, Rippling, Polymarket, and the Centers for Disease Control and Prevention (CDC). Adoption is largely driven by the increase of model-generated code that makes it easier for subtle defects to reach production. As models write more React, small mistakes can propagate at enormous scale. In the worst cases, these defects lead to production failures:</p>
+<ul>
+ <li><strong>Outages</strong>: Incorrect <code>useEffect</code> usage takes down production. Cloudflare traced its September 2025 dashboard and API outage to one effect with a faulty dependency. Despite human review and test, the bug still shipped to production.</li>
+ <li><strong>Lost revenue</strong>: Slow interfaces cost sales. Google and Deloitte found that a 0.1s mobile speedup increased retail conversions by 8.4%. Rakuten 24 increased revenue per visitor by 53.4% after improving Core Web Vitals.</li>
+ <li><strong>Legal risk</strong>: Interfaces that are not accessible exclude customers and expose companies to lawsuits. WebAIM found automated accessibility failures on 95.9% of the top one million home pages and US federal web accessibility lawsuits increased by 27% in 2025.</li>
+</ul>
+<h2>Building ReactBench</h2>
+<p>Each task type uses a different construction and evaluation process.</p>
+<h3>Write React</h3>
+<p>Write React measures whether an agent can implement real work without introducing a React regression. Each task starts from a merged pull request in an open-source repository. The agent receives the base repository and an issue-style instruction. The reference patch and verifier are not provided.</p>
+<ul>
+ <li><strong>Behavior</strong>: The verifier injects the hidden behavior tests and verifies the results in a separate container after the agent completes.</li>
+ <li><strong>React health</strong>: A pinned React Doctor scan compares the submission with the base commit. If a new issue is detected, it fails.</li>
+</ul>
+<h3>Fix React</h3>
+<p>Fix React measures whether an agent can recognize and refactor React problems from source code alone. We select a component with known React issues and ask the agent to improve it without naming those findings.</p>
+<ul>
+ <li><strong>React health</strong>: The agent must remove every target without introducing another graded React issue. The grader ignores line shifts.</li>
+ <li><strong>Behavior</strong>: The task’s test suite must still pass to ensure refactoring the component did not regress it in functionality.</li>
+</ul>
+<h3>React Doctor as a verifier</h3>
+<p>We built React Doctor, an open-source, deterministic React verifier with 400+ rules to cover problems outside behavioral test assertions:</p>
+<ul>
+ <li><strong>Correctness</strong>: Catches conditional hooks, unstable list keys, hydration mismatches, and deprecated React APIs.</li>
+ <li><strong>State and effects</strong>: Flags derived or duplicate state, useEffect abuse, and infinite rerenders.</li>
+ <li><strong>Performance</strong>: Finds unnecessary renders, layout thrashing, sequential async work, and bundle-heavy imports.</li>
+ <li><strong>Accessibility and security</strong>: Detects unlabeled controls, keyboard-inaccessible interactions, unsafe HTML, and secrets exposed to client bundles.</li>
+</ul>
+<h3>From real pull requests to verified tasks</h3>
+<ul>
+ <li><strong>Mine candidates</strong>: We collect merged pull requests from open-source React projects.</li>
+ <li><strong>Filter candidates</strong>: We built automated filters to check if there were meaningful changes to product code. Then, reviewers assess exceptions that cover broader feature work or important projects, and have realistic behavioral tests.</li>
+ <li><strong>Author tasks</strong>: Each reviewer converts validated pull requests into a realistic issue-style instruction. If the candidate’s tests are too strict, reviewers will rebuild a custom test harness to validate behavior.</li>
+ <li><strong>Validate behavior</strong>: The tests must fail against the pinned base commit and pass with the reference solution. The unchanged repository must score 0, while the reference solution must score 1.</li>
+ <li><strong>Test the verifier</strong>: An adversarial agent attempts to earn full credit without implementing the requested behavior.</li>
+ <li><strong>Pin the release</strong>: For each task, we pin the source commit, environment, test suite, reference solution, and verifier configuration. We also have a versioned manifest that records a hash for each published artifact.</li>
+</ul>
+<h3>Behavioral coverage</h3>
+<p>Every task defines deterministic behavioral checks before release. We use the repository’s existing Vitest, Jest, or Playwright tests when they fully specify the requested behavior.</p>
+<p>When existing tests leave gaps, we build a separate harness around observable behavior. Reviewers confirm that the verifier accepts valid implementations beyond the reference solution.</p>
+<h3>Clean-room grading</h3>
+<p>The agent and verifier run in separate containers. Before grading, the verifier restores its own Git metadata, dependencies, protected configuration, hidden tests, and pinned React Doctor binary.</p>
+<p>Continuous integration (CI) confirms that both containers use the same source commit. The verifier runs offline and doesn’t make external network requests. The agent cannot access hidden tests or the reference solution during its run.</p>
+<h3>Separating model failures from benchmark failures</h3>
+<p>A zero can reflect a model failure, unclear instructions, a brittle test, a verifier error, an infrastructure failure, or an invalid run.</p>
+<p>Reviewers inspect the trajectory and final patch before including a result in model-performance conclusions. They classify each reviewed rollout as a legitimate solve, genuine model failure, verifier false positive, verifier false negative, or invalid run.</p>
+<h3>Testing ReactBench against reward hacking</h3>
+<p>The adversarial agent probes the test infrastructure, reward files, Git history, and React Doctor inputs. Its goal is to earn full credit without implementing the requested behavior.</p>
+<p>We fix or remove any task that exposes a cheat, then rerun every control. This final check tests whether ReactBench measures the requested work rather than an agent’s ability to exploit the grader.</p>
+<h2>Limitations</h2>
+<p>React Bench evaluates agents, not models in isolation. Differences among Codex CLI, Claude Code, Cursor, Gemini CLI, and other harnesses can affect results.</p>
+<p>Every task combines behavioral tests with React Doctor as a verifier. These checks catch important React problems, but they cannot guarantee visual correctness and other important attributes.</p>
+<p>Also, the benchmark primarily covers open-source React projects. Results may not generalize to proprietary codebases, different architectures, or other frontend frameworks or setups.</p>
+<p>React Bench will publish versioned tasks, solutions, manifests, and release records so others can inspect and reproduce each evaluated task set.</p>
+<h2>Future work</h2>
+<p>We plan to compare more models, on more effort levels. Additionally, we plan to run not only on the commercial harnesses, but also on mini-swe-agent to get a more solid baseline.</p>
+<p>We also plan to expand into visual design and other frontend frameworks and diversify the repositories and task types represented.</p>
+<p>We’re constantly improving ReactBench. Report benchmark issues on GitHub. Model labs and coding-agent teams can reach out to evaluate models on our held-out task set, get early access to new benchmarks, or collaborate with us.</p>
+<h2>Acknowledgments</h2>
+<p>ReactBench exists because engineers and open-source maintainers contributed their time and expertise. We thank everyone who reviewed its tasks, drafts, and evaluation infrastructure.</p>

@@ -1,0 +1,112 @@
+<h1>G-Eval, Explained</h1>
+<p>Everyone who has shipped a summarization feature, a chatbot, or an internal writing assistant has hit the same wall. The model works. You can feel it works when you read the outputs. But when someone in a review meeting asks, “How do we know it works?” the honest answer used to be a shrug followed by a metric nobody in the room actually believes. G-Eval closes that gap. It is a way to score open-ended text generation that agrees with what a careful human reviewer would say.</p>
+<p>G-Eval is based on a 2023 paper by Yang Liu and coauthors at Microsoft, which is open-sourced in their official repository. The core idea is simple - give a large language model a rubric, let it…</p>
+<ul>
+ <li>write its own evaluation steps for that rubric</li>
+ <li>force it to fill out a structured scoring form</li>
+ <li>then read the probability mass behind the score it gives</li>
+</ul>
+<p>The idea is not to rely solely on single-digit scores. This article walks through what G-Eval actually is, why each mechanism matters, and how to use it well in a real system.</p>
+<h2>What G-Eval Is</h2>
+<p>G-Eval is a prompting framework for using a large language model as a reference-free evaluator of generated text. Reference-free means it does not need a gold-standard example to compare against, which matters because most real outputs, a customer support reply, a summary of a novel document, a chatbot turn, do not have one correct answer sitting in a dataset somewhere.</p>
+<p>The framework has three components:</p>
+<ol>
+ <li>A prompt that states the task and defines the evaluation criterion precisely, for example, “rate this summary’s coherence on a scale of 1 to 5,” with coherence defined in concrete terms rather than left to the model’s imagination.</li>
+ <li>A chain-of-thought (CoT) of evaluation steps that the model generates for itself from the task and criterion, before it ever sees a specific example to score.</li>
+ <li>A scoring function that calls the model with the prompt, the generated CoT, and the actual input and candidate output, and converts the model’s response into a fine-grained numeric score using the underlying token probabilities rather than the raw printed digit.</li>
+</ol>
+<p>Put together, this turns “ask an LLM to grade something” from a vague, inconsistent request into a structured, repeatable procedure.</p>
+<h2>Why It Works</h2>
+<h3>Specific Rubrics, Not Generic.</h3>
+<p>The prompt is not “rate this 1 to 5.” Instead, it should define the dimension precisely. A vague rubric gives the model nothing to anchor its judgment against, so it falls back on a generic sense of “does this look fine,” which does not discriminate well between a mediocre output and a genuinely strong one. A precise rubric gives the model specific things to check for, which is exactly what makes a human rater consistent too.</p>
+<h3>Chain-of-thought Forces Model to Read</h3>
+<p>Instead of you hand-writing the evaluation steps for every criterion on every task, which does not scale past a handful of internal benchmarks, G-Eval asks the model to generate its own steps from just the task description and the criterion. For a coherence check, the model typically produces something like:</p>
+<pre><code>1. Read the source text carefully and identify the main topic and key points.
+2. Read the candidate output and compare it to the source. Check whether it
+   covers the main topic and key points, and whether it presents them in a
+   clear, logical order.
+3. Assign a score for coherence based on the Evaluation Criteria.</code></pre>
+<p>Generating this before scoring anything forces the model to commit to a concrete evaluation procedure rather than pattern-matching to “this reads like a competent piece of writing” and stopping there. It also gives you something valuable - an audit trail. When a score looks wrong, you can read the chain-of-thought and see exactly where the judge’s reasoning diverged from what you would have said.</p>
+<p>Note that we are not writing evaluation steps by hand for every new rubric, which is what makes G-Eval usable for arbitrary custom dimensions like “does this response match our brand voice” or “does this answer respect the customer’s stated refund policy,” dimensions that no off-the-shelf metric was ever going to cover.</p>
+<h3>Direct Scoring Has Failure Modes</h3>
+<p>The naive version of this idea, just ask the model to output an integer score, has two problems that show up as soon as you look at score distributions across many examples rather than one example at a time.</p>
+<p>First, direct scoring tends to collapse onto a dominant value. Ask for coherence from 1 to 5 across a batch of outputs, and one digit, often the middle of the range, ends up absorbing most of the responses, regardless of real quality differences between them.</p>
+<p>Second, given that most models output integers (even when we ask for decimal scoring), it becomes super difficult to rank two candidates against each other, or track whether a prompt change moved quality up or down by a small amount.</p>
+<h3>Probability Weighting is the Fix</h3>
+<p>G-Eval’s answer to both problems is to stop trusting the printed digit and instead read the probability the model assigns to each possible score, then take the expectation:</p>
+<p>score = ∑ i = 1 n p ( s i ) × s i</p>
+<p>where S = \{s1, s2, ..., sn} is the predefined score set, for example, the integers 1 through 5, and p(si) is the probability the model assigns to that token in the scoring field. A judge that is 55 percent confident in a 4 and 45 percent confident in a 5 does not report a flat 4. It reports 4.45. Here, the decimal captures a real distinction between two candidates that the model considers almost the same.</p>
+<p>But, how do we get the probability distribution of tokens? This requires an underlying API to expose token-level log probabilities (such as OpenAI’s logprobs parameter), and a lot of chat-completion endpoints either do not expose them at all or only expose them awkwardly.</p>
+<p>The practical workaround, covered below, is to sample the same prompt multiple times at a nonzero temperature and treat the frequency of each score as a stand-in for its probability. It costs more calls, but it recovers most of the benefit.</p>
+<h2>The Bias You Need to Know About</h2>
+<p>Fun fact, LLM judges show a measurable bias toward text generated by models from their own family, even when human reviewers prefer the alternative. This is a well-documented self-preference bias in LLM-as-a-judge systems, explored in detail in the Judging LLM-as-a-Judge with MT-Bench paper. So, never use the same model, or a close relative of it, for judging.</p>
+<h2>G-Eval in Practice</h2>
+<p>The full method is a two-step pipeline. Step one, generate the chain-of-thought once per rubric, since it depends only on the task and the criterion definition, not on any specific input, so it can be generated once and cached. Step two, call the judge per example using that cached chain-of-thought plus the actual input and candidate.</p>
+<p>Step one: generate the evaluation steps:</p>
+<pre><code>cot_prompt = """
+You will be given one summary written for a document.
+Your task is to rate the summary on one metric.
+
+Evaluation Criteria:
+Coherence (1-5) - the collective quality of all sentences. The summary
+should be well-structured and well-organized, building from sentence to
+sentence to a coherent body of information about a topic, rather than
+being a heap of loosely related facts.
+
+Evaluation Steps:
+"""
+
+response = client.chat.completions.create(
+    model="gpt-4",
+    messages=[\{"role": "user", "content": cot_prompt}],
+    temperature=1.0,
+)
+evaluation_steps = response.choices[0].message.content</code></pre>
+<p>Step two, score a specific input and output pair using the cached steps, and read the token probabilities if your API exposes them:</p>
+<pre><code>scoring_prompt = f"""
+\{cot_prompt}
+\{evaluation_steps}
+
+Source:
+\{source_text}
+
+Summary:
+\{candidate_text}
+
+Evaluation Form (scores ONLY):
+- Coherence:
+"""
+
+response = client.chat.completions.create(
+    model="gpt-4",
+    messages=[\{"role": "user", "content": scoring_prompt}],
+    temperature=1.0,
+    logprobs=True,
+    top_logprobs=5,
+)
+
+top_logprobs = response.choices[0].logprobs.content[0].top_logprobs
+scores = \{"1": 1, "2": 2, "3": 3, "4": 4, "5": 5}
+weighted_score = 0.0
+total_prob = 0.0
+for entry in top_logprobs:
+    token = entry.token.strip()
+    if token in scores:
+        prob = pow(2.718281828, entry.logprob)
+        weighted_score += prob * scores[token]
+        total_prob += prob
+final_score = weighted_score / total_prob if total_prob &gt; 0 else None</code></pre>
+<p>If your provider does not expose token-level log probabilities for chat completions, fallback to sample the same prompt several times at a nonzero temperature and take the mean of the discrete scores you get back. A few practical habits to follow</p>
+<ul>
+ <li>Pin the judge model version as part of your evaluation setup.</li>
+ <li>Never use the system under test and the judge from the same model family.</li>
+ <li>Cache the chain-of-thought per rubric rather than regenerating it on every call.</li>
+ <li>Calibrate every rubric against a small set of human-labeled examples before you trust it.</li>
+ <li>Write the rubric to explicitly rule out biases you do not want rewarded, for example, telling the judge not to prefer longer responses purely for length, since judges left to their own devices tend to read extra length as thoroughness even when it adds nothing.</li>
+</ul>
+<p>Alternatively, if you would rather not build and manage this pipeline entirely from scratch, you can use established open-source LLM evaluation frameworks like DeepEval that provide a pre-built, production-ready G-Eval implementation.</p>
+<h2>When This Is the Wrong Tool</h2>
+<p>G-Eval is the wrong tool, and a needlessly expensive one, for anything with a sharp, closed-form answer. Whether a response contains personal information, whether it is toxic, or whether an output is valid JSON, none of these need a reasoning model reading a rubric. They need a fast classifier or a parser, and reaching for an LLM judge there buys you nothing but latency and cost.</p>
+<h4>Footnote</h4>
+<p>G-Eval is a prompting framework that turns a large language model into a reference-free evaluator of generated text. It works by combining a precisely defined rubric, a chain-of-thought of evaluation steps the model generates for itself, and a scoring step that reads the model’s token probabilities across possible scores instead of trusting the printed digit.</p>
+<p>Its most important caution is that LLM judges show a measurable bias toward text generated by their own model family, so the judge should always come from a different family than the system under test. Used well, with a specific rubric, a cached chain-of-thought, an independent judge model, and periodic recalibration against human labels, it is one of the more reliable ways to measure open-ended text quality.</p>

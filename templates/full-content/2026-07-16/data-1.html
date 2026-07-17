@@ -1,0 +1,100 @@
+<h1>Agent Memory From Scratch</h1>
+<h3>Ingest, query, and serve a unified memory from a single database.</h3>
+<p>Agent memory is one of the hottest problems in AI engineering right now, with Graphiti, mem0, HydraDB, and cognee all racing to solve it. A race this crowded means one thing: nobody has cracked it yet.</p>
+<p>But if you’re thinking of jumping straight into an agent memory tool without understanding how it works under the hood, read this first.</p>
+<blockquote>
+ <p>Here is what happened in one of my tests: LangChain’s <code>MongoDBGraphStore</code> gave me a knowledge graph (KG) in 10 minutes, and from 5 documents it invented 17 node types and 34 relationship types, where <code>part_of</code>, <code>Part Of</code>, and <code>part of</code> were three different ways to express the same relationship.</p>
+</blockquote>
+<p>That’s why it’s incredibly important to <strong>understand how the memory layer works under the hood</strong>, so you know its limitations, how to properly configure it for your data, and how to plug it into your agent.</p>
+<p>Or even decide if <strong>you need a unified memory at all, and if so, which tool to use.</strong></p>
+<p>Claude Code comes with a built-in memory layer powered by files. Is this enough for you or not?</p>
+<p>Then, if you move to a more powerful solution, should you use a vector database, a graph database, or a combination of both? Do you need temporality or versioning?</p>
+<p>And ultimately, how should you serve your memory layer to your agent? Through an MCP server, a CLI, or plain skills?</p>
+<p>The reality is that there is no blueprint on how to build your own unified memory layer. Too many choices, too many trade-offs.</p>
+<p>But that’s why I want to show you how to build a unified agent memory from scratch, in the most complicated way possible: via knowledge graphs (KGs). Plus all the other moving pieces: ingestion, querying, and serving.</p>
+<p><strong>Why?</strong> Because all the popular vendors (cognee, Graphiti, Neo4j’s agent memory, etc.) go in this direction. Plus, if you know how this works, it will be incredibly easy for you to build simpler solutions.</p>
+<p>So, I am not saying that KGs are always the way to go. They are not. But they are definitely something you need to understand. At least to know when to stay away from them.</p>
+<p>Let’s go!</p>
+<h2>A Session With a Unified Memory</h2>
+<p>First, here is what I expect a unified memory plugged into a harness to do.</p>
+<p>I open Claude Code and ask what I need to do today. The memory already knows: building a coding agent for my next open source project.</p>
+<p>I ask it to gather everything relevant I have on building a coding agent: Obsidian notes, Readwise highlights, starred repos, all ingested long ago. Then to build an LLM wiki on top of that as my agent memory while I implement the plan.</p>
+<p>When I’m done, the conversation is ingested too, so the next session already knows all my decisions around the project.</p>
+<p>Nothing in that session lived in the harness. Claude Code was just the interface.</p>
+<p>So how do I implement a unified memory that supports this? Let’s kick off with the architecture.</p>
+<h2>The Architecture, End to End</h2>
+<p>Sources in, subgraphs out. In between sit 4 pieces: an ontology, a write path, one collection, and a serving layer.</p>
+<p>The whole database layer is powered by MongoDB: a document warehouse plus a knowledge-graph store doing text, vector, and graph search in one collection. Because we use a single database, lineage is free: nodes hold references to their source documents, not copies from a separate source. This works incredibly well at 2-3 hops at query time.</p>
+<p>OG databases such as MongoDB scale really well up to millions of documents via sharding and replicas.</p>
+<p>Writes are 2 durable pipelines. A data pipeline normalizes each source into the warehouse. A memory pipeline cleans, chunks, extracts, normalizes, embeds, and writes the knowledge-graph objects. Both pipelines are powered by an orchestrator, such as Prefect or DBOS, to serve them, scale them, and make them durable.</p>
+<p>On the read side, we offer multiple ways to interact with the unified memory: standard graph search encoded directly into the tool, agentic search where the agent writes its own MongoDB query, and a deep-search primitive that creates an on-demand LLM wiki for exploring larger subgraphs via progressive disclosure. Reads never touch the orchestrator, as they need to be fast and don’t benefit from the orchestrator’s durability or scheduling features.</p>
+<p>The memory is reachable only through a FastMCP server exposing agent-shaped primitives (query, deep-search, ingest), never raw database operations. The MCP server should never be an API wrapper, but directly expose business logic to the harness. A hook fires the conversation ingestion as the session runs, so what the agent learns flows back into the memory — a process known as “continual learning.”</p>
+<p>The most interesting part is not the database, the ingestion, or the query logic, but the ontology that makes everything possible.</p>
+<h2>The Ontology Is the Contract</h2>
+<p>An ontology is a contract between the writer and the reader. The LLM extracts against it. The query layer reads against it. Define it once as Pydantic, serialize with <code>model_json_schema()</code>, and dump that JSON into both writing and reading system prompts. 1 artifact, 2 consumers, no drift.</p>
+<p>The ontology defines what the knowledge graphs look like. All the KG instances are extracted by passing the input data and the ontology schema to an LLM.</p>
+<p>The memory is 3 layers. The long-term layer is the knowledge graph: the POLE+O entities plus <code>preference</code> and <code>fact</code>. A short-term layer holds the dialogue as <code>conversation</code> and <code>session</code> nodes. A reasoning layer records the agent’s work as <code>agent</code>, <code>tool_call</code>, and <code>memory</code> nodes.</p>
+<p>One powerful ontology design is based on the 5 POLE+O nouns from law-enforcement analysis: Person, Object, Location, Event, Organization, which Neo4j Labs writes up as the POLE+O data model. Each noun carries an optional subtype used to further refine the ontology within a specific domain. For gaming, this can look like:</p>
+<ul>
+ <li>Person: Player, Character</li>
+ <li>Object: Item, Quest</li>
+ <li>Event: Raid, Battle</li>
+</ul>
+<p>Because the agent memory is often used for a personal assistant, you also need to plug <code>preference</code> and <code>fact</code> nodes into the ontology. A <strong>fact</strong> is an atomic subject-predicate-object triplet, an island no edge may touch, reachable only by similarity. A <strong>preference</strong> is the personalization layer with typed slots.</p>
+<pre><code>nodes: person · organization · location · event · object
+       preference · fact
+edges: related_to, with semantic_type ∈ \{
+         knows, member_of, employed_by,
+         owns, uses, located_at, resides_at,
+         alias_of, has_task, ... 
+       }</code></pre>
+<p>Now, on top of the KG instances extracted by the LLM, we can also have structured nodes that are directly inferred via code.</p>
+<p>Such as:</p>
+<pre><code>nodes: document · chunk
+edges: part_of · next · mentions · referenced · has · same_as · superseded_by</code></pre>
+<p>With the contract fixed, let’s see how we can ingest KG objects into the unified memory based on the ontology schema.</p>
+<h2>The Write Path</h2>
+<p>There are 7 stages in one direction. Chunk the document (512-token chunks, 64 overlap). Extract nodes and edges with an LLM. Validate. Resolve names. Embed. Deduplicate. Upsert into the MongoDB unified memory.</p>
+<p>During the LLM extraction, we pass in a chunk and we receive a JSON response with nodes and edges, the same shape Neo4j Labs lands on in How Entity Extraction Works.</p>
+<p>The model sees one chunk and nothing else. It receives no IDs and no prior state. It returns JSON. Every edge endpoint points to a node’s <code>name</code> in the same record. This allows us to scale the extraction pipeline through batching to process large documents of 1,000,000+ units.</p>
+<p>Validation is done via Pydantic. We load the JSON response into a Pydantic model and validate it against the schema.</p>
+<p>Name resolution only checks whether two canonical names match. It’s done purely on the name and its aliases: alias, exact, fuzzy 0.85, semantic 0.80, filtered by type.</p>
+<p>But there is a next step, where we actually check if an entity is the same instance as another that already exists in the graph.</p>
+<p>Deduplication runs on embeddings computed on the whole node content: ≥0.95 cosine merges, ≤0.85 makes a new node, and the gap writes a <code>same_as</code> edge for a human to judge.</p>
+<p>So why two steps?</p>
+<p>Name resolution simply helps us group entities by their canonical name. For example, “Demis Hassabis” and “Demis Hassabis, CEO” would both be resolved to “Demis Hassabis”. Or “Apple” and “Apple Inc.” would both be resolved to “Apple”. Super powerful for analytics and human curation.</p>
+<p>Deduplication is the sensitive one — it decides what actually merges. It shouldn’t flag “Apple” and “Apple Inc.” as duplicates, as they are different entities with different meanings.</p>
+<p>A wrong merge is the only unrecoverable mistake. That’s why, when the similarity score has low confidence, between 0.85 and 0.95, we don’t merge the nodes automatically, as the operation can be irreversible.</p>
+<h2>Append-Only Logs vs. a Single Knowledge Graph Collection</h2>
+<p>There are 3 designs, and the winner? Well... It depends... As always.</p>
+<p>An <strong>append-only log plus a materialized view</strong> buys versioning and soft-delete for free, but you pay for it. <strong>Nested relationships</strong> duplicate edges and make them awkward to query. <strong>Separate edge docs</strong> give queryable edges, no duplication, and the cheapest footprint, at the cost of built-in temporal history and versioning.</p>
+<p>Because the graph is a projection of the append-only log, a bad extraction is fixed by invalidating its event. You can change the materialization logic and replay it without re-extracting a single source. Also, full-graph temporality belongs to the log alone.</p>
+<p>The log’s real cost: a vector index is at least as large as the data it covers. Indexing both the log and the view inflates ~10 GB of data toward ~40 GB of RAM. Index only the view, leave the log cold on disk, and it collapses back toward ~10 GB. But the idea is that adding an append-only log brings a lot of engineering effort you then have to maintain.</p>
+<p>So think three times before you sign up for it.</p>
+<p>At query time, the agents see the materialized view, not the log itself. Given the RAM cost, reach for the log only when versioning or the time dimension is core to your business logic. Otherwise, keep it simple and stick to a single knowledge graph collection.</p>
+<p>Within the data model, Node IDs are <code>\{user_id}:\{type}:\{name}</code>. Edge IDs are <code>\{source}|\{type}|\{target}</code>. Because the key is content-derived, every write is idempotent.</p>
+<p>The reality? You can get temporality even without a dedicated append-only log. Preferences and facts carry <code>valid_from</code> / <code>valid_until</code>, and a superseding preference writes a <code>superseded_by</code> edge.</p>
+<h2>Three Ways to Read the Memory</h2>
+<p>The 3 retrieval methods below are the serving layer’s search primitives, the tools the MCP server exposes to the agent.</p>
+<p><strong>Graph search</strong> is the default retrieval, baked into a single function. It runs <code>$vectorSearch</code> and <code>$text</code> in parallel over the KG collection. Fuse the <em>ranks</em> with Reciprocal Rank Fusion (RRF). Keep the fused top 10 as seed nodes, then expand with a bidirectional <code>$graphLookup</code> at 2 hops by default. That multi-hop step is the entire difference between RAG and GraphRAG.</p>
+<p><strong>Deep search</strong> widens the walk to 3 hops and persists the result to disk as a memory wiki the agent can access via progressive disclosure. The LLM wiki is a mini-graph of its own: you keep the (entity, relationship, entity) triplets by cross-referencing files, where each file is an entity. You can see it as a local cache that is either discarded between sessions or kept in sync with the KG collection.</p>
+<p><strong>NL query</strong> is agentic search that lets the LLM write its own MongoDB queries based on the ontology. Here you have to validate that the query is syntactically correct, and especially guard it against harmful intents such as deleting or modifying data. It’s safer to use this mode purely for read operations.</p>
+<p>RRF replaces a reranker (a second model that re-scores the retriever’s top candidates) you don’t need yet. It is 20 lines of Python, needs no model, and runs in microseconds. Reach for a cross-encoder (a heavier model that compares the query against each candidate) when you search millions of heterogeneous documents.</p>
+<p><strong>When do you need to switch from a single database (MongoDB) to a graph database (Neo4j)?</strong> Past 4 hops, past ~100M to 1B vectors, when graphs <em>are</em> your business logic, or purely to visualize them: that is where you leave MongoDB for Neo4j. It’s common to use a single database in production (MongoDB) and a graph database as an internal tool for data exploration and analysis (Neo4j). This is a powerful combo, because for an internal tool you don’t care that much about 99.99% SLAs, while you can fully leverage Neo4j’s Cypher query language to explore and analyze your graph data.</p>
+<h2>Open, Closed, and Small</h2>
+<p>Extraction (from ingestion) and query translation (from agentic search) use <code>gemini-3.1-flash-lite</code>. Embeddings are Voyage <code>voyage-3.5</code> at 1024 dimensions. Both are closed APIs.</p>
+<p>You can take this further and fine-tune an open-source SLM (such as the Liquid family of models) as an extractor, query translator, or embedding model on your own data.</p>
+<p>The issue with SLMs is that without fine-tuning they perform poorly on new data. But the beautiful part about them is that after fine-tuning they perform as well as a frontier model on a scoped task, while being much cheaper and faster to run.</p>
+<p>I won’t go too much into fine-tuning here, but the idea is that at first you always want to start with an API that quickly gets stuff done, and then slowly replace the most important parts with your own fine-tuned models. You usually have to decide this based on cost, latency, performance, data privacy, or other dimensions important to your use case.</p>
+<h2>Build vs Buy: When Not To Build This</h2>
+<p>Everything above assumed you build everything yourself. But in reality, there are 3 levels to choose from.</p>
+<p><strong>Level 1:</strong> build the memory, the logic, and the serving layer yourself on one database.</p>
+<p><strong>Level 2:</strong> keep only the business logic and serving layer on top of a memory SDK, such as Graphiti, <code>neo4j-labs/agent-memory</code>, or mem0.</p>
+<p><strong>Level 3:</strong> run an off-the-shelf engine, such as cognee, managed Zep, or HydraDB.</p>
+<p>This is a problem about owning your context layer, which I have a full article on.</p>
+<p>Buy when you don’t care that much about customization. Build when you want <em>your</em> own solution. But since building everything yourself usually isn’t worth it (or you just don’t have the time to do it — even with Claude Code), the best solution is <strong>Level 2</strong>, where you own the business logic and can customize the serving layer to your needs.</p>
+<p>But honestly, because things move so fast and I am lazy, my long-term memory still lives in Obsidian, Readwise, and Google Drive, plus a serving layer that creates scoped LLM wikis per project as agent memory. This way, you create mini-graphs for one specific problem, powered purely by .md files, without any infrastructure hassle. The reality is that this works for personal use only, and not so much for shipping a production-ready solution.</p>
+<p><em>But here is what I’m wondering:</em></p>
+<blockquote>
+ <p><em><strong>If you keep dumping everything into the unified memory, where do you draw the line between what your agent should remember forever and what it should be allowed to forget?</strong></em></p>
+</blockquote>

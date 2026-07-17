@@ -1,0 +1,113 @@
+<p>Monkey see, monkey do! 🍌</p>
+<h2>/plan makes perfect sense. It really shouldn't!</h2>
+<p>You've heard this pitch; you may have even shipped it. The expensive model is clearly the better architect, but it feels like a waste to use it for the entire pipeline. Why not let it do the <strong>"hard part"?</strong></p>
+<p>Read the code, think deeply, write a precise plan. Then a model a tenth the price executes the plan. Senior architect, junior engineer.</p>
+<p>Sounds great, right?</p>
+<p>Find the red dot above, labeled <code>Opus 4.8 + /plan†</code>. Opus plans read-only, Gemini Flash implements: lands at <strong>$3.18 per task, 12.7 minutes, 84.6% pass</strong>.</p>
+<p>Opus doing the entire task by itself, no handoff, no junior: <strong>$2.78, 10.1 minutes, 84.6%</strong>.</p>
+<p>The <em>"cost-saving"</em> measure costs 14% <em>more</em> than not saving. <strong>Huh?</strong></p>
+<p>The mistake is upstream of the architecture diagram. People price agents the way they price people: senior time is expensive, so minimize senior involvement.</p>
+<p>But the expensive part of an agent's day is not the fixing, building, or even the thinking. <strong>Opus fixing things does not cost money. Opus <em>reading</em> things costs money.</strong></p>
+<p>Take a look at this admittedly anecdotal distribution of where our tokens went; fully automated agents look no different.</p>
+<p>Nine percent of the tokens are edits. The rest is reading, and this split is not a quirk of one harness, or something you can "fix". Any agent, any model, any scaffold: the bill is essentially <code>O(reads)</code>.</p>
+<p>Now walk through every reason you'd reach for /plan, with that in mind:</p>
+<ul>
+ <li><strong>"I want the deep understanding of the big model."</strong> The understanding lives in 100K+ tokens of grounded context: files read, dead ends eliminated, hypotheses tested. The plan document is a 2K-token postcard from that context. The executor gets the postcard, not the understanding, and has to rebuild the rest at its own expense.</li>
+ <li><strong>"The task is very complicated."</strong> Then you don't want the main agent executing <em>at all</em>; a single read-only planning turn isn't the answer. Let it explore, then dispatch sub-agents to do the work. A game of telephone doesn't help you here.</li>
+ <li><strong>"I'm cost constrained."</strong> Reading is the cost. /plan makes the frontier model read everything at frontier prices, then makes the cheap model read it <em>again</em>. You didn't move the expensive part; you duplicated it.</li>
+</ul>
+<p>Look at the top ribbon. Opus reads <code>base.py</code>, <code>signing.py</code>, the test file (twenty cards of gray), then writes its plan and leaves. And what's the first thing Flash does with that beautiful document? It re-reads <code>base.py</code> and the test file, because a plan is not a file and you cannot edit prose. The gray reads just keep stacking, first at Opus prices, then again at Flash prices. There is no version of this where a second reader is the cost optimization.</p>
+<h2>Hand off a trajectory, not a fairytale</h2>
+<p>A plan document is a literal postcard, describing a journey to a model that never took it.</p>
+<p>What actually <em>could</em> transfer something of value is the context window itself:</p>
+<p><code>/prewalk</code> does this:</p>
+<ol>
+ <li>Start the task on the frontier model with one hidden instruction prefixed: <em>plan deeply, then capture the plan as a todo list, then start.</em></li>
+ <li>The frontier model explores, writes the plan, initializes the todo list.</li>
+ <li>The moment the <strong>first edit lands</strong> (the point where it was confident enough to act), you swap to the cheap model and <strong>prune the planning instruction</strong> from context.</li>
+</ol>
+<p>The trick is that:</p>
+<ul>
+ <li>The cheap model never goes "wait, I thought we were planning". There is no planning instruction left in its context.</li>
+ <li>As far as it knows, it explored around, created a comprehensive plan in the form of a todo list, and then confidently started executing.</li>
+ <li>Even better, it already made one <strong>valid move</strong>! <em>(a free in-context example)</em></li>
+</ul>
+<h3>How we got here</h3>
+<p>The nice thing about working in an open-source harness is that you get to chat with people about how they do things, and almost everyone has a completely different setup.</p>
+<p>Anyhow: I'd occasionally start easy-to-medium tasks with a frontier model, then switch to Kimi K27 after a few turns so it wouldn't fall into its usual thought loops. I never bothered to measure whether this was rational... until someone else mentioned doing the same thing.</p>
+<p>Naturally, we had to benchmark it: are we idiots, or does this actually work, and when?</p>
+<p><strong>First attempt:</strong> swap at a fixed turn, say #4. Obviously bad in hindsight: sometimes the frontier model is still lost at turn four, sometimes it has already finished the whole fix. <strong>Second attempt:</strong> swap after the first edit. The model has demonstrated the pattern once, in place, in style. Pretty nice, although still finicky: small models kept declaring the task done out of nowhere.</p>
+<p>The solution was to ask our unwitting herding agent to spell out a plan step by step, and then, once it's ready to execute, init a TODO list with a validation step for each item. It then edits some piece of code, and that's when we trigger the swap.</p>
+<p>Gating on any edit alone is no good; the todo list still has a very important role here. Our tiny friend can forget the plan, a validation step, or what it's doing entirely, but it cannot forget the todo reminder that bugs it endlessly, giving us free steering.</p>
+<h3>The receipts</h3>
+<p><strong>GPT-5.6 Sol</strong>:</p>
+<table>
+ <thead>
+  <tr>
+   <th>arm</th>
+   <th>pass</th>
+   <th>cost</th>
+   <th>duration</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Executor: oneshot (GPT 5.6 Luna)</td>
+   <td>77%</td>
+   <td>$0.60</td>
+   <td>570s</td>
+  </tr>
+  <tr>
+   <td>/prewalk</td>
+   <td>85%(+10%)</td>
+   <td>$1.04(−39%)</td>
+   <td>300s(−47%)</td>
+  </tr>
+  <tr>
+   <td>GPT 5.6 Sol: oneshot</td>
+   <td>88%</td>
+   <td>$1.71</td>
+   <td>372s</td>
+  </tr>
+ </tbody>
+</table>
+<p><strong>Opus 4.8</strong>:</p>
+<table>
+ <thead>
+  <tr>
+   <th>arm</th>
+   <th>pass</th>
+   <th>cost</th>
+   <th>duration</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Executor: oneshot (Gemini Flash 3.5)</td>
+   <td>60%</td>
+   <td>$1.16</td>
+   <td>360s</td>
+  </tr>
+  <tr>
+   <td>/prewalk</td>
+   <td>78%(+30%)</td>
+   <td>$1.46(−47%)</td>
+   <td>402s(−34%)</td>
+  </tr>
+  <tr>
+   <td>Opus 4.8: oneshot</td>
+   <td>85%</td>
+   <td>$2.78</td>
+   <td>606s</td>
+  </tr>
+ </tbody>
+</table>
+<h2>The effect we didn't expect</h2>
+<p>Every SWE-bench task is a bug that was really fixed, years ago, in public. The answer to the exam is on GitHub.</p>
+<p>Same model, same scaffolds, almost the same idea, yet wildly different behavior. Why does <code>/plan</code> still cheat while <code>/prewalk</code> doesn't?</p>
+<p>Best explanation we have: <strong>prewalk starves it, from both ends.</strong> Cheating is what a capable model does when it gets desperate. In the solo traces the GitHub turns start mid-run, once exploration stalls: Sol breaks around turn 14, Opus around turn 12. Prewalk terminates the frontier model at the <em>beginning</em> of its effort budget, median ~7 turns: it exits while it's still deriving an approach and landing a first edit (the confident phase), well before its googling phase begins.</p>
+<h2>Prefill walked so prewalk could run</h2>
+<p>None of this is a new idea. It's the oldest trick in the book: <strong>prefill</strong>. Assistant doesn't do what you want? Start the assistant's turn yourself, and the model continues as if the words were its own.</p>
+<p>It began as a consistency hack prior to grammar-constrained decoding. Then the red-teamers found the other end. Prefill "Sure, here's how to…" and a much larger model sails past its own refusal: it has no channel distinguishing words it said from words placed in its mouth, and consistency with "having already accepted" beats the system prompt.</p>
+<p>But the principle can't stop working, because it isn't a funny quirk; it's what autoregression <em>is</em>. But nothing stops you from handing it ten innocently prefilled <strong>turns</strong>: exploration that already happened, a todo list mid-checkmark.</p>
+<p>We upstreamed it to omp, where it ships as of today as <code>--prewalk</code>, <code>--prewalk-into &lt;model&gt;</code>, or just <code>/prewalk</code>. It should be easy to implement essentially anywhere, so if you get a chance to give it a go, do let us know how it fares!</p>

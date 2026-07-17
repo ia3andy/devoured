@@ -1,0 +1,114 @@
+<h1>How We Refresh Razorpay's Data Warehouse 10x Faster with Graphs and Indexes</h1>
+<h2>Background</h2>
+<p><strong>Razorpay</strong> provides the payment infrastructure for millions of merchants globally. Behind every payment, settlement, and refund is a microservices architecture where each service owns its own database. While this keeps services independent and scalable, it creates a challenge for stakeholders who need to see across those boundaries.</p>
+<p>The <strong>Data Platform</strong> team manages the infrastructure that bridges this gap. Transactional data flows into the lake via CDC pipelines, ingested onto S3 in Delta Lake, Apache Iceberg, or plain Parquet formats. On top of the lake, we build domain-specific warehouse tables — wide, pre-joined tables that co-locate all the data a consumer needs, queryable via Trino. These power two use cases: <strong>Analytics</strong> (internal dashboards on Tableau and Superset) and <strong>Reporting</strong> (merchants and regulated entities who download structured data exports; Razorpay generates nearly a million such reports per month).</p>
+<p>The warehouse tables that power both use cases are called <strong>Facts</strong>. A <strong>Fact</strong> is a flat denormalised table on S3, produced by joining 10 to 30 microservice tables and materialising the result once. A settlement Fact, for example, merges payments, refunds, adjustments, and card details into a single wide row so that a dashboard or report reads from a single table instead of joining across services in real time. It is closer to a domain-specific materialised view than a classical data warehouse fact table. We maintain over 50 such Facts, and approximately 40% of all merchant reports are served directly from them.</p>
+<p>As data volumes and the number of entities per fact grew, the batch generation pipeline began to show its limits, prompting us to rethink the refresh strategy, the data layout, and how to handle high-cardinality dimensions. The rest of this post covers that journey.</p>
+<h2>The Full Refresh Pipeline: Our Baseline and the Pain</h2>
+<p>The original full-refresh pipeline was straightforward.</p>
+<ol>
+ <li><strong>Schedule: </strong>Airflow schedules Spark jobs on EMR daily during off-peak hours, passing a Fact Config from S3—a configuration file listing the tables to join, columns to select, join conditions, and the output format.</li>
+ <li><strong>Full Refresh</strong>: The job then reads all source tables from the data lake, performs a full Spark join, and overwrites the entire denormalised table back to S3.</li>
+ <li><strong>Notify</strong>: Once complete, it publishes the max(primary_table_updated_at) timestamp to the Reporting Service, which uses it to split queries: the Fact covers the historical window, and TiDB — our warm store, a distributed MySQL-compatible database holding recent transactional data; fills the freshness gap for data not yet materialised into the Fact.</li>
+</ol>
+<p>This approach created three classes of problems:</p>
+<ol>
+ <li><strong>Operational</strong>: Pipelines ran on spot nodes for many hours, making spot loss inevitable. Since the business logic required the full dataset at once, there was no safe checkpoint — a single failure meant restarting from scratch. We eventually chained smaller facts together to create checkpoints.</li>
+ <li><strong>Scaling</strong>: Our data has back-dated references — a payment today can reference an order from five years ago, a refund can reference a year-old payment. This forces unbounded joins and full table scans on every secondary table with no safe time window to apply. The Payments fact grew to join over 30 tables and ran for 8–10 hours. Facts initially contained data from 2018, and to manage cost, we reduced fact retention to one year as a stopgap, allowing some reports to fall back to warm stores for older data — but this deepened our TiDB dependency and blocked retention initiatives on the warm store.</li>
+ <li><strong>Cost</strong>: Pipelines ran for 70+ hours per day across large EMR clusters. We moved most facts to alternate-day schedules, creating up to 48-hour freshness lags.</li>
+</ol>
+<h2>Previous Attempts and Challenges: The Path to Solution</h2>
+<p>We attacked this problem from both short-term and long-term perspectives. Fact decomposition, revised data retention, alternative-source fallbacks, and alternate-day scheduling served as short-term solutions to maintain stability without affecting the user experience.</p>
+<p>To solve these problems in the long term, we built a streaming pipeline that subscribes to Kafka CDC topics, models the Fact config as a dependency graph, and performs TiDB lookups to produce denormalised rows in near real time.</p>
+<p>The solution worked for a year but eventually failed for three primary reasons:</p>
+<ol>
+ <li><strong>Highly mutable data</strong>: 10–20 change streams joined at 10M+ events per 30-min window drove costs unsustainably high.</li>
+ <li><strong>All data in warm store</strong>: Back-dated references forced us to keep all historical data in TiDB, blocking any retention initiative.</li>
+ <li><strong>Write amplification</strong>: High-cardinality joins amplified upsert volumes. Since joins were slow on the lake, we had no option but to force all join tables into precomputed facts.</li>
+</ol>
+<h2>The Pivot: Incremental Facts</h2>
+<p><em>The core insight: treat Facts as incrementally maintainable graphs. Instead of regenerating the full table, process only the change events for each entity using the dependency graph to know which related rows to fetch, and a secondary index to know where on the lake to find them.</em></p>
+<p>Consider a real-world payment creation flow, you first create an <strong><em>Order</em></strong> for the product you want to buy, and a <strong>Payment </strong>is made on that order using a <strong>Card </strong>by applying a <strong>Discount </strong>allowed by the ongoing <strong>Offer. </strong>This relationship can be visualised as a graph as shown in the image and this became one of the core insights for the approach.</p>
+<p>Before we into the low level details, we need to understand the following constraints:</p>
+<ol>
+ <li><strong>Data Partitioning</strong>: Our data lake on S3 contains source tables in open-source Delta format and partitioned on `<strong>created_date</strong>`.</li>
+ <li><strong>Data Indexing: </strong>We use Z-ordering on the primary key and merchant_id columns. Since these columns have high cardinality, this setup is inefficient for lookup queries.</li>
+</ol>
+<p>Three design questions had to be resolved:</p>
+<p><strong>1. How do you fetch all updates for an entity on T-1 day?</strong></p>
+<p>We built a silver-layer pipeline that creates flattened, deduplicated tables partitioned by updated_date, retaining only the latest change per primary key per day.</p>
+<p><strong>2. How do you know which related rows to fetch for a change event?</strong></p>
+<p>We modelled the Fact config as a traversable in-memory dependency graph, with edges derived from join conditions. Consider a fact that joins five tables:</p>
+<pre><code>SELECT P.*, O.*, C.*, D.*, O.* 
+FROM payments P 
+LEFT JOIN orders O ON O.id = P.order_id    -- edge: Payments → Orders 
+LEFT JOIN cards  C ON C.id = P.card_id     -- edge: Payments → Cards 
+LEFT JOIN discounts D on D.payment_id = P.id -- edge: Payments → Discounts 
+LEFT JOIN offers O on O.id = D.offer_id  -- edge: Discounts → Offers</code></pre>
+<p>This produces the graph as shown above. Each edge carries the join predicate as metadata.</p>
+<p>The graph tells us exactly what to fetch for any change event:</p>
+<ul>
+ <li><strong>Update on Payments (P1)</strong>: follow edges outward — look up Orders where orders.id = P1.order_id, and Cards where cards.id = P1.card_id. Combine to form a complete denormalised row.</li>
+ <li><strong>Update on Orders (O1)</strong>: back-traverse to the root — look up Payments where payments.order_id = O1.id to find the primary keys affected. Cards are not in the path from Orders to the root, so it is skipped.</li>
+</ul>
+<p><strong>3. How do you look up data efficiently on the lake?</strong></p>
+<p>We built a Secondary Index per entity , a small table holding join columns and <strong>created_date</strong> partition values. For example, a payment index table would include id, card_id, order_id, and created_date.</p>
+<p>Because this table has a small sub-set of columns that change infrequently, it is significantly smaller and easier to maintain than the original source table.</p>
+<p>The index narrows reads to a handful of partitions, eliminating full table scans. An independent batch pipeline upserts the Secondary Index from the silver layer. This is the core component that removed our dependency on TiDB for historical lookups.</p>
+<h2>Incremental Processing using Graph Traversals</h2>
+<p>When a warehouse job is triggered, it parses the Fact configuration to create a dependency graph in memory. It processes updates for each node sequentially, starting from the primary node. Processing logic differs between the primary table and secondary tables. We can therefore broadly classify processing into two phases: the <strong>Primary flow</strong> and the <strong>Secondary flow</strong>.</p>
+<h2>The Primary Flow:</h2>
+<p>In this flow, we process only the primary table in the graph (payments, in the example above).</p>
+<p>For example:</p>
+<ol>
+ <li><strong>Fetch</strong> primary table updates from the last checkpoint.</li>
+ <li><strong>Join</strong> updates with each secondary index to get created_date partition values; use those to read only the relevant partitions of each source table.</li>
+ <li><strong>Stitch</strong> all data into denormalised rows and <strong>upsert</strong> into the target fact, scoping the merge to affected partitions only.</li>
+</ol>
+<h2>The Secondary Flow</h2>
+<p>In this flow, we iterate through all secondary tables in the graph using a level-order traversal and process them sequentially.</p>
+<ol>
+ <li><strong>Fetch updates</strong> for the secondary table from the last checkpoint. (e.g offers)</li>
+ <li><strong>Back-traverse the graph</strong>: Join with the indexes of all ancestor nodes up to the root (e.g., discounts_index, payments_index for Offers) to enrich each update row with the primary key and partition values needed for the target merge. We don’t need a full source table read, since the required ancestor data is already in their indexes.</li>
+ <li><strong>Merge into Fact</strong>: Upsert the partially denormalised rows to the target fact, scoped to affected partitions.</li>
+</ol>
+<h2>Handling High Cardinality and Dimension Tables</h2>
+<p>High-cardinality dimension tables are expensive to denormalise due to write amplification: a single update can fan out to thousands of fact-row rewrites.</p>
+<p>For example, consider a "Payment Links" table in which a single link can accept thousands of payments. If Payment Links is a secondary table and a column is updated, thousands of payments in the Fact table must be updated to reflect that single change. <strong>Hence, not every join belongs in a precomputed fact.</strong></p>
+<p>However, joins on our lake are expensive too because our domain doesn’t support time-bounded joins, which requires a full table scan on secondary tables. We wanted to push down a common predicate to reduce scans on the secondary tables.</p>
+<p>For example, if you are joining payment_links and orders:</p>
+<pre><code>SELECT *
+FROM payment_links LEFT 
+JOIN orders on orders.id = payment_links.order_id
+WHERE payment_links.merchant_id = m1 and payment_link.created_at between t1 and t2</code></pre>
+<p>If we run this query on Trino, it will push down filters (merchant_id, created_at) for payment_links, but will result in a full table scan for orders.</p>
+<p>Report generation is usually scoped by merchant_id, which is present in most tables. We decided to use it as a common predicate. Since merchant_id has high cardinality, we cannot partition data on it; instead, we use bucketing on merchant_id with a fixed number of buckets, similar to sharding. We chose Iceberg (V2) as the table format for its native bucketing support.</p>
+<p>Adding merchant_id to both sides of the join condition lets Trino push predicate on both the sides, scanning only the matching bucket:</p>
+<pre><code>LEFT JOIN orders on orders.merchant_id = payment_links.merchant_id 
+AND orders.id = payment_links.order_id
+WHERE payment_links.merchant_id = m1 and payment_link.created_at between t1 and t2</code></pre>
+<p>This unlocked joins in the data lake. We addressed the remaining gaps by building an Iceberg replication pipeline and tuning non-Fact tables with sort orders and `merchant_id` bucketing. We also used hidden month/day partitioning to reduce merge scans. Finally, we added a query builder in Reporting Service to route joins intelligently. Some joins are served from the precomputed Fact table, while others run between Fact and Iceberg tables at query time.</p>
+<h2>Production Rollout</h2>
+<p>Rolling out to production was more challenging than anticipated. We needed to ensure that no inaccurate data reached our merchants.</p>
+<p>We followed three phases to ensure accuracy before decommissioning the legacy flow:</p>
+<ol>
+ <li><strong>Data reconciliation</strong>: Compared incremental and full-refresh facts record-by-record, resolving checkpointing, out-of-order events, and index lag issues until we hit 100% accuracy.</li>
+ <li><strong>Shadow testing</strong>: Ran A/B experiments generating shadow reports from incremental facts in parallel with live reports. Automated nightly comparisons flagged mismatches; we iterated until both were identical.</li>
+ <li><strong>Gradual live rollout</strong>: Progressively shifted live traffic to incremental facts with a fallback to the legacy flow, addressing edge cases without merchant impact.</li>
+</ol>
+<p>Moving to a three-pipeline architecture from a single full refresh pipeline naturally raises the chance of a hiccup here and there, so we’ve made the system self-healing. Each pipeline now publishes its own checkpoints, meaning downstream pipelines can see exactly where their upstream counterparts are at and intelligently decide how much data to process if they’re lagging. If we do hit a delay, we automatically fall back to sources like TiDB to keep data fresh in reports. We also have Data Quality checks watching the whole flow; when they spot a mismatch, they flag it on our slack channels, narrowing down the debug scope.</p>
+<h2>Impact</h2>
+<p>We migrated the five largest facts to the incremental strategy. The ~90% reduction in compute time translated to proportional cost savings. Restoring full historical coverage in Facts allowed us to reduce TiDB retention significantly. Runtime joins enabled decomposing large monolithic facts into smaller, domain-specific ones — reducing blast radius and maintenance cost.</p>
+<h2>Lessons Learned</h2>
+<ol>
+ <li><strong>Streaming isn’t always the answer: </strong>State-heavy joins at high event volumes eventually become cost-prohibitive. Batch + incremental can win.</li>
+ <li><strong>The lake should be queryable, not just archival: </strong>Secondary indexes on the lake eliminated warm-store dependency for historical lookups. Iceberg is adding native support for secondary indexes in upcoming releases.</li>
+ <li><strong>Not every dimension belongs in a materialised fact: </strong>Runtime joins with bucketed Iceberg tables are cheaper than write amplification at scale.</li>
+ <li><strong>Facts are graphs, not tables: </strong>Modelling fact configs as traversable dependency graphs is what unlocks incremental maintenance.</li>
+</ol>
+<h2>Future Roadmap</h2>
+<p>We’ve seen incredible operational and cost improvements from migrating our first five Facts, and it’s clear that the Incremental Strategy is the right path forward. We’re excited to transition the rest of our facts onto this new approach. Alongside this, we’re also diving into these key initiatives to push things even further:</p>
+<ol>
+ <li><strong>Real-time secondary index</strong>: We are exploring Apache Flink to merge the index pipeline into CDC ingestion. This approach achieves near-real-time freshness and reduces latency for lookups and ad-hoc queries.</li>
+ <li><strong>Extend support to more Sinks</strong>: Applying incremental processing to unlock savings and near-real-time freshness for warehouse tables in other destinations like ClickHouse, TiFlash, etc.</li>
+</ol>

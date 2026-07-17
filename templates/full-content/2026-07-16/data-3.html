@@ -1,0 +1,49 @@
+<h2>Introduction: The evolution of Grab’s Data Lake</h2>
+<p>At Grab’s scale, managing petabytes of data across billions of S3 objects demands more than a storage layer. It demands a robust architectural primitive that supports the high-concurrency needs of a modern “Lakehouse.” Our goal is full storage-compute separation, leveraging S3 as an elastic foundation for both near-real-time metrics and large-scale batch transformations.</p>
+<p>For years, the vast majority of our tables were Hive Parquet, managed through the Hive Metastore with a directory-based layout. This model served us well, but as data volume grew, the directory-and-metastore approach became the limiting factor. We are now transitioning to a table-centric architecture built on modern table formats, treating data as a first-class primitive to ensure consistency and performance across our internal data transformation platforms: Slide, which powers batch transformations, and Hugo, which handles online-to-data-lake ingestion. Along the way, we also built the UnifiedSparkCatalog, a unified Spark catalog that hides table-format differences from users entirely, which we are open-sourcing alongside this post.</p>
+<h2>The catalyst for change: Challenges with Hive Parquet</h2>
+<p>For years, Hive Parquet was the backbone of our Data Lake, representing the vast majority of our tables. However, as data volume scaled, the architectural limitations of directory-based storage became apparent. We identified four primary bottlenecks:</p>
+<ul>
+ <li><strong>Catalog latency:</strong> The Hive Metastore (HMS) became a centralized failure point. High concurrency during metadata access led to O(n) listing overhead, where query planning time scaled linearly with partition count, crippling throughput.</li>
+ <li><strong>The small file problem:</strong> The directory layout left us with severe file fragmentation. Certain Machine Learning (ML) datasets had an average file size under 1 MB, with thousands of files in each partition. At this scale, the overhead of S3 object listing and metadata request latency drove up Application Programming Interface (API) costs and slowed scan operations.</li>
+ <li><strong>Operational toil:</strong> Data engineers faced constant manual overhead for partition registration. Without native ACID support (no native <code>UPSERT</code> or <code>DELETE</code>), teams relied on complex workarounds to manage data changes carefully.</li>
+ <li><strong>The broken information loop:</strong> A fundamental disconnect existed between the catalog and storage. Because the HMS, not the storage layer, was treated as the source of truth, direct S3 modifications frequently left the catalog stale and out of sync with the actual state on disk.</li>
+</ul>
+<h2>Why Iceberg? Strategic alignment and future-proofing</h2>
+<p>We evaluated several open table formats before selecting Apache Iceberg as our default. The deciding factors came down to community governance, engine compatibility, and long-term flexibility.</p>
+<p>Recent industry momentum, including growing cloud-native support for Iceberg, further validates this direction. We are positioning Grab to be format-agnostic in the long term, but Iceberg provides the most mature foundation today.</p>
+<h2>Adopting Iceberg at scale</h2>
+<p>Migrating an established lake is not a flag flip. Our challenge was rolling out Iceberg across a lake that was overwhelmingly Hive Parquet, queried by many engines and teams, without breaking the downstream consumers that depended on those tables. Rather than converting everything at once, we moved the highest-value tables first. The efficiency gains across our production workloads have been substantial. Here are representative examples:</p>
+<ul>
+ <li><strong>Query performance via Z-ordering:</strong> On a high-traffic navigation dataset, we achieved roughly a <strong>10x improvement in query runtime</strong>. Z-ordering co-locates rows with similar values across specified dimensions, enabling Trino to leverage data skipping and min/max statistics to prune irrelevant files during query planning. This reduced query runtime from 70 seconds to 6 seconds.</li>
+ <li><strong>S3 API cost reduction:</strong> For a heavily queried operations table, daily S3 API costs were reduced by up to 95% with no changes to the queries themselves. Larger file sizes and the elimination of expensive object listing during query planning drove most of the savings.</li>
+ <li><strong>Compute savings:</strong> For a dataset used in funnel analysis, we reduced cluster resource usage by approximately half. A separate ML feature pipeline also improved feature freshness for downstream models.</li>
+</ul>
+<h2>The UnifiedSparkCatalog: Making mixed formats transparent</h2>
+<p>Migrating to Iceberg solved our storage and metadata problems, but it surfaced a new one at the developer-experience layer. Modern table formats like Delta, Iceberg, and Hudi each implement their own custom catalog that extends Spark’s <code>SessionCatalog</code>. In a standard Spark runtime, only one catalog implementation can be set as the default <code>spark_catalog</code>. Supporting additional formats requires explicit catalog declarations, meaning users must reference tables with format-specific prefixes like <code>iceberg_catalog.schema.table</code> or <code>delta_catalog.catalog.schema.table</code>.</p>
+<p>With Iceberg, Delta, Hudi, and Hive tables now coexisting and tables actively migrating between formats, this created two problems: engineers had to know the underlying format of every table they queried, and any format migration silently broke every downstream query that hardcoded a prefix.</p>
+<p>The UnifiedSparkCatalog is our answer. It is a unified Spark catalog that abstracts the complexity of working with mixed table formats so users never need to think about which format a table uses. We took inspiration from Trino’s Table Redirection, a feature that transparently points a query at the right connector when a table’s format differs from the catalog it was queried through. Our Spark equivalent works as follows:</p>
+<h3>How it works</h3>
+<ol>
+ <li><strong>Table detection:</strong> The catalog loads metadata from the Hive Metastore.</li>
+ <li><strong>Format identification:</strong> A <code>TableTypeDetector</code> utility identifies the format based on metadata properties (e.g., the <code>provider</code> field) or path-based inference.</li>
+ <li><strong>Operation routing:</strong> The catalog delegates the operation to the correct format-specific catalog (Iceberg’s <code>SparkCatalog</code>, Delta’s <code>DeltaCatalog</code>, etc.) without requiring any prefix from the user.</li>
+</ol>
+<h3>Key design decisions</h3>
+<ul>
+ <li><strong>Lazy initialization:</strong> Catalogs for each format are initialized only when first needed, reducing startup overhead. If a format’s JAR is missing from the classpath, initialization continues gracefully. The catalog simply skips that format rather than failing the entire session.</li>
+ <li><strong>Naming as <code>spark_catalog</code>:</strong> The catalog reports its name as <code>spark_catalog</code> because Spark treats this name specially for legacy Hive Data Manipulation Language (DML) operations. Many internal Spark code paths check for this exact name to determine whether to use Hive-compatible logic for inserts, updates, and deletes. Using any other name would break legacy Hive table operations.</li>
+ <li><strong>Catalog reuse:</strong> Before creating a new catalog instance, the system checks whether one already exists in Spark’s catalog manager. This preserves compatibility with plugins like OpenLineage, which inspect catalog class types for lineage extraction.</li>
+ <li><strong>Fallback behavior:</strong> If a table is not found in the expected format-specific catalog, the system falls back to the base session catalog, ensuring robust behavior for standard Hive tables.</li>
+</ul>
+<p>We are open-sourcing UnifiedSparkCatalog alongside this blog post. The code and documentation are available <a href="https://github.com/grab/unified-spark-catalog">here</a>.</p>
+<h2>Lessons learned and overcoming hurdles</h2>
+<p>Scaling Iceberg across a large ecosystem revealed several technical nuances:</p>
+<ul>
+ <li><strong>Hive lock contention:</strong> We encountered “zombie locks” in the HMS that blocked commits. We traced this to a low read timeout on the metastore side under high load. Adjusting retry intervals and increasing the timeout resolved the issue.</li>
+ <li><strong>Timestamp handling:</strong> Spark 3.4 introduced <code>TIMESTAMP_NTZ</code> (no time zone), while Iceberg defaults to <code>TIMESTAMP_LTZ</code> (local time zone). This caused compatibility issues with legacy Hive views. We resolved it through a custom migration workflow and targeted patches to our Trino deployment to ensure consistent casting.</li>
+ <li><strong>Storage tier costs:</strong> Generating Iceberg metadata involves reading historical data, which can trigger a one-time cost spike as files move between S3 storage tiers. To manage this, we prioritize migrations based on a table’s scan frequency and API operation costs rather than migrating the entire lake at once.</li>
+</ul>
+<h2>Conclusion: The road ahead</h2>
+<p>Apache Iceberg is now foundational to Grab’s data strategy. It is the default format for Slide and Hugo, and adoption is expanding across our compute platforms.</p>
+<p>Looking forward, we are experimenting with <strong>Storage Partitioned Joins</strong> to eliminate shuffle stages in Spark and monitoring the <strong>Apache XTable</strong> project to maintain interoperability between formats. Our journey does not end with adoption. We will continue contributing back to the ecosystem, starting with the upcoming release of the UnifiedSparkCatalog.</p>
