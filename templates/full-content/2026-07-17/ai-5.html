@@ -1,0 +1,69 @@
+<h1>Harness Handbook</h1>
+<p>Making agent harnesses understandable, auditable, and editable.</p>
+<p>Open an open-source coding-agent codebase and you may want to see how it actually runs, verify that it behaves as safely as the documentation claims, or adapt it into an agent of your own. These goals sound different, but once you are in the code they all reduce to concrete questions about behavior. Will the agent ask before deleting a file, for example? Answering that means finding the confirmation logic, tracing bypass paths, and identifying every implementation site a change would touch. In a repository with thousands of files, searches for <em>delete</em>, <em>permission</em>, or <em>confirm</em> return scattered fragments—and piecing them back into a full behavior chain is hard work.</p>
+<p>The problem is not missing code, but missing a path from behavior to implementation. What is needed is not another code index, but a map that connects the two. Harness Handbook organizes scattered implementation into a <strong>behavior-level manual</strong>: it structures execution around system behavior and links every step to verifiable code evidence. Users can ask directly what they want to understand, audit, or change, and the Handbook locates the relevant behavior units, implementation sites, and next steps. As the harness evolves, this map keeps the system understandable and reviewable—and keeps humans in the loop throughout.</p>
+<h2>At a glance</h2>
+<ol>
+ <li><strong>The problem Harness Handbook addresses.</strong> A harness shapes how agent behavior unfolds, yet that behavior is often implicit and buried in complex code. Harness Handbook organizes it into a navigable, verifiable behavior map.</li>
+ <li><strong>Reading a harness.</strong> The Handbook explains how a harness runs in terms of system behavior, then links those explanations back to code evidence—so readers need not start from a file tree and disconnected source fragments.</li>
+ <li><strong>More reliable harness changes with coding agents.</strong> The Handbook maps natural-language change requests to the relevant behavior units and implementation sites, helping the agent skip irrelevant searches, miss fewer dependencies, and produce a tighter edit plan.</li>
+ <li><strong>Building your own agent on an existing harness.</strong> By presenting the harness’s behavior and capabilities in natural language, the Handbook lets users understand and adjust the system without wading through low-level code—and build an agent that fits their needs.</li>
+</ol>
+<h2>Why does an agent harness need a behavior-level manual?</h2>
+<p>When people talk about AI agents, they often start with model capability. Once an agent starts doing real work, however, the question quickly shifts from “what can the model do?” to “what will the system allow it to do?” Whether a command runs, whether the user is asked before a file is deleted, and how failures are handled are decided not only by the model, but also by the harness that surrounds it.</p>
+<p>To understand how these behaviors arise, you have to examine the harness itself. Doing so comprehensively is difficult in production. Codex, for example, coordinates the model, tools, state, permissions, and execution environment to turn each user request into a sequence of real actions—but the relevant implementation is spread across <strong>2,267 files, more than 34,000 functions, and nearly 160,000 code connections</strong>. At that scale, a file tree shows where code lives, but not how those pieces work together to produce a behavior.</p>
+<p>Directories and search results alone cannot reconstruct a complete behavior. What we need is a different way to read the system: start from behavior, then trace back to source code for verification. That approach serves three goals.</p>
+<h3>Understand: See how the harness runs</h3>
+<p>Follow one request through the full flow: what the model receives, when tools are called, how state moves, and how the system responds to failure.</p>
+<h3>Audit: Verify that behavior matches expectations</h3>
+<p>Trace the actual execution path to check permissions, confirmation logic, sandboxing, and data flow, including unusual routes that might bypass those protections.</p>
+<h3>Adapt: Build your own agent</h3>
+<p>First see which capabilities the harness already provides and which behaviors and code support them, then extend or adjust the system for your own needs.</p>
+<h2>Why is one behavior scattered across so many locations?</h2>
+<p>“Ask the user before deleting a file” sounds like a simple rule. To verify how it works in code, however, you must follow a chain of decisions: does the model request confirmation, can the tool call be intercepted, where is the user’s choice recorded, and under what conditions is the deletion finally executed? Any link in that chain can change the outcome.</p>
+<p>Each implementation site controls only one part of the chain. No single <code>confirmBeforeDelete()</code> function represents the complete behavior. You have to trace prompts, tool wrappers, permissions, and state through to sandbox execution and fallback paths before you can tell whether the request will run, be rejected, or enter another flow.</p>
+<p>So when you ask, “Will it really ask me before deleting a file?”, you are not running a keyword search—you are reconstructing a behavior chain and finding code evidence for every decision along it. We call this <strong>behavior localization</strong>. How completely you reconstruct that chain shapes the explanation, the risk review, and the change boundary. Harness Handbook turns behavior chains hidden in the codebase into a map you can browse layer by layer and verify against source code.</p>
+<h2>Harness Handbook: a navigable behavior map</h2>
+<p>Because a single behavior can span many implementation sites, the Handbook cannot simply repackage the file tree. Harness Handbook represents the harness in behavior-centric terms, using L1, L2, and L3 to narrow the question step by step. Every level preserves verifiable code evidence, so readers can check each explanation and ground later edits in source.</p>
+<p><strong>L1 · System overview</strong> starts with a global view of the harness. Instead of listing files and functions, it follows one request through the system: how the request enters, which stages it passes through, how state moves between them, and how model output becomes a real action.</p>
+<p><strong>L2 · Behavior-unit overview</strong> then breaks that system flow into behavior units. Each unit captures a coherent class of behavior and records its responsibilities, inputs and outputs, dependencies, and key state.</p>
+<p><strong>L3 · Behavior-unit detail</strong> finally zooms into one unit: when a behavior is triggered, how it executes, how state changes, which path is taken after an exception or failure, and which files and functions provide the evidence.</p>
+<h3>An example L3 behavior unit</h3>
+<p>Return to the example of “confirm before deleting a file.”</p>
+<h4>Confirm before file deletion</h4>
+<p>When the agent requests file deletion, the harness does not execute the operation immediately. It first checks the permission policy and user-confirmation state, then determines whether to proceed, reject the request, or return an error.</p>
+<ul>
+ <li><strong>Trigger:</strong> The model emits a deletion call such as <code>delete_file(path)</code>.</li>
+ <li><strong>Permission rule:</strong> Permission configuration marks file deletion as a high-risk operation that requires user confirmation before execution.</li>
+ <li><strong>State change:</strong> The harness records the confirmation request and user response, then uses them to determine whether the current execution may continue.</li>
+ <li><strong>Execution path:</strong> User approval → run in the <code>sandbox runner</code>; rejection or lack of authorization → abort the call and return an error.</li>
+ <li><strong>Edge cases:</strong> <code>headless</code> mode, auto-approval policies, or fallback paths may change the confirmation flow and need separate checks.</li>
+</ul>
+<p><strong>Evidence:</strong> <code>tools/file_ops.py</code> · L32–78, <code>tools/wrapper.py</code> · L84–128, <code>policy/permissions.py</code> · L15–66, <code>runtime/sandbox.py</code> · L40–112, <code>state/manager.py</code> · L40–61</p>
+<h2>How is the behavior map generated from code?</h2>
+<ol>
+ <li><strong>Extract facts:</strong> The first step extracts static program facts: files, functions, classes, call relationships, state reads and writes, configuration boundaries, and external API calls.</li>
+ <li><strong>Organize by behavior:</strong> The second step reorganizes the program graph into a behavior map. It sketches a coarse execution skeleton of the harness lifecycle, then maps functions, modules, and code regions to the corresponding stages and behavior units.</li>
+ <li><strong>Synthesize the handbook:</strong> Finally, the converged map is rendered as the system overview, behavior-unit overview, and behavior-unit detail.</li>
+</ol>
+<h2>How do you get from a behavior question to code evidence?</h2>
+<p>Once the behavior map exists, readers can start from a specific question and work toward code evidence layer by layer—without searching the entire repository first. We call this <strong>Behavior-Guided Progressive Disclosure (BGPD)</strong>.</p>
+<h3>One evidence path, three uses</h3>
+<ul>
+ <li><strong>Understand:</strong> Start at L1 and L2 to map the harness’s overall execution flow, state transitions, and dependencies among behavior units.</li>
+ <li><strong>Audit:</strong> Continue into L3, checking the unit’s triggers, permission rules, state changes, fallback paths, and code evidence one by one.</li>
+ <li><strong>Adapt:</strong> Use the Handbook to find the relevant behavior units, implementation links, and dependency paths—then define the change boundary.</li>
+</ul>
+<h2>Does the Handbook help a coding agent find relevant code more accurately?</h2>
+<p>We run the same coding agent on the same harness change requests, varying only whether it may consult the Handbook before localization. Results show that the Handbook-assisted planner wins more often while using fewer tokens per case. The gain comes from steering search toward relevant code earlier, cutting irrelevant exploration, and yielding a tighter plan.</p>
+<h2>Handbook Studio: turning the behavior map into an operational entry point</h2>
+<p>Handbook Studio is a workbench where users connect a repository, generate the three-level Handbook, and read, verify, and propose changes on the same behavior map.</p>
+<ul>
+ <li><strong>Read:</strong> The three-level handbook forms a navigable workbench.</li>
+ <li><strong>Cross-check:</strong> Every behavior description links back to code evidence. Click a behavior unit, state variable, or execution path and a split view opens the corresponding source on the right.</li>
+ <li><strong>Modify:</strong> Changes start on the behavior map. Select a behavior unit, describe what should change, and the system generates a reviewable edit plan and code diff.</li>
+</ul>
+<h3>Example: temporary environment variables for one command</h3>
+<p>The user states: “Let this command carry its own environment variables without affecting later commands.” On the behavior map, this is a field-level change. In the repository, it expands into the parameter schema, two tool descriptions, the shell and unified-exec execution paths, the spawn-environment merge point, and the mirrored tests—14 coordinated code updates across 10 files.</p>
+<h2>Takeaways</h2>
+<p>Open code does not make behavior self-evident. What a complex agent harness needs is a behavior-level manual—organized around what the system does, with a path back to code evidence at every step.</p>

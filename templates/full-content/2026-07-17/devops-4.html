@@ -1,0 +1,132 @@
+<h1>How to Encrypt Terraform State Files</h1>
+<p>Your Terraform state files contain the attributes and metadata of the resources and data sources that make up your Terraform configurations. This includes sensitive data such as passwords, database connection strings, certificate private keys, and more. By default, Terraform stores this information in plain text in your state file, so anyone with read access to that file can see it.</p>
+<p>You can use ephemeral values and ephemeral resources to keep some of this sensitive data out of your state file in the first place. But even data that isn’t classified as sensitive is often something you’d rather not share in plain text. After all, the state file reveals a lot about your infrastructure.</p>
+<p>In this post, we’ll explore how to encrypt your Terraform state file, both at rest and in transit. We’ll also look at an encryption feature that OpenTofu offers, and Terraform doesn’t.</p>
+<h2>What is Terraform state file encryption?</h2>
+<p>In simple terms, encryption turns a human-readable piece of information into something unintelligible using a secret key. With the same key (or a closely related one), you can reverse the transformation and turn the unintelligible data back into something readable.</p>
+<p>In the context of Terraform state files, encryption means protecting the data they contain by rendering it unreadable to unauthorized users. If someone walked into a data center where you store your state files, pulled a hard drive out of a rack, and walked out with it, they still shouldn’t be able to read your state file.</p>
+<p>The Terraform state file contains metadata, resource and data source attributes, check block results, and output values. Resource and data source attributes can include sensitive information such as API keys, certificate private keys, and passphrases. You can declare input variables and outputs as sensitive, which tells Terraform not to print them as plain text in logs. But this doesn’t change how Terraform stores those values in the state file.</p>
+<p>This is why state file encryption matters: you need to protect the sensitive data inside the state file.</p>
+<p>Two types of encryption matter here:</p>
+<ul>
+ <li><strong>Encryption in transit</strong> is when you encrypt the state file as it is transmitted over a network (e.g. during a Terraform operation in your CI/CD pipeline). This keeps the state file from moving in a readable format that someone could intercept.</li>
+ <li><strong>Encryption at rest</strong> is when you encrypt the state file data where it’s stored, usually the Terraform state backend (e.g., Amazon S3 or Google Cloud Storage).</li>
+</ul>
+<h2>How to encrypt Terraform state</h2>
+<p>In the following sections, we’ll cover how to encrypt Terraform state. If you’re worried about a complicated, math-heavy procedure, you will be glad to know that most of the work is handled for you.</p>
+<p>Two important concepts used in the following sections are:</p>
+<ul>
+ <li>A <strong>managed Terraform state backend</strong> is a backend based on a managed cloud service. Three popular examples are Amazon S3, Azure Storage, and Google Cloud Storage (GCS). This category also includes automation platforms that manage state storage for you, such as Spacelift and HCP Terraform.</li>
+ <li>A <strong>self-managed Terraform state backend</strong> is a backend that you’re responsible for setting up and configuring. Examples include HashiCorp Consul, HTTP, Kubernetes, and PostgreSQL. Note that there could be managed offerings of these backends as well, e.g., Amazon RDS for PostgreSQL or Azure Kubernetes Service.</li>
+</ul>
+<h3>Encryption in transit</h3>
+<p>Encryption in transit protects against someone reading your data as it moves over a network, a threat known as eavesdropping. The standard way to encrypt data in transit is with TLS and HTTPS. Communicating over HTTPS doesn’t stop someone from listening in on the traffic, but the data they intercept will be unintelligible.</p>
+<p>If you use a managed Terraform state backend, encryption in transit is managed for you.</p>
+<p>There’s no setup to enable it, and no way to turn it off. Every interaction with the backend requires an HTTPS connection, whether from the CLI, Terraform, or a graphical user interface.</p>
+<p>If you use a self-managed backend, you’re responsible for configuring encryption in transit. This means configuring TLS certificates and enabling all relevant encryption-in-transit settings for the selected backend.</p>
+<pre><code>verify_incoming = true
+verify_outgoing = true
+verify_server_hostname = true
+ca_file = "consul-agent-ca.pem"
+cert_file = "dc1-server-consul-0.pem"
+key_file = "dc1-server-consul-0-key.pem"</code></pre>
+<h3>Encryption at rest for state backends</h3>
+<p>All the officially supported Terraform state backends support encryption at rest in some form, but it may not be enabled by default.</p>
+<p>For managed Terraform state backend services (Amazon S3, GCS, Azure Storage, etc.), encryption at rest is always enabled by default, and there is usually no option to disable it.</p>
+<pre><code>resource "aws_s3_bucket" "state" \{
+  bucket_prefix = "terraform-state-"
+}
+
+resource "aws_kms_key" "state" \{
+  description = "KMS key for Terraform state file encryption"
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "state" \{
+  bucket = aws_s3_bucket.state.bucket
+
+  rule \{
+    apply_server_side_encryption_by_default \{
+      kms_master_key_id = aws_kms_key.state.arn
+      sse_algorithm     = "aws:kms"
+    }
+  }
+}</code></pre>
+<h2>State file encryption at rest with OpenTofu</h2>
+<p>With OpenTofu, you can explicitly encrypt state files and plan files on top of the encryption at rest you configure at the backend level.</p>
+<pre><code>terraform \{
+  encryption \{
+    key_provider "aws_kms" "default" \{
+      kms_key_id = "e6088080-95d4-4950-95d3-32a08225ee33"
+      region     = "eu-north-1"
+      key_spec   = "AES_256"
+    }
+
+    method "aes_gcm" "default" \{
+      keys = key_provider.aws_kms.default
+    }
+
+    state \{
+      method = method.aes_gcm.default
+    }
+  }
+}</code></pre>
+<pre><code>terraform \{
+  encryption \{
+    # configure your current encryption method (i.e. no encryption method)
+    method "unencrypted" "migrate" \{}
+
+    key_provider "aws_kms" "default" \{
+      kms_key_id = "e6088080-95d4-4950-95d3-32a08225ee33"
+      region     = "eu-north-1"
+      key_spec   = "AES_256"
+    }
+
+    method "aes_gcm" "default" \{
+      keys = key_provider.aws_kms.default
+    }
+
+    state \{
+      method = method.aes_gcm.default
+
+      fallback \{
+        # reference the current encryption method in a fallback block
+        method = method.unencrypted.migrate
+      }
+    }
+  }
+}</code></pre>
+<h2>Core best practices for Terraform state file encryption</h2>
+<h3>1. Always enable encryption at rest and encryption in transit</h3>
+<p>This almost goes without saying, but you should always enable both types of encryption for your Terraform state.</p>
+<h3>2. Implement network restrictions for state and encryption keys</h3>
+<p>Set up network protection mechanisms to restrict access to your state files and to the encryption keys you use to protect them. Never implicitly trust network traffic, even from within your private networks.</p>
+<h3>3. Limit access to state files and encryption keys</h3>
+<p>Anyone with the proper authentication and authorization to run terraform apply or tofu apply directly can access the sensitive data in your state file. Limit who can run apply commands for your infrastructure by centralizing your Terraform operations in a CI/CD pipeline or automation platform.</p>
+<h3>4. Keep sensitive data out of your encrypted state file</h3>
+<p>Use ephemeral values and ephemeral resources in your Terraform configurations to avoid storing sensitive information in the state file in the first place. Use a service such as HashiCorp Vault to configure dynamic credentials for databases and third-party platforms.</p>
+<h3>5. Use custom encryption keys if possible</h3>
+<p>A custom encryption key gives you several benefits: you can specify the encryption key type, set the cadence of key rotation, and configure access management for your keys at a more granular level.</p>
+<h2>How to manage Terraform state with Spacelift</h2>
+<p>Spacelift takes managing Terraform to the next level by giving you access to a powerful CI/CD workflow and unlocking features such as:</p>
+<ul>
+ <li><strong>Policies (based on Open Policy Agent)</strong></li>
+ <li><strong>Multi-IaC workflows</strong></li>
+ <li><strong>Build self-service infrastructure</strong></li>
+ <li><strong>Integrations with any third-party tools</strong></li>
+ <li><strong>Secure state management and locking</strong></li>
+</ul>
+<h2>Key takeaways</h2>
+<p>Your Terraform state file should be encrypted in transit and at rest. If you’re using a managed Terraform state backend, these encryption mechanisms are enabled by default and are managed for you.</p>
+<p>Terraform has no built-in support for state file encryption; instead, it relies entirely on the encryption built into your chosen state backend. This is one major feature that sets OpenTofu apart from Terraform: OpenTofu has built-in support for state file encryption.</p>
+<h2>Frequently asked questions</h2>
+<ul>
+ <li>
+  <h3>Does Terraform encrypt state files by default?</h3>
+  <p>No. Terraform’s open-source CLI stores state in plaintext, both locally and when written to remote backends. Encryption at rest depends entirely on the backend you configure.</p></li>
+ <li>
+  <h3>What's the difference between Terraform and OpenTofu state encryption?</h3>
+  <p>OpenTofu ships native client-side encryption through an encryption block that supports AWS KMS, GCP KMS, Vault, and PBKDF2 key providers. Terraform’s open-source CLI has no equivalent and relies on backend-level encryption.</p></li>
+ <li>
+  <h3>Can I encrypt Terraform state without changing my backend?</h3>
+  <p>Yes, through server-side encryption offered by your existing backend, for example setting encrypt = true on an S3 backend. Terraform’s CLI itself has no native client-side encryption, so anything stronger requires switching to OpenTofu or wrapping the file with an external tool like SOPS.</p></li>
+</ul>

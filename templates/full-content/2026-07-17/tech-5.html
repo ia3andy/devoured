@@ -1,0 +1,71 @@
+<p>Last week in San Francisco, I met Jarred Sumner, creator of JavaScript runtime, Bun, and was keen to learn more about the rewrite of Bun from Zig to Rust. But at the time, Jarred didn’t want to say too much, as the tool used for the migration, Fable, was out of action due to the US government imposing export controls.</p>
+<p>Fortunately, the situation is now resolved and Fable is available globally, and Jarred has published a detailed post about the project. Before we get into the migration, some context:</p>
+<p><strong>Bun is a complex project, with lots of production software depending on it. </strong>Bun itself does many things:</p>
+<ul>
+ <li>JavaScript, TypeScript and CSS transpiling, minifying and bundling</li>
+ <li>A test runner</li>
+ <li>A package manager (npm-compatible)</li>
+ <li>Other things: module resolution, a WebSocket client, Node.js implementations and many modules</li>
+</ul>
+<p>Today, Bun has 22 million monthly downloads, and software like Claude Code and OpenCode depend on it, while hosting providers like Vercel, Railway and DigitalOcean do first-party support for Bun.</p>
+<h3>Why a rewrite?</h3>
+<p>Zig is not a memory safe language, and memory-related bugs occurred continuously.<strong> </strong>Jarred lists memory-related bugs in the latest version of Bun: memory leaks, crashes due to memory issues, heap-out-of-bounds writes, and so on. This was after the Bun team patched the Zig compiler to reduce memory-related issues, and put end-to-end memory leak tests in place. As Jarred says:</p>
+<blockquote>
+ “Our bugfix list felt bad and I was tired of going to sleep worrying about crashes in Bun. I don't blame Zig for that - other users of Zig don't have the bugs we had, and mixing GC with manually-managed memory is an uncommon enough thing for software to need that no language really designs for it. (...) For Bun, correctly handling the lifetimes of garbage-collected values and manually-managed values has been a major source of stability issues - most often small memory leaks and occasionally crashes. Every memory allocation has to be meticulously reviewed. Where do these bytes get freed? How do we ensure it only gets freed once? Did we check for JavaScript exceptions properly? Is this garbage-collected pointer visible to the conservative stack scanner? Is this garbage collected memory or manually managed memory?”
+</blockquote>
+<p>Moving to a memory-safe, yet performant language could eliminate such errors, and Rust is one such language that fitted the bill. Jarred:</p>
+<blockquote>
+ “A large percentage of bugs from that list are use-after-free, double-free, and "forgot to free" in an error path. In safe Rust, these are compiler errors and RAII-like automatic cleanup with Drop. Compiler errors are a better feedback loop than a style guide.”
+</blockquote>
+<p>However, doing a <em>full</em> rewrite on Rust has always been a terrible idea. Or at least, it used to be, because of how unbearably long it would have taken:</p>
+<p><strong>There are two problems with rewrites: they take too long, and they take waaaay too long. </strong>A dev who has done rewrites probably knows how things tend to go:</p>
+<ol>
+ <li>Make an educated guess about how long it will take; say, nine months.</li>
+ <li>Nine months later, there’s still another ~6 months to go because new functionality is added to the <em>original</em> codebase, and now that new functionality needs to be added in!</li>
+ <li>By 15 months in, there’s still months left to go for the same reason!</li>
+ <li>In the end, you manage to mandate a “feature freeze” for two months and finish the rewrite in ~18 months, if lucky. The original nine-month estimate can end up taking 2+ years.</li>
+</ol>
+<p>Jarred likened rewriting Bun in Zig to this:</p>
+<blockquote>
+ “Historically, rewrites are a terrible idea. Excluding comments, Bun is 535,496 lines of Zig. A rewrite in another language would take a small team of engineers a full year. A year of zero user-facing impact is not a realistic option we could consider. So, enforcement through code-style to fix stability issues was our best bet, and was our plan when we added Rust-inspired smart pointers to Bun's codebase. But honestly, I didn't want to do it. Homegrown smart pointers offer worse ergonomics than Rust, with none of the guarantees. What if, instead, I spend a week testing if Anthropic's new model [Fable] can rewrite Bun in Rust?”
+</blockquote>
+<h3>Rewriting Bun with Fable</h3>
+<p>Unsurprisingly, the rewrite was not as simple as typing a prompt like: “Claude, rewrite Bun in Rust. Make zero mistakes.” Instead, this is how Jarred did it:</p>
+<p><strong>Step #1: Prep work.</strong> Three hours of intense prep work with Claude, explained Jarred:</p>
+<blockquote>
+ “Before writing any code, I spent about 3 hours talking to Claude about how to map patterns from our Zig codebase closely to Rust. Claude serialized this discussion into a PORTING.md document.”
+</blockquote>
+<p>This guide is a 600-line file with instructions like:</p>
+<p>Ground rules:</p>
+<ul>
+ <li>No tokio, rayon, hyper, async-trait, futures. No std::fs, std::net, std::process. Bun owns its event loop and syscalls. (Rust core/std slice, iter, mem, fmt, and core::ffi are fine — only the I/O-touching modules are banned.)</li>
+ <li>No async fn. Everything is callbacks + state machines, same as the Zig.</li>
+ <li>Borrow-checker reshaping is allowed. When matching Zig flow yields overlapping &amp;mut, capture the needed scalar (.len(), index) into a local, drop the borrow, then re-borrow. Do NOT reach for raw pointers just to silence borrowck; leave // PORT NOTE: reshaped for borrowck so Phase B diff readers aren't confused.</li>
+</ul>
+<p><strong>Step #2: Trial run + adversarial review. </strong>Asking Claude to rewrite three files out of 1,448 total number of files. After the rewrite, Jarred ran two separate adversarial reviews with Claude to critique the result, in separate sessions than the one that Claude made the changes in.</p>
+<p><strong>Step #3: split up the work across 64 AI agents. </strong>Jarred split up the job so that agents worked on files independent from one another, in parallel.</p>
+<p><strong>Step #4: iron out issues with the run (~1 day). </strong>When Jarred attempted to run all this, agents kept getting in each other’s way:</p>
+<blockquote>
+ “I asked Claude to loop the workflow on all 1,448 .zig files, and about 2 minutes in, one Claude ran git stash before committing. Another ran git stash pop. And then git reset HEAD --hard. They were stepping on each other! And if I put each Claude into a separate worktree, I would run out of disk space because Bun's git repository is too big and eventually the changes will need to be compiled and seen together. So, I asked Claude to edit the workflow to instruct Claude to never run git stash or git reset or any git command that doesn't commit a specific file at once. No cargo either. No slow commands at all. Then, Claude resumed the workflows. And it was working! Too slowly, so I split it into just 4 workflow shards each with their own worktree (4 worktrees total), each running 16 Claudes committing and pushing files.”
+</blockquote>
+<p><strong>Step #5: have it run and wait ~2 days. </strong>The parallel agents went to work, and completed the rewrite of 535,496 lines of Zig code over the course of two days. Each commit was checked by two adversarial reviews, before being committed.</p>
+<p><strong>Step #7: fix ~1,600 compiler errors (~12 hours).</strong> The rewrite was completed, but nothing compiled. Going crate-by-crate, Jarred had Claude fix compiler errors:</p>
+<blockquote>
+ “Fixing the cyclical dependencies revealed about 16,000 compiler errors. A massive number for 1 human, but not a crazy number for 64 Claude’s at once. To maximize parallelism, the workflow looped over each crate. For each crate, run cargo check, group the output by file and save the errors to a file. Fix all the compiler errors within that crate. 2 adversarial reviewers for the crate's changes. 1 fixer applies the fixes”
+</blockquote>
+<p><strong>Step #8: run tests locally (~2 days). </strong>Bun has a large test suite. The next step was to get these tests to run without compilation errors.</p>
+<p><strong>Step #9: get the test suite to pass CI (~3 days). </strong>Once the tests were running (and failing), the next step was to fix the code, so that the tests could pass. This took two days.</p>
+<p><strong>Step #10: Done in 11 days! </strong>After all the tests passed and Jarred verified that everything worked as expected, he merged the changes. The whole process took 11 days, from planning to the finish.</p>
+<h3>How repeatable is this process?</h3>
+<p><strong>The rewrite cost a whopping $165,000 with API pricing. </strong>With Fable’s API prices, the rewrite consumed 5.9 billion uncached input tokens, 690 million output tokens, and 72 billion cached input token reads.</p>
+<p><strong>What if AI enables rewrites and migrations that wouldn’t have been considered before? </strong>The idea of rewriting Bun in Rust without AI was impractical, admits Jarred:</p>
+<blockquote>
+ “By hand, I think this would've taken three engineers with full context on the codebase about a year, during which time we wouldn't be able to improve Node.js compatibility, fix bugs, fix security issues or implement new features. We never would've done that. The realistic alternative was to do nothing and keep fixing the bugs at the top of this post forever.”
+</blockquote>
+<p>If AI can shorten a one-year rewrite to a week: would you do it? If the answer is “hell, yes:” a blueprint now exists in the form of the Bun migration on how to do it. There are some caveats:</p>
+<ol>
+ <li>You need an engineer who is very motivated and knows the codebase very well</li>
+ <li>You need an extremely robust test suite, so when the test suite passes, you know it works</li>
+ <li>You need to be willing to invest a lot in tokens, not knowing how well it all will work</li>
+</ol>
+<p>Migrations with AI are surely speeding up, but only when projects are well-engineered like Bun’s has been.</p>

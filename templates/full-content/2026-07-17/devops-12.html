@@ -1,0 +1,42 @@
+<h2>Detecting Full Table Scans With SQLite</h2>
+<p>I’m at RubyConf this week, and it’s great!</p>
+<p>I recently read that lobste.rs is now running on SQLite. One part from the post caught my attention:</p>
+<blockquote>
+ <p>I wish we could say in a test, “Fail if you encounter any full table scans”. Which would have caught the perf issues we experienced during the first deploy.</p>
+</blockquote>
+<p>SQLite collects information about prepared statements and exposes those statistics though an API. The upshot of this is that we can tell whether a statement did a full table scan after executing the statement without using an <code>EXPLAIN</code>.</p>
+<p>Here’s an example program that demonstrates detecting a query did a full table scan:</p>
+<pre><code>db = SQLite3::Database.new(":memory:")
+
+db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+
+# Insert a bunch of records
+1_000.times do |i|
+  db.execute("INSERT INTO users (name, age) VALUES (?, ?)",
+    ["user#\{i}", i % 100])
+end
+
+# Prepare a statement and query it
+stmt = db.prepare("SELECT * FROM users WHERE age = ?")
+stmt.bind_param(1, 42)
+stmt.to_a
+
+# Check the number of full scan steps, we see a bunch because the query
+# did a full table scan
+fullscan_steps = stmt.stat(:fullscan_steps)
+puts "fullscan_steps: #\{fullscan_steps}"
+if fullscan_steps &gt; 0
+  puts "=&gt; query performed a full table scan"
+end
+
+# Create an index
+db.execute("CREATE INDEX idx_users_age ON users(age)")
+
+# Now the query won't do a full table scan
+stmt2 = db.prepare("SELECT * FROM users WHERE age = ?")
+stmt2.bind_param(1, 42)
+stmt2.to_a
+
+puts "after adding index, fullscan_steps: #\{stmt2.stat(:fullscan_steps)}"
+</code></pre>
+<p>Feels like we could integrate this in to Rails and warn or raise in test / development. I’m not sure if we’d want to check this all the time in production, but maybe it would be fine?</p>

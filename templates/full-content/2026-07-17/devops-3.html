@@ -1,0 +1,88 @@
+<p><strong>In short:</strong> At GTC 2026, NVIDIA released OpenShell, an open source runtime that sandboxes autonomous AI agents with kernel-level policy: what files they can touch, what processes they can spawn, where their traffic can go. It is a serious piece of engineering and it validates something we have argued all year: agent security belongs in the environment, not in the prompt. But agent identity, agent-to-agent governance, and cross-sandbox communication all sit outside its scope today. This post covers what OpenShell does, where it stops by design, and three integration patterns that close the gap with Tigera Lynx.</p>
+<p>Most attempts to control AI agents work at the model layer (alignment, system prompts) or the application layer (guardrail libraries, output filters). Both share a flaw: the thing being secured is also the thing doing the securing. A sufficiently confused or sufficiently compromised agent can talk its way past its own instructions.</p>
+<p>OpenShell takes a different position, and it is the right one. Put the controls in the environment, where the agent cannot negotiate with them. An agent inside an OpenShell sandbox cannot leak a credential it never received, and cannot call an endpoint the kernel refuses to route.</p>
+<p>If that argument sounds familiar, it should. It is the same case we made in Why We Built Lynx and throughout the AI agent accountability series: controls the agent can override are not controls. NVIDIA arriving at the same conclusion, with an Apache 2.0 project and a partner list that includes Cisco, CrowdStrike, Google Cloud, and Microsoft Security, is the strongest endorsement the environment-layer approach has had yet.</p>
+<p>So this is not a “versus” post. OpenShell and Lynx solve different halves of the same problem, and NVIDIA said so first: its own launch announcement says securing autonomous systems “requires an integrated ecosystem”.</p>
+<h2>What OpenShell actually does</h2>
+<p>OpenShell is a secure runtime for a single agent on a single machine. You install it with one command, then launch an agent inside a sandbox:</p>
+<pre><code>openshell sandbox create -- claude</code></pre>
+<p>That agent (Claude Code, Codex, Cursor, OpenCode, or your own container image) now runs inside an isolated environment governed by a declarative YAML policy with four layers:</p>
+<ul>
+ <li><strong>Filesystem:</strong> Which paths the agent can read or write, enforced with Landlock and locked at sandbox creation.</li>
+ <li><strong>Process:</strong> Which binaries can execute and which syscalls are available, enforced with seccomp. An agent can install a verified skill but cannot run an unreviewed binary.</li>
+ <li><strong>Network:</strong> deny-by-default egress, intercepted at the HTTP method and path level, hot-reloadable as approvals are granted.</li>
+ <li><strong>Inference:</strong> A “Privacy Router” that decides which LLM backend serves each call, keeping sensitive context on local models and routing to frontier models only when policy allows. Credentials are swapped at the router, so the real API key never sits inside the sandbox.</li>
+</ul>
+<p>The threat model is specific and well chosen: long-running, self-evolving agents with shell access, live credentials, and the ability to rewrite their own code. Prompt injection, malicious third-party skills, subagents inheriting permissions they should not have. When the agent hits a policy wall, it can propose a policy change and a human approves or rejects it. Autonomy with a human holding the pen.</p>
+<p>It is currently alpha (“proof of life,” in NVIDIA’s words), runs on macOS, Windows via WSL 2, and Linux, and targets everything from a developer laptop to DGX-class machines.</p>
+<h2>Where OpenShell stops, on purpose</h2>
+<p>Here is the part that matters for anyone running agents in production. NVIDIA’s technical documentation is explicit about what OpenShell does not address:</p>
+<ul>
+ <li>Agent-to-agent communication governance</li>
+ <li>Agent identity and authentication</li>
+ <li>Cross-sandbox communication patterns</li>
+</ul>
+<p>Kubernetes is the near-miss on that list. OpenShell does run on Kubernetes: an experimental Helm chart, marked not for production, that provisions sandbox pods on a cluster. But putting sandboxes on Kubernetes and governing a fleet across Kubernetes are different jobs. Each sandbox still enforces its own YAML in isolation, with no shared agent identity and no view of its neighbors.</p>
+<p>Read that list again. It is not a gap NVIDIA missed; it is a boundary they drew deliberately, and they drew it exactly where the fleet begins. OpenShell answers “what can this agent do on this box?” It does not attempt to answer “which of my two hundred agents called the payments MCP server last Tuesday, under whose authority, and using which model?” And as we argued in The AI Agent Accountability Gap, network policies, API gateways, and RBAC cannot answer those questions either.</p>
+<p>They are the questions Lynx exists for. Side by side:</p>
+<table>
+ <tbody>
+  <tr>
+   <td><strong>Concern</strong></td>
+   <td><strong>OpenShell</strong></td>
+   <td><strong>Lynx</strong></td>
+  </tr>
+  <tr>
+   <td>Scope</td>
+   <td>One agent, one sandbox</td>
+   <td>A fleet of agents across a cluster</td>
+  </tr>
+  <tr>
+   <td>Agent identity &amp; authentication</td>
+   <td>No first-class agent identity (users and components authenticate; agents just get injected credentials)</td>
+   <td>SPIFFE/SPIRE workload identity, mTLS, per-agent JWTs</td>
+  </tr>
+  <tr>
+   <td>Policy</td>
+   <td>YAML per sandbox</td>
+   <td>Cedar policy across agents, MCP servers, and LLM providers</td>
+  </tr>
+  <tr>
+   <td>A2A and MCP traffic</td>
+   <td>Out of scope</td>
+   <td>Gateway proxy, every request authorized individually</td>
+  </tr>
+  <tr>
+   <td>Agents you didn’t launch</td>
+   <td>Not applicable</td>
+   <td>eBPF detection classifies them as sanctioned, shadow, or unknown</td>
+  </tr>
+  <tr>
+   <td>Audit</td>
+   <td>Local allow/deny logs per sandbox</td>
+   <td>Fleet-wide Agent Trail, including which model actually served each call</td>
+  </tr>
+ </tbody>
+</table>
+<p>One box, two hundred boxes. Same philosophy, different altitude.</p>
+<h2>Closing the gap: three integration patterns</h2>
+<p>None of these require code changes in either product. They use configuration surfaces both systems document today: OpenShell’s deny-by-default egress policy and credential injection on one side, Lynx’s gateway, registry, and token service on the other. To be clear about what this is: a proposed reference architecture drawn from published documentation, not a tested walkthrough. OpenShell is weeks old and still alpha. But the seams line up well enough that I think the patterns are worth writing down now.</p>
+<h3>Pattern 1: One road out of the sandbox</h3>
+<p>OpenShell intercepts all outbound traffic and denies by default. So write the narrowest useful network policy: the only egress a sandbox is allowed is the Lynx Agent Gateway.</p>
+<p>Every MCP call, every A2A request, every LLM call now has exactly one path, and that path runs through Cedar authorization on a per-request basis, with the decision recorded in Agent Trail. The division of labor is clean. OpenShell guarantees the agent cannot go around the gateway, even if it is compromised and actively trying. Lynx decides what is allowed through the gateway, and remembers what happened.</p>
+<p>Neither system can do the other’s job here. Lynx cannot stop a process inside someone’s laptop sandbox from opening a raw connection; OpenShell can. OpenShell has no idea whether this agent should be allowed to call that MCP tool with those arguments, but Lynx does.</p>
+<h3>Pattern 2: The API key never enters the sandbox</h3>
+<p>OpenShell’s Privacy Router already routes inference calls through controlled backends and swaps credentials on the way out. Lynx, as of the current release cycle, treats LLM providers as first-class governed entities: registered in the registry, subject to Cedar policy, visible on the access map, recorded in Agent Trail down to the model that actually served the request.</p>
+<p>Chain them. Local-model traffic stays on the box, served by Nemotron or whatever the Privacy Router prefers. Frontier-model traffic routes to the Lynx LLM gateway, where Cedar decides which agent may use which provider and which model, and the credential is attached centrally.</p>
+<p>Follow the key. The OpenAI or Anthropic API key exists in exactly one place, inside Lynx. Not in the sandbox, not in the agent’s environment variables, not in a dotfile the agent can read and exfiltrate. And every frontier call, from every sandbox on every developer machine, lands in one audit trail with the caller’s identity and the served model attached. A prompt-injected agent can ask for the key all it wants; there is nothing on the box to steal.</p>
+<h3>Pattern 3: Identity from birth</h3>
+<p>OpenShell deliberately focuses on securely running agents rather than defining who those agents are. It provides sandboxing, credential management, and integration with existing identity systems, but it doesn’t maintain a persistent registry of agent identities or establish a trust model between agents. Lynx complements that layer by giving every agent a verifiable identity from the moment it is created.</p>
+<p>The integration is intentionally lightweight: a wrapper around openshell sandbox create registers the new agent with the Lynx registry and associates it with an existing workload identity; whether SPIFFE, OIDC, or another supported mechanism. From its first network request, the sandbox represents a known, authenticated agent rather than an anonymous process.</p>
+<p>This pattern is what makes the first two enforceable per agent instead of per box, and it has a side effect worth naming. A developer’s local experiment, sandboxed with OpenShell and registered with Lynx, shows up on your access map as a sanctioned agent. The same experiment without registration is exactly the shadow agent that Lynx’s eBPF detection was built to catch. Registration at sandbox creation makes the sanctioned path the lazy path, which is the only kind of security policy developers reliably follow.</p>
+<h2>Same policy idea, from laptop to cluster</h2>
+<p>There is a deeper symmetry underneath these patterns. OpenShell’s filesystem and process layers do at sandbox scope roughly what Lynx’s agent-detector does at node scope with eBPF; its network and inference layers do locally what the Lynx gateway does for the fleet with Cedar. Nobody has built a translator between OpenShell YAML and Cedar yet. But the layers correspond closely enough that policy parity across the laptop-to-cluster boundary looks like an engineering problem, not a research problem. An agent developed under a given OpenShell policy could be promoted to Kubernetes with the same intent expressed as Cedar plus a quarantine baseline. That is the roadmap conversation this post is meant to start.</p>
+<p>Two smaller threads point the same direction. OpenShell’s Kubernetes chart means sandboxes can run on a Lynx-governed cluster, sitting inside two independent kernel enforcement planes, one inside the sandbox and one on the node, so even a sandbox escape lands in Lynx’s detection perimeter. And OpenShell logs every allow/deny decision locally; forwarding those over OTLP into Agent Trail would put runtime decisions and traffic decisions in a single timeline. Both are speculative today. Neither is far-fetched.</p>
+<h2>The other half</h2>
+<p>OpenShell is the most credible answer yet to a question we have been asking all year: how do you give an agent real autonomy without handing it the keys to the host? If you are running coding agents locally, try it; the install is two commands and the defaults are sensible.</p>
+<p>Then ask the question NVIDIA deliberately left open. When that agent, and the forty like it across your organization, start talking to MCP servers, to each other, and to three different LLM providers, who is checking identity at the door? Whose policy decides, and where is the record?</p>
+<p>OpenShell holds the agent. Lynx governs the fleet. The seam between them is thinner than you would expect, and the patterns above are how we would stitch it.</p>
