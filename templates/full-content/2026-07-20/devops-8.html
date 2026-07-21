@@ -1,0 +1,124 @@
+<ul>
+ <li>A sample Databricks App (FastAPI + React) that scores credit card transactions for fraud in real time using Model Serving route optimization for low-latency inference and Lakebase Postgres for online feature and profile lookups.</li>
+ <li>Fast inference alone is not enough. The app pairs route-optimized Model Serving with Lakebase, plus the connection pooling, OAuth token rotation, and autoscaling patterns that keep latency stable under load.</li>
+ <li>Across 5,000 requests, the route-optimized endpoint returned in 27 ms at p50 and 37 ms at p95 end-to-end, with 8.9 ms median Lakebase feature lookups and 100% success, well inside checkout latency budgets.</li>
+</ul>
+<p>You're standing at the register. You tap your card. A tiny spinner appears for maybe half a second, maybe less, and then it says Approved. Or it doesn't.</p>
+<p>During that time, something had to decide whether this charge looks like you, or like someone who stole your card number in a data breach six months ago. It had to know things about you: your spending patterns, your daily limit, whether you even allow purchases from other countries. And it had to do all of that fast enough that you didn't notice it happened.</p>
+<p>This post is about what that "something" looks like when you build it on Databricks. We'll walk through retail-app, a sample application (FastAPI backend, React frontend, deployed as a Databricks App) that brings two platform capabilities together:</p>
+<ul>
+ <li>Model Serving with route optimization, a faster network path to your deployed model.</li>
+ <li>Lakebase, a managed Postgres for the profile and feature data the model needs at prediction time, featuring autoscaling so the database scales with demand instead of becoming the new bottleneck.</li>
+</ul>
+<h2>The flow: what actually happens on a transaction</h2>
+<p>Before we look at code, here's the plain story of a single payment. Two checks run in sequence: a model scores the charge, then the app checks your profile rules. Either one can decline the transaction.</p>
+<p>The model runs first because we want its latency numbers regardless of the outcome. Then the profile lookup (daily spending cap, international transaction toggle, country of residence) feeds a handful of if-statements. The response includes timing for every step so you can see exactly where the milliseconds went.</p>
+<p><strong>Updating your profile</strong> (changing your daily limit, toggling international transactions) is a separate action. You save changes to the database, and the <em>next</em> payment picks them up. No redeployment, no cache invalidation.</p>
+<h2>Route optimization: why the network path matters</h2>
+<p>When a model is deployed behind Databricks Model Serving, there's a network hop between your application and the inference container. For batch workloads, a few extra milliseconds per request is irrelevant. For a checkout experience, it's everything.</p>
+<p>Route optimization shortens that network path. When you enable route optimization on an endpoint, Databricks Model Serving improves the network path for inference requests, resulting in faster, more direct communication between your client and the model. This optimized routing unlocks higher queries per second (QPS) compared to non-optimized endpoints and provides more stable and lower latencies for your applications.</p>
+<p>You enable it when you create the endpoint, and you query through the <strong>data-plane</strong> flow using OAuth, not personal access tokens. You get lower latency and higher throughput for the same compute, which is exactly what an interactive fraud-scoring use case needs.</p>
+<p>In the sample app, the endpoint is called <code>fraud-detection-lakebase</code>.</p>
+<p>A few things to notice:</p>
+<ul>
+ <li><code>serving_endpoints_data_plane.query</code>: This is the data-plane query path, which is what route optimization uses. The Databricks SDK handles the OAuth token exchange under the hood.</li>
+ <li><code>asyncio.to_thread</code>: The SDK's query method is synchronous. Wrapping it in <code>to_thread</code> keeps the FastAPI event loop free while the model runs.</li>
+ <li><code>dataframe_records</code>: The payload is a list of dictionaries (one per row). For fraud scoring, we send one transaction at a time.</li>
+</ul>
+<p>The model itself returns <code>fraud_probability</code>, <code>fraud_flag</code>, and (crucially) its own internal timing: <code>lookup_ms</code> (how long the feature lookup inside the model container took), <code>inference_ms</code> (CatBoost prediction), and <code>total_ms</code>. The backend maps these through so the frontend can show a latency waterfall.</p>
+<h2>Lakebase: Postgres for the data the model needs</h2>
+<p>The fraud model doesn't just look at the transaction in isolation. It looks up the customer's historical features (average transaction amount, cross-border ratio, chargeback rate, velocity over the past 24 hours) using the first six digits of the credit card (the BIN) as the lookup key. Those features live in a Lakebase Postgres table called <code>customer_features</code>.</p>
+<p>This is the same table the <em>backend</em> reads from for profile data (name, daily limit, international toggle). One table, two readers: the model container reads features for inference, the FastAPI app reads profile fields for business rules.</p>
+<p>On the read side, the backend borrows a connection from the pool, runs a parameterized <code>SELECT</code> by <code>user_id</code>, and returns the connection in a <code>finally</code> block. On the write side, when a user changes their daily limit or toggles international transactions in the UI, the backend builds a dynamic <code>UPDATE</code> from an allowlist of editable columns.</p>
+<h2>Connection pooling and OAuth token rotation</h2>
+<p>Every transaction in this app hits Lakebase at least twice: once inside the model container for the feature lookup, and once in the backend for the profile check. Opening a fresh connection each time means a TCP handshake plus a TLS negotiation on every single request, which would easily add 20-50 ms of overhead per call. A connection pool keeps a handful of connections open and ready, so most requests just grab one and go.</p>
+<p>The pool itself is a <code>psycopg2.pool.ThreadedConnectionPool</code> with 3–10 connections. Because Lakebase authenticates via OAuth, the app exchanges service principal credentials for an access token, then uses the <strong>client ID as the Postgres username</strong> and the <strong>token as the password</strong>.</p>
+<h2>The model's side: feature lookup inside the container</h2>
+<p>The fraud model itself (deployed as an MLflow pyfunc) does its <em>own</em> Lakebase lookup at prediction time. It extracts the card BIN, queries <code>customer_features</code>, assembles a feature vector, and runs CatBoost inference.</p>
+<p>The model container maintains its own <code>ThreadedConnectionPool</code> to Lakebase, with background token refresh so the pool stays valid across long-running serving instances. This is the same pattern as the backend (pool + OAuth rotation), but running inside the model container rather than the FastAPI process.</p>
+<h2>Business rules: the profile check</h2>
+<p>After the model scores the transaction, the backend reads the customer's profile from Lakebase and runs two simple rules. First, it compares the transaction amount against the user's daily spending limit. Second, if the user has disabled international transactions, the backend checks whether the transaction's country matches the user's country of residence.</p>
+<h2>Lakebase autoscaling with scale-to-zero: handling demand</h2>
+<p>In production, your Postgres instance needs to handle both the model container's feature lookups <em>and</em> the backend's profile reads. Lakebase autoscales, adjusting compute within a configured min/max range so you're not paying for peak capacity at 3 AM, but you're also not dropping queries at noon. With scale-to-zero enabled, you also stop paying when no transactions are flowing.</p>
+<h2>Putting it together: end-to-end latency breakdown</h2>
+<table>
+ <thead>
+  <tr>
+   <th><strong>Measurement</strong></th>
+   <th><strong>What it captures</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>model_call_ms</td>
+   <td>Wall-clock time for the entire serving call</td>
+  </tr>
+  <tr>
+   <td>model_lookup_ms</td>
+   <td>Feature lookup inside the model container</td>
+  </tr>
+  <tr>
+   <td>model_interfere_ms</td>
+   <td>CatBoost prediction time</td>
+  </tr>
+  <tr>
+   <td>model_total_ms</td>
+   <td>Total time inside the model container</td>
+  </tr>
+  <tr>
+   <td>business_logic_ms</td>
+   <td>Profile read + rule evaluation</td>
+  </tr>
+  <tr>
+   <td>backend_total_ms</td>
+   <td>Wall-clock time from request start through fraud model call</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Results: How fast is it really?</h2>
+<table>
+ <thead>
+  <tr>
+   <th><strong>Metric</strong></th>
+   <th><strong>p50</strong></th>
+   <th><strong>p95</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Feature lookup</strong></td>
+   <td>8.9 ms</td>
+   <td>13.9 ms</td>
+  </tr>
+  <tr>
+   <td><strong>Inference</strong></td>
+   <td>0.4 ms</td>
+   <td>6.0 ms</td>
+  </tr>
+  <tr>
+   <td><strong>Total model time</strong></td>
+   <td>9.5 ms</td>
+   <td>17.6 ms</td>
+  </tr>
+  <tr>
+   <td><strong>End-to-end round trip</strong></td>
+   <td>27.2 ms</td>
+   <td>37.3 ms</td>
+  </tr>
+ </tbody>
+</table>
+<ul>
+ <li><strong>End-to-end round trip is 27 ms at the median, 37 ms at p95.</strong> That's the full journey: caller → route-optimized data plane → model container → Lakebase lookup → CatBoost inference → response. Well within the latency budget for a checkout flow.</li>
+ <li><strong>Feature lookup is single-digit milliseconds at p50 (8.9 ms).</strong> The model's connection pool to Lakebase keeps connections warm, so most reads skip the TLS handshake entirely.</li>
+ <li><strong>Inference is essentially free.</strong> CatBoost prediction on a 12-feature vector takes 0.4 ms at the median.</li>
+ <li><strong>Network overhead is ~17 ms.</strong> Route optimization keeps this consistent: the p50-to-p95 spread is only 4 ms.</li>
+</ul>
+<h2>Try it yourself: deploy the app to your workspace</h2>
+<p>The app is built as a Databricks App (FastAPI backend, React frontend) using apx.</p>
+<p>The key files:</p>
+<ul>
+ <li><code>src/retail_app/backend/router.py</code>: Transaction endpoint, fraud check, business rules</li>
+ <li><code>src/retail_app/backend/postgres.py</code>: Lakebase connection pool, profile CRUD</li>
+ <li><code>model_training/fraud_model.py</code>: MLflow pyfunc with feature lookup and CatBoost</li>
+ <li><code>app.yml</code>: Deployment config</li>
+</ul>

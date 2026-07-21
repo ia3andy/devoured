@@ -1,0 +1,52 @@
+<h1>Securing the AI supply chain on GKE: Introducing k8s-aibom for automated AI BOMs</h1>
+<p>How should your security team manage shadow AI? Workloads deployed by developers without formal registration can often evade traditional security scanners, because organizations are reluctant to slow down development and compromise stability by demanding privileged Daemonsets, kernel-level access, and manual pod-spec edits.</p>
+<p>To break this deadlock, today we are open-sourcing <a href="https://github.com/GoogleCloudPlatform/k8s-aibom">k8s-aibom</a>. This lightweight, unprivileged Kubernetes controller continuously monitors the cluster API and container environments to automatically detect running AI runtimes (like vLLM and Triton) and generate standard <a href="https://cyclonedx.org/capabilities/mlbom/">CycloneDX Machine Learning Bill of Materials</a> (ML-BOMs).</p>
+<p>By providing automated, audit-grade visibility directly from runtime execution — regardless of whether the workload was formally registered — k8s-aibom can help teams safely move AI projects from pilot to production without developer integration friction.</p>
+<h3><strong>The architecture of zero friction</strong></h3>
+<p>k8s-aibom is designed from the ground up to respect both the CISO mandate for total visibility and the SRE mandate for cluster stability. It deploys as a single, unprivileged Deployment in the k8s-aibom-system namespace. It involves zero developer friction — no sidecars, no eBPF kernel modules, no privileged DaemonSets, and no modifications to existing developer pod specifications.</p>
+<p>k8s-aibom watches for AI workloads and produces BOMs.</p>
+<p>The discovery pipeline executes through four clear stages:</p>
+<ol>
+ <li>
+  <p><strong>Scrape cluster workloads</strong>: The controller continuously monitors KServe resources, Deployments, StatefulSets, DaemonSets, and Jobs across the cluster.</p></li>
+ <li>
+  <p><strong>Identify AI stacks</strong>: Advanced pattern matching inspects container images, environment variables, and command-line arguments to detect serving runtimes (vLLM, Triton Inference Server, TGI, Ollama), autonomous agent frameworks (LangChain, AutoGen, CrewAI), vector databases and RAG stores (Milvus, Qdrant, pgvector), as well as distributed training jobs and evaluation harnesses.</p></li>
+ <li>
+  <p><strong>Generate standard manifests</strong>: The controller compiles the discovered artifacts into formal OWASP CycloneDX 1.6 Machine Learning Bill of Materials (ML-BOM) documents.</p></li>
+ <li>
+  <p><strong>Export to sinks</strong>: The controller attaches the resulting ML-BOM directly to the custom resource status (status.bomDocument) of an in-cluster AIBOM Custom Resource (CR) and routes it to optional external sinks, including Google Cloud Storage buckets and external webhook endpoints.</p></li>
+</ol>
+<p>Application teams do not need to modify their pod specifications, inject sidecar containers, or alter their continuous integration and continuous delivery (CI/CD) pipelines. Furthermore, k8s-aibom treats the Kubernetes cluster state as a pure functional input: Identical cluster inputs produce byte-identical ML-BOM documents. This deterministic property makes k8s-aibom an ideal fit for GitOps workflows, enabling site-reliability engineers (SREs) to perform exact diffs and trigger precise change-detection alerts when AI dependencies drift.</p>
+<h3><strong>Where existing AIBOM tooling falls short</strong></h3>
+<p>Many AI BOM solutions offer build-time scanners producing BOMs from artifacts at rest. These tools help you track the code that was intended to be deployed.</p>
+<p>Commercial AI security platforms extend the picture with cloud-native posture management, but typically through external scanning shaped around vendor-specific data models. Few, if any, of these tools help compliance reviewers, security operations (SecOps) teams, and platform engineers understand what is running right now, what is it connected to, and how can we verify those assertions.</p>
+<p>We purpose-built k8s-aibom to bridge that gap. It produces BOMs from live cluster observation rather than artifact scanning, emits standards-conformant CycloneDX 1.6 ML-BOMs that integrate with the broader OWASP and Open Source Security Foundation (OpenSSF) supply-chain ecosystem rather than vendor-proprietary formats, and runs as an unprivileged controller on any conformant Kubernetes cluster — making it complementary to existing build-time and posture-management tooling rather than a replacement for either.</p>
+<h3><strong>The Confidence Model: Separating intent from inference</strong></h3>
+<p>For compliance auditors and SecOps engineers, raw telemetry is often noise. Standard monitoring tools indicate that a container is running, but can’t prove whether an AI model was explicitly configured by a platform engineer or dynamically pulled by an autonomous script at runtime. k8s-aibom solves this ambiguity through its deterministic Confidence Model, categorizing discovered assets into distinct tiers:</p>
+<ol>
+ <li>
+  <p><strong>Declared</strong>: Explicitly defined by the customer or developer in the workload configuration (For example, explicitly passed container arguments such as --model meta-llama/Llama-2-7b.) A “declared” confidence detection represents clear human intent.</p></li>
+ <li>
+  <p><strong>Inferred</strong>: Derived autonomously by the controller's pattern-matching engine through deep inspection of container images, environment variables, and execution profiles. (For example, identifying ^vllm/.* container signatures.)</p></li>
+ <li>
+  <p><strong>Unresolved</strong>: Applied to workloads where an active AI presence is detected, but exact model parameters, weights, and versions can’t be deterministically established. An “unresolved” confidence detection immediately flags the workload for targeted security review.</p></li>
+</ol>
+<p>This structured taxonomy allows compliance reviewers to instantly separate explicit engineering intent from machine inference, establishing an unassailable chain of trust during audits.</p>
+<h3><strong>Immutability and least privilege: Building an audit-grade security model</strong></h3>
+<p>Auditors remain deeply skeptical of standard observability telemetry because logs and metrics can be modified, dropped, and tampered with by compromised nodes or elevated administrators. k8s-aibom establishes an audit-grade evidence trail built on strict least-privilege isolation and data immutability.</p>
+<p>The controller operates under a dedicated Kubernetes service account bound to a minimal Identity and Access Management (IAM) Workload Identity. It acts as the sole identity authorized to write BOM records to external storage sinks, requiring only roles/storage.objectCreator permissions.</p>
+<p>To satisfy the most stringent audit and evidentiary standards, the Google Cloud Storage external sink implementation enforces DoesNotExist preconditions on object creation. Once an ML-BOM is written to the Cloud Storage bucket, the object becomes cryptographically immutable.</p>
+<p>It can’t be silently overwritten, modified, or retroactively tampered with by compromised cluster actors or rogue workloads. SecOps teams gain absolute assurance that the historical audit log presented to regulators represents an unalterable record of cluster execution.</p>
+<h3><strong>Accelerating governance readiness: Mapping to global regulatory frameworks</strong></h3>
+<p>By automating the generation of standardized CycloneDX 1.6 ML-BOMs, k8s-aibom directly bridges the gap between low-level Kubernetes runtime state and high-level governance frameworks. It unblocks stalled GKE AI deployments by providing the foundational empirical data essential to major global standards:</p>
+<ul>
+ <li>
+  <p><strong>EU AI Act</strong>: Designed to help organizations align with <a href="https://ai-act-service-desk.ec.europa.eu/en/ai-act/article-12">Article 12</a> (automated logging and record-keeping for continuous traceability) and <a href="https://ai-act-service-desk.ec.europa.eu/en/ai-act/article-50">Article 50</a> (transparency obligations for AI systems). By automatically cataloging serving runtimes and agent stacks, the tool helps simplify the gathering of technical evidence that may be needed during compliance audits.</p></li>
+ <li>
+  <p><strong>NIST AI Risk Management Framework (AI RMF)</strong>: Provides continuous, empirical asset visibility that can help support the Govern, Map, Measure, and Manage functions, helping shift compliance workflows from purely manual checks toward more automated asset inventory tracking.</p></li>
+ <li>
+  <p><strong>ISO/IEC 42001</strong>:Supports compliance efforts for AI management system asset discovery and tracking, reducing the reliance on manual spreadsheets or periodic snapshot audits for inventory validation.</p></li>
+</ul>
+<h3><strong>Getting started</strong></h3>
+<p>It’s rare that a technical solution like k8s-aibom can help mitigate the <a href="https://cloud.google.com/transform/these-4-ai-governance-tips-help-counter-shadow-agents">multi-faceted problem of shadow AI</a>, impacting CISOs, governance, risk, and compliance teams, SecOps teams, platform engineers, and developers.</p>
+<p>To learn more by inspecting the controller, review the CRD definitions, and contribute to the open-source k8s-aibom project, please visit the <a href="https://github.com/GoogleCloudPlatform/k8s-aibom">k8s-aibom GitHub Repository</a>.</p>

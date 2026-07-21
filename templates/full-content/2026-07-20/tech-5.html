@@ -1,0 +1,67 @@
+<h1>How Anthropic runs large-scale code migrations with Claude Code</h1>
+<p>A step-by-step guide to running large code migrations with AI agents — including Bun's million-line Zig-to-Rust port.</p>
+<p>Code migrations, projects that port a production codebase to a new language, were multi-year endeavors until recently.</p>
+<p>In the last month, individual developers at Anthropic migrated 10 code packages consisting of tens to hundreds of thousands of lines of code using Claude Fable 5, Claude Opus 4.8, and dynamic workflows. In this article we’ll cover two examples along with best practices from these projects.</p>
+<p>Jarred Sumner, co-founder of Bun and Member of Technical Staff at Anthropic, used Claude Code to migrate Bun from Zig to Rust. A million lines of code were produced in less than two weeks, with 100% of Bun's existing test suite passing in CI before merge. Nineteen regressions surfaced after merge and have all been fixed. The Rust port was shipped inside Claude Code in June.</p>
+<p>Mike Krieger, co-lead of Anthropic Labs, migrated a Python codebase to 165,000 lines of TypeScript over a weekend. This included hundreds of agents, eight phase gates, three adversarial review rounds, and a final parity check that diffed every command's output against the Python original.</p>
+<p>Claude Code’s new capabilities change the math for these long-deferred projects. Below is the six-step process we now use, drawn from what these migrations taught us.</p>
+<p>The core insight is that you don’t fix the code. <strong>You fix the process (loop) that produced the code</strong>.</p>
+<h2>Why and when to migrate languages</h2>
+<p>Before going straight into <em>the how</em>, it’s worth discussing <em>the when</em> and <em>why</em> because the assumptions around these projects have evolved.</p>
+<p>Teams launch migrations because of landscape changes between their initial build and current project. Either a known trade-off has become limiting, a better approach has emerged, or the original ecosystem is shrinking.</p>
+<p>For example, Jarred originally chose Zig because it offered C-level performance with radical simplicity, ideal for a solo founder “writing Bun in 1 year in a cramped Oakland apartment pre-LLM.” This simplicity came with known tradeoffs.</p>
+<p>Fast forward to 2026. Bun's CLI is getting over 10 million monthly downloads and is used extensively within Claude Code.</p>
+<p>As recently as last quarter, those tradeoffs wouldn’t have been enough to justify freezing the roadmap and committing resources to a multi-quarter project. Migrating languages can deliver smaller, faster, and safer systems, but no one wants to pay for them.</p>
+<p>Software engineers have also had to contend with the career risk inherent in these formerly mega-projects. You could maintain two parallel code bases for quarters or years, and if the end result was 90% parity, you had a bigger headache than when you started.</p>
+<p>Now, the worst case scenario is you delete the branch and try again.</p>
+<p>There still needs to be a justifiable business case. While million line migrations no longer cost $3 to $4 million in engineering resources over the course of a four year project, they still cost tens to hundreds of thousands of dollars or more to execute. The Bun migration, for example, consumed 5.9 billion uncached input tokens and 690 million output tokens — around $165,000 at API pricing. The main portion of Mike’s port was 27 million tokens.</p>
+<p><strong>However, the migration case no longer needs to be existential.</strong> A year of memory-bug patches in the changelog, or one chronic bottleneck, can now justify it.</p>
+<p>The compile step was the impetus for Mike's project. The internal tool his team works on ships to users as a single binary. Producing that binary with the Python toolchain took roughly eight minutes per platform, totaling a 30-minute wait across the build matrix on every release. After the port, the same compile now takes about two seconds, the binary starts 6x faster, and the team was able to retire a separate deployment pipeline.</p>
+<h2>Why AI changes the code migration math</h2>
+<p>Claude Fable 5 is our most capable, generally available model. Fable and Opus 4.8 are particularly good at delegating, directing, and verifying parallel workstreams with subagents while finding multiple paths towards stated goals.</p>
+<p>Large code migrations are a particularly effective use case for these advanced models because:</p>
+<ul>
+ <li><strong>The work is parallel</strong>. Work can be executed across thousands of independent units such as files and crates, so agents can work at the same time rather than have one waiting on the other.</li>
+ <li><strong>Context is clear and comprehensive.</strong> The old code serves as a great spec for the model. It also serves as a core reference to help build the guide for translation agents to follow.</li>
+ <li><strong>There is a built-in referee</strong>. Many large codebases will include a test suite that agents can use to verify their work. Agents perform their best when verification is objective, because the model can grind against a ground truth for days without a human arbitrating quality.</li>
+ <li><strong>The queue writes itself</strong>. When a compiler or test run fails, that becomes the next item for an agent to fix.</li>
+ <li><strong>They require consistency and edge case handling</strong>: The process is built so drift has nowhere to hide: reviewers cite the rule behind every finding, so a violation becomes a queue item instead of a quiet divergence. And when an agent does hit an edge case, the fix becomes a rule every subsequent agent follows.</li>
+</ul>
+<h2>Six steps for large code migrations</h2>
+<p><em>The process below has been generalized to be relevant to multiple languages and scenarios.</em></p>
+<h3>Prerequisites</h3>
+<p>A prerequisite before starting on your migration project is to have a strong judge in place, otherwise you won’t have an exit condition or measure of success.</p>
+<p>The judge must be able to evaluate both the original code and the target code on equal terms. Test suites written in the original language will often depend on internal functions that won't exist in the target code.</p>
+<p>To build this judge:</p>
+<ul>
+ <li><strong>Categorize existing tests</strong>. Use Claude to identify which tests are expressible as external calls and which depend on internals that won't port.</li>
+ <li><strong>Rewrite for portability.</strong> Convert the external-facing tests into assertions that can run against both the original and the port. Use adversarial agents to verify the rewritten tests don't weaken the assertions.</li>
+ <li><strong>Validate the judge</strong>. Run it against the original code to confirm it passes. Then run it against deliberately broken code to confirm it fails — a judge that doesn't catch breakage isn't a judge.</li>
+</ul>
+<h3>Step 1 — Create the rulebook, dependency map, and gap inventory</h3>
+<p>In this stage we are creating the foundations of our migration: an inventory of places where code will need to be refactored rather than just translated, a rulebook for how to translate our code, and a dependency map to order our migration implementation workstreams.</p>
+<h4>Rulebook</h4>
+<p>The exact shape of the rulebook depends on key architectural decisions you must make at the start. Chief among them, if the new code will follow the same structure, or if it will be completely redesigned.</p>
+<h4>Dependency map</h4>
+<p>You need to understand file dependencies to effectively break up workstreams for a parallel migration so you know which files to migrate first and which files to contain in the same batch.</p>
+<h4>Gap inventory and skeptic reviewers</h4>
+<p>The new language has different requirements from the old language that must be met. Both Jarred and Mike created gap inventory files capturing this implicit knowledge.</p>
+<h3>Step 2 — Stress-test the rules</h3>
+<p>This step involves a mini-migration that serves as a “shakedown cruise” for the larger migration. Regardless, throw out any translated files. The goal is to refine the rules, not make incremental progress.</p>
+<h3>Step 3 — Translate everything</h3>
+<p>For the remaining steps, you run the same multi-agent loop architecture: implement, review, and fix. You can offload implementer work to smaller models and keep reviewers on larger ones.</p>
+<p>The work queue should be mechanical. A batch script decides what’s done by checking whether the translated file exists on disk, then slices the pending files into batches for the implementer agents. Because the queue is rebuilt from disk every time, the migration is resumable by construction.</p>
+<h3>Steps 4, 5, 6 — Compile, run, and match behavior</h3>
+<p>These three steps share the same loop architecture and need progressively less human judgment. You fix errors from the compiler, resolve crashes from smoke tests, and run the test suite to compare program behavior across the two codebases.</p>
+<h2>Code migrations best practices</h2>
+<ul>
+ <li><strong>Don't follow this guide blindly.</strong> Each migration is different. Treat this as a starting point, and plan your specific migration with Claude before committing to it.</li>
+ <li><strong>Don’t focus on individual failures.</strong> Individual failures are the loop's job. Fixer agents burn those down. Your attention belongs on the patterns.</li>
+ <li><strong>Make review adversarial and verification mechanical.</strong> Adversarial review allows for longer running tasks and is often worth the token consumption. Let scripts — a compiler, a diff, a test suite — be the referee.</li>
+ <li><strong>Don't use the largest model for everything.</strong> Token spend concentrates in your loops, so design them deliberately. Smaller models handle the high-volume implementation fan-out well; save your largest model for reviewers and for anything that writes rules other agents will follow.</li>
+ <li><strong>Front-load the human hours.</strong> The rulebook and the stress test are the most time-consuming. Everything after is mostly queues burning down.</li>
+ <li><strong>Make the work queue mechanical and resumable.</strong> Done should mean "the output file exists on disk."</li>
+</ul>
+<h2>Review loop results, not code</h2>
+<p>Jarred’s Bun migration is now in production, although every migration has tradeoffs. The new codebase is measurably better. Every memory leak the team's tooling can detect has been fixed. The binary is smaller and faster.</p>
+<p>Consider whether it’s time to re-run the math of your long deferred migration. Pick the codebase you've been tolerating and ask Claude what the migration process looks like for it.</p>

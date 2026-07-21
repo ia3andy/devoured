@@ -1,0 +1,78 @@
+<h1>Postgres 19 Compression: from pglz to LZ4</h1>
+<p>Postgres 19 is planning to change the default TOAST compression from pglz to LZ4, so let's look at how Postgres compresses data in table storage and indexes. Postgres uses a single, unified compression framework for table (heap), TOAST, and indexes. In heap and TOAST, compression is automatic and on by default for variable-length types like TEXT, VARCHAR, BYTEA, and JSONB. In indexes, it is opportunistic: compression fires only when an individual key exceeds the size threshold, not for every variable-length value stored in an index.</p>
+<h2>History of Postgres Compression</h2>
+<p>Compression was first added in Postgres 7.0, released in 2000, but not in the form it takes today. At the time, Postgres had a strict 8kB maximum row size, and trying to insert more than 8kB would throw an error. Fixing this row size limit was a priority for the Postgres core team.</p>
+<p>The first attempt to work around the limit was an explicitly compressed field. Postgres 7.0 shipped an <code>lztext</code> data type that used the pglz compression algorithm. This implementation had tradeoffs: the 8kB row limit still existed, and users had to explicitly choose a compressed data type.</p>
+<p>After the 7.0 release, the next logical step might have been to add more compressed data types like <code>LONG</code> or <code>BLOB</code> (as many closed source databases were doing at the time). Instead, the Postgres core team rejected additional data types and rallied around TOAST. Discussions on the pgsql-hackers mailing list show the group split the 8kB problem into two distinct problems: a data type problem and a physical storage problem. Compression and TOAST were the answer to the physical storage problem.</p>
+<h2>TOAST with pglz</h2>
+<p>With Postgres 7.1, TOAST was implemented using pglz.</p>
+<p>The pglz algorithm lives in the <code>pg_lzcompress.c</code> file. Because Postgres is open source, we can read the author's reasoning for home-rolling a compression algorithm right in the comments:</p>
+<ul>
+ <li><strong>Trade ratio for speed:</strong> pglz is fast to compress and decompress, and willingly gives up compression ratio to get there. The source code calls this <em>another "speed against ratio" preference characteristic of the algorithm.</em></li>
+ <li><strong>Minimal memory usage:</strong> the algorithm uses a 4096-byte sliding window, small enough not to affect Postgres' memory needs. The comments note that the compressor works best for attributes of a size between 1K and 1M, so it trades away performance on very large values.</li>
+ <li><strong>Aggressive fail-safe:</strong> the algorithm is designed to fail fast when data does not compress well, to avoid wasting CPU cycles.</li>
+ <li><strong>No external dependencies:</strong> the algorithm is self-contained and does not require any external libraries. Back then, Linux was not the default server OS for the cloud (nor was there a "cloud"), so Postgres needed a compression algorithm that would work everywhere it was compiled.</li>
+</ul>
+<p>Jan Wieck authored the algorithm and left an acknowledgement at the bottom of the file:</p>
+<blockquote>
+ <p>Many thanks to Adisak Pochanayon, who's article about SLZ inspired me to write the PostgreSQL compression this way.</p>
+</blockquote>
+<p>Adisak Pochanayon's SLZ article described a compression scheme built for the game industry, where it was used to compress graphics and audio data.</p>
+<h2>Why move from pglz to LZ4?</h2>
+<p>pglz was built for a different era, and LZ4 is a modern algorithm whose tradeoffs match modern hardware. Postgres' LZ4 rollout follows a path similar to the original pglz implementation: first as an option, then as standard. Since Postgres 14, LZ4 has been available via a system-wide setting (<code>default_toast_compression = 'lz4'</code>) or a column-specific setting (<code>column_name text COMPRESSION lz4</code>).</p>
+<ul>
+ <li><strong>Faster compression:</strong> LZ4 compresses significantly faster than pglz. On an totally unscientific test, a 2,000 row INSERT of ~10 kB values, LZ4 completes in roughly 6 ms versus 50 ms for pglz (8× faster). Decompression throughput is similar between the two algorithms with this data set, as I/O and memory latency dominated over CPU decode time.</li>
+ <li><strong>Better compression ratio (sometimes):</strong> LZ4's 64 kB sliding window (versus pglz's 4 kB) finds more back-references in the data, which expands compression. On a similar, totally unscientific workload, LZ4 produced 111 bytes stored per 10,400 bytes raw (98.9% reduction) versus pglz's 186 bytes (98.2% reduction), and used 312 kB of total heap space versus pglz's 472 kB. There are situations where pglz has a better compression ratio.</li>
+ <li><strong>Continues to fail fast:</strong> LZ4 has an efficient early-abort mechanism designed to detect random or incompressible data quickly.</li>
+</ul>
+<h2>Postgres storage strategies</h2>
+<p>First off, you need to know that Postgres has a few different storage strategies for columns:</p>
+<p><strong>EXTENDED</strong> (we capitalize it because the Postgres docs do, not because we're yelling) lets Postgres use every tool available. This is the default for variable-length types like TEXT, VARCHAR, BYTEA, and JSONB. Values can be stored uncompressed, compressed, in the heap, or in TOAST.</p>
+<p><strong>PLAIN</strong> stores the column inline in the heap, uncompressed. It is the default for fixed-width types like INT, FLOAT, and BOOL. These values rarely benefit from compression.</p>
+<p><strong>EXTERNAL</strong> tells Postgres to store the column in TOAST, but not compress it.</p>
+<p><strong>MAIN</strong> tells Postgres to try compressing the column, but avoid moving it to TOAST if possible.</p>
+<h2>The varlena format</h2>
+<p>For variable-length types, Postgres uses a format called <code>varlena</code> to store the data. <code>varlena</code> is a self-describing format with a header that records the length of the data and whether it is compressed. It is used for all variable-length types (including TEXT, VARCHAR, BYTEA, and JSONB) and it is what gets stored in the heap, in TOAST, and in indexes.</p>
+<p>Only variable-length types are compressed. Fixed-length types (like INT, FLOAT, and BOOL) are never compressed; they are stored directly in the heap.</p>
+<h2>The compression decision tree</h2>
+<p>When writing data (insert or update), Postgres attempts to get the row size below a threshold of roughly 2 kB (<code>toast_tuple_target</code>, default 2040 bytes). It uses the following decision tree for EXTENDED columns:</p>
+<ol>
+ <li>If the entire row is already smaller than ~2 kB, Postgres writes the row directly to the heap, uncompressed.</li>
+ <li>If the row exceeds the threshold, Postgres sorts the EXTENDED columns by size and attempts to compress the largest one. If compression succeeds and brings the total row size under the threshold, it stops and writes to the heap. If not, it moves to the next largest column.</li>
+ <li>If all eligible columns are compressed and the row still exceeds the threshold, Postgres begins moving the largest EXTENDED or EXTERNAL columns out-of-line into the TOAST table, replacing each with an 18-byte pointer in the main heap tuple until the row fits.</li>
+ <li>If it still doesn't fit, Postgres loops back to compress any MAIN columns inline. If that fails, it takes the last resort: moving those MAIN columns out-of-line into TOAST.</li>
+</ol>
+<p><strong>Checking actual compression savings</strong></p>
+<pre><code>-- pg_column_size: bytes as stored in the heap or TOAST table (after compression)
+-- octet_length:  bytes of raw character data (uncompressed)
+
+SELECT
+  pg_column_size(payload) AS stored_bytes,
+  octet_length(payload)   AS raw_bytes,
+  round(
+    (1 - pg_column_size(payload)::numeric
+          / NULLIF(octet_length(payload), 0)) * 100, 1
+  ) AS compression_pct
+FROM events WHERE length(payload) &gt; 100 LIMIT 5;
+</code></pre>
+<p><code>pg_column_size</code> reports the compressed data size. When it returns a value much smaller than <code>octet_length</code>, the value was successfully compressed. When the two are approximately equal, the value did not compress well enough to save space. In that case, if the value is large (above the ~2 kB threshold), it will still have been moved to the TOAST table uncompressed.</p>
+<h2>Compression in indexes</h2>
+<p>B-tree index pages store key values as <code>IndexTuple</code> entries. Each entry contains an <code>IndexTupleData</code> header (8 bytes) followed by the key datum. For variable-length types, the datum uses the same <code>varlena</code> format as heap tuples (piggybacking on the workaround built for the 8kB row limit).</p>
+<p>Postgres uses a single compression framework tied to the TOAST architecture. It flags in the varlena header whether the data is compressed. If the heap already compressed a value, it goes into the index compressed. If a value is uncompressed and exceeds 510 bytes (<code>TOAST_INDEX_TARGET</code>, about 1/16 of the 8 kB buffer page), the index code invokes the same TOAST compression routine inline to try to make it fit. If the compressed form fits, it is stored compressed. If even the compressed form exceeds the limit, the write transaction fails.</p>
+<p>This is why <code>repeat('x', 5000)</code> can be B-tree indexed: LZ4 compresses 5,000 repeated characters down to ~38 bytes, well within the 2704-byte cap. Random or pseudo-random data of the same length produces a compressed form nearly equal to the original, which exceeds the cap and cannot be indexed.</p>
+<pre><code>-- These succeed: both compressible, both fit after LZ4 compression
+CREATE INDEX ON docs (body);
+
+INSERT INTO docs VALUES (repeat('x', 5000));    -- stored: ~38 bytes compressed
+INSERT INTO docs VALUES (repeat('ab', 2000));   -- stored: ~35 bytes compressed
+
+-- This fails: md5 output is pseudo-random, essentially incompressible
+INSERT INTO docs VALUES (
+  (SELECT string_agg(md5(g::text), '') FROM generate_series(1, 88) g)
+);
+-- 2816 chars of MD5 → compressed form ≈ 2816 bytes → index row size 2832 &gt; 2704
+-- ERROR:  index row size 2832 exceeds btree version 4 maximum 2704 for index "..."
+-- HINT:   Values larger than 1/3 of a buffer page cannot be indexed.
+</code></pre>
+<h2>The future of compression in Postgres</h2>
+<p>There's a lot to learn about how Postgres moves forward by looking at compression. The early false step of dedicated compressed data types was acknowledged, and the underlying pglz work was retooled into TOAST, which has been a huge success. In moving from pglz to LZ4, Postgres is taking a similar approach: first a test, then a migration. The core team has moved intentionally to make sure the compression algorithm change is the correct path.</p>

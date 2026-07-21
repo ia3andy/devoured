@@ -1,0 +1,132 @@
+<h1>Repeatable Read vs Snapshot Isolation</h1>
+<p>Here’s a question: when you choose <code>Repeatable Read</code> isolation level in MySQL, does it actually give you <code>Snapshot Isolation</code> semantics instead? How different are they and why does it matter?</p>
+<h2>Theory</h2>
+<h3>ANSI Standard Isolation Levels</h3>
+<p>PostgreSQL, MySQL, SAP, and many other databases implement the four common isolation levels which are defined in SQL-92 based on anomaly protection:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Isolation</th>
+   <th>Summary</th>
+   <th>A1</th>
+   <th>A2</th>
+   <th>A3</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>READ UNCOMMITTED</td>
+   <td>weakest</td>
+   <td>Yes</td>
+   <td>Yes</td>
+   <td>Yes</td>
+  </tr>
+  <tr>
+   <td>READ COMMITTED</td>
+   <td>basic atomicity</td>
+   <td>no</td>
+   <td>Yes</td>
+   <td>Yes</td>
+  </tr>
+  <tr>
+   <td>REPEATABLE READ</td>
+   <td>basic isolation</td>
+   <td>no</td>
+   <td>no</td>
+   <td>Yes</td>
+  </tr>
+  <tr>
+   <td>SERIALIZABLE</td>
+   <td>strongest</td>
+   <td>no</td>
+   <td>no</td>
+   <td>no</td>
+  </tr>
+ </tbody>
+</table>
+<p>Anomaly A1 is “dirty reads” (T1 sees the data T2 wrote before it commits, and indeed T1 might even see it if T2 is rolled back).</p>
+<p>Anomaly A2 is “inconsistent reads” (T1 reads a row, T2 does something to it and commits, and T1 reads it again but gets a different value).</p>
+<p>Anomaly A3 is “phantoms” (T1 reads some rows via a select predicate, T2 changes the set of rows matching that predicate, e.g. by adding a new row, and commits, and T1 reads again but this time the select results are slightly different due to the actions of T2, so they still aren’t perfectly isolated).</p>
+<h3>Theoretical Relation to Locking</h3>
+<p>A bit of an oversimplification, but in traditional theory, these levels were implemented by different locking regimes for phantom prevention, read sets, and write sets, e.g. none, short (only during the operation), or long (hold till the end of the transaction):</p>
+<table>
+ <thead>
+  <tr>
+   <th>Isolation</th>
+   <th>Phantom Locks</th>
+   <th>Read Locks</th>
+   <th>Write Locks</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>READ UNCOMMITTED</td>
+   <td>no</td>
+   <td>no</td>
+   <td>long</td>
+  </tr>
+  <tr>
+   <td>READ COMMITTED</td>
+   <td>no</td>
+   <td>short</td>
+   <td>long</td>
+  </tr>
+  <tr>
+   <td>REPEATABLE READ</td>
+   <td>short</td>
+   <td>long</td>
+   <td>long</td>
+  </tr>
+  <tr>
+   <td>SERIALIZABLE</td>
+   <td>long</td>
+   <td>long</td>
+   <td>long</td>
+  </tr>
+ </tbody>
+</table>
+<p>Note that the phantom prevention locks can take many forms, e.g. predicate locks, precision locks, gap locks, range locks, index locks, etc, but the basic goal is to make sure the matched set of a predicate does not vary, e.g. between repeated SELECTs in a transaction.</p>
+<h3>But in Reality</h3>
+<p>Modern databases don’t necessarily provide exactly these isolation semantics or implement them using the above simple locking regimes.</p>
+<p>MVCC systems that can read at a specific timestamp are such a convenient tool and intuitive concept, they are widely used to achieve read set isolation and phantom prevention with less locking, higher performance, and higher concurrency. The practice is now quite prevalent.</p>
+<p>Thus, PostgreSQL uses snapshot isolation internally, even in its default isolation level of <code>Read Committed</code>. MySQL also acquires a read snapshot as of the first select in a transaction, and uses the same snapshot during subsequent selects, in its default isolation level of <code>Repeatable Read</code>.</p>
+<p>A careful review of the literature shows that <code>Snapshot Isolation</code> (SI) is very similar to <code>Repeatable Read</code> (RR), but they aren’t exactly the same. They are both stronger than <code>Read Committed</code> but weaker than <code>Serializable</code>. The best summary of their difference is that SI allows write skew but blocks phantoms, whereas RR blocks write skew but allows phantoms.</p>
+<h2>Let’s Experiment</h2>
+<h3>MySQL</h3>
+<pre><code>SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;</code></pre>
+<h3>PostgreSQL</h3>
+<pre><code>SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ;</code></pre>
+<h3>The Actual Write Skew Test</h3>
+<p>Terminal 1: Andy is checking whether it’s safe for him to take some time off:</p>
+<pre><code>BEGIN;
+SELECT name FROM doctor WHERE oncall=TRUE AND name&lt;&gt;'Andy';</code></pre>
+<p>Terminal 2: Brad, the other doctor, has the same plan:</p>
+<pre><code>BEGIN;
+SELECT name FROM doctor WHERE oncall=TRUE AND name&lt;&gt;'Brad';
+UPDATE doctor SET oncall=FALSE WHERE name='Brad';
+COMMIT;</code></pre>
+<p>Back at terminal 1: Andy thinks “quick let’s get in before anything changes”:</p>
+<pre><code>UPDATE doctor SET oncall=FALSE WHERE name='Andy';
+SELECT name FROM doctor WHERE oncall=TRUE;
+COMMIT;</code></pre>
+<h3>Epilogue</h3>
+<p>Andy was bitten by the infamous write skew anomaly, which is not allowed under RR, but is allowed under SI. By the way, this happens in both MySQL RR and PostgreSQL RR. Simply put, Andy and Brad were operating from the same snapshotted read view, against which their writes were individually valid, but the two transactions overlap in a non-serializable way, and the combination of overlapping writes lead to an unacceptable outcome–there is nobody oncall.</p>
+<h2>Minor Plot Twist</h2>
+<p>It’s not exactly an unexpected plot twist, but it turns out RR in MySQL is weirder than you think. It is not really SI either, if you consider the lost updates anomaly, which should not be allowed in either RR or SI.</p>
+<h3>Lost Update Test</h3>
+<p>Terminal 1 (seeking to deposit $20):</p>
+<pre><code>BEGIN;
+SELECT cash FROM account WHERE id=1;</code></pre>
+<p>While this is going on, in terminal 2 (seeking to deposit $30):</p>
+<pre><code>BEGIN;
+SELECT cash FROM account WHERE id=1;
+UPDATE account SET cash=130 WHERE id=1;
+COMMIT;</code></pre>
+<p>Back to terminal 1, which saw a balance of $100:</p>
+<pre><code>UPDATE account SET cash=120 WHERE id=1;
+COMMIT;</code></pre>
+<p>This is bad, it means the $30 deposit was overwritten. From the user’s perspective, either the total should be $150, or one of the transactions should have failed. This is a thing that can happen to you in RR isolation level on MySQL.</p>
+<h3>Some Advice re Lost Update</h3>
+<p>Although <code>Serializable</code> isolation level would prevented this problem in MySQL, if you are doing this type of transaction pattern, consider making the database aware of your intent by using <code>SELECT ... FOR UPDATE</code>.</p>
+<h2>Summary</h2>
+<p>People don’t always define terms in the same way (even when they think they do), and practice often diverges from theory. This is especially so in the world of database isolation levels.</p>
