@@ -1,0 +1,35 @@
+<h1>Sparse By Design</h1>
+<h2>Kimi K3 And Open Model Scaling</h2>
+<p>When Moonshot publishes the Kimi K3 checkpoint on July 27th, it will be the largest open weights model ever released: 2.8 trillion parameters, a 1M token context window, native multimodality, and benchmarks that clear Opus 4.8 and sit roughly one generation behind Fable 5 and GPT-5.6.</p>
+<p>The discourse has fixated on 2.8 trillion.</p>
+<p>The more important number is 16.</p>
+<h2>From 28% To 2%</h2>
+<p>K3 activates 16 of 896 experts per token — under 2% of its expert weights touched per forward pass. That is not an implementation detail. It is the terminal point (so far) of the most consistent architectural trend in open models.</p>
+<p>Total parameters have grown ~20x since Mixtral, and ~3x in the last twelve months alone.</p>
+<p>Active parameters have barely grown at all: a 17-49B band for 27 months. Moonshot shipped K2, K2.5 and K2.6 across nine months with the identical skeleton — 1T total, 32B active — three releases, <strong>zero growth in active parameters.</strong></p>
+<p>There is scatter (GLM-5.2 is <em>less</em> sparse than V4-Pro), so this is a trend with variance, not a law. But the direction is unambiguous: hold per-token compute roughly flat, inflate total capacity relentlessly.</p>
+<p>Why? Because at a fixed training compute budget, more experts means lower loss. The model learns more from the same FLOPs. And the bill is paid in the one resource that has cheap tiers, storage, rather than the two that are scarce and rationed: compute and memory bandwidth.</p>
+<p>The open source labs have discovered that the cheapest way to buy intelligence is to spend capacity.</p>
+<p>Sparsity is partly an adaptation: when FLOPs are rationed, you scale the axis outside export controls.</p>
+<h2>KV Cache Compression</h2>
+<p>Even though expert weights are getting sparser, longer context windows grow the KV cache, and the cache is hauled from memory on every token, exactly like weights.</p>
+<p>This is where the companion trend closes the loophole. Attention compression (DeepSeek’s CSA/HCA hybrid, Multi-head Latent Attention, K3’s new attention architecture) is collapsing the cache. V4-Pro’s KV cache at 1M context is <strong>10%</strong> the size of its predecessor’s.</p>
+<p>Sparser experts shrink the weight-bytes moved per token. Compressed attention shrinks the cache-bytes moved per token. Nothing on the model roadmap shrinks the bytes <em>stored</em>. That number only goes up.</p>
+<p>Every architectural trend points away from peak bandwidth scarcity and toward capacity as the binding constraint.</p>
+<h2>Constraint moves from compute to storage</h2>
+<p>Sparsity is what makes a 2.8T model servable at all. As Jamin Ball from Altimeter wrote about the true cost of serving frontier open models:</p>
+<blockquote>
+ <p><em>One force that historically factored into open model pricing (anyone can serve it) is much weaker when “anyone” means “anyone with a supernode and a serving stack tuned for a brand new attention architecture.”</em></p>
+</blockquote>
+<blockquote>
+ <p><em>A 2.8T model probably has a structurally higher serving floor than a 1T model no matter is serving it. The K2-era 10x discount existed (partially) because those models were both smaller AND served at thin margins. K3 only gives you the second one. For two years “open” and “cheap” were used interchangeably, but they were never the same thing.</em></p>
+</blockquote>
+<p>Due to sparsity, per-token inference runs ought to run at the cost of a mid-size dense model.</p>
+<p>In that sense, sparsity has democratised the <em>compute</em> of frontier inference.</p>
+<p>It has done nothing for capacity. At MXFP4, K3’s weights alone are ~1.4TB. Ten-plus H200s just to load them, before the KV cache on a 1M window - this is why Moonshot recommends supernode configurations “with 64 or more accelerators.”</p>
+<p>Ever increasing sparsity moves the cost from compute to storage.</p>
+<h2>Two Serving Regimes</h2>
+<p>A plausible scenario in low-batch environments (such as enterprises looking to self-host) would see a tiered memory approach (or memory hierarchies) with most frequently used experts stored in HBM whilst less frequently used experts would be in cheap DRAM. A sort of power law for MoE models.</p>
+<p>This cost/efficiency gain disappears in hyperscale environemnts. A production server batches hundreds of concurrent requests, and each token picks its own 16 experts. Collectively, a full batch lights up most of the 896 every forward pass. There are no reliably cold experts. So frontier serving pools <em>everything</em> in rack-level HBM across 64+ accelerators and routes tokens to the chips holding their experts. In this regime, sparsity doesn’t reduce HBM purchased at all, it converts bandwidth demand into HBM <em>capacity</em> demand. More stacks, streamed less hard.</p>
+<p>At low utilisation, a single power user, i.e. an enterprise with a handful of concurrent sessions, experts genuinely are cold, and tiering the model into system DRAM while hot-loading experts works. This is the regime that matters for open weights specifically, because the entire point of downloading a checkpoint is running it outside a hyperscaler. Sparsity is the only reason the self-hosting path exists at all for trillion-scale models.</p>
+<p><strong>Routing is paramount.</strong> Today’s routers spread tokens roughly uniformly across experts, which is why hot/cold tiering fails at scale. If labs train routers with deliberate locality, i.e. popular experts, predictable paths, true tiering becomes viable even at high batch, and the cheap-capacity DRAM camps win much bigger.</p>
