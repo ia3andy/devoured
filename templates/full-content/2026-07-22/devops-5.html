@@ -1,0 +1,53 @@
+<p>A cache keepalive is the one optimization every agent builder agrees on, and almost everyone runs it at the wrong setting.</p>
+<p>The convention is to ping every 30 seconds. That convention costs 8× more than necessary, and the surprise is bigger: at the ten-minute pause I measured, <strong>only one of the four major providers saved money with a keepalive</strong>. I measured this across Anthropic, OpenAI, Gemini, and DeepSeek, with a harness that can prove its own timing, and the numbers rearranged a few of my beliefs. The right interval is about 4 minutes, not 30 seconds. A 30 s keepalive <em>loses</em> money at long gaps on every provider I tested. On Anthropic, the 4-minute keepalive saves real money. On DeepSeek it buys latency, not dollars. On OpenAI and Gemini it buys nothing at these gaps. Whether to keep the cache warm is a per-provider decision, not a universal one.</p>
+<h2>The pause that eats the cache</h2>
+<p>Provider prompt caches are one of the best deals in the API: send a prefix the server processed a moment ago, and you pay about a tenth of the input price and skip most of the prefill latency. But the cache expires in minutes, and agentic workloads are the worst possible user of it. An agent thinks, acts, waits. It fires a request, runs a build or a test suite or sits on a human approval for ten minutes, and only then sends the follow-up that would have reused the (now large) conversation prefix. The pause outlives the cache. The follow-up pays full price, full latency, and at agent scale this is a real line item.</p>
+<p>The defense is well known. Re-send the exact prefix on a timer during the pause; every read refreshes the TTL. Aider shipped it in 2024, Anthropic's docs recommend it, and community posts worked out the Anthropic cost mechanics and even a 4-minute interval on paper. The folklore, it turns out, had the right answer. What it didn't have was measurement. Everything above is practice and arithmetic. Everything below is measured: four providers, two prefix sizes, idle gaps to ten minutes, three independent runs, every call timestamped.</p>
+<p>Credit where the project started: in a conference room in Bellevue, at AgentSys, where I saw Haiying Shen and Simon Peter present <a href="https://arxiv.org/abs/2606.16824?ref=blog.mempko.com">CacheWise</a>, their study of KV-cache management for coding agents. Their trace analysis shows from the serving side exactly the problem above: agent sessions reuse enormous prefixes, and naive eviction wrecks them. Their question was how the <em>server</em> should manage the cache for agents; mine became what the <em>client</em> can do about it on its own. The keepalive is the client's answer, and this study is my thanks for the inspiration.</p>
+<h2>Providers come in three regimes</h2>
+<ul>
+ <li><strong>Hard TTL (Anthropic).</strong> The baseline is warm through 5 minutes and dead at 10: 0 of 48 samples across three runs. The keepalive holds 40 of 40. Eviction here is a cliff, exactly as documented, and the keepalive is a money decision.</li>
+ <li><strong>Lossy (DeepSeek via DeepInfra).</strong> The baseline leaks at every gap and is gone at 10 minutes (4 of 48). The keepalive holds 42 of 42 there but itself misses about 20% at 1 minute, because a router endpoint pin is not a machine pin: the ping warms one machine, the follow-up lands on another.</li>
+ <li><strong>Sticky (OpenAI, Google).</strong> Baselines survive 10 minutes most of the time (OpenAI 39/48, Google 20/24). There is little to defend. The keepalive is variance removal, and at short gaps it is pure waste.</li>
+</ul>
+<h2>The interval is the whole game</h2>
+<p>Here is the entire economics of the keepalive, and it is settled arithmetic:</p>
+<ol>
+ <li><strong>A ping costs the read price</strong> (≈10% of input) every interval τ. Holding a prefix costs 0.1× per τ.</li>
+ <li><strong>A re-prefill costs 100%</strong> once (125% on Anthropic, which bills the cache write).</li>
+ <li><strong>So spend per hour falls as 1/τ</strong>, and the interval buys nothing except TTL safety. The optimal interval is the largest one safely under the TTL: τ* = TTL − margin ≈ <strong>4 minutes</strong> at Anthropic's 5-minute TTL.</li>
+ <li><strong>Break-even is idle ≈ τ(w/r − 1)</strong>: about 46 minutes at Anthropic's prices, 36 for OpenAI and DeepSeek, 12 for Google (its cached reads are 0.25×, not 0.1×). Past that, stop pinging: let the cache die and pay the re-prefill.</li>
+</ol>
+<p>That last one is the rule worth internalizing, so here it is as insurance. Every ping is a premium you pay to avoid one claim: the re-prefill. On Anthropic the premium is 0.1× the input price and the claim is 1.25×, so the claim is worth 12.5 premiums. Pay one premium every 4 minutes and you can afford twelve of them before the premiums exceed the claim. Twelve premiums at 4 minutes apart is <strong>46 minutes</strong> of pause. That is the line.</p>
+<p>Concretely, on a 100k-token Anthropic prefix (about $0.30 of input at list price): each ping costs $0.03, and a cold re-prefill costs $0.38.</p>
+<ul>
+ <li><strong>10-minute pause:</strong> two pings, $0.06, and you skip the $0.38. Keep it warm. You are 6× ahead.</li>
+ <li><strong>46-minute pause:</strong> eleven pings, $0.33, versus the $0.38 re-prefill. Roughly a wash. This is the line.</li>
+ <li><strong>1-hour pause:</strong> fifteen pings, $0.45, to avoid a $0.38 re-prefill. Stop pinging. Let the cache go cold and pay the re-prefill when you come back.</li>
+</ul>
+<p>The formula tells you where your own line sits once you plug in your prices and interval. The point is that <em>there is</em> a line, it is closer than people assume, and past it the disciplined move is to stop paying premiums on a policy you will never claim.</p>
+<p>The 30-second convention everyone copies has a break-even of about 6 minutes, which is why it loses money at a 10-minute gap on all four providers. I ran the 4-minute arm too: pings fired at +240.1s and +480.1s (0.1s drift), held 23 of 24 samples warm, and cost <strong>7.8× less</strong> than the 30-second arm for the same warmth. The convention isn't cautious. It's just expensive.</p>
+<h2>When not to keepalive at all</h2>
+<p>This part surprised me, and it is the part the folklore misses. <strong>OpenAI:</strong> the cache is sticky (39 of 48 samples warm at 10 minutes with no help), so the keepalive insures variance, not eviction; at these gaps it isn't worth the pings. <strong>DeepSeek:</strong> a cold re-prefill is so cheap ($0.043 for 100k) that even the 4-minute keepalive only breaks even on cost. What it buys is latency (5.4s → 1.4–2.0s to first token), so it's a latency play, not a money play. <strong>Gemini:</strong> the worst case for the strategy, and I measured it to be sure: even the 4-minute keepalive costs 40% more than just letting the cache die ($0.186 vs $0.131 at 100k), because Gemini combines a sticky baseline (little to insure) with 0.25× cached reads (expensive insurance), no affinity lever (hits are a machine lottery with a minute of commit delay), and a 12-minute break-even horizon. The prescription is per-provider, not universal.</p>
+<h2>What is settled, and what I believe</h2>
+<p>Settled: the arithmetic above, the measured retention curves, the measured 7.8×, and the break-even horizons. Those you can check against the data, which is public with the harness.</p>
+<p>Belief: what happens when everyone takes this advice. A cache tier's eviction policy ranks by expected reuse; a keepalive manufactures recency, so once every client pings, LRU has nothing left to rank and the tier degrades for everyone. Residency today is priced per read, not per token-hour held, so each operator's rational rent payment imposes an unpriced cost on every other tenant. My prediction: keepalive adoption forces providers to meter residency directly. Google's explicit cache already bills per token-hour, and Anthropic's 1-hour tier at 2× write is a step in the same direction. The arbitrage is real, and it has an expiry date.</p>
+<h2>The policy</h2>
+<ul>
+ <li><strong>Keep warm only across bounded, plausibly reused pauses</strong> (a tool call, an approval wait), at τ* = TTL − margin. About 4 minutes at Anthropic, about 50 on the 1-hour tier.</li>
+ <li><strong>Abandon the keepalive past the break-even horizon</strong> (≈46 minutes at Anthropic prices). Let it die, re-prefill, walk away.</li>
+ <li><strong>Know your provider's regime.</strong> At today's prices and gaps: Anthropic saves money, DeepSeek buys latency only, OpenAI and Gemini buy nothing. One honest caveat: OpenAI's TTL is "5 to 10 minutes," and our 10-minute gap sat inside its sticky window; somewhere past that there may be a band where its keepalive pays. We did not measure it, so we do not claim it.</li>
+ <li><strong>Skip it below the TTL</strong>, and on providers whose cache is sticky (OpenAI, Gemini) or whose re-prefill is trivially cheap (DeepSeek, unless you are buying latency).</li>
+ <li><strong>Never keep a dead session warm.</strong> The pi agent harness implements exactly this: pings only while a tool batch runs, default off.</li>
+</ul>
+<p>Keep it warm, briefly, at the right rate. Ping less.</p>
+<h2>References</h2>
+<ul>
+ <li>Shubham Tiwari, Tapan Chugh, Nash Rickert, Simon Peter, Ratul Mahajan, Haiying Shen. <a href="https://arxiv.org/abs/2606.16824?ref=blog.mempko.com">CacheWise: Understanding Workloads and Optimizing KVCache Management for Efficiently Serving LLM Coding Agents</a>.</li>
+ <li>Maxim Khailo. <a href="https://arxiv.org/abs/2607.19214?ref=blog.mempko.com">Keeping the Cache Warm Pays: Keepalive Economics for Agentic Workloads</a>.</li>
+ <li>Aider AI. <a href="https://github.com/Aider-AI/aider/blob/main/HISTORY.md?ref=blog.mempko.com">Change history</a>.</li>
+ <li>Anthropic. <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching?ref=blog.mempko.com">Prompt caching</a>.</li>
+ <li>Veritas Supera. <a href="https://vsits.co/coffee-break-cache-keepalive/?ref=blog.mempko.com">We Taught Our AI Agents to Take Coffee Breaks</a>.</li>
+ <li>Brandon Wie. <a href="https://brandonwie.dev/posts/anthropic-prompt-cache-ttl?ref=blog.mempko.com">Anthropic Prompt Cache TTL + Cost Mechanics</a>.</li>
+ <li>OpenClaw. <a href="https://github.com/openclaw/openclaw/issues/62475?ref=blog.mempko.com">Cache keep-warm pings proposal</a>.</li>
+</ul>

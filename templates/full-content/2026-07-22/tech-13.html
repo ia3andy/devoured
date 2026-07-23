@@ -1,0 +1,86 @@
+<p>In this post, I’d like to collect some thoughts on what I believe is a new paradigm in software engineering. It is feasible today, and my colleagues and I have used it successfully over the past two weeks. In short, the paradigm combines <strong>formal verification and AI</strong>:</p>
+<ul>
+ <li>Humans specify what they want the software to do in a formal language such as <a href="https://lean-lang.org/">Lean</a>.</li>
+ <li>AI writes the software <em>and</em> a formal proof that it adheres to the specification. The proof is machine-checkable, eliminating the need for human review of the generated implementation.</li>
+</ul>
+<h2>AI by itself suffers from the review bottleneck</h2>
+<p>I believe that this combination of formal verification and AI is <em>much</em> more effective than AI by itself. The reason is code review. Even if agents can write code at near-zero marginal cost, reviewing all that code becomes the new bottleneck.</p>
+<p>So why not YOLO it and drop review altogether? In some domains, that might be fine. But for most codebases, AI would have to get <em>a lot</em> better first. The way I think about it, AI may now be roughly on par with a single human at writing code. A single developer can maintain quality, but cannot scale; human teams scale by distributing the work and using code review to keep quality high. AI scales the writing without scaling the reviewing, creating a bottleneck.</p>
+<p>Note that I am not talking about airplanes here. Lots of “ordinary” software isn’t critical enough to need formal verification for its own sake, but it <em>is</em> critical enough that you don’t want to YOLO it either. The key point of this post is: <strong>formal verification is a means to use AI more effectively</strong>. The increase in assurance is almost a side effect.</p>
+<h2>Eliminating the review bottleneck</h2>
+<p>The formal verification + AI approach can eliminate human review of generated implementation code in two ways. First, assuming the specification captures the intended behavior, you don’t have to worry about correctness of the code. Second, if the code is entirely managed by AI, its maintainability and human readability become less important.</p>
+<p>The general framework is as follows:</p>
+<ul>
+ <li><strong>Humans define the <em>hard constraints</em></strong>: These are the required properties of the software, expressed as a formal specification. Usually, they capture some notion of correctness.</li>
+ <li><strong>Humans define the <em>optimization objectives</em></strong>: Benchmarks measure what the code should optimize for. Obvious examples include runtime and resource usage, but the objectives can also include hard-to-formalize properties that can be tested experimentally.</li>
+ <li><strong>Agents write the code and proofs</strong>: Every proposed change comes with a formal proof that the software satisfies the hard constraints. Benchmarks also run automatically for each change and measure the optimization objectives.</li>
+</ul>
+<p>One special case of this framework is <a href="https://github.com/karpathy/autoresearch">Andrej Karpathy’s autoresearch project</a>, which searches for better machine learning algorithms. Its primary acceptance signal is a soft goal: model performance on a validation set. Useful model quality is difficult to specify exhaustively as a hard constraint, so empirical measurement is the natural driver in that setting.</p>
+<p>The point of this framework is that little human effort is needed to evaluate each generated implementation change. Hard constraints are proven to be met by the agent. Optimization objectives are measured automatically. If there are several objectives, a human may still need to choose among tradeoffs—what if quality improves, but runtime also increases?—although even that could potentially be automated.</p>
+<h2>Analogies to machine learning</h2>
+<p>Before I worked in applied cryptography, I was a machine learning engineer building tools to <a href="https://scalableminds.com/voxelytics">segment 3D image data</a>. The analogies between this approach and machine learning are striking:</p>
+<ul>
+ <li>Because the agents can see the benchmarks and repeatedly optimize against them, the benchmarks are essentially the <em>training set</em>. Each one can be <em>labeled</em>, i.e., come with a desired output, or <em>unlabeled</em>.</li>
+ <li><em>Overfitting</em> is a risk of this approach. We want the resulting algorithm to also perform well on inputs outside the training set.</li>
+ <li>One way to mitigate overfitting is to give instructions like “try to write general passes” or “don’t add a new pass, generalize an existing one”. It’s a form of <em>regularization</em>.</li>
+ <li>Asking agents to optimize a metric resembles <em>reinforcement learning</em>. For example, our circuit optimizer performed poorly on one metric simply because I hadn’t told the agents to optimize it. A poor <em>reward</em> design!</li>
+ <li>More generally, <em>specification gaming</em> is a serious issue. We did catch an agent <a href="https://github.com/powdr-labs/apc-optimizer/pull/147#issuecomment-5003090287">exploit a weakness in the spec</a>.</li>
+ <li>And, of course, <em>we no longer understand the implementation</em>. We measure how well the software works in practice, but we also get a proof that it satisfies the formal specification. That is stronger than the usual machine-learning setting.</li>
+</ul>
+<h2>A Hello World example</h2>
+<p>Suppose we wanted to implement a function that returns the k-th smallest element of a list of integers. We’ll start with Lean definitions that capture what it means for this function to be correct:</p>
+<pre><code>/-- `x` is the k-th smallest element of `l` (0-indexed). -/
+def IsKthSmallest (k : Nat) (l : List Int) (x : Int) : Prop :=
+  x ∈ l ∧ (l.filter (· &lt; x)).length ≤ k ∧ k &lt; (l.filter (· ≤ x)).length
+
+/-- An implementation is correct if it returns the k-th smallest element,
+    for all valid `k` and `l`. -/
+def IsCorrect (impl : Nat → List Int → Int) : Prop :=
+  ∀ (k : Nat) (l : List Int), k &lt; l.length → IsKthSmallest k l (impl k l)</code></pre>
+<p>Then we bootstrap the implementation section. Lean’s <code>sorry</code> keyword is a placeholder for a proof or implementation that we haven’t written yet. It will panic when executed and generate a compiler warning. This is the section that the AI agents will fill in.</p>
+<pre><code>def selectKthSmallest (k : Nat) (l : List Int) : Int := sorry
+theorem selectKthSmallest_correct_impl : IsCorrect selectKthSmallest := sorry</code></pre>
+<p>In theory, the agent could simply weaken the statement of <code>selectKthSmallest_correct_impl</code>. To prevent that, we add another theorem in a section that agents are not allowed to change, with the proof delegating to the former:</p>
+<pre><code>theorem selectKthSmallest_correct : IsCorrect selectKthSmallest :=
+  selectKthSmallest_correct_impl</code></pre>
+<p>Finally, we’ll add a synthetic benchmark to measure the runtime of the implementation. This is an optimization objective.</p>
+<pre><code>def randomInts (seed : Nat) (count : Nat) : List Int :=
+  (List.range count).map (fun i =&gt; Int.ofNat ((i * 2654435761 + seed) % 100000))
+
+def bench (k : Nat) (input : List Int) : IO Unit := do
+  let t0 ← IO.monoNanosNow
+  let c ← IO.lazyPure (fun _ =&gt; selectKthSmallest k input)
+  let t1 ← IO.monoNanosNow
+  IO.println s!"  k=\{k}: \{Float.ofNat (t1 - t0) / 1e6} ms  (result \{c})"
+
+def main : IO Unit := do
+  for n in [1000, 10000, 100000] do
+    let input := randomInts 42 n
+    IO.println s!"n=\{n}"
+    for k in [1, 5, n / 10, n / 2, n - 1] do
+      bench k input</code></pre>
+<p>The full demo is available <a href="https://gist.github.com/georgwiese/d5bd12da7c4f130b97b10bc568370fab">here</a>. You can point your favorite agent at it and ask it to replace the <code>sorry</code> sections so that the program compiles without warnings and runs as fast as possible on the benchmarks.</p>
+<p>I tried this. At first, the agent chose the simplest implementation: sorting the full list and selecting the k-th element. It then improved the implementation by switching to <a href="https://en.wikipedia.org/wiki/Quickselect">quickselect</a>. The final implementation and proof are around 150 lines long.</p>
+<h2>Case study: powdr autoprecompiles</h2>
+<p>For the past two years, my work at <a href="https://powdr.org/">powdr</a> has largely focused on <a href="https://powdr.org/blog/accelerating-ethereum-with-autoprecompiles">autoprecompiles</a> for zkVMs. In essence, the core component of the system is a function like this:</p>
+<pre><code>fn optimize(input_circuit: Circuit) -&gt; Circuit</code></pre>
+<p><code>Circuit</code> has a notion of <em>equivalence</em>. The <code>optimize</code> function is correct if the output circuit is equivalent to the input circuit. For example, the identity function would be a correct optimizer. A circuit also has a measurable size. A <em>good</em> optimizer reduces that size significantly.</p>
+<p>This maps cleanly to the framework above: optimizer correctness is a hard constraint; circuit-size reduction and optimizer runtime are optimization objectives. The <a href="https://github.com/powdr-labs/apc-optimizer/tree/main"><code>apc-optimizer</code></a> repository implements this framework and is set up as follows:</p>
+<ul>
+ <li>Around 500 lines of Lean specify exactly what it means for an optimizer to be correct. The core is <a href="https://github.com/powdr-labs/apc-optimizer/blob/main/ApcOptimizer/Spec.lean"><code>Spec.lean</code></a>, if you want to get a feel for it. Writing the specification took around two days, plus a day of review by team members.</li>
+ <li>We check in a few relevant benchmarks. Those are real-world input circuits for which we care about optimizer performance. A benchmarking script measures both the quality of the optimizer and the runtime.</li>
+ <li>When a PR is opened, CI (1) applies a label if only a whitelisted set of files was touched (which excludes all of the specification and benchmarks), and (2) runs the benchmarks and posts the result into a comment.</li>
+</ul>
+<p>In practice, “reviewing” an AI-generated implementation PR consists of checking for the label and skimming a comment. AI agents have written 100% of the optimizer implementation and its proofs with minimal guidance. We do not review the generated code at all. In fact, I barely know Lean.</p>
+<p><strong>Results</strong>: Circuit-size reduction is on par with our previous implementation; see <a href="https://github.com/powdr-labs/bench-results/tree/gh-pages/results/2026-07-20-0557-lean">this comparison</a> across a suite of benchmarks. The agents were asked to optimize only a subset of these benchmarks, so the results on the others are evidence that the optimizer generalizes. Runtime is still slower than that of our Rust implementation, but it has not been a priority so far, and we are confident that it can be improved. Our slowest test case became more than three times faster in the last three days.</p>
+<p><strong>Integration</strong>: We have integrated this code into our main codebase as an alternative to our existing Rust implementation. Lean can be compiled to C, which is then invoked from Rust via FFI.</p>
+<p>For more information about this specific use case, see our <a href="https://powdr.org/blog/formally-verified-autoprecompiles">blog post on formally verified autoprecompiles</a>.</p>
+<h2>What this means for software engineering</h2>
+<p>On a personal note, it has felt overwhelming to rebuild a core component of our main product in just a week or two. I think many software engineers feel both overwhelmed by what AI can do today and underwhelmed by how much faster it lets them ship. I believe the review bottleneck described above explains much of that gap. Formal verification <em>can</em> close it.</p>
+<p>The key question, of course, is how widely this approach applies. That remains largely an open question, and I hope this post sparks discussion. Here are a few thoughts:</p>
+<ul>
+ <li>For the approach to deliver a meaningful speedup, writing and auditing the specification must be substantially cheaper than writing and maintaining the implementation.</li>
+ <li>Reusable libraries of concepts would help. For example, most web backends have some notion of user accounts, access rights, and databases. Just as we now reuse software libraries, we could reuse specification libraries.</li>
+ <li>Thanks to FFI, we can introduce AI-generated, formally verified code one module at a time without rewriting the entire codebase. Even if the approach applies only to certain components, it can still be valuable there. In our case, we used it only for the optimizer.</li>
+</ul>
+<p>Ultimately, software development might no longer be about code, but about requirements. Critical properties would be specified formally; everything else could be expressed through prompts and validated through automated and manual testing. We might never see the generated code—or even know the programming language it was written in.</p>

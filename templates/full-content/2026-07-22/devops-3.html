@@ -1,0 +1,68 @@
+<h1>Argo Rollouts 1.10 Release Candidate</h1>
+<p>We’re excited to announce the release candidate for Argo Rollouts 1.10! This release includes contributions from 46 contributors and includes 98 commits, covering more reliable rollout reconciliation, safer Job-based analysis, better Istio reliability, expanded plugin support, and reduced controller resource usage. If you are still using Traefik v2, there is also a potential breaking change.</p>
+<p>You can check out the <a href="https://github.com/argoproj/argo-rollouts/compare/v1.9.0...v1.10.0-rc1">full CHANGELOG</a> for the complete list of changes, and grab the RC from the <a href="https://github.com/argoproj/argo-rollouts/releases/tag/v1.10.0-rc1">v1.10.0-rc1 release page</a>.</p>
+<h2>More Reliable Rollout Reconciliation</h2>
+<p>This release fixes a class of bugs where the controller could briefly act on outdated information about a Rollout, occasionally causing it to miss or override an action a user had just taken, like unpausing, aborting, or promoting a rollout while a deployment was already in progress. Rollouts now respond more consistently and predictably to manual actions, even under concurrent changes. We know that there are several more improvements that can be done in this area, so stay tuned.</p>
+<h2>Detect failed Jobs faster</h2>
+<p>If you use Kubernetes Jobs to run analysis, this release fixes a case where a job that never actually finished because it failed to even start would be incorrectly reported as <strong>Successful</strong>. That could let a bad rollout continue even though the analysis never really passed. These cases (image not found or not pulled) are now correctly reported as <strong>Inconclusive</strong> instead.</p>
+<pre><code>metrics:
+  - name: job-metric
+    provider:
+      job:
+        spec:
+          activeDeadlineSeconds: 10 # generically bounds how long a hung job can run before it's reported Inconclusive
+          template:
+            spec:
+              containers:
+                - name: my-job
+                  image: wrong-image-name:any
+              restartPolicy: Never</code></pre>
+<p>This is the first step in a larger effort to improve the Job metric provider. We want to make the Job metric as powerful as the other metric providers (even reporting inconclusive on its own) so expect more improvements there in future releases.</p>
+<h2>Istio Traffic-Routing Reliability</h2>
+<p>If you use Istio to split traffic between canary and stable versions, this release fixes several timing issues that could cause brief live traffic errors during canary rollouts and rollbacks including one where a fast rollback could briefly send far more traffic to a canary than it was scaled to handle. Canary progression and rollbacks should now be noticeably more reliable under Istio. Again, we know that lots of Argo Rollouts users employ Istio, and this is an area that is constantly getting new fixes and updates.</p>
+<h2>Breaking Change: Traefik Now Defaults to v3</h2>
+<p>Argo Rollouts now assumes <strong>Traefik v3</strong> by default. If you are already running Traefik v3, no action is needed.</p>
+<p>If you’re still on <strong>Traefik v2</strong>, you <strong>MUST </strong>tell the controller to use the older API version before upgrading, or it won’t be able to talk to your Traefik resources:</p>
+<pre><code>--traefik-api-group=traefik.containo.us
+--traefik-api-version=traefik.containo.us/v1alpha1</code></pre>
+<h2>New Notification Channels: Microsoft Teams and Nats.io</h2>
+<p>Rollout and analysis notifications can now be sent to <strong>Microsoft Teams</strong>, using its modern Workflows connector, and to <strong>Nats.io</strong> in addition to the channels already supported (Slack, email etc.). If you’re currently notifying Teams via the older Office 365 Connectors integration, this is also the recommended upgrade path, since Microsoft is retiring that integration in 2026.</p>
+<pre><code>data:
+  service.teams-workflows: |
+    recipientUrls:
+      my-channel: https://api.powerautomate.com/webhook/&lt;your-webhook-id&gt;</code></pre>
+<h2>Traffic-Routing Plugins Catch Up to Built-In Providers</h2>
+<p>Two capabilities that were previously only available with the built-in ALB and Istio traffic routers now also work with any traffic-routing plugin, like the <a href="https://github.com/argoproj-labs/rollouts-plugin-trafficrouter-gatewayapi">Gateway API plugin</a>:</p>
+<ul>
+ <li><strong>Ping-pong services</strong>, which allow zero-downtime rollouts for long-lived connections (like gRPC or database connections) that can’t tolerate a mid-request cutover.</li>
+ <li><strong>Traffic mirroring</strong>, which sends a copy of live traffic to the canary for testing, without it affecting real users or counting toward canary analysis.</li>
+</ul>
+<h2>Datadog: Configurable Request Timeout</h2>
+<p>Datadog analysis queries previously had a fixed 10-second timeout, which meant a query that was simply slow could fail an analysis. You can now raise (or lower) this timeout per metric:</p>
+<pre><code>provider:
+  datadog:
+    requestTimeout: 30s # default is 10s</code></pre>
+<h2>Lower Controller Memory and CPU Usage</h2>
+<p>The controller now uses noticeably less memory and CPU, especially on large clusters. This comes from two changes: it no longer keeps track of Kubernetes objects it doesn’t actually need, and it reads objects from its internal cache more efficiently. If you run Argo Rollouts on a large cluster or scrape it frequently with Prometheus, you should see a real drop in resource usage.</p>
+<h2>Aligning With Argo CD</h2>
+<p>As sibling projects under the Argo umbrella, Argo Rollouts and Argo CD often solve the same problems twice. This release brings a few things over from Argo CD directly, so both projects stay closer in how they’re built and maintained:</p>
+<ul>
+ <li><strong>Switched the dashboard UI to </strong><a href="https://pnpm.io/"><strong>pnpm</strong></a><strong>.</strong> The UI build now uses pnpm instead of yarn, matching the same move Argo CD already made, resulting in faster installs and less disk usage for anyone building the UI from source.</li>
+ <li><strong>Smarter CI for documentation-only changes.</strong> A PR that only touches documentation no longer triggers the full build/test/e2e suite, cutting down turnaround time for doc contributions.</li>
+ <li><strong>A cherry-pick bot.</strong> Backporting a merged fix to an older release branch now happens automatically via a bot, instead of requiring a manual cherry-pick.</li>
+</ul>
+<h2>Other Improvements</h2>
+<ul>
+ <li><strong>Dashboard:</strong> added a page-size selector, so you can view more rollouts per page in the table view.</li>
+ <li><strong>Dashboard:</strong> the full container image name is now visible while editing a rollout, instead of being cut off.</li>
+ <li><strong>GitOps:</strong> fixed an issue where Argo CD could incorrectly report a rollout as “out of sync” when a certain optional field was left unset in Git.</li>
+ <li><strong>Build system:</strong> teams maintaining a private fork of Argo Rollouts can now build and publish images to their own container registry, rather than having everything hard-coded to the project’s registry.</li>
+ <li><strong>Traffic routing:</strong> fixed a bug where rollouts using a custom traffic-weight scale (instead of the standard 0–100%) could fail to send any traffic to the canary at all.</li>
+ <li><strong>Blue-green analysis:</strong> fixed a bug where analysis could be canceled and the rollout promoted early if pods briefly dropped out during normal cluster activity, even though nothing was actually wrong.</li>
+ <li><strong>CRDs:</strong> kubectl explain now shows proper field descriptions for Rollouts again, after a change had accidentally stripped them out.</li>
+ <li><strong>Controller:</strong> removed a misconfigured health check that was adding unnecessary load on busy clusters.</li>
+</ul>
+<h2>Bug Fixes</h2>
+<p>Beyond the fixes above, this release includes 18 additional smaller bug fixes across traffic routing, analysis, metric providers, the dashboard, and the controller. See the <a href="https://github.com/argoproj/argo-rollouts/compare/v1.9.0...v1.10.0-rc1">full CHANGELOG</a> for the complete list.</p>
+<h2>Summary</h2>
+<p>As always, a huge thank you to everyone who contributed code, documentation, bug reports, and reviews to this release. If you are also building any kind of plugin for Argo Rollouts (metric, traffic, step) we would love to know about it!</p>

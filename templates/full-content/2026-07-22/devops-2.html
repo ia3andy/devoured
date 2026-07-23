@@ -1,0 +1,59 @@
+<p>Starting today, Cloudflare Internal DNS is generally available. Cloudflare Internal DNS provides authoritative and recursive DNS for private networks on the same global network and control plane customers already use for public DNS, Zero Trust, networking, and application services.</p>
+<p>Internal DNS — sometimes also referred to as private DNS — is one of the last pieces of enterprise infrastructure still managed separately from the rest of the network. Many organizations operate one platform for public DNS, another for internal DNS, and use cloud-native DNS services inside each cloud environment with separate security policies layered on top. None of these systems share a common control plane. Split-horizon DNS adds another layer of complexity, often requiring multiple DNS environments to remain synchronized so internal and external users receive different answers for the same hostname. When those systems drift, outages follow.</p>
+<p>With Cloudflare Internal DNS, you get a single platform to manage public and private DNS resources, enforcing <a href="https://developers.cloudflare.com/cloudflare-one/traffic-policies/dns-policies/">DNS policies</a> and gaining visibility across your entire DNS stack. For Enterprise customers, this is included with <a href="https://www.cloudflare.com/products/gateway/">Cloudflare Gateway</a> without any additional charge.</p>
+<h2>Why customers are adopting Internal DNS</h2>
+<p><strong>Consolidate DNS operations</strong>. Public and private DNS run on one platform, with one API, one audit trail, and one place to set policy. The appliance refresh cycle and the scaling bottlenecks that came with legacy DNS go away.</p>
+<p><strong>Simplify split-horizon DNS</strong>. Internal and external resolution are defined as separate views over shared zones, managed from a single control plane. There are no parallel systems to keep in sync, so there's no drift to chase down.</p>
+<p><strong>Extend Zero Trust to DNS</strong>. Resolver policies decide which users and devices resolve against which view, enforced by the same Cloudflare Gateway that already governs the rest of your traffic. Private name resolution stops being the gap in an otherwise Zero Trust architecture.</p>
+<p><strong>Modernize legacy infrastructure</strong>. Retire hardware appliances, legacy DNS servers, and cloud-locked resolvers. Cloudflare Internal DNS runs on the infrastructure behind 1.1.1.1, with no hardware to rack and no capacity to provision.</p>
+<h2>What we built</h2>
+<p>Cloudflare Internal DNS consists of two components: <strong>Gateway Resolver</strong> and <strong>Internal Authoritative DNS</strong>. Authoritatively managing zones is a different job from enforcing DNS security and routing policies.</p>
+<p>The Gateway Resolver handles recursive resolution and policy evaluation. <a href="https://blog.cloudflare.com/introducing-cloudflare-for-teams/">Launched in 2020</a> and powered by 1.1.1.1 for public resolution, it comes with a built-in policy engine that can filter DNS queries and redirect queries to different upstream sources — all based on <a href="https://developers.cloudflare.com/cloudflare-one/traffic-policies/expression-syntax/">flexible expressions</a>, with comprehensive logging and audits feeding a single pane of glass.</p>
+<p>Internal Authoritative DNS serves records for internal zones built on the same authoritative platform Cloudflare has operated for over a decade and that <a href="https://w3techs.com/technologies/overview/dns_server">serves more domains</a> than any other provider.</p>
+<p>There are three primary objects customers work with:</p>
+<ul>
+ <li><strong>Internal Zones</strong> hold the authoritative records for private resources: environment-specific apps, service endpoints, databases.</li>
+ <li><strong>DNS Views</strong> group zones into the resolution context a given set of users or devices should see. This is what makes split-horizon work without parallel systems.</li>
+ <li><strong>Resolver Policies</strong> sit in Gateway and route matching queries to a specific view.</li>
+</ul>
+<p>Zone references let administrators reuse a shared zone across multiple views rather than copying its records into each one. A common zone like intranet.local is defined once and referenced everywhere it's needed, which is the difference between a Don't-Repeat-Yourself configuration and the duplicated, drift-prone setup that split-horizon usually forces.</p>
+<h3>How a query resolves</h3>
+<p>A DNS query from a client first hits the Gateway Resolver, where policy is evaluated. From there, one of three things happens. If a resolver policy matches and points at an internal view, the query is routed to Internal Authoritative DNS and answered from the matching view's zones. If policy blocks the query, it is dropped at the resolver. Otherwise, the query follows the public path, with 1.1.1.1 resolving it against the public DNS hierarchy. Views can also fall back to public resolution when a name isn't found internally, so a single resolver can serve both private and public names without the client needing to know which is which.</p>
+<h3>How a change propagates</h3>
+<p>Record changes follow a predictable, high-speed path from input to edge.</p>
+<p>Every change enters through the same DNS Records API, whether it originates in the dashboard, in Terraform, or in a direct API call. That unified ingress means there is exactly one write path to reason about and audit, regardless of how the change was made. The change is persisted in Cloudflare's core data centers for durability and validated before it propagates.</p>
+<p>From there, changes replicate across Cloudflare's global network and affected cached entries are invalidated as the updates arrive, so edited records take effect in seconds rather than waiting on TTL expiry.</p>
+<h3>Getting started</h3>
+<p>If you're an Enterprise customer using Cloudflare Gateway, you have access to Internal DNS today. Open the Cloudflare dashboard, navigate to Networking, then <a href="https://dash.cloudflare.com/?to=/:account/internal-dns">Internal DNS</a>.</p>
+<p>Setting up Internal DNS typically takes three steps: create a zone, create a view, and define a resolver policy that determines which users and devices should resolve against that view.</p>
+<p>Create an internal zone and your first internal record:</p>
+<pre><code>POST https://api.cloudflare.com/client/v4/accounts/zones
+\{
+  "account": \{
+    "id": "\{account_id}"
+  },
+  "name": "corp.internal",
+  "type": "internal"
+}
+
+POST https://api.cloudflare.com/client/v4/zones/\{zone_id}/dns_records
+\{
+  "type": "A",
+  "name": "db.corp.internal",
+  "content": "10.0.1.50",
+  "ttl": 300
+}</code></pre>
+<p>Then create a DNS view and link your zone to it:</p>
+<pre><code>POST https://api.cloudflare.com/client/v4/accounts/\{account_id}/internal_dns/views
+\{
+  "name": "production-view",
+  "zones": ["\{zone_id}"]
+}</code></pre>
+<p>Finally, <a href="https://developers.cloudflare.com/cloudflare-one/traffic-policies/resolver-policies/#create-a-resolver-policy">create a Gateway resolver policy</a> in the <a href="https://dash.cloudflare.com/?to=/:account/one/traffic-policies/resolver-policies">Zero Trust dashboard</a> that routes matching traffic to your view. <a href="https://developers.cloudflare.com/cloudflare-one/networks/resolvers-and-proxies/dns/locations/">Create a Gateway location</a>, set your conditions, select Internal DNS View as the resolution method, and choose your view. That's it. Queries matching your policy now resolve against your internal zones.</p>
+<p>Terraform support is available, and because Terraform writes through the same DNS Records API as everything else, infrastructure-as-code changes follow the identical ingestion and propagation path. Full documentation and end-to-end configuration examples are available in <a href="https://developers.cloudflare.com/dns/internal-dns/get-started/#manage-with-terraform">our developer documentation</a>.</p>
+<h3>Internal DNS as part of the Connectivity Cloud</h3>
+<p>Internal DNS works with any Cloudflare connectivity method that routes DNS traffic through the Gateway Resolver, including the Cloudflare One Client (formerly WARP), DNS over HTTPS (DoH), DNS over TLS (DoT), standard DNS on port 53, PAC file deployments, and Cloudflare WAN.</p>
+<p>For organizations running Cloudflare WAN, every device on the connected network can resolve internal hostnames through Cloudflare without requiring the Cloudflare One Client on individual devices. The result is a consistent DNS experience across remote users, branch offices, data centers, and cloud environments using a single control plane.</p>
+<p>More importantly, Internal DNS is not a standalone DNS service. It extends the same Connectivity Cloud platform that organizations already use to secure users with Zero Trust, connect networks with Cloudflare WAN, accelerate applications, and protect Internet-facing services.</p>
+<p>Bringing private DNS onto the same global network as everything else is just the starting point. Tighter integration across DNS, networking, and Zero Trust policy is where this goes next — so resolving an internal hostname, reaching the service behind it, and enforcing who is allowed to access it become decisions made through a single platform, rather than multiple disconnected systems.</p>
+<p>Ready to consolidate your DNS? Open the dashboard, head to Networking, then <a href="https://dash.cloudflare.com/?to=/:account/internal-dns">Internal DNS</a>, and create your first zone today. Questions or want to compare notes with other operators? Join the conversation in the <a href="https://community.cloudflare.com">Cloudflare Community</a>.</p>

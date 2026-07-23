@@ -1,0 +1,85 @@
+<p>When we benchmark an LLM serving setup, the number almost everyone reaches for first is throughput: how many requests per second the system can push through. It is easy to measure, easy to compare, and it lines up nicely with the thing finance actually cares about, which is dollars per request. So we chase it, tuning batching, raising concurrency, squeezing the GPU, and watching requests per second climb.</p>
+<p>The trouble is that this number, on its own, can keep rising while your service quietly gets worse. I ran into exactly that while tuning vLLM on a single GPU and the gap was wide enough to be worth walking through because the lesson travels far beyond my particular setup.</p>
+<h2>Throughput counts plates, goodput counts happy diners</h2>
+<p>Picture an LLM endpoint as a restaurant kitchen. Throughput is the number of plates that leave the pass every hour. It tells you the kitchen is busy but it says nothing about whether the food arrived hot, on time or at the right table. A kitchen can double its plates per hour and still send a full room of cold and late dinners.</p>
+<p>The metric that captures what we actually want is goodput. The definition is refreshingly plain: it is the number of completed requests per second that also meet your latency targets. For LLM serving those targets are usually time to first token (TTFT), the wait before anything appears on screen, and time per output token (TPOT), the pace at which the rest of the answer streams out. A request that finishes but blows past either target is a plate that left the kitchen cold. It still counts toward throughput but it does not count toward goodput.</p>
+<h2>The setup, and how I drove load</h2>
+<p>Everything here runs on parts you probably already have. I served Qwen2.5-7B with vLLM on a single NVIDIA A10G with 24 GB of memory inside an EKS cluster, drove load with GuideLLM, and watched the system through Prometheus and Grafana with GPU level metrics coming from NVIDIA’s DCGM exporter. The entire setup is on GitHub, Kubernetes manifests and all, so you can reproduce my runs and, more usefully, aim the same benchmark at your own model and real traffic instead of the synthetic load I used.</p>
+<p>One honest note before the numbers. A single A10G is not the GPU you would pick for a production-grade LLM service, so the absolute numbers here will look modest next to an H100 cluster. I picked it on purpose to keep these studies cheap enough to repeat often. The point of this post is not the ceiling, it is the shape of the trade-off between throughput and latency, and that shape holds regardless of how big the GPU is.</p>
+<p>I focused on changing only three vLLM settings: <code>gpu_memory_utilization</code>, the batched token budget (<code>max_num_batched_tokens</code>), and the cap on <code>concurrent sequences (max_num_seqs)</code>. I picked these three on purpose because together they decide the throughput against latency trade-off, they control how much GPU memory is left for the KV cache, how much work goes into each batch step and how many requests run at the same time. They are also the settings an operator can safely change in production without touching the model, the hardware, or the cluster, so holding everything else fixed keeps the results easy to read and easy to reproduce.</p>
+<p>How you send the traffic matters just as much as how you tune it, so it is worth being explicit about it. I used GuideLLM in two ways. A rate sweep ramps the request rate up gradually and lets me read latencies while the server still keeps up, so the numbers reflect real serving and not a backlog. A throughput run does the opposite, firing requests as fast as the server will take them to find the ceiling, which pushes it into saturation. I will use both in this post, and the contrast between them is part of the lesson.</p>
+<h2>What the studies show</h2>
+<p>I ran the same setup against three kinds of traffic because the shape of the traffic decides which latency target actually bites. A chatbot sends a fairly short prompt and gets a fairly short answer. A reasoning workload sends a short prompt and gets a very long answer, on the order of 4,000 tokens. An agentic workload sends many short calls one after another to finish a single task.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Workload</th>
+   <th>Prompt / Output (tokens)</th>
+   <th>What the SLO hangs on</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Chatbot</td>
+   <td>~485 / 121</td>
+   <td>tight TTFT, medium TPOT</td>
+  </tr>
+  <tr>
+   <td>Reasoning</td>
+   <td>~400 / 4000</td>
+   <td>TPOT, with TTFT loose</td>
+  </tr>
+  <tr>
+   <td>Agentic</td>
+   <td>~512 / 128</td>
+   <td>per-call TTFT that adds up</td>
+  </tr>
+ </tbody>
+</table>
+<p>The chatbot study is the clearest case, so start there, and start with what I actually asked it to do. The goal was to maximize combined token throughput, <code>prefill_token_throughput + decode_token_throughput</code>, under one constraint: average TTFT had to stay at or below 1.5 seconds. I also added a windowing rule, scoring each config from a stretch of eight consecutive data points where prefill throughput had settled down rather than from any single sample. The reason is simple and worth keeping in mind for your own benchmarks too. A live metric like token throughput jitters as individual requests start and finish so one sample can land on a lucky peak or an unlucky dip. Requiring eight steady points in a row is an easy way to score the system’s real running rate instead of a blip.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Config</th>
+   <th>gpu_memory_utilization</th>
+   <th>max_num_batched_tokens</th>
+   <th>max_num_seqs</th>
+   <th>TTFT avg</th>
+   <th>Prefill tput</th>
+   <th>Decode tput</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Exp 1</td>
+   <td>0.89</td>
+   <td>4160</td>
+   <td>212</td>
+   <td>1395 ms</td>
+   <td>1925 tok/s</td>
+   <td>478 tok/s</td>
+  </tr>
+  <tr>
+   <td>Exp 20</td>
+   <td>0.87</td>
+   <td>2150</td>
+   <td>271</td>
+   <td>1403 ms</td>
+   <td>2934 tok/s</td>
+   <td>690 tok/s</td>
+  </tr>
+ </tbody>
+</table>
+<p>Both configs land at almost the same TTFT, right under the 1.5 second ceiling I set. That is not a coincidence, it is the constraint doing exactly what I asked it to do: hold the first-token wait at the edge of what I said was acceptable then squeeze as much combined throughput out of the rest of the system as it can. Exp 20 wins that squeeze by a wide margin, with about <strong>50 percent more combined throughput</strong> than Exp 1.</p>
+<p>That extra throughput is not free, and the bill shows up somewhere I did not constrain. Exp 1’s <strong>p95 TPOT sits at about 50 milliseconds</strong>. Exp 20’s sits at about <strong>494 milliseconds</strong>, nearly ten times higher. I told the search to protect the first token. I never told it to protect the pace of the stream that follows, so it spent that budget without asking. If your target user is reading a chat response as it streams in, a half-second gap between tokens is the difference between a smooth reply and one that visibly stutters even though both configs kept their promise on the metric I actually constrained.</p>
+<p>The two latencies move in different directions because they come from two stages of the same request. TTFT comes out of the prefill stage, where the model reads your prompt, and bounding it directly is what keeps both configs near the same 1.4 second mark. Every token after that comes from the decode stage, where vLLM advances all the active requests at once, one token to each per step. Pushing more combined throughput means packing more work into each of those steps, and a fuller step takes longer to run, so every request gets its next token a little later. Picture the kitchen sending one course to every table each round: a fuller room makes each round longer and every table waits more between courses. Constrain how fast the kitchen seats you and brings the first course, and the wait gets pushed onto the gap between the courses that follow.</p>
+<p>Reasoning and agentic ran a different experiment on purpose. I kept the same goal, maximizing combined prefill and decode throughput, but with no TTFT constraint at all, and I drove load with a throughput run instead of a sweep, sending requests as fast as the server would take them to find the ceiling. The chatbot study answers “how much throughput can we get while keeping the first token fast”. These two answer “how much throughput is actually available”, which is a fair question on its own, as long as you read the latency that comes with the answer rather than assuming it does not matter.</p>
+<p>It still does not come for free, and it still varies between configs that post similar throughput. In the agentic study, the two best configs I found were nearly tied on requests per second, 6.20 against 6.11, yet their p95 TPOT differed by about 220 milliseconds, 682 against 902. Same throughput, a noticeably different stream once you are inside one of those many chained calls. In the reasoning study, where each answer runs to about 4,000 tokens, the config with the best raw throughput was not the one you would want once you cared about latency: asking the same search to respect a tighter inter-token target pushed the winner to a different configuration entirely. Three different studies, three different ways of asking the question, and the same answer comes back each time: a throughput number with nothing else attached does not tell you which configuration to run.</p>
+<h2>Optimize for the thing you actually sell</h2>
+<p>Three lessons come out of this for anyone running inference in production.</p>
+<p>First, a throughput number with no SLO next to it is marketing, not engineering. The honest target is goodput, meaning requests per second that actually met your latency targets. Count anything else and you are counting cold plates.</p>
+<p>Second, the config with the best goodput is not the one you would guess. In my reasoning runs, two settings that looked almost the same ended up far apart and one nearby setting failed outright. The space is full of small cliffs like that, so hand tuning tends to stop at the first number that looks good instead of the best one. The reliable way through it is an automated, data-driven search that tries many configs against your real targets rather than a few hand-picked guesses.</p>
+<p>Third, none of this stays put. Traffic, prompts, and models all change over time, and the best config moves with them so the search has to run again, not once.</p>
+<p>There is a fourth point worth making even though my study did not test it directly. I changed only three serving knobs and the gap was already this wide. The same trade-off lives in the layers I held fixed too, in the GPU settings, the runtime, and the scheduling, and the largest gains tend to come from tuning the whole stack together rather than one layer at a time since the layers interact.</p>
+<p>The practical move is small and worth doing early. Set your TTFT and TPOT targets first, then look for the config that gives you the most throughput while still meeting them instead of chasing throughput on its own. You will often ship a smaller requests-per-second number and a clearly better service, the trade your users would make every time.</p>
+<p>If you want to see the gap on your own hardware the full setup is on GitHub at <a href="https://github.com/graz-dev/vllm-benchmark">github.com/graz-dev/vllm-benchmark</a>. Clone it, point GuideLLM at your own model and traffic, set your SLOs, and search for the best goodput rather than the best raw throughput. That gap is usually where your real headroom is hiding.</p>

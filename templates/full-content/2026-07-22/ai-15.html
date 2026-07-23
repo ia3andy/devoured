@@ -1,0 +1,222 @@
+<h2>make codex open!</h2>
+<p><strong>Universal provider proxy for OpenAI Codex &amp; Claude Code</strong> — use any LLM with Codex CLI, App, SDK, and Claude Code.</p>
+<p><code>npm install -g @bitkyc08/opencodex</code> · <code>ocx start</code> · <strong>localhost:10100</strong></p>
+<p>Use Claude, Gemini, Grok, GLM, DeepSeek, Kimi, Qwen, Ollama, or any other LLM with Codex — and with <strong>Claude Code</strong> — without waiting for anyone to add support.</p>
+<p>opencodex is a lightweight local proxy that translates Codex's Responses API into whatever your provider speaks. Streaming, tool calls, reasoning tokens, images — everything works, in both directions.</p>
+<p><strong>Codex, running any model.</strong> Pick a provider and go — same Codex workflow, different brain.</p>
+<p>It can also manage a <strong>ChatGPT account pool</strong> for Codex auth. Add multiple ChatGPT / Codex accounts, refresh their 5h / weekly / 30d quota in the dashboard, and let new sessions auto-route to the lowest-usage healthy account. Existing Codex threads stay pinned to the account that started them, so long SSH, tmux, or mobile-connected sessions do not jump accounts mid-conversation.</p>
+<pre><code>Codex CLI / App / SDK ──/v1/responses──▶ opencodex ──▶ Any provider
+                                              │
+              Anthropic · Google · xAI · Kimi · Ollama Cloud · Groq
+              OpenRouter · Azure · DeepSeek · GLM · …and OpenAI itself
+</code></pre>
+<h2>Supported platforms</h2>
+<table>
+ <thead>
+  <tr>
+   <th>OS</th>
+   <th>Status</th>
+   <th>Service manager</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>macOS (arm64 / x64)</td>
+   <td>Fully supported</td>
+   <td>launchd</td>
+  </tr>
+  <tr>
+   <td>Linux (x64 / arm64)</td>
+   <td>Fully supported</td>
+   <td>systemd (user unit)</td>
+  </tr>
+  <tr>
+   <td>Windows (x64)</td>
+   <td>Fully supported</td>
+   <td>Task Scheduler (hidden) / opt-in native service (<code>--native</code>, WinSW)</td>
+  </tr>
+ </tbody>
+</table>
+<p>Requires <a href="https://nodejs.org">Node</a> 18+. The Bun runtime is bundled automatically on <code>npm install</code> — no separate Bun install needed. All three platforms work natively (no WSL needed on Windows).</p>
+<h2>Quick start</h2>
+<pre># Install (bundles the Bun runtime automatically — only Node 18+ required)
+# Prefer a user-owned Node (nvm/fnm) — avoid `sudo npm install -g …`
+npm install -g @bitkyc08/opencodex
+
+# Interactive setup (writes config, injects into Codex, and offers autostart shim install)
+ocx init
+
+# Start the proxy
+ocx start
+
+# If you skipped it during init, install the on-demand autostart shim later
+ocx codex-shim install
+
+# Use Codex normally — it now routes through opencodex
+codex "Write a hello world in Rust"</pre>
+<p><strong>"bundled Bun runtime is missing" / npm blocked Bun install scripts?</strong></p>
+<p>opencodex bundles the Bun runtime as a dependency and runs it via a Node launcher, so you do <strong>not</strong> need to install Bun yourself. If you see a "bundled Bun runtime is missing" error, the install skipped lifecycle scripts (including npm blocking bun's postinstall under <code>allowScripts</code>) or optional dependencies. Reinstall without those flags, allowing bun's install script:</p>
+<pre>npm install -g --allow-scripts=bun @bitkyc08/opencodex   # no --ignore-scripts, no --omit=optional
+
+# if the original install used sudo, keep using sudo:
+sudo npm install -g --allow-scripts=bun @bitkyc08/opencodex</pre>
+<p>npm's own warning suggests an abbreviated command without the package name — that would reinstall the current directory, so always pass <code>@bitkyc08/opencodex</code> explicitly.</p>
+<p>If you installed with <code>sudo</code> into a root-owned prefix, the sudo reinstall above unblocks that prefix — but prefer migrating to a user-owned Node (nvm, fnm, or a user npm prefix) when you can.</p>
+<h2>Add a provider</h2>
+<p>The fastest way to add a provider is through the web dashboard:</p>
+<pre>ocx gui</pre>
+<p>This opens the dashboard at <code>http://localhost:10100</code>. From there:</p>
+<ol>
+ <li>Click <strong>"Add Provider"</strong></li>
+ <li>Pick from <strong>40+ built-in providers</strong> — or enter a custom OpenAI-compatible endpoint</li>
+ <li>Paste your API key (or log in via OAuth for Anthropic, xAI, and Kimi)</li>
+ <li>Models are <strong>auto-discovered</strong> from the provider's <code>/v1/models</code> endpoint</li>
+</ol>
+<p>Your new provider is ready to use immediately. No restart needed.</p>
+<p>You can also add providers through <code>ocx init</code> (interactive CLI) or by editing <code>~/.opencodex/config.json</code> directly.</p>
+<h2>Model routing</h2>
+<p>Target any configured provider and model using the <code>provider/model</code> syntax:</p>
+<p>Providers whose own model ids contain <code>/</code> (zenmux, openrouter, nvidia, …) are exposed to Codex with inner slashes aliased to <code>-</code> (e.g. <code>zenmux/moonshotai-kimi-k3-free</code>); the proxy transparently routes them back to the native id, and the raw full-slash form keeps working too.</p>
+<pre># Use Claude Opus through Anthropic
+codex -m "anthropic/claude-opus-4-8" "Explain this stack trace"
+
+# Use Gemini through Google
+codex -m "google/gemini-3-pro" "Write unit tests for auth.ts"
+
+# Use GLM through Ollama Cloud
+codex -m "ollama-cloud/glm-5.2" "Write a SQL migration"
+
+# Use a local model through Ollama
+codex -m "ollama/llama3" "Refactor this function"</pre>
+<p>When you omit the <code>provider/</code> prefix, opencodex routes to the default provider — or auto-matches based on the model name pattern (e.g., <code>claude-*</code> routes to Anthropic, <code>gpt-*</code> routes to OpenAI).</p>
+<p>Routed models also appear in the <strong>Codex App</strong> model picker with per-model reasoning effort controls.</p>
+<h2>OpenAI provider account modes</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Provider ID</th>
+   <th>Route</th>
+   <th>Credential</th>
+   <th>Behavior</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>openai</code></td>
+   <td>Codex login</td>
+   <td>Main + added Codex accounts</td>
+   <td>Pool by default; optional Direct mode</td>
+  </tr>
+  <tr>
+   <td><code>openai-apikey</code></td>
+   <td>OpenAI API</td>
+   <td>API key/key pool</td>
+   <td>No Codex account routing</td>
+  </tr>
+ </tbody>
+</table>
+<ul>
+ <li>Pool includes the main Codex login and added accounts, with affinity, quota, cooldown, and failover.</li>
+ <li>Direct short-circuits pool state and uses only the current caller/main-login bearer.</li>
+ <li>Fresh installs and configs with no persisted mode default to Pool. Change the mode on the dashboard's <strong>Providers</strong> page; model ids stay bare in either mode.</li>
+</ul>
+<h3>Pool account behavior</h3>
+<p>Open <strong>Codex Auth</strong> in the dashboard to add accounts and choose which account should handle the next Codex session. opencodex keeps these behaviors:</p>
+<ul>
+ <li><strong>Existing sessions keep affinity.</strong> A thread id is bound to the selected account and reused on later turns, so a long request or a mobile/SSH-attached session keeps using the same account.</li>
+ <li><strong>New sessions can auto-route.</strong> When auto-switch is enabled, opencodex compares the hottest known quota window across 5h, weekly, and 30d usage, then picks a lower-usage eligible account for new sessions once the active account crosses the threshold.</li>
+ <li><strong>Quota lookup is built in.</strong> The dashboard can refresh all account quotas in one click, and the request log labels pool traffic with non-PII account ordinals.</li>
+ <li><strong>Failures fail closed.</strong> Token failures mark reauthentication instead of falling back to another credential silently; 429 quota responses put the account in cooldown and can fail over future work to another eligible pool account.</li>
+</ul>
+<h2>Highlights</h2>
+<ul>
+ <li><strong>Use any LLM with Codex.</strong> 5 protocol adapters cover Anthropic Messages, Google Gemini, Azure, OpenAI Responses passthrough, and every OpenAI-compatible Chat Completions endpoint.</li>
+ <li><strong>Use any LLM with Claude Code too.</strong> The same daemon serves the Anthropic Messages API (<code>/v1/messages</code> + <code>count_tokens</code>): <code>ocx claude</code> launches Claude Code fully wired.</li>
+ <li><strong>Pool ChatGPT accounts safely.</strong> Keep existing Codex threads on one account while new sessions can auto-pick a lower-usage account from the pool.</li>
+ <li><strong>Log in once, skip the API key.</strong> OAuth support for xAI, Anthropic, and Kimi means you can authenticate with your existing account.</li>
+ <li><strong>Works everywhere Codex does.</strong> Injects into Codex CLI, TUI, App, and SDK automatically.</li>
+ <li><strong>History-safe injection.</strong> The proxy points Codex's own built-in <code>openai</code> provider at itself; new threads keep their native provider tag.</li>
+ <li><strong>See what's happening.</strong> The web dashboard shows providers, OAuth status, model selection, and a live request log.</li>
+ <li><strong>Runs in the background.</strong> Install as a system service (launchd / systemd / Task Scheduler) and forget about it.</li>
+ <li><strong>Clean exit, zero residue.</strong> <code>ocx stop</code> shuts down the proxy and restores Codex to its original configuration.</li>
+</ul>
+<h2>Providers &amp; adapters</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Provider</th>
+   <th>Adapter</th>
+   <th>Auth</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>OpenAI (ChatGPT login)</td>
+   <td><code>openai-responses</code></td>
+   <td>forward (no key)</td>
+  </tr>
+  <tr>
+   <td>OpenAI (API key)</td>
+   <td><code>openai-responses</code></td>
+   <td>key</td>
+  </tr>
+  <tr>
+   <td>Anthropic Claude</td>
+   <td><code>anthropic</code></td>
+   <td>oauth / key</td>
+  </tr>
+  <tr>
+   <td>xAI Grok</td>
+   <td><code>openai-chat</code></td>
+   <td>oauth / key</td>
+  </tr>
+  <tr>
+   <td>Kimi (Moonshot)</td>
+   <td><code>openai-chat</code></td>
+   <td>oauth / key</td>
+  </tr>
+  <tr>
+   <td>Google Gemini</td>
+   <td><code>google</code></td>
+   <td>key</td>
+  </tr>
+  <tr>
+   <td>Azure OpenAI</td>
+   <td><code>azure-openai</code></td>
+   <td>key</td>
+  </tr>
+ </tbody>
+</table>
+<h2>CLI</h2>
+<pre>ocx init                       # interactive setup
+ocx start [--port 10100]       # start the proxy
+ocx stop                       # stop + restore native Codex
+ocx gui                        # open the web dashboard
+ocx claude [args...]           # launch Claude Code wired to the proxy</pre>
+<h3>Autostart: service vs shim</h3>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th><code>ocx service</code> / <code>ocx service install</code></th>
+   <th><code>ocx codex-shim install</code></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>How</strong></td>
+   <td>OS service manager (launchd / systemd / schtasks)</td>
+   <td>Wraps script launchers for <code>codex</code></td>
+  </tr>
+  <tr>
+   <td><strong>When</strong></td>
+   <td>Always running after login</td>
+   <td>On-demand</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Disclaimer</h2>
+<p>opencodex is an independent, community-maintained project and is <strong>not affiliated with or endorsed by OpenAI, Anthropic, or any other provider</strong>.</p>
+<p>Some providers — notably Anthropic (Claude) — may suspend or restrict accounts that route API traffic through third-party proxies. <strong>Use at your own risk (UAYOR).</strong></p>
+<h2>License</h2>
+<p>MIT</p>

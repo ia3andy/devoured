@@ -1,0 +1,130 @@
+<h2>Deploy OpenTelemetry Gateway on AWS: Monitoring Your Observability Pipeline</h2>
+<p>At scale, your telemetry pipeline is likely growing faster than your ability to monitor it. Teams invest heavily in observing their applications’ traces, metrics, and logs but rarely ask a critical question: <i>who is watching the watchers?</i> When your observability pipeline silently drops data due to backpressure, network issues, or misconfiguration, you lose visibility precisely when you need it most.</p>
+<p>This post walks you through deploying an OpenTelemetry Gateway on Amazon EKS and instrumenting the gateway itself so you can detect pipeline degradation. Let’s call this pattern “Monitor the Monitoring Pipeline”. Through this post, you will learn how to configure the OpenTelemetry gateway, expose its health metrics, forward those metrics to Amazon CloudWatch using the recently launched native OpenTelemetry metrics support, build PromQL-based dashboards utilizing PromQL Query Studio, and alarms that alert you when your observability infrastructure needs attention.</p>
+<h3>OpenTelemetry Collector Deployment Patterns</h3>
+<p>The OpenTelemetry Collector supports three primary deployment patterns on Kubernetes, each suited to different operational requirements.</p>
+<p><strong>Agent mode</strong> deploys collectors as a DaemonSet with one collector pod per node. Agents collect node-level metrics and logs, handle local service discovery, and forward telemetry upstream with minimal configuration.</p>
+<p><strong>Sidecar mode</strong> runs a collector container alongside each application pod. The main advantage is simplicity because each pod contains both the application and collector, no service discovery is needed. However, this doubles your container count and requires managing CPU and memory allocation individually for each pod, which can lead to over- or under-allocation at scale.</p>
+<p><strong>Gateway mode</strong> deploys collectors as a standalone Kubernetes Deployment, exposing a single OTLP endpoint that applications or other collectors send telemetry to. For a scaled production setup, as your cluster grows to hundreds of pods across many nodes, having every workload authenticate and export to CloudWatch directly means duplicated credentials, thin per-pod batches, and no central place to filter or control cost. The gateway consolidates that into a single egress tier that batches efficiently, scales independently, and becomes the one scalable, reliable, fault tolerant place to add sampling, filtering, and multi-backend routing.</p>
+<p>This post implements the agent-to-gateway pattern. OTel-instrumented workloads send telemetry to an OTel agent (a DaemonSet), which enriches and forwards it to a centralized OTel gateway (a Deployment). The gateway batches, authenticates, and exports to CloudWatch using native OpenTelemetry support, and self-monitors its own health. Alongside it, the CloudWatch Observability EKS add-on provides infrastructure observability (node, pod, container metrics and logs via Container Insights) which is the layer beneath the pipeline, so you can tell whether a degradation is the pipeline or the nodes it runs on. Let’s now see how to deploy this pattern and monitor the telemetry pipeline.</p>
+<p><strong>Prerequisites</strong></p>
+<ul>
+ <li>Amazon EKS cluster running Kubernetes 1.31 or later</li>
+ <li>OIDC provider configured for IAM Roles for Service Accounts (IRSA)</li>
+ <li>AWS CLI v2 and kubectl with cluster access</li>
+ <li>IAM role for the gateway ServiceAccount with CloudWatchAgentServerPolicy managed policy attached. The CloudWatch Observability add-on service account also needs CloudWatch permissions (CloudWatchAgentServerPolicy) via IRSA or EKS Pod Identity</li>
+ <li>Outbound network access to CloudWatch endpoints from the cluster</li>
+</ul>
+<p><strong>The data flow:</strong></p>
+<ul>
+ <li>EKS workloads emit telemetry over OTLP to a node-local OTel agent (DaemonSet)</li>
+ <li>CloudWatch Observability EKS Add-on sends infrastructure metrics and container logs to CloudWatch in parallel via Container Insights</li>
+ <li>OTel Collector Gateway (Deployment) receives telemetry from the agents, batches, and self-monitors</li>
+ <li>Agents handle local collection and Kubernetes-metadata enrichment; the gateway is the centralized control point</li>
+ <li>Gateway exports via OTLP HTTP+SigV4 to CloudWatch native OTLP endpoint (monitoring.&lt;region&gt;.amazonaws.com/v1/metrics)</li>
+ <li>CloudWatch PromQL Query Studio is used to query gateway and application metrics with PromQL</li>
+ <li>CloudWatch Dashboard is used to visualize pipeline health and application performance</li>
+</ul>
+<p><strong>Step 1: Enable the CloudWatch Observability EKS Add-on</strong></p>
+<p>Install the add-on which provides infrastructure observability for the cluster.</p>
+<pre><code>aws eks create-addon \
+    --cluster-name my-cluster \
+    --addon-name amazon-cloudwatch-observability \
+    --addon-version v6.2.0-eksbuild.1</code></pre>
+<p><strong>Step 2: Deploy the OpenTelemetry Collector Gateway</strong></p>
+<pre><code>ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+curl -sSL https://raw.githubusercontent.com/aws-observability/observability-best-practices/main/sandbox/otel-gateway-deployment/gateway.yaml \
+    | sed "s/&lt;ACCOUNT_ID&gt;/$ACCOUNT_ID/g" | kubectl apply -f -</code></pre>
+<p><strong>Step 3: Deploy the OpenTelemetry agent (DaemonSet)</strong></p>
+<pre><code>kubectl apply -f https://raw.githubusercontent.com/aws-observability/observability-best-practices/main/sandbox/otel-gateway-deployment/agent.yaml</code></pre>
+<p><strong>Step 4: Send application telemetry to the agent</strong></p>
+<pre><code>env: 
+    - name: NODE_IP 
+      valueFrom: 
+        fieldRef: 
+          fieldPath: status.hostIP 
+    - name: OTEL_EXPORTER_OTLP_ENDPOINT 
+      value: "http://$(NODE_IP):4317" 
+    - name: OTEL_EXPORTER_OTLP_INSECURE 
+      value: "true"</code></pre>
+<p><strong>Step 5: Verify telemetry is reaching the gateway</strong></p>
+<pre><code># Confirm the gateway pods are running
+kubectl get pods -n otel-gateway
+# Then confirm data is arriving in CloudWatch Query Studio (PromQL), sample query to test:
+rate(otelcol_receiver_accepted_metric_points[5m])</code></pre>
+<h3>Monitor the monitoring: Gateway self-telemetry</h3>
+<p>The “metrics/internal” pipeline scrapes the gateway’s own telemetry endpoint every 10 seconds and exports those metrics to CloudWatch.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Metric</th>
+   <th>What it tells you</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>otelcol_receiver_accepted_metric_points</td>
+   <td>Data entering the pipeline</td>
+  </tr>
+  <tr>
+   <td>otelcol_receiver_refused_metric_points</td>
+   <td>Data dropped (non-zero = data loss)</td>
+  </tr>
+  <tr>
+   <td>otelcol_exporter_sent_metric_points</td>
+   <td>Data delivered to CloudWatch</td>
+  </tr>
+  <tr>
+   <td>otelcol_exporter_send_failed_metric_points</td>
+   <td>Failed exports</td>
+  </tr>
+  <tr>
+   <td>otelcol_exporter_queue_size</td>
+   <td>Current queue depth</td>
+  </tr>
+  <tr>
+   <td>otelcol_exporter_queue_capacity</td>
+   <td>Max queue capacity</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Alerting on pipeline degradation</h3>
+<p><strong>Queue saturation (data loss imminent)</strong></p>
+<pre><code>max(otelcol_exporter_queue_size / otelcol_exporter_queue_capacity) &gt; 0.8</code></pre>
+<p><strong>Export failures (backend connectivity)</strong></p>
+<pre><code>sum(rate(otelcol_exporter_send_failed_metric_points[5m])) &gt; 0</code></pre>
+<p><strong>Memory limiter activation (active data loss)</strong></p>
+<pre><code>sum(rate(otelcol_receiver_refused_metric_points[5m])) &gt; 0</code></pre>
+<p><strong>Export success ratio below SLO (primary indicator)</strong></p>
+<pre><code>sum(rate(otelcol_exporter_sent_metric_points[5m])) / sum(rate(otelcol_receiver_accepted_metric_points[5m])) &lt; 0.99</code></pre>
+<h3>PromQL in CloudWatch Query Studio</h3>
+<p><strong>Pipeline throughput:</strong></p>
+<pre><code>sum(rate(otelcol_receiver_accepted_metric_points[5m]))</code></pre>
+<p><strong>Export success rate (%):</strong></p>
+<pre><code>sum(rate(otelcol_exporter_sent_metric_points[5m])) / sum(rate(otelcol_receiver_accepted_metric_points[5m])) * 100</code></pre>
+<p><strong>Queue utilization trend:</strong></p>
+<pre><code>otelcol_exporter_queue_size / otelcol_exporter_queue_capacity * 100</code></pre>
+<h3>CloudWatch Dashboard</h3>
+<pre><code># Download the dashboard body, then create the dashboard
+curl -sSL https://raw.githubusercontent.com/aws-observability/observability-best-practices/main/sandbox/otel-gateway-deployment/dashboard.json -o dashboard.json
+aws cloudwatch put-dashboard \
+   --dashboard-name OTel-Gateway-Pipeline-Health \
+   --dashboard-body file://dashboard.json</code></pre>
+<h3>Scaling to multiple clusters</h3>
+<p>As you add clusters, you can promote the gateway to a shared tier and run the gateway on a different cluster. Patterns include:</p>
+<ul>
+ <li><strong>Multiple clusters, one account, one VPC</strong>: Use an internal Network Load Balancer (NLB) for the gateway and point remote cluster agents to the NLB DNS.</li>
+ <li><strong>Multiple clusters, one account, different VPCs</strong>: Use VPC peering or Transit Gateway to reach the internal NLB.</li>
+ <li><strong>Multiple clusters, multiple accounts</strong>: Use AWS PrivateLink for connectivity and metrics centralization to aggregate data.</li>
+</ul>
+<h3>Cleanup</h3>
+<pre><code># Delete the agent tier
+kubectl delete namespace otel-agent
+# Delete the gateway
+kubectl delete namespace otel-gateway
+# Remove any alarms you created
+aws cloudwatch delete-alarms --alarm-names "OTelGateway-QueueSaturation" "OTelGateway-ExportFailures"
+# Delete dashboard
+aws cloudwatch delete-dashboards --dashboard-names "OTel-Gateway-Pipeline-Health"</code></pre>
+<h3>Conclusion</h3>
+<p>This post walked through the end-to-end setup for deploying an OpenTelemetry gateway on Amazon EKS workloads, utilizing CloudWatch’s native OpenTelemetry support. Your OTel-instrumented workloads no longer need vendor-specific exporters or proprietary agents; the same OTLP payload your apps already emit goes straight to CloudWatch via a standard HTTP endpoint. By combining native OpenTelemetry integration with a dedicated gateway that scrapes its health metrics, you built a self-monitoring observability pipeline.</p>

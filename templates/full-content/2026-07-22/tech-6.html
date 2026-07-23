@@ -1,0 +1,64 @@
+<h2>Introduction</h2>
+<p>I'm Rodrigo, I work on the research team at Greptile, the AI code review agent.</p>
+<p>Greptile uses a variety of models under the hood, but the main review agent is usually a frontier model from either OpenAI or Anthropic.</p>
+<p>Most of the code that Greptile reviews is also written by models from OpenAI and Anthropic. It got me thinking - are models good at finding bugs in their own code?</p>
+<h2>Methodology</h2>
+<ul>
+ <li>I curated two datasets of 500 PRs each, one authored by Claude Code and one by Codex.</li>
+ <li>Model authorship was determined via commit trails such as <code>Co-authored by: Claude Opus 4.7</code>, PR title prefixes like <code>[codex]</code>, and branch prefixes like <code>codex/</code>.</li>
+ <li>Using sentiment analysis, upvote/downvote ratios, and git archaeology, I built a ground truth dataset of verified bugs. The two datasets contain roughly 1,500 ground truth comments in total.</li>
+ <li>I ran both Codex and Claude Code's <code>/review</code> feature 3 times per PR, measured recall by matching comments against ground truth with an LLM-as-a-judge, and averaged the results.</li>
+ <li>Stylistic comments, praise, and documentation suggestions were excluded. Final results reflect recall on high-severity bugs only.</li>
+</ul>
+<h2>Findings</h2>
+<h3>1. Models are worse at finding bugs in their own code</h3>
+<p>The data shows that both models find more bugs in code written by the other model than in code they wrote themselves.</p>
+<h3>2. Models produce the same types of bugs that they are most likely to miss in review</h3>
+<p>I wanted to find out why this was. I decided to categorize the types of bugs that each model was producing into categories like "Performance" and "UI".</p>
+<p>This revealed a fascinating pattern: the types of bugs a model introduces most often are the same types it's more likely to miss during review.</p>
+<p>Claude-authored PRs have a higher share of "wrong data or missing behavior" bugs compared to Codex. That's a category where GPT outperforms Claude as a reviewer. Meanwhile, Codex-authored PRs skew more toward speculative semantic issues and error handling failures - categories where Claude's recall is stronger.</p>
+<p>Each model seems to have its own mental checklist, its own design instincts. The bugs it introduces are reflections of the things it doesn't naturally worry about, and those are exactly the things it fails to flag during review. A different model, with different instincts, helps you fill in the gaps.</p>
+<h3>3. Claude models go wide, GPT models go deep</h3>
+<p>Researching this question meant reading a lot of model traces, and that's where things got interesting.</p>
+<p>I spent a lot of time analyzing how each model behaves when tasked with a code review: the evidence that it gathers, where it spends its reasoning tokens, and what it decides to flag or ignore. Here's what stood out.</p>
+<p>During initial testing, I observed a stark contrast in the number of comments each model would post per review. The average Codex review would land at around 1 to 2 comments, while Opus would post around 7 to 8. I considered two possible explanations:</p>
+<ul>
+ <li>GPT comments <em>less</em> than it should.</li>
+ <li>Opus comments <em>more</em> than it should.</li>
+</ul>
+<p>Both turned out to be true. GPT searches for bugs depth-first. Opus goes breadth-first.</p>
+<p>Across the board, LLM code review traces can be split into three phases:</p>
+<ol>
+ <li><strong>Scope</strong>: The model reads the diff and understands the changes the PR introduces. By this point, models tend to identify <em>potential</em> issues that could be considered bugs.</li>
+ <li><strong>Investigate</strong>: The model searches the codebase with the goal of gathering evidence to confirm the existence of such bugs.</li>
+ <li><strong>Summarize</strong>: The model summarizes its findings and produces the final review artifacts.</li>
+</ol>
+<p>In the first two phases, the results of each tool call progressively build the context window that will ultimately be used to produce the final result. To understand what was going on, I looked at what share of the context window was built during each phase.</p>
+<p>The difference was significant. Opus gets most of its context during the <strong>Scope</strong> phase. GPT gets most of it from the <strong>Investigate</strong> phase. I theorized the following:</p>
+<ul>
+ <li>Opus takes a preventive approach - willing to comment on things that <em>could</em> be bugs.</li>
+ <li>GPT places a big emphasis on verifying that what looks wrong is <em>actually</em> wrong.</li>
+</ul>
+<h3>4. GPT leaves bugs behind</h3>
+<p>You would think that a strong emphasis on verification wouldn't hurt results. When curating the dataset, we built our ground truth from high-severity, verified bugs.</p>
+<p>Yet initially, GPT had very low recall. It would be easy to blame the model's capabilities, but GPT 5.5 is a frontier model. I was convinced that this wasn't a skill issue.</p>
+<p>I tried adding an extra instruction explicitly telling the model to target around 7 to 10 comments per review. Suddenly, it recovered. Not an elegant solution, but it confirmed my suspicion: GPT was leaving bugs behind.</p>
+<p>Looking at the reasoning traces made it even clearer. The model would often identify the bugs I expected it to post, explicitly mentioning them as potential issues in its reasoning summaries. Yet it wouldn't post them.</p>
+<p>After multiple iterations of tuning extra instructions, I started to see both improvement and the potential root cause: conflicting instructions and post-training reinforced behavior.</p>
+<p>Instructions like "be thorough" or "output all the bugs you can find" would often lead the model into internal debates about whether to follow the <em>developer</em> or the <em>user</em> instructions. The language of OpenAI's <code>/review</code> system prompt leads GPT 5.5 to aggressively narrow the scope of its reviews with the goal minimizing noise.</p>
+<p>The performance eventually improved. Nonetheless, I couldn't help but feel that prompting it away from that behavior felt less like crafting a request and more like trying to jailbreak the model.</p>
+<h3>5. Opus wants you to be careful</h3>
+<p>Opus had the opposite problem. Each review produced far more comments than it should have. At first I assumed the model was just noisy, but the traces told a different story.</p>
+<p>Opus tries to review code the way a human would. Instead of focusing strictly on bugs, it concerns itself with intent - hedging on whether something is a bug or a deliberate choice, trying to foresee potential problems, making stylistic suggestions, and even praising code it finds well-written.</p>
+<p>Whether this style is useful or annoying is a matter of taste. But a holistic approach without proper verification produces false positives, and false positives are not free. Each one costs an engineer's attention, and in an agentic workflow, each one costs compute. One of the promises of AI code review is that they make verification cheap. The challenge is knowing when to cast a wide net and when to go deep.</p>
+<h2>Shipping Model Inversion</h2>
+<p>The most interesting finding was that Codex catches more bugs in Claude-authored code, and vice versa. Knowing this, we built a small feature we're calling Model Inversion.</p>
+<p>It detects which coding agent authored a PR - based on commit trails, branch prefixes, and PR titles - and routes the review to a different model. If Claude wrote it, GPT reviews it, and vice versa.</p>
+<p><strong>Model inversion is experimental</strong>, and we're still learning how far the effect goes as models improve. Based on our initial research, we're optimistic that it will help our users catch more bugs.</p>
+<h2>Closing Thoughts</h2>
+<p>One thing that stood out from the GPT work: models weight their system instructions heavily, and post-training techniques like Deliberate Alignment encourage them to reason about user intent before acting. In practice, this meant that getting GPT to simply report all the bugs it found was surprisingly difficult.</p>
+<p>The model was not disobedient - it was doing exactly what it was trained to do. I believe that it is worth paying attention to the tension between alignment and usefulness.</p>
+<p>But setting post-training quirks aside, it is undeniable that models are getting smarter every month. A year ago, the performance difference in the opening figure would likely have been larger.</p>
+<p>It is tempting to ask whether the capabilities of frontier models will eventually converge. Two superintelligent forms - gods, knowers of all things - are indistinguishable from each other. But the current landscape looks more like Ancient Greece. Instead of a god of thunder, a god of fire, and a god of the seas, we have a god of race conditions, a god of SQL injections, and a god of user experience.</p>
+<p>While that remains the case, we will continue evaluating every model to ensure PRs are routed to the agent most capable of reviewing them.</p>
+<p>If you have any feedback on the methodology, questions about the feature, or want to share interesting findings like these with us, send me an email: <a>rodrigo@greptile.com</a>.</p>
