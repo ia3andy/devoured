@@ -1,0 +1,76 @@
+<h2>The startup's Postgres survival guide</h2>
+<p>A guide to preventing Postgres from toppling over.</p>
+<p>Over the past half year or so, I’ve been writing an internal doc for our engineers trying to distill two years of Postgres battles into a somewhat cohesive document. While I love the Postgres manual, I find it’s hard to turn to when shit hits the fan because it’s just so darn comprehensive. I thought this might be useful for others and would appreciate feedback (or other tidbits that you’ve learned running Postgres in production).</p>
+<p>Before starting Hatchet, while I was familiar with SQL, the extent of my knowledge was basically: if a query is slow, you need an index. That’s the starting point for this doc; I’m going to assume you’re familiar with SQL basics, rows, tables, and know roughly what an index is.</p>
+<p><em>And if Claude is writing all of your queries, this might be a waste of time! I recommend supabase/agent-skills</em></p>
+<h3>A quick note on ORMs</h3>
+<p>This guide should still be useful, but you might need to translate some of these tips into your ORM of choice. Lots of optimizations as you scale just aren’t possible with ORMs unless you can break past the abstraction layer and write SQL. You can do this gracefully or non-gracefully; Prisma TypedSQL or equivalents look interesting for this. We use <code>sqlc</code> at Hatchet which gets us very similar behavior; highly recommend if you’re a Go stack.</p>
+<h3>The simple stuff: good reads, writes and schemas</h3>
+<p>Let’s start with the basics: queries and schemas at low volume.</p>
+<h4>Writing a good schema</h4>
+<p>After you’re deployed, schemas are by far the hardest to change moving forward, so it’s worth spending some time on them. I’d recommend building your schema iteratively: start with a rough approximation for your tables and primary keys, then write some queries on those tables based on your application needs. You can approximate this with some questions: <em>Is this a high-read and/or high-write table? What are the most common filters on reads? Which columns am I updating the most?</em></p>
+<p>If you want to be more formal about it, you can look into database normalization into 1NF/2NF/3NF, but I’ve found normal forms to sometimes be at odds with query efficiency and ease of use, which is critical when you’re moving fast—sometimes it’s just easier to dump data into a <code>jsonb</code> column.</p>
+<p>My rules of thumb for schemas are:</p>
+<ul>
+ <li>Use identity columns (auto-incrementing integers, slightly more performant than <code>bigserial</code>) or built-in UUIDs for primary keys</li>
+ <li>Always use <code>timestamptz</code></li>
+ <li>Always use primary keys</li>
+ <li>Use foreign keys with cascading deletes for low-volume tables, particularly where database consistency and correctness are important. Careful at higher volume.</li>
+</ul>
+<h4>Writing good read queries</h4>
+<p>Let’s start with <code>SELECT</code> queries. A useful—albeit slightly inaccurate—mental model for fast selects is: under the hood, Postgres is either going to find a single row in a table very quickly, or it’s going to read every single row in your table using something called a <em>sequential scan</em> 😞.</p>
+<p>It’s going to find a single row very quickly when you filter by:</p>
+<ul>
+ <li>An explicit index</li>
+ <li>A unique constraint (just a special case of index)</li>
+ <li>A primary key (these are automatically indexed in Postgres)</li>
+</ul>
+<p>Indexes by default use a <code>btree</code> implementation. It’s most helpful to think of indexes as just another table in Postgres, with data stored in a specific format which is optimized for lookups (more on this later). These trees are great because finding a single row happens in approximately <code>log(n)</code> time, where <code>n</code> is the number of rows in the table—in other words, really fast.</p>
+<p>When Postgres can’t use an index, it’ll use something called a sequential scan, or <code>seq scan</code>. Seq scans are much slower than index lookups, but modern databases are so fast at loading rows into memory that you probably won’t even notice at first: seq scans on tables with less than 20k rows are pretty much instant.</p>
+<h4>Writing performant joins</h4>
+<p>For inner joins, there’s rarely an argument for not using primary keys as the inner join; it usually speaks to a schema design or normalization problem. Treat <code>ON</code> clauses with the same respect as a <code>WHERE</code> clause—the same principles apply. Use an index.</p>
+<h4>Compound indexes and aligning ORDER BY to your indexes</h4>
+<p>Often the first slow query in your application will be a list query across a large table. In this case, you can use a compound index. In more complex cases, a good rule of thumb is: the <code>ORDER BY</code> columns should be the last columns in the index, and you should align columns to the ordering in the <code>ORDER BY</code>. Note that Postgres can scan btrees in both directions, so sometimes the <code>DESC</code> is irrelevant—but for compound indexes it’s good practice.</p>
+<h4>Writing good write queries</h4>
+<p>The premise of successful writes is:</p>
+<ol>
+ <li><strong>Keep transactions short.</strong> Don’t go querying an external service in the middle of a transaction unless you have a really good reason to.</li>
+ <li><strong>Be careful of the rows you’re locking</strong> for writing; in other words, only lock what you need. Every time you update a row, you’re taking out a lock on that row for a short period of time until the transaction commits.</li>
+</ol>
+<p>As your system gets busier, you’re going to start noticing the impact of locks more. In particular, you might try to create an index at some point in the future with a simple <code>CREATE INDEX</code> command: turns out this locks your table and prevents inserts and updates! When creating an index on an existing large table, always use <code>CREATE INDEX CONCURRENTLY</code>.</p>
+<h4>Migrations</h4>
+<p>Getting really good at writing migrations is an important technical advantage: it helps you iterate much faster and increases your uptime. As a starting point, try to keep migrations additive (in other words, don’t delete or remove columns) and run them in a transaction wherever possible; this will make rollbacks and partial migrations much easier to deal with.</p>
+<p>The simplest mental model for good migrations is: does this block all of my writes, or does it not? Creating an index without <code>CONCURRENTLY</code> blocks all your writes, so you might see downtime. Generally, operations which call <code>ALTER TABLE</code> should be worth a second look; for example, adding a new check constraint to a very large table can block your writes as well (unless you add it with the <code>NOT VALID</code> keyword).</p>
+<h4>Connection management</h4>
+<p>Every time you execute a transaction or query against your database, you’re utilizing a connection. Connections are expensive in a number of dimensions (cpu and memory), and high connection churn can lead to a lot of unnecessary resource waste, so connections should be long-lived. Connection storms (when you start using up a ton of new connections at the same time) can also lead to very hard to debug edge cases related to internal Postgres locks.</p>
+<p>Because of all these connection footguns, external connection poolers like pgbouncer are great! If you can’t add this for whatever reason, in-memory connection poolers are a great second option.</p>
+<h3>Intermediate: the query planner, bulk updates, and autovacuum</h3>
+<h4>Introducing the leakiest of abstractions, the query planner</h4>
+<p>At a certain point, your queries might become complex enough that a simple index won’t cut it. At this point, you will need to concern yourself with the <em>query planner</em>. The query planner looks at the query you pass in, and it figures out how it should translate your query into a set of internal operations in the database.</p>
+<p>This limited information is the table statistics. These statistics are collected for every <code>ANALYZE</code>. This also happens when autovacuum is run, so more frequent autovacuums also mean that your query statistics will be more up to date. A common reason why your query is behaving improperly is not analyzing frequently enough.</p>
+<p>This is where <code>EXPLAIN ANALYZE</code> is your friend. This outputs the query plan for the query and executes the query (careful running this in production—you can use <code>EXPLAIN</code> without <code>ANALYZE</code> to get a query plan), and then compares its estimates based on the table statistics to the actual number of rows scanned.</p>
+<h4>Sometimes it just makes sense to seq scan</h4>
+<p>There are cases where you think an index should be used, but the query planner is still seq scanning anyway, despite table statistics being up to date and the index being valid. In these cases, Postgres is usually estimating that the cost of the seq scan will be smaller than the cost of the index scan. Index scans do come with some overhead; indexes are stored separately from the actual data in the table (called the heap)—finding all of the rows in the heap can be expensive!</p>
+<h4>Writing lots of data</h4>
+<p>To reduce overhead when writing a lot of data, we can pack a batch of rows into each query. The simplest way to do this is to send all queries to the Postgres server at once in an implicit transaction. Batching is very powerful: we found that it can ~10× your throughput.</p>
+<h4>Default autovacuum settings can kill your database</h4>
+<p>Autovacuum is a critical operation in Postgres databases that sometimes needs to be tuned, especially in high-write scenarios. The autovacuum daemon is responsible for a number of things, including cleaning up dead tuples and managing transaction ids.</p>
+<p>What’s a <em>dead tuple</em>? A tuple is an instance of a row on the filesystem. Every time you update or delete a row, a version of that row is left in Postgres until all transactions which started before that row was updated or deleted have committed or rolled back. These rows which can no longer be read by any transactions are <em>dead tuples</em>.</p>
+<p>If you’re writing data quickly enough, sometimes autovacuum can’t keep up, which will get you into a very unhealthy state. If you use up all transaction ids in the system before they can be reclaimed by autovacuum, you’ll reach a dreaded state called <strong>transaction id wraparound</strong>. This will mean a big chunk of downtime.</p>
+<h4>Other types of bloat</h4>
+<p>Besides dead tuples, there are two other kinds of bloat you’ll often encounter in a busy Postgres system:</p>
+<ol>
+ <li>Table bloat caused by partially filled pages. When dead tuples are reclaimed, this can lead to pages not being entirely filled, which can increase the disk usage of Postgres.</li>
+ <li>Index bloat is a special case of table bloat, and is similarly solved by good autovacuum settings. But Postgres has a built-in command for dealing with this, which is <code>REINDEX INDEX CONCURRENTLY</code>.</li>
+</ol>
+<h3>Some advanced stuff</h3>
+<h4>FOR UPDATE SKIP LOCKED</h4>
+<p>The best way to think about this Postgres feature is that it reserves the rows that you’re selecting for use in your transaction without interfering with other queries. It’s also very useful in cases where you’re doing many independent updates of rows, or you’re managing leases on objects in your system across many instances of your application.</p>
+<h4>Partitioning</h4>
+<p>Postgres has built-in partitioning which allows you to subdivide your tables based on row values, like timestamps or hashes. This can be incredibly useful for time-series data because:</p>
+<ol>
+ <li>Each partition can be autovacuumed independently, allowing you to scale up autovacs on your table</li>
+ <li>Deleting old data is near-instant—you simply drop the table partition, rather than iterating through rows</li>
+</ol>
+<h4>Tricks for large table migrations</h4>
+<p>If you try to migrate really large tables, it can take many hours to copy data in a single transaction. This isn’t good—long-running transactions prevent autovacuum from doing its job properly. One of the tricks we’ve learned is to use Postgres triggers and run a large batched backfill outside of a transaction, using unique constraints on the primary key to prevent duplicate writes.</p>

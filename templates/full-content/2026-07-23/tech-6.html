@@ -1,0 +1,97 @@
+<h1>The State of WebMCP: July 2026</h1>
+<p>WebMCP in July 2026 is a standard with everything except users. The spec has Google and Microsoft engineers as editors, a live origin trial in Chrome, a Lighthouse audit category waiting for it, and a draft the editors updated two days ago. It also has close to zero deployment on real websites, and not one mainstream AI agent that calls the tools.</p>
+<h2>The short version</h2>
+<ol>
+ <li>WebMCP lets a web page register typed JavaScript functions that browser AI agents can call, instead of forcing agents to scrape the DOM or click around with computer vision.</li>
+ <li>The spec is a W3C Community Group draft co-edited by Google and Microsoft. It isn’t on the standards track yet.</li>
+ <li>Chrome is running a public origin trial from Chrome 149 through 156. Edge ships support behind a flag. Firefox and Safari are watching.</li>
+ <li>Site adoption is close to zero, and no mainstream agent consumes the tools yet. Google says Gemini in Chrome will be the first.</li>
+ <li>The API moved from <code>navigator.modelContext</code> to <code>document.modelContext</code> in the 21 July spec draft, and Chrome 150 deprecates the old location. Early adopters already carry migration debt.</li>
+ <li>Lighthouse gained agentic-browsing audits in May. They sit at “Not Applicable” on most sites today, which is why the next twelve months are the window.</li>
+</ol>
+<h2>What WebMCP is</h2>
+<p>An AI agent that wants to book a table on your site today has two options. It can parse your DOM and guess which button does what, or it can take screenshots and click coordinates. Both are slow, brittle and expensive, and both break the day you ship a redesign.</p>
+<p>WebMCP gives the page a third option: tell the agent what it can do. A site registers tools in JavaScript, each with a name, a natural-language description and a JSON schema for inputs. The browser exposes those tools to whatever agent is driving, the agent calls them like functions, and your existing frontend code does the work.</p>
+<pre><code>const modelContext = document.modelContext ?? navigator.modelContext;
+
+await modelContext.registerTool(\{
+  name: "search-products",
+  description: "Search the product catalogue and return matching items",
+  inputSchema: \{
+    type: "object",
+    properties: \{
+      query: \{ type: "string", description: "Search phrase" },
+      maxResults: \{ type: "number" }
+    },
+    required: ["query"]
+  },
+  execute: async (\{ query, maxResults = 10 }) =&gt; \{
+    const results = await searchCatalogue(query, maxResults);
+    return \{ content: [\{ type: "text", text: JSON.stringify(results) }] };
+  }
+});</code></pre>
+<p>You’ll need that feature-detection line at the top. The spec moved the API from <code>navigator</code> to <code>document</code> to reflect that tools belong to a specific page, and Chrome deprecated <code>navigator.modelContext</code> in Chrome 150 while the origin trial still ships it. Framework maintainers are mid-migration; Angular has an open issue tracking the move. If you’re implementing this month, you’re writing the fallback.</p>
+<p>Three design decisions matter more than the syntax:</p>
+<ul>
+ <li><strong>The browser is the middleman.</strong> The page never speaks MCP directly. As Microsoft’s Patrick Brosset clarified, WebMCP borrows only MCP’s tool primitives; the browser handles protocol and transport.</li>
+ <li><strong>Tools run in the page, as the user.</strong> An agent calling your tools inherits the logged-in session, which is what makes them useful and what makes them dangerous.</li>
+ <li><strong>A declarative variant is coming for forms.</strong> The explainer describes HTML attributes that annotate existing forms so agents can fill them without custom JavaScript. The spec section for it is still marked TODO, but Lighthouse already audits the attributes, which tells you where Google expects this to land.</li>
+</ul>
+<h2>How we got here</h2>
+<p>WebMCP has two parents. The scrappy one is MCP-B, Alex Nahas’s 2025 open-source project that put MCP servers inside the browser tab and proved sites could expose tools to extensions. The institutional one arrived on 28 August 2025, when Patrick Brosset proposed WebMCP from the Microsoft Edge team, and Google joined as co-author shortly after.</p>
+<h2>Supply and demand, out of sync</h2>
+<p>A protocol needs two sides. Sites must register tools, and agents must call them. In July 2026 the supply side is warming up while the demand side hasn’t arrived.</p>
+<p><strong>Browsers</strong> are ahead. Chrome’s origin trial means any site can register a token and expose tools on production traffic today. Edge’s support sits behind a flag, and Microsoft co-authoring the spec makes deeper Edge integration a matter of when. Firefox and Safari sit in the discussion threads without commitments, which matters less than it sounds while the consuming agents are all Chromium-adjacent anyway.</p>
+<p><strong>Agents</strong> are behind. As of the most recent independent audit in May, no mainstream agent client calls <code>modelContext</code> tools. Claude, ChatGPT Agent, Perplexity and Gemini all still read pages the old way. Google says Gemini in Chrome will consume WebMCP tools, and when it ships it’ll be the first mainstream consumer and the reference implementation for everyone else.</p>
+<p>Compare the server-side protocol it borrows from. MCP proper is thriving: roughly 97 million monthly SDK downloads, thousands of servers, and a specification release candidate due 28 July. Buyers already pay for agent-to-tool infrastructure at scale; the browser leg is the part still waiting for proof.</p>
+<h2>Adoption, measured honestly</h2>
+<p>No vendor or analyst publishes a measured adoption number, so writers reach for “approximately zero” and they’re right. What exists today:</p>
+<ul>
+ <li><strong>Named pilots.</strong> At I/O, Google listed Expedia, Booking.com, Shopify, Credit Karma, TurboTax, Redfin, Etsy, Instacart and Target as origin-trial participants.</li>
+ <li><strong>A checker cottage industry.</strong> webmcp-checker.com launched within days of the Chrome 146 preview, a 19-point validator extension followed in March, and at least three more single-page checkers ship the same audit.</li>
+ <li><strong>Serious libraries, thin platforms.</strong> The WebMCP-org npm packages descend from the MCP-B work and are maintained. React hooks from MCPCat track the spec.</li>
+ <li><strong>Our own crawls agree.</strong> We’re wiring WebMCP detection into Spronta’s rendered crawls, and across the sites we’ve checked so far, registered tools round to zero outside demos and the checker sites themselves.</li>
+</ul>
+<h2>Lighthouse is the quiet forcing function</h2>
+<p>Since May, Lighthouse ships an agentic-browsing category with three WebMCP audits, and most SEO teams haven’t noticed.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Audit</th>
+   <th>What it checks</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>webmcp-registered-tools</code></td>
+   <td>Inventory of tools the page exposes</td>
+  </tr>
+  <tr>
+   <td><code>webmcp-form-coverage</code></td>
+   <td>Forms missing declarative tool attributes</td>
+  </tr>
+  <tr>
+   <td><code>webmcp-schema-validity</code></td>
+   <td>Malformed tool schemas and unnamed inputs</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Security is the sleeper issue</h2>
+<p>WebMCP tools execute in the page with the user’s session. The spec gates access behind a permissions policy and secure contexts, added <code>requestUserInteraction()</code> so tools can force a human confirmation, and Chrome publishes tool security guidance. Those gates cover the browser’s side of the problem, and none of them stops a deceived model from calling a legitimate tool.</p>
+<h2>What you should do about it</h2>
+<p><strong>Think in three layers.</strong> Agent readiness is a stack, and WebMCP is only the top of it. The base is <em>readable</em>: clean markup, working llms.txt, content that survives without JavaScript. The middle is <em>queryable</em>: structured data an agent can fetch without parsing your marketing pages. The top is <em>actionable</em>: WebMCP tools for search, forms and transactions.</p>
+<p><strong>If agent traffic already converts for you</strong>, join the origin trial now. Ship one or two tools where structure beats scraping by the widest margin: site search, availability lookups, a lead form. Write the <code>document.modelContext</code> fallback, keep schemas boring, and put a human confirmation on anything that spends money.</p>
+<p><strong>If you run a normal B2B marketing site</strong>, you’ve got a year of runway and no reason to waste it rebuilding. Spend it on the boring layers: fix what blocks agents today, annotate your forms when the declarative spec lands, and re-run Lighthouse each Chrome release so the audit flip never surprises you.</p>
+<h2>Frequently asked questions</h2>
+<h3>What is WebMCP?</h3>
+<p>WebMCP (Web Model Context Protocol) is a proposed web standard that lets a page register typed JavaScript tools which browser AI agents can call directly, instead of scraping the DOM or driving the page with computer vision. A site describes each tool with a name, a natural-language description and a JSON schema, and the browser exposes those tools to the agent.</p>
+<h3>Is WebMCP a W3C standard?</h3>
+<p>No. WebMCP is a Draft Community Group Report from the W3C Web Machine Learning Community Group, edited by engineers from Google and Microsoft. It isn't on the W3C standards track, and the API surface is still changing between drafts.</p>
+<h3>Which browsers support WebMCP in July 2026?</h3>
+<p>Chrome runs a public origin trial from Chrome 149 to Chrome 156, so sites can test WebMCP on production traffic. Edge ships experimental support behind a flag. Firefox and Safari participate in spec discussions but haven't committed to implementation.</p>
+<h3>Do any AI agents use WebMCP today?</h3>
+<p>No mainstream agent calls WebMCP tools yet. Claude, ChatGPT Agent, Perplexity and Gemini still read pages through the DOM or screenshots. Google says Gemini in Chrome will consume WebMCP tools, which would make it the first mainstream client.</p>
+<h3>What is the difference between WebMCP and MCP?</h3>
+<p>MCP is a client-server protocol for connecting AI applications to external tools, and it's widely adopted. WebMCP borrows MCP's tool primitives but runs inside the browser: the page registers tools in JavaScript and the browser handles protocol and transport. A site can offer both a hosted MCP server for headless agents and WebMCP tools for agents that browse.</p>
+<h3>Should I add WebMCP to my website now?</h3>
+<p>Measure before you build. Join the origin trial if agent traffic already matters to your business, start with one or two high-value tools such as search or a lead form, and treat every tool as a security boundary. For most sites the near-term win is making content readable and queryable for agents, then adding WebMCP tools as consuming agents ship.</p>

@@ -1,0 +1,128 @@
+<h1>Backfilling: the most underrated feature of a data pipeline</h1>
+<p>Most data organizations design for one direction of time: forward. When a pipeline goes live, its job is to ingest whatever shows up - new filings, new prices, new transactions. That part gets attention, dashboards, and service level agreements. What gets far less attention is everything that existed before the pipeline did.</p>
+<p>Backfilling is the feature that lets you give that same attention to the rest of your data. In my experience, teams often treat it as an afterthought patched on during a crisis. I decided to design for it from day one, and it’s made a real difference in how much time we spend fighting our own pipeline.</p>
+<h2>What we mean by backfilling</h2>
+<p>Backfilling shows up in two forms, and they often get conflated.</p>
+<p>The first is historical ingestion: loading data that already exists in the world as if you had been collecting it all along. Form ADV is a good example - the SEC has published decades of investment adviser filings. Backfilling here means treating 24 years of history with the same rigor as tomorrow’s filing, not as a one-time bulk import that gets “special-cased” and forgotten.</p>
+<p>The second is migration: moving data that already lives in one of your own systems into a new one. This is the kind of backfill most engineers have scar tissue from. Organizations sink enormous budgets into “migrations,” and they are almost always painful, rarely fully complete, and leave behind a trail of engineers who never want to touch that codebase again.</p>
+<p>I treat both as the same underlying problem, and that changes how you build.</p>
+<h2>Migration code is production code</h2>
+<p>Our pipeline runs in three stages - extract, raw, transform. Extract pulls the filings as-is from the SEC. Raw lands them in table form, no cleanup. Transform is where we apply the cleaning, modeling, and merge logic that turns raw filings into usable data. It is these three stages that allow us to ingest from multiple sources, including backfilling historical data.</p>
+<p>Engineers’ usual intuition when backfilling is to write a separate script, because it feels like a one-off job. They assume it’ll be quick and easy. Typically, the script walks through history, does its thing, and gets deleted - or, more realistically, gets left in a scripts/ folder to rot. Sound familiar?</p>
+<p>That intuition is exactly what makes backfills fragile. The logic that ran once, under pressure, has never been tested with the same rigor as your production pipeline.</p>
+<p>Instead, the incremental pipeline and the backfill should be treated as the same pipeline, not just similar ones. A config flag changes what data it looks at, not how it processes that data.</p>
+<p>At Opto, we run this on Dagster, and its run config has been the mechanism that makes this practical. Our transform layer for Form ADV takes the same config object:</p>
+<pre><code>class FormAdvTransformConfig(Config):
+    full_refresh: bool = False
+    refresh_crd: list[str] | None = None
+</code></pre>
+<p>From that object, we resolve one of three modes:</p>
+<pre><code>def get_mode_from_config(config: FormAdvTransformConfig) -&gt; FormAdvTransformMode:
+    if config.refresh_crd:
+        return FormAdvTransformMode.REFRESH_SINGLE
+    if config.full_refresh:
+        return FormAdvTransformMode.FULL_REFRESH
+    return FormAdvTransformMode.INCREMENTAL
+</code></pre>
+<p><strong>Incremental</strong> - process only what changed since the last run. The default, and the cheapest.</p>
+<p><strong>Full refresh</strong> - rebuild everything from raw. This is our backfill: a schema change, a recovery, or genuinely loading history for the first time.</p>
+<p><strong>Single entity</strong> - reprocess one specific record on demand. Invaluable when a customer asks “why does this look stale?” and you need an answer in ten seconds, not a full pipeline run.</p>
+<h2>Why this matters: the transform logic never has to know why it’s running</h2>
+<p>The contract is simple: regardless of mode, the output is always the same shape - batches of keys to process.</p>
+<pre><code>def get_crds_to_process(config, session) -&gt; list[list[str]]:
+    if config.refresh_crd:
+        return [config.refresh_crd]
+
+    if config.full_refresh:
+        all_crds = query_all_crds(session)
+        return chunk_into_batches(all_crds, batch_size=5000)
+
+    crds = query_crds_with_source_date(session, partition_date)
+    return chunk_into_batches(crds, batch_size=5000)
+</code></pre>
+<p>The transform loop downstream doesn’t branch on mode at all:</p>
+<pre><code>crd_batches = get_crds_to_process(config, session)
+
+for batch_num, crd_batch in enumerate(crd_batches):
+    process_batch(crd_batch, session)
+</code></pre>
+<p>Once or forty thousand times, the loop runs the same processing logic either way. The code path you verify against a single CRD in refresh_crd mode is the same code path that runs against all 1.8M rows in a full refresh. There’s no separate “backfill logic” to have less confidence in.</p>
+<h2>Backfills are safe because time is bi-temporal</h2>
+<p>None of this works if re-running a backfill can silently overwrite or corrupt what’s already there - that’s where bi-temporality does the heavy lifting. Every write carries a business time and a system time, so re-running a backfill just opens new system-time versions instead of destroying history:</p>
+<pre><code>session.write_to_ducklake(
+    data=df,
+    schema_name="transform",
+    table_name="form_adv_firm_identity",
+    mode="bi-temporal-merge",
+    key_columns=["firm_crd_number"],
+    value_columns=["legal_name", "business_name", ...],
+    date_column="filing_date",
+)
+</code></pre>
+<h2>Analyzing the results with MotherDuck</h2>
+<p>Once you have a system that’s resilient and keeps everyone on one standardized approach instead of a dozen ad hoc ones, you get to spend more time actually analyzing the data instead of babysitting the pipeline. For that, we have a secret weapon: the MotherDuck MCP server.</p>
+<p>The goal for “raw” is simple: get the source dataset into table format with zero assumptions - the data as we received it.</p>
+<p>A simple prompt gets us started: “Use the MotherDuck MCP server, focus on my database shared_sec_lakehouse_prod and the table transform.form_adv_firm_ownership, and analyze my data.”</p>
+<h3>Key Observations</h3>
+<ul>
+ <li>The data is freshly full-refreshed - all 1.8M rows share the same <code>system_valid_from</code> (2026-07-04), indicating a recent full pipeline run.</li>
+ <li>Ownership status is highly fragmented - 309 distinct values, many being comma-joined multi-role combinations. The top status categories (Member, Shareholder, Managing Member) account for &lt;30% of non-null rows; 48% are null. This is a normalization opportunity if needed downstream.</li>
+ <li>Temporal depth is excellent - 26 years of history with clear open/close patterns tracking real ownership changes over time.</li>
+ <li>The volume growth trend is healthy - ownership records opened per year grew from ~30k in 2002 to ~114k in 2024, reflecting both market growth and improved SEC reporting requirements post-2012.</li>
+</ul>
+<h3>Temporal Gaps Between Versions - 8,137 cases</h3>
+<p>When an owner disappears and then reappears for the same <code>firm_crd_number</code> + <code>owner_key</code>, there’s a gap between the <code>valid_to</code> of the prior record and <code>valid_from</code> of the next.</p>
+<p>Root cause breakdown:</p>
+<ul>
+ <li>82% have a different <code>value_hash</code> - the person genuinely left and returned with updated data (name change, new role, etc.).</li>
+ <li>18% (1,441) have an identical <code>value_hash</code> - the owner disappeared from one filing then reappeared unchanged in a later filing.</li>
+</ul>
+<h3>Summary Scorecard</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Dimension</th>
+   <th>Grade</th>
+   <th>Notes</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Uniqueness</td>
+   <td>A</td>
+   <td>Zero duplicates on any key combination</td>
+  </tr>
+  <tr>
+   <td>Temporal integrity</td>
+   <td>A-</td>
+   <td>No overlaps; 8,137 gaps are source-inherent</td>
+  </tr>
+  <tr>
+   <td>Completeness (keys)</td>
+   <td>A</td>
+   <td>100% populated on firm_crd, owner_key, owner_name, owner_type</td>
+  </tr>
+  <tr>
+   <td>Completeness (values)</td>
+   <td>B</td>
+   <td>ownership_status 48% null, entity_in_which 76% null</td>
+  </tr>
+  <tr>
+   <td>Freshness</td>
+   <td>A</td>
+   <td>Data current through May 2026</td>
+  </tr>
+  <tr>
+   <td>Normalization</td>
+   <td>B-</td>
+   <td>ownership_status highly fragmented; entity identifiers only 73% coverage</td>
+  </tr>
+  <tr>
+   <td>Referential integrity</td>
+   <td>A</td>
+   <td>Zero orphans relative to firm_identity</td>
+  </tr>
+ </tbody>
+</table>
+<h2>The real payoff</h2>
+<p>A resilient pipeline is what buys us that time in the first place - time we can spend more productively analyzing the data. Paired with the MotherDuck MCP server, that combination has saved us a ton of time: we ship faster, and with more confidence in what we’re shipping.</p>

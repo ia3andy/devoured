@@ -1,0 +1,143 @@
+<h1><strong>AI Schema Analyzer: Powered by </strong>Iceberg<strong> and Lakekeeper</strong></h1>
+<p>If there is anything been making a statement in Data Engineering world other than AI that would be <strong>Iceberg</strong>.</p>
+<p>Iceberg, high-performance, open-source table format designed for massive analytical datasets in data lakes and lakehouse architectures.</p>
+<p>Iceberg makes any big data engine to work seamlessly at the same time.</p>
+<p>This blog is not going to be another blog talking about Iceberg. But our intention is to take it to a step further and connect with AI for Schema Drift impact analysis.</p>
+<h2>The Goal</h2>
+<p>The most common and painful area in Data Engineering world is the schema drift.</p>
+<p>1 small change schema change in source will break your all the downstream processes which depends on it.</p>
+<p>In this blog we will create our own AI Impact Analyst. Who is going to guard your Iceberg tables for any changes and analyse the impact and provide you with the recommendations.</p>
+<h2>Chapters</h2>
+<ol>
+ <li><strong>Infrastructure setup</strong>: Familiarize you with the tools and services been used and set it up using Docker</li>
+ <li><strong>Demo</strong>: We shall run our sample demo job present the use case</li>
+ <li><strong>AI Impact Analyst</strong>: Finally our AI agent who will analyze the impact and provide you the recommendations.</li>
+</ol>
+<h2>Flow</h2>
+<p>The Query Engines run DDL → Lakekeeper updates catalog/storage → change event hits Kafka → analyst analyzes → Slack + SQLite.</p>
+<h2>Chapter 1: Infrastructure setup</h2>
+<p>Lets create a docker based setup to be able to run our processes locally.</p>
+<h3>Lakekeeper</h3>
+<p>Lakekeeper is a secure, fast, and user-friendly Apache Iceberg REST Catalog built with Rust and available under the Apache License.</p>
+<p>I recommend you to read the official documentation here: https://docs.lakekeeper.io/</p>
+<p><strong>Lakekeeper</strong> is our main Actor who is responsible to maintain the Iceberg Catalog using REST.</p>
+<h3>RedPanda(Kafka)</h3>
+<p>Lakekeeper pushes change events straight to Kafka, so the analysis happens within seconds of the change, with zero scanning of table metadata.</p>
+<p>Redpanda is a Kafka-API-compatible broker which will store the events from lakeKeeper.</p>
+<h3>MinIO</h3>
+<p>We use minio which is a S3-compatible storage for the demo warehouse.</p>
+<h3><strong>FastAPI</strong></h3>
+<p>Which works as intermediate process which will fetch the events from Kafka and provides to the Analyzer service.</p>
+<h3>AI Analyst</h3>
+<p>AI Analyst, is a FastAPI + aiokafka + Anthropic SDK which reads the event from Kafka and processes using the configured model and provides the impact analysis.</p>
+<h2>Chapter 2: DEMO</h2>
+<h3>Pre-requisites</h3>
+<p>Make sure you have the below setup done</p>
+<ol>
+ <li>Docker compose</li>
+ <li>Anthropic API key</li>
+ <li>Slack webhook</li>
+</ol>
+<pre><code>git clone https://github.com/ajithshetty/lakekeeper-catalog-impact-analyst.git
+cd lakekeeper-catalog-impact-analyst</code></pre>
+<pre><code>cp .env.example .env
+# edit .env: set ANTHROPIC_API_KEY and SLACK_WEBHOOK_URL
+docker compose up -d - build</code></pre>
+<p>Give it around 30 seconds for all services to become healthy.</p>
+<p>Docker Compose handles the ordering via health checks. The `warehouse-setup` container automatically creates `demo-warehouse` on first boot and no manual step is needed.</p>
+<p>You can access the minio here:</p>
+<pre><code>http://localhost:9001/browser/warehouse</code></pre>
+<p>Lets connect to LakeKeeper and make sure we have our warehouse created.</p>
+<pre><code>http://localhost:8181/ui/warehouse</code></pre>
+<h2>Chapter 3: AI Impact Analyst</h2>
+<p>Lets simulate the Spark job using the docker.</p>
+<pre><code>docker compose --profile demo up spark</code></pre>
+<p>This container will:</p>
+<ol>
+ <li>Create a name space</li>
+ <li>Create the sample tables</li>
+ <li>Insert sample rows into our table</li>
+ <li>Make some DDL changes by adding columns</li>
+ <li>More changes by renaming a column</li>
+ <li>Drop the tables</li>
+</ol>
+<p>We have defined the severity of each of these operations in our job.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Step</th>
+   <th>DDL</th>
+   <th>Analyst severity</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>1</td>
+   <td>CREATE NAMESPACE × 2</td>
+   <td>info</td>
+  </tr>
+  <tr>
+   <td>2</td>
+   <td>CREATE TABLE sales.customers</td>
+   <td>info</td>
+  </tr>
+  <tr>
+   <td>3</td>
+   <td>CREATE TABLE sales.orders (partitioned)</td>
+   <td>info</td>
+  </tr>
+  <tr>
+   <td>4</td>
+   <td>CREATE TABLE analytics.daily_revenue</td>
+   <td>info</td>
+  </tr>
+  <tr>
+   <td>5</td>
+   <td>INSERT sample rows</td>
+   <td>—</td>
+  </tr>
+  <tr>
+   <td>6</td>
+   <td>ADD COLUMN orders.discount</td>
+   <td>low</td>
+  </tr>
+  <tr>
+   <td>7</td>
+   <td>ADD COLUMN customers.phone</td>
+   <td>low</td>
+  </tr>
+  <tr>
+   <td>8</td>
+   <td>RENAME COLUMN customers.email → contact_email</td>
+   <td><strong>medium–high</strong></td>
+  </tr>
+  <tr>
+   <td>9</td>
+   <td>DROP TABLE analytics.daily_revenue</td>
+   <td><strong>high</strong></td>
+  </tr>
+  <tr>
+   <td>10</td>
+   <td>Recreate daily_revenue with new schema</td>
+   <td>medium</td>
+  </tr>
+  <tr>
+   <td>11</td>
+   <td>DROP TABLE sales.orders</td>
+   <td><strong>critical</strong></td>
+  </tr>
+ </tbody>
+</table>
+<p>Make sure our tables are created.</p>
+<p>Lets head to lakekeeper and check the same.</p>
+<p>As we made changes to our schema, this emits an event to Kafka.</p>
+<p>And our FastAPI service fetches the same and provides the AI powered Anlyzer.</p>
+<p>We can see the logs from the container Analyst.</p>
+<pre><code>docker compose logs -f analyst</code></pre>
+<p>Also Re-confirm if events are flowing in.</p>
+<pre><code>http://localhost:8000/events</code></pre>
+<p>Finally based on the changes we made in the Spark job, the events are emitted from the Lakekeeper to Kafka.</p>
+<p>We have our FastAPI service which reads from the Kafka and pushes it to our Analyzer service.</p>
+<p>Analyzer service is an Agent which is been instructed to be a data platform reliability assistant.</p>
+<p>Using the Anthropic API we connect to the configured model and analyze the event.</p>
+<p>Finally send out the analysis and recommendation in slack.</p>

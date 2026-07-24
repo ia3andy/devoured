@@ -1,0 +1,83 @@
+<h1>Durable Objects are Made for Agents</h1>
+<p>For the last few months, I've been building almost exclusively with Cloudflare Durable Objects (DOs). They are a wonderful primitive for building products (particularly agents), and I wish more providers out there had a similar offering. There really isn't anything like them in the market.</p>
+<p>As I was comparing notes with various friends, I realized that most people haven't really even heard of DOs, and don't understand why they are such a big deal. It's a shame because they really are a near-perfect fit for building agents on top of them.</p>
+<p>I won't gloss over the fact that there are shortcomings with DOs, and I wanted to share some thoughts about where they shine as well as where they fall short.</p>
+<p><em>Disclosure: I am long a small amount of NET and am very bullish on their prospects.</em></p>
+<h2>What are Durable Objects?</h2>
+<p>Durable Objects combine a few simple concepts...</p>
+<ol>
+ <li><strong>A serverless V8 isolate for running your code.</strong> It spins up and down on demand. You write some form of code that is JS/WASM compatible and it runs within v8. You have access to a subset of Node APIs. Each instance is <strong>keyed by ID</strong>, so you write code, which then is invoked many times (a la Lambda) but with unique context. This is essentially the same thing a Cloudflare Worker is doing.</li>
+ <li><strong>A paired SQLite instance per DO.</strong> You get the ability to read and write to durable storage, and not really have to worry that much about reading and writing from the database.</li>
+ <li><strong>Request routing to a particular isolate.</strong> The system that Cloudflare orchestrates in the background is the request routing and spinning up and down of each isolate.</li>
+</ol>
+<p>Rather than thinking about your code as a bunch of services which talk to a database, you start thinking about your service as a set of many 'objects' which are event driven by new requests or by timers you can set (called alarms). Each one gets an ID, and requests are routed accordingly to a single isolate by ID. To see what I mean, here's what a simplified version of a Chat Room looks like:</p>
+<pre><code>// src/index.ts
+import \{ DurableObject } from "cloudflare:workers";
+
+export interface Env \{
+  CHAT_ROOMS: DurableObjectNamespace&lt;ChatRoom&gt;;
+}
+
+// The outer Worker routes each request to the right room.
+export default \{
+  async fetch(request: Request, env: Env) \{
+    // Example: /room/general
+    const name = new URL(request.url).pathname.split("/").pop();
+    if (!name) return new Response("Not found", \{ status: 404 });
+
+    // Every request for the same name reaches the same object.
+    const room = env.CHAT_ROOMS.getByName(name);
+    return room.fetch(request);
+  },
+} satisfies ExportedHandler&lt;Env&gt;;
+</code></pre>
+<p>Each <code>ChatRoom</code> instance then handles its own state: it accepts websockets and broadcasts every message to everyone connected to that room:</p>
+<pre><code>// One Durable Object instance is one chat room.
+export class ChatRoom extends DurableObject&lt;Env&gt; \{
+  private sockets = new Set&lt;WebSocket&gt;();
+
+  async fetch(_request: Request): Promise&lt;Response&gt; \{
+    const \{ 0: client, 1: server } = new WebSocketPair();
+    server.accept();
+    this.sockets.add(server);
+
+    server.addEventListener("message", (event) =&gt; \{
+      for (const socket of this.sockets) socket.send(event.data);
+    });
+    server.addEventListener("close", () =&gt; \{
+      this.sockets.delete(server);
+    });
+
+    return new Response(null, \{ status: 101, webSocket: client });
+  }
+}
+</code></pre>
+<p>Once you start thinking this way... you start wanting to make <em>everything</em> a DO.</p>
+<p>Sticking with the chat metaphor... suppose you are spinning up a Slack clone (as is trendy to talk about these days). You might lay out your data model like this:</p>
+<pre><code>WorkspaceDO: name, slug, channels, members
+ChannelDO: name, topic, is_private, messages
+</code></pre>
+<p>When a user loads Slack, they typically want some sort of notification feed on the workspace, and a realtime feed of a channel. Sending a message to a channel should be ordered. You typically don't query <em>across</em> channels (except for a search use case, which can hit a vector store). If you wanted to go nuts you could even have specific ThreadDOs, or UserDOs, or any sort of DB you don't need to JOIN against.</p>
+<h2>The great parts about DOs</h2>
+<p>Starting with the beginning of the dev lifecycle, an extremely underrated part of working with DOs is their local dev setup. Locally, you run your services using <code>wrangler</code>. It's a CLI that functions as a local env + all-in-one toolkit for working with Cloudflare.</p>
+<p>I initially was a bit weirded out by this, but using wrangler for local dev is actually quite nice. It becomes really quick to test changes when your coding agent doesn't rely on Docker or Postgres. Because it's all running SQLite in prod, the production drift for connecting to a DB is fairly minimal.</p>
+<p>DOs also run explicitly in a single-threaded manner. That means you have to worry less about locking and concurrency. You know that only one invocation of your DO is running against its storage at a time.</p>
+<p>Durable Objects also come with <em>native</em> support for websockets. This is a godsend for anyone who has spent a long time thinking about fan-out for large-scale notification feeds. Rather than having some sort of large multi-tiered fanout system, you just keep connections warm per-DO, and then broadcast to any connected listeners. It's perfect for building agents or Slack-like experiences.</p>
+<p>Binding to other DOs, services, or R2 buckets all feels much more intuitive vs what I'd see with AWS or GCP. You simply specify the bindings in the <code>wrangler.jsonc</code> configuration, and then you get the ability to talk to the service. No need to think about complex network rules, VPCs, Security Groups, or NAT ingress.</p>
+<p>By far the biggest benefit of DOs is that they are super cheap. They only cost you for storage when paused. You can spin up as many of them as you'd like. They are basically the perfect primitive for 'per-agent' workloads. All of my infra for running a decently sized multi-agent workload was something like $10/mo, where on AWS it's easily 10-50x the cost.</p>
+<p>Preview environments are ~close to free. Since DOs are cheap and don't cost anything while idle, you can just tell your agent to create new versions in CI on every single branch and deploy and then clean them up later.</p>
+<p>As a last bonus, I find working with Cloudflare infra to be <em>extremely token efficient</em>. To build a chat room implementation, you only require a few lines of code. Like humans, coding agents that have to explore the sprawl across a large codebase tend to slow way way down.</p>
+<p>If you do decide to go the DO route and don't really care much about the internals, I'd recommend using either Think or Flue. Both make a lot of fairly sane choices in my opinion.</p>
+<h2>What's harder</h2>
+<p>I said before that DOs had an amazing concurrency model because they are single-threaded. This is true, but you can't just straight up ignore the complexity either. There's a good blog post on this which goes into detail, but the gist is that some functions get marked as having readable/writable gates. If you aren't careful, some part of your function may end up sampling from an LLM before writing to storage; and that hangs all your subscribers! I hit a few cases where agent-generated code would end up blocking read requests for 10s of seconds at a time.</p>
+<p>I also hit a few reliability issues early on that I just had no ability to go and fix. Stuff like misconfigured gateways to cloud LLM APIs, or inability to deploy via the Cloudflare APIs. These weren't necessarily DO-specific things, but I felt like I wasn't getting the same level of observability or control that I might from AWS/GCP/Azure.</p>
+<p>If you decide to use DOs, the first-class support is all Typescript. In general I'm a fan of Typescript, but you should know that if you want to work in Rust, Golang, or Python, you will have fewer options available and fewer examples.</p>
+<p>I ended up just using my own types rather than the Wrangler typegen. For a long time I couldn't figure out how to get them working properly, before I just gave in and had all services declare interfaces/contracts.</p>
+<p>Every so often, missing parts of the Node APIs can come and bite you. I got hit a few times because HTTP/2 isn't supported for things like gRPC to the Modal APIs. This makes some sense, since a worker can't just hang for a long time, but it does make you have to be careful about library usage, especially around native deps.</p>
+<p>Migrations and versioning also get a bit trickier. Typically the way you change data shape within the DO is by adding some migration code when the DO wakes. This works pretty well, but it's easy to lose track of "what's the current state" of the schema, especially if you didn't wake every single DO. You can effectively never remove the old migration paths, unless you go through and wake all DOs.</p>
+<p>Lastly, many of my potential customers want the ability to BYO-Cloud. This is pretty understandable if you're building a product which deals with sensitive data, and Cloudflare makes it a bit of a non-starter.</p>
+<h2>What else is there?</h2>
+<p>I mentioned before that no other cloud seems to have a similar offering. While that's true, I do think there are a few early but interesting options.</p>
+<p><strong>Restate</strong> provides a cheap durable execution runtime, similar to a faster / cheaper Temporal. It's built by the ex-Flink team so it leans heavily into a log structure for handling events and replaying. Restate has a concept of 'Virtual Objects', which provide many of the same semantics as a Durable Object: single writer, attached storage, etc. You can self-host Restate, and it has bindings in other languages like Rust and Golang (disclosure: I am a small-time angel investor, and am a fan of what they are doing). I've started using it as my durable-execution-runtime on AWS.</p>
+<p><strong>Rivet</strong> is a new YC company that provides infrastructure they refer to as 'actors'. Spiritually it feels very similar to a lot of what Cloudflare is building—they lean heavily into V8 isolates. I haven't seriously evaluated them, but from what I can tell on the outside, they seem to be doing a lot of the right things.</p>
+<p>In terms of other primitives I think are promising, <strong>Vercel</strong> leads the pack. Workflows, Sandboxes, AI Gateway, Vercel Connect, and Functions all create usable primitives which you can string together to build these same sorts of long-lived agents. EVE feels like the culmination of all of these tools, composed in a straightforward manner.</p>
