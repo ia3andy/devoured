@@ -1,0 +1,113 @@
+<p>Security engineers using Cloud SIEM spend their day-to-day investigating signals, tuning detection rules, managing suppressions, running historical jobs across interconnected workflows, and more. Agents are becoming a practical way to navigate that complexity, and we built a set of security tools for the Datadog MCP Server to support them.</p>
+<p>Cloud SIEM is only one part of a broader cloud security ecosystem, so the Security MCP toolset has to grow across many teams and products. That growth comes with a constraint. The tools share a single context window, so every new tool consumes more of that window. Add enough tools and the agent can lose track of which one fits the task in front of it.</p>
+<p>We built these tools under that constraint, and we’ll cover what we learned in this post. We’ll show how we scoped tools around what users already do and managed the shared context window with progressive disclosure. We’ll also cover how we tested non-deterministic agent behavior with a custom eval framework and governed a growing multi-team toolset.</p>
+<h2>Scope MCP tools around what users already do</h2>
+<p>Deciding what to build first is challenging for a product as broad as Cloud SIEM. Assumptions about what an agent should do can send you in the wrong direction and waste time and resources on developing tools that may prove unhelpful.</p>
+<p>Before building any tools, we analyzed API call patterns and Real User Monitoring (RUM) data to find where users already spent time and where they hit friction. We also reviewed Bits Chat logs to see what people asked for directly.</p>
+<p>A few patterns stood out. Detection rule authoring was among the most common. Of the sample pool we analyzed, 44% of messages involved authoring and editing detection rules, and users often asked the agent to assess a rule and even name it:</p>
+<blockquote>
+ <p><em>Can we read the security signal I have open? Tell me: What exactly fired and why (rule name, detection method, what was new/anomalous) with Who/what triggered it (user, account, IP, user agent, geo)?</em></p>
+</blockquote>
+<p>Signal investigation was a distinct pattern. Users regularly pasted raw signal JSON into the chat to understand what a signal meant and what to do about it. That told us an agent needs direct access to a signal’s full contents, not just a summary, so we built a tool that returns a signal’s full payload.</p>
+<p>Another pattern was bulk triage. Users wanted the agent to take triage actions for them, such as assigning a signal, closing it with a verdict like benign or malicious, and leaving a note for whoever looks next:</p>
+<blockquote>
+ <p><em>Assign the signal to me, and close it as a benign true positive.</em></p>
+</blockquote>
+<p>They also wanted to do this at scale:</p>
+<blockquote>
+ <p><em>Mark all those signals as archived against these IPs.</em></p>
+</blockquote>
+<p>The Cloud SIEM UI lets you manage up to 50 signals at a time, and we found users working through signals in consecutive batches of 50 to get past that ceiling. About 25% of customers triaged signals in bulk, and 14% pushed right up against the 50-signal cap.</p>
+<p>One session showed how far past the cap the demand could go. Over a 9-minute window, a single customer fired seven bulk triage calls back to back. Each of these seven came back at exactly 52,366 bytes, roughly 50 signals each.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Time (UTC)</th>
+   <th>Response</th>
+   <th>Gap</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>17:34:48</td>
+   <td>52,366 B</td>
+   <td>53s</td>
+  </tr>
+  <tr>
+   <td>17:36:06</td>
+   <td>52,366 B</td>
+   <td>78s</td>
+  </tr>
+  <tr>
+   <td>17:37:06</td>
+   <td>52,366 B</td>
+   <td>60s</td>
+  </tr>
+  <tr>
+   <td>17:38:25</td>
+   <td>52,366 B</td>
+   <td>79s</td>
+  </tr>
+  <tr>
+   <td>17:39:07</td>
+   <td>52,366 B</td>
+   <td>42s</td>
+  </tr>
+  <tr>
+   <td>17:41:22</td>
+   <td>52,366 B</td>
+   <td>135s</td>
+  </tr>
+  <tr>
+   <td>17:42:41</td>
+   <td>52,366 B</td>
+   <td>79s</td>
+  </tr>
+ </tbody>
+</table>
+<p>A response that size meant that the user was maxing out the 50-signal cap repeatedly, triaging more than 350 signals in one sitting. Users wanted to act on more than 50 signals at once, and an agent was a natural way to achieve that.</p>
+<h2>Keep the shared context window lean</h2>
+<p>Scoping the work still left the harder problem of managing shared context. The Security MCP toolset started with tools for querying security findings. As it grew to cover Cloud SIEM, Code Security, App and API Protection, and more, the shared context window grew with it. A larger context window raises the risk of confusing the agent. We didn’t want an agent investigating App and API Protection signals when a user asked about Cloud SIEM.</p>
+<p>We built more than a dozen security tools in all, and two of them best illustrate the context problem. The first is a schema tool that teaches the agent how to author a detection rule, giving it the fields and grammar a valid rule needs. The second is a triage tool for acting on signals in bulk.</p>
+<p>The principle behind both is the same. Give the agent only what a task needs, and keep everything else out of the context window. The schema tool applies it through progressive disclosure, and the triage tool resolves signal IDs from a query instead of carrying them in context.</p>
+<h3>Return only the schema a task needs</h3>
+<p>Detection rule creation made the problem concrete. The schema tool carries rule schemas for several products, including Cloud SIEM, Workload Protection, and App and API Protection, each with its own fields, options, and permission models. Serving everything at once fills the context window with detail most tasks never use.</p>
+<p>We designed a schema tool that uses progressive disclosure. Instead of serving every product’s schema upfront, the tool returns what a task actually needs.</p>
+<p>The tool breaks the schema into named sections, such as top-level fields, query syntax, options, and examples. It also accepts filters for rule type and detection method, and it can drop any sections that aren’t needed. Leave the filters out and the tool returns everything. Pass them and it returns only the matching slice.</p>
+<p>Take a request to build a brute-force detection rule:</p>
+<blockquote>
+ <p><em>I want to create a Cloud SIEM detection rule for brute-force attempts. Trigger it when the same source IP makes an unusual number of failed login attempts to our login or auth API endpoints within 5 minutes. The traffic comes from our nginx API gateway logs in production.</em></p>
+</blockquote>
+<p>The agent doesn’t pull the full catalog. It leaves the section list unset, so the tool returns every section, but the rule type and detection methods it specifies filter the contents down to what the task needs.</p>
+<pre><code>\{
+  "telemetry": \{
+    "intent": "Fetch detection rule schema/grammar before authoring a log_detection brute-force rule for nginx auth endpoints"
+  },
+  "rule_types": [
+    "log_detection"
+  ],
+  "detection_methods": [
+    "threshold",
+    "anomaly_detection"
+  ]
+}</code></pre>
+<p>The savings depend on how narrowly the agent can scope its request. Each security product owns its own rule types, so filtering to a single rule type cut token usage by about 15% in our testing. Filtering further by detection method, as in the request above, brought the reduction to 41–47%.</p>
+<h3>Triage hundreds of signals from a single query</h3>
+<p>Bulk triage needed its own tool. Our first version accepted a list of signal IDs and called the batch triage endpoint in a loop until every signal was updated. The approach worked, but two problems surfaced as we tested it.</p>
+<p>Signal IDs are long strings, and every ID counted toward the tool’s input tokens. Passing hundreds of them meant loading a large block of text into context on every call. Including each ID was also slow for the agent, which added latency on top of the token cost.</p>
+<p>We redesigned the tool to accept a search query instead of a list of IDs. The tool runs the query, fetches the matching signal IDs itself, and triages them in batches until it finishes. The IDs never enter the agent’s context, so input token cost stays flat no matter how many signals the query matches. The tool now handles up to 500 signals in a single call.</p>
+<p>Before the redesign, updating 50 signals took at least 2 minutes. Afterwards, updating hundreds of signals took a little over a minute.</p>
+<h2>Test non-deterministic agent behavior with a custom eval framework</h2>
+<p>Careful scoping improved tool selection, but it didn’t prove the tools worked. Agent behavior is non-deterministic, and the technology is young enough that no checklist can sign off a tool as production-ready. Traditional tests assume the same input produces the same output, and an agent doesn’t offer that guarantee. We needed a way to verify tools worked reliably and didn’t break existing ones.</p>
+<p>We built a custom eval runner and integrated it with the AI Platform team’s continuous integration (CI) eval runner. When anyone modifies the toolset, the runner automatically runs evals across all security tools. Any regression in the baseline eval score greater than 5% is flagged. The runner also flags any tool that ships without eval coverage, which became one of our first governance mechanisms. Contributors can’t quietly add tools that go untested.</p>
+<h3>Make the evals meaningful and cost effective to run</h3>
+<p>An eval is only as useful as the behavior it measures. We check whether the agent called the tools it should, avoided the ones it shouldn’t, used a sensible number of tools, passed correct arguments, and followed a reasonable trajectory to the answer. A weighted score rolls these checks up, and we give tool selection accuracy the most weight, because the agent picking the right tool from a large toolset is our top priority.</p>
+<p>We also run each scenario several times and average the results, which reduces the noise that non-deterministic behavior introduces. Each eval generates an experiment in Agent Observability that shows where a failure occurred, so a drop in the score comes with the detail needed to fix it. We targeted a baseline success rate of about 80%, which leaves room for the occasional hallucination without masking real regressions.</p>
+<p>Running scenarios repeatedly gets expensive, so the runner mocks tool responses. Instead of calling a real tool and pulling back a long response, the eval uses stubbed data. Mocking cuts output token cost, and the savings compound every time we rerun a scenario to average out noise.</p>
+<h2>Govern a growing multi-team toolset</h2>
+<p>Automated evals caught regressions in a single tool, but quality across the whole toolset became a coordination problem as more teams contributed. Without shared standards, a new tool could degrade the ones already serving customers.</p>
+<p>We set up a lightweight governance committee designed around a self-service model. The reason is development velocity. Unlike deterministic features, MCP tools improve mainly through rapid iteration and heavy dogfooding against real use cases, so a heavy approval process would slow the exact feedback loop that makes them better. Every tool stays self-service through the stages before general availability (GA), so contributors ship and iterate without waiting on review. Contributors are responsible for meeting the established standards, such as a minimum eval score, before a tool reaches customers.</p>
+<p>To make those standards clear and easy to understand, the committee maintains shared infrastructure and develops best practices that any team can reuse. The committee’s main concern is whether a new tool degrades the toolset already in production.</p>
+<h2>Key takeaways for building MCP tools in complex domains</h2>
+<p>Building MCP tools for Cloud SIEM showed us that real user behavior, not assumptions, should decide what you build first. Real agent behavior should decide what you refine next. Progressive disclosure keeps a shared context window manageable, custom evals keep non-deterministic tools reliable, and light governance keeps a multi-team toolset coherent without slowing anyone down.</p>
+<p>Another lesson is that no checklist marks an MCP tool as done. Building production-quality tools in a complex domain is iterative, and the most reliable signal is watching how agents and users behave together in practice. To learn more about what workflows our MCP Server supports, see our Cloud SIEM documentation.</p>

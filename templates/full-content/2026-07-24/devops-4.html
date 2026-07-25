@@ -1,0 +1,106 @@
+<h2><strong>Introduction</strong></h2>
+<p>Running a database on Kubernetes is well understood. Running one that survives a complete regional failure, a corrupted control plane, or a severed network requires a fault-resistant architecture. This post walks through how to build a <strong>multi-cluster MongoDB deployment on Kubernetes</strong> that can withstand those failures. We will use the Percona Operator for MongoDB, an open-source Apache 2.0 Licensed Kubernetes Operator, as our example. For relational workloads, similar patterns are available through projects like Vitess and CloudNativePG.</p>
+<p>If you are new to multi-cluster MongoDB on Kubernetes, <a href="https://www.percona.com/blog/deploying-percona-operator-for-mongodb-across-gke-clusters-with-mcs/">Ivan Groenewold’s post</a> is a great place to start. It walks you through a complete multi-cluster setup you can follow hands-on.</p>
+<h2><strong>Single Point of Failure: The risk of a single-cluster setup.</strong></h2>
+<p>Standard Kubernetes excels at self-healing within a single cluster, automatically recovering from crashed Pods or failed Nodes. However, it has no built-in mechanism to handle failures at the cluster level itself: <em>a regional outage, a corrupted control plane, or a network partition can take down your entire database with no automatic recovery path.</em></p>
+<p>Distributing MongoDB nodes across separate Kubernetes clusters addresses this gap and enables three core scenarios:</p>
+<ul>
+ <li><strong>Disaster Recovery (DR)</strong>: If an entire region goes down, nodes in a secondary cluster already hold a full copy of the data and enough votes to elect a new Primary and resume writes automatically.</li>
+ <li><strong>Live Migrations</strong>: Running nodes across two clusters lets you shift application traffic gradually between environments, for example, during a cloud provider migration, without taking the database offline. <em>Note that coordinating a clean cutover still requires careful application-level planning around connection strings and write consistency.</em></li>
+ <li><strong>Maintenance without Stopping</strong>: You can drain and upgrade one cluster entirely while the database continues accepting writes through the nodes in the remaining cluster, with no scheduled downtime.</li>
+</ul>
+<p><strong>Architecture Overview</strong></p>
+<p>To manage the complexity of multi-cluster deployments, the architecture divides clusters into two roles, ensuring that Kubernetes-level operations (handled by the Operator) and database-level operations (handled by MongoDB) do not interfere with each other. All nodes, regardless of which cluster they run in, <strong>belong to a single MongoDB replica se</strong>t, which is what enables cross-cluster voting and leader elections.</p>
+<h3><strong>1. Defining Site Roles</strong></h3>
+<p>Each cluster is assigned to one role to prevent conflicts between independent Kubernetes control planes:</p>
+<ul>
+ <li><strong>Main Site:</strong> The primary cluster, fully managed by the Operator. It holds the Primary node and handles application writes. The Operator here is responsible for provisioning TLS certificates, user credentials, and replica set configuration.</li>
+ <li><strong>Replica Site:</strong> The Operator runs with unmanaged mode to true, which means it does not generate certificates or user credentials, and does not attempt to initialize a new replica set. Instead, the user needs to copy <strong>TLS secrets and credentials from the Main Site</strong>, allowing the Replica Site nodes to authenticate and join the existing replica set. This prevents the problem where two independent operators attempt to control the same database simultaneously.</li>
+</ul>
+<h3><strong>2. Connecting Clusters with the MCS API</strong></h3>
+<p>Even though each Kubernetes cluster runs an independent control plane, the MongoDB replica set spans across all of them. The Kubernetes Multi-Cluster Services API (MCS API) makes this possible. When <code>multiCluster.enabled: true</code> is set, the Operator creates <code>ServiceExport</code> and <code>ServiceImport</code> resources so nodes in different clusters can discover and communicate with each other via a shared DNS zone (<code>svc.clusterset.local</code>).</p>
+<p><strong>Note</strong> that the MCS API is not included in a standard Kubernetes installation and requires a separate implementation such as Submariner, Cilium ClusterMesh, or a managed provider solution like GKE’s native MCS.</p>
+<p>To enable multi-cluster service discovery with the Percona Operator for MongoDB, set <code>multiCluster.enabled:</code> true in your <code>cr.yaml</code>:</p>
+<pre><code>apiVersion: psmdb.percona.com/v1
+kind: PerconaServerMongoDB
+metadata:
+  name: main-cluster
+spec:
+  crVersion: 1.23.0
+  image: perconalab/percona-server-mongodb-operator:main-mongod8.0
+  imagePullPolicy: Always
+  updateStrategy: SmartUpdate
+    multiCluster:
+      enabled: true  # &lt;---  Enable multi-cluster service discovery
+      DNSSuffix: svc.clusterset.local  # &lt;--- The Global DNS standard</code></pre>
+<p>After applying the configuration, verify that the Operator created the <code>ServiceExport</code> resources. Note that it takes approximately five minutes for resources to sync across the fleet. This is how it looks:</p>
+<pre><code>kubectl get serviceexport
+NAME                 AGE
+main-cluster-rs0    6m
+main-cluster-rs0-0  6m
+main-cluster-rs0-1  5m</code></pre>
+<p>The <strong>Main Site</strong> (Cluster A) runs the Primary node and is fully managed by the Operator. The <strong>Replica Site</strong> (Cluster B) holds Secondary nodes in <code>unmanaged</code> mode. <code>ServiceExport</code> and <code>ServiceImport</code> resources bridge the two clusters via a shared <code>svc.clusterset.local</code> DNS zone, enabling cross-cluster replica set membership.</p>
+<h2><strong>How to Design for High Availability</strong></h2>
+<p>Before choosing how to distribute clusters, it helps to understand how MongoDB itself decides which node is in charge.</p>
+<p>A MongoDB replica set requires a strict majority of its voting members to elect a Primary and accept writes. With four voting members spread equally across two locations, neither side can reach a majority if the network between them is severed, and both sides stop accepting writes, even if every server is healthy.</p>
+<p>The solution is a fifth member, placed in a third location. With 5 total votes, one side reaches 3 votes; a majority, and elects a new Primary. This is the 2+2+1 pattern.</p>
+<p>Have an odd number of MongoDB voting members, placed in different locations, so that if one location or network link fails, one side can still have enough votes to keep/elect a Primary.</p>
+<p>With the Percona Operator for MongoDB, the 2+2+1 pattern is configured directly in <code>cr.yaml.</code> Start by defining the total number of data-bearing replica set members across both sites:</p>
+<pre><code>replsets:
+ - name: rs0
+   size: 2       # 2 nodes in Main Site + 2 nodes in Replica Site
+   expose:
+     enabled: true
+     type: ClusterIP</code></pre>
+<p>Then add the extra member as a separate entry under the same <code>externalNodes</code> section:</p>
+<pre><code>externalNodes:
+    - host: third-site-rs0-4.psmdb.svc.clusterset.local
+      votes: 1
+      priority: 1</code></pre>
+<h2><strong>Deployment Workflow</strong></h2>
+<p>The following steps deploy the 2+2+1 pattern across two Kubernetes clusters using the Main and Replica site roles described above.</p>
+<ol>
+ <li><strong>Connect the Networks:</strong> Set up cross-cluster network connectivity using Cilium ClusterMesh, Submariner, or your cloud provider’s native solution (such as GKE Fleet). This is a prerequisite; the MCS API requires an implementation to be installed before the Operator can create functional <code>ServiceExport</code> and <code>ServiceImport</code> resources.</li>
+ <li><strong>Deploy the Main Site:</strong> Deploy the Operator and apply your <code>cr.yaml</code> on the primary cluster. Ensure replica set pods are exposed with <code>type: ClusterIP</code>, this is required by the <strong>MCS API</strong> since nodes communicate internally across clusters.</li>
+ <li><strong>Copy the Secrets:</strong> The Main and Replica sites must share the same TLS certificates and user credentials to communicate. Run <code>kubectl get secrets</code> on the Main Site to confirm the exact names in your deployment.</li>
+ <li><strong>Deploy the Replica Sites:</strong> Start the remote clusters, but remember to set their operators to <strong>“unmanaged” mode</strong>. This tells the nodes to join the existing database instead of trying to create a new one.</li>
+</ol>
+<pre><code>apiVersion: psmdb.percona.com/v1
+kind: PerconaServerMongoDB
+metadata:
+  name: replica-cluster
+spec:
+  # ----------------------------------------------------
+  # This tells the Operator NOT to start a new database, 
+  # but to join the existing one to prevent split-brain.
+  # ----------------------------------------------------
+  unmanaged: true
+  multiCluster:
+    enabled: true
+    DNSSuffix: svc.clusterset.local</code></pre>
+<ol>
+ <li><strong>Finalize the Replica Set:</strong> Update <code>cr-main.yaml</code> on the Main Site to add the Replica Site nodes as <code>externalNodes</code>. Two nodes are added as voting members with lower priority, and the third as a non-voting member, this prevents split-brain if the Replica Site loses connectivity.</li>
+</ol>
+<pre><code>replsets:
+ - name: rs0
+   size: 2
+   externalNodes:
+   - host: replica-cluster-rs0-0.psmdb.svc.clusterset.local
+     votes: 1
+     priority: 1
+   - host: replica-cluster-rs0-1.psmdb.svc.clusterset.local
+     votes: 0
+     priority: 0</code></pre>
+<p>Once these steps are complete, the replica set spans both clusters and is ready for the failover behavior described in the next section.</p>
+<h3><strong>Failover Behavior: The Election Process</strong></h3>
+<p>MongoDB’s replica set protocol includes built-in failure detection and automatic leader election. If the Primary node goes offline, whether a single pod crashes or an entire region is down, the remaining nodes automatically elect a new Primary without any operator or human intervention.</p>
+<p>Let’s look back at our 2+2+1 setup. To stay online, the database needs a strict majority (3 out of 5 votes). If Cluster A completely fails, the two nodes in Cluster B plus the node at Cluster C give us exactly the 3 votes we need to choose a new Primary.</p>
+<p>Under the default configuration, the median time before a cluster elects a new primary does not typically exceed 12 seconds; this includes the time to detect the failure and complete the election. In a multi-region setup, cross-cluster network latency may extend this window, so your application connection logic should include <strong>retryable writes</strong> to handle the brief period during which no Primary is available. The <code>electionTimeoutMillis</code> setting can be tuned if your latency requirements demand faster detection.</p>
+<h3><strong>Architecture After Failover</strong></h3>
+<p>After a regional failure, your database is still working, but it enters a “degraded” state. This means it is functioning, but with fewer resources than normal.</p>
+<ul>
+ <li><strong>The New Primary:</strong> A node in Cluster B is promoted to be the new leader and starts accepting new data.</li>
+ <li><strong>Less Redundancy:</strong> Your database is now running with the exact minimum number of nodes needed for a majority. In our 2+2+1 setup, you are surviving on just those 3 remaining members.</li>
+ <li><strong>Reduced Fault Tolerance:</strong> Even though your application survived the crash of Cluster A, your safety margin is completely gone. <strong><em>If you lose just one more node in Cluster B or the node at Cluster C, the database will lose its majority and lock into “read-only” mode.</em></strong></li>
+</ul>
+<p>The replica set detected the failure, held an election, and promoted a new Primary, automatically, without human intervention. That is the 2+2+1 pattern working as designed.</p>

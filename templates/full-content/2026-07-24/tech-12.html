@@ -1,0 +1,114 @@
+<h2>Everyone Should Know SIMD</h2>
+<p><a href="https://en.wikipedia.org/wiki/Single_instruction,_multiple_data">SIMD</a> has a reputation for being complex. I've met many very good software engineers who dismiss it as something too complex to learn or a niche optimization meant for only the highest-performance software, not useful in everyday programming.</p>
+<p>I think that's wrong. SIMD can be simple to understand, and common "process N values at a time" SIMD code to speed up a naive for loop almost always follows the same general shape. Once you learn the basics, writing SIMD is just about as easy as a for loop. And when it's not, it's usually a good sign to skip it for now.</p>
+<p>Every developer should know at least that much SIMD.</p>
+<p>This post uses Zig for examples but is a general piece that applies to any programming language. Support for SIMD instructions varies by programming language and I hope that more programming languages expose these generic concepts in the future!</p>
+<p>I hate that I have to do this for every post now, but I also want to note this was completely hand-written with no AI assistance.</p>
+<h2>Background: What Is SIMD?</h2>
+<p>If you already know what SIMD is, skip this section.</p>
+<p><a href="https://en.wikipedia.org/wiki/Single_instruction,_multiple_data">SIMD</a> allows a CPU to operate on multiple values in parallel. For example, instead of comparing one byte at a time, a CPU can compare 4, 8, or even more bytes with a single instruction.</p>
+<p>If you ever see loops like this in your code:</p>
+<pre><code>for (byte in bytes) \{ /* ... */ }
+for (character in string) \{ /* ... */ }
+for (value in array) \{ /* ... */ }</code></pre>
+<p>There is an opportunity to use SIMD. SIMD turns those into this:</p>
+<pre><code>for (8 byte chunk in bytes) \{ /* ... */ }</code></pre>
+<p>This results in a localized speedup that directly maps to the parallelism: you process data 4x, 8x, or even faster.</p>
+<p>The only real requirement for this to pay off is that you need to be regularly processing a large enough number of bytes. If you're doing these for loops across data that is only ever a handful or dozens of bytes, it's not worth it. But if this is iterating over hundreds, thousands, millions of bytes, the payoff will be huge.</p>
+<p>That's the basics. Projects such as <a href="https://github.com/simdutf/simdutf">simdutf</a> and <a href="https://github.com/simdjson/simdjson">simdjson</a> take this to an extreme and use SIMD techniques that can be difficult to understand. But you do not need to write algorithms like those to benefit from SIMD. The common case is dramatically simpler.</p>
+<h2>The Common Shape</h2>
+<p>The common "process N values at a time" SIMD code follows the same five steps:</p>
+<ol>
+ <li>Broadcast any constants you need and initialize vector accumulators, if any.</li>
+ <li>Loop over input one vector-width chunk at a time.</li>
+ <li>Perform the comparison or arithmetic across all lanes in parallel.</li>
+ <li>Reduce or store the vector result as needed.</li>
+ <li>Handle the remaining elements with a scalar tail. A scalar tail is just your normal loop from before vectorizing, but it only processes the remainder that doesn't fit into a full vector.</li>
+</ol>
+<p>As you do this more and more, you'll begin to naturally decompose every for loop into these five steps and writing SIMD becomes nearly as natural as writing a scalar loop.</p>
+<h2>A Real Example</h2>
+<p>Let's look at a real example from Ghostty. We'll look at the scalar implementation, the SIMD implementation, and then map it back to the common shape above.</p>
+<p>I have a slice of decoded codepoints that I want to consume until I see a value at or below <code>0xF</code> (a C0 control character). Terminals are <em>mostly</em> plain characters to be printed, so we try to batch all those together. So this loop finds the end of the next printable run as quickly as possible.</p>
+<p>The scalar loop is one line:</p>
+<pre><code>while (end &lt; cps.len and cps[end] &gt; 0xF) end += 1;</code></pre>
+<p>It processes one codepoint at a time. It is easy to understand.</p>
+<p>Here is the generic vector version with no CPU-specific intrinsics and no comments. I will explain it in detail later.</p>
+<pre><code>if (simd.lanes(u32)) |lanes| \{
+    const V = @Vector(lanes, u32);
+    const threshold: V = @splat(0xF);
+    while (end + lanes &lt;= cps.len) : (end += lanes) \{
+        const values: V = cps[end..][0..lanes].*;
+        const greater_than_threshold = values &gt; threshold;
+        if (@reduce(.And, greater_than_threshold)) continue;
+        const mask: std.meta.Int(.unsigned, lanes) = @bitCast(greater_than_threshold);
+        end += @ctz(~mask);
+        break;
+    }
+}
+
+while (end &lt; cps.len and cps[end] &gt; 0xF) end += 1;</code></pre>
+<p>This can improve the loop's throughput by up to 4x with ARM NEON (including Apple Silicon), 8x with AVX2 (most modern x86 CPUs), and 16x with AVX-512 (some Intel CPUs and AMD Zen 4 and newer).</p>
+<p>In real-world end-to-end throughput from terminal program to finalized terminal state on an AVX2 Intel desktop, this was more like a 5x speedup. You always lose some of the ideal speedup due to the other stuff around the SIMD code, but... that's still 5x!</p>
+<p>Okay, now I understand that those 12 lines are going to look really alien to someone not familiar with the concepts. So now let's back up and explain it step by step, mapping it directly to the shape previously mentioned.</p>
+<h2>Step 1: Broadcast Constants</h2>
+<p>Let's start with the first three lines:</p>
+<pre><code>if (simd.lanes(u32)) |lanes| \{
+    const V = @Vector(lanes, u32);
+    const threshold: V = @splat(0xF);</code></pre>
+<p><code>simd.lanes(u32)</code> is a helper in Ghostty that returns the number of <code>u32</code> values the target CPU can process at once. These individual values are called <em>lanes</em>. On ARM this returns 4, AVX2 returns 8, and AVX-512 returns 16. If the target doesn't have a vector size we want to use, it returns <code>null</code> and we skip all of this code and do zero SIMD work.</p>
+<p><code>@Vector(lanes, u32)</code> creates the vector type. If <code>lanes</code> is 8, then <code>V</code> is a single value containing eight <code>u32</code> values that the CPU can operate on in parallel. And so on.</p>
+<p>Finally, we need to compare every value to <code>0xF</code>. A vector comparison requires a vector on both sides, so <code>@splat(0xF)</code> copies, or <em>broadcasts</em>, <code>0xF</code> into every lane. The result is a vector that looks like this:</p>
+<pre><code>\{ 0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF }</code></pre>
+<p>This is step 1: prepare the vector type and broadcast any constants. Some algorithms also initialize a vector accumulator here, but this algorithm doesn't need one.</p>
+<h2>Step 2: Loop One Vector at a Time</h2>
+<p>Next, we loop over one complete vector at a time:</p>
+<pre><code>while (end + lanes &lt;= cps.len) : (end += lanes) \{
+    const values: V = cps[end..][0..lanes].*;</code></pre>
+<p>If <code>lanes</code> is 8, we only enter the loop when at least eight values remain. Inside the loop, we load those eight values into the vector <code>values</code>. At the end of every loop, <code>end += lanes</code> moves forward by eight values instead of one.</p>
+<p>The requirement for a <em>complete</em> vector is important. If only five values remain, we can't load an eight-lane vector. There are various tricks to handle this, but we do the easy thing and handle them via our scalar tail, which I'll explain later in step 5.</p>
+<p>This is step 2: load and loop over the input one vector-width chunk at a time. You can see the lane-count speedup here!</p>
+<h2>Step 3: Perform the SIMD Operation</h2>
+<p>Now we perform the comparison:</p>
+<pre><code>const greater_than_threshold = values &gt; threshold;</code></pre>
+<p>Both <code>values</code> and <code>threshold</code> are vectors, so this maps to a vector operation (a literal vector CPU instruction). The one <code>&gt;</code> compares every lane in <code>values</code> to every corresponding lane in <code>threshold</code>. If there are eight lanes, this is equivalent to performing the scalar comparison <code>cps[end] &gt; 0xF</code> eight times, but it does it in one CPU instruction instead.</p>
+<p>The result is another vector with one boolean per lane. Conceptually, it looks something like this:</p>
+<pre><code>values:                 \{ 0x41, 0x42, 0x43, 0x0A, 0x44, 0x45, 0x46, 0x47 }
+threshold:              \{  0xF,  0xF,  0xF,  0xF,  0xF,  0xF,  0xF,  0xF }
+greater_than_threshold: \{ true, true, true, false, true, true, true, true }</code></pre>
+<p>This is the actual SIMD operation. There is no explicit inner loop. The <code>&gt;</code> operator applies to every lane in parallel.</p>
+<h2>Step 4: Reduce the Vector Result</h2>
+<p>We now have a vector of booleans, but the original loop needs to know the location of the first value at or below <code>0xF</code>.</p>
+<p>First, let's handle the common case where every value is above <code>0xF</code>:</p>
+<pre><code>if (@reduce(.And, greater_than_threshold)) continue;</code></pre>
+<p><code>@reduce(.And, ...)</code> combines every boolean using <code>and</code> and returns a single boolean. If every lane is <code>true</code>, we <code>continue</code> and process the next vector. In our example, lane 3 is <code>false</code>, so <code>@reduce</code> returns <code>false</code> and we fall through to find exactly which lane failed.</p>
+<p>If any lane is <code>false</code>, then we need to find exactly which lane failed:</p>
+<pre><code>const mask: std.meta.Int(.unsigned, lanes) = @bitCast(greater_than_threshold);
+end += @ctz(~mask);
+break;</code></pre>
+<p><code>@bitCast</code> turns the vector of booleans into an integer with one bit per lane. A <code>1</code> bit means the value was greater than <code>0xF</code> and a <code>0</code> means it wasn't. We invert the mask so failed comparisons are <code>1</code>, and then <code>@ctz</code> counts the number of zero bits before the first failure. That count is the index of the first failing lane.</p>
+<p>We add that index to <code>end</code> and break because we found the control character.</p>
+<h2>Step 5: Finish with the Scalar Tail</h2>
+<p>After the vector loop, we run the exact scalar loop we started with:</p>
+<pre><code>while (end &lt; cps.len and cps[end] &gt; 0xF) end += 1;</code></pre>
+<p>If the input length isn't an exact multiple of the vector width, this processes the remaining values. For example, an eight-lane vector loop leaves anywhere from zero to seven values for this loop. This is called the <em>scalar tail</em>.</p>
+<p>This loop also handles CPUs where <code>simd.lanes(u32)</code> returns <code>null</code>. In that case we skip all of the SIMD code and the scalar loop processes the entire input. The original implementation remains both the fallback and the tail.</p>
+<h2>Recap: The Common Shape</h2>
+<ol>
+ <li><code>@splat(0xF)</code> broadcasts the comparison value into every lane.</li>
+ <li>The <code>while</code> loop loads <code>lanes</code> values at a time.</li>
+ <li><code>values &gt; threshold</code> compares every lane in parallel.</li>
+ <li><code>@reduce</code>, <code>@bitCast</code>, and <code>@ctz</code> find the first failed comparison.</li>
+ <li>The original scalar loop handles the remainder and unsupported CPUs.</li>
+</ol>
+<h2>Why Can't the Compiler Do This?</h2>
+<p>Sometimes it can! Compilers can <a href="https://llvm.org/docs/Vectorizers.html">auto-vectorize</a> simple loops, particularly regular arithmetic loops without complex control flow. You should always compile the scalar version with optimizations and see what your compiler produces before manually writing SIMD.</p>
+<p>But compilers are severely limited in what they can auto-vectorize and are in general very poor at it. Auto-vectorization has been an active area of compiler research for decades, and <a href="https://arxiv.org/abs/2406.04693">recent research</a> still begins from the observation that production compilers regularly miss vectorization opportunities.</p>
+<h2>Everyone Should Know SIMD</h2>
+<p>Every developer should be able to recognize the opportunity and, most importantly, should <em>not be scared of SIMD</em>. If you see a hot loop scanning, comparing, counting, or transforming a large amount of contiguous data, you should be able to imagine processing it a vector-width chunk at a time.</p>
+<p>This post demonstrates that these common cases follow a very regular pattern that you quickly get used to. And with good language support, you don't need to know any assembly or CPU-specific quirks to get easy improvements.</p>
+<h2>Footnotes</h2>
+<p>1. Very impressive projects like simdutf and simdjson use extremely complex SIMD tricks to achieve their goals. But this isn't what I'd consider "everyday SIMD."</p>
+<p>2. C0 controls extend beyond <code>0xF</code>. This is the cutoff Ghostty uses for this specific code path; ESC and other control-sequence handling happens elsewhere.</p>
+<p>3. Generic vectors remove the CPU-specific syntax, not CPU-specific code generation. Zig still lowers these operations to the instruction set enabled for the target. Ghostty falls back to scalar code when it can't choose a supported vector width.</p>
+<p>4. The comparison itself is one vector operation. Loading the vector, reducing the result, and locating the failed lane require additional instructions. The important part is that we're doing multiple comparisons at once.</p>
+<p>5. This post was based on a <a href="https://lobste.rs/s/gkcjic/simd_for_collision#c_pwdpep">Lobsters comment I wrote</a>.</p>

@@ -1,0 +1,201 @@
+<h1>Building a Custom Metrics Exporter for Kubernetes</h1>
+<p>Kubernetes ships with built-in awareness of CPU and memory, but most real-world scaling decisions depend on signals that live entirely outside that narrow window: how many messages are waiting in a queue, how long the last batch job took, how many active WebSocket connections a pod is holding. When the built-in metrics are not enough, a <em>metrics exporter</em> bridges that gap.</p>
+<p>This post walks through writing one from scratch, packaging it as a container, and wiring it into a cluster so that Prometheus — and ultimately the HorizontalPodAutoscaler — can consume it.</p>
+<h2>What a metrics exporter actually does</h2>
+<p>An exporter is a small HTTP server with a single responsibility: expose application state as text on a <code>/metrics</code> endpoint. Prometheus <em>scrapes</em> that endpoint on a regular interval, stores the time-series data, and makes it available for queries, alerts, and autoscaling rules.</p>
+<p>In some cases you can instrument your application directly — embedding the Prometheus client library and exposing <code>/metrics</code> from within the same process — rather than running a separate exporter. A standalone exporter makes more sense when the data source is external to your application or when you do not control the application code.</p>
+<p>The format Prometheus expects is plain text — one metric per line, with a name, optional labels, and a numeric value. Client libraries handle the serialization for you, so in practice you only need to decide what to measure and call the right function when that value changes.</p>
+<h2>Choosing what to measure</h2>
+<p>Before writing any code, it helps to decide what kind of signal you are dealing with. The Prometheus data model has three main types:</p>
+<ul>
+ <li><em>Counters</em> only ever increase. They are the right tool for totals: requests served, jobs processed, errors encountered. Never use a counter for a value that can go down.</li>
+ <li><em>Gauges</em> represent a current snapshot of a value that can rise and fall freely. Queue depth, active connections, and cache size are all gauges.</li>
+ <li><em>Histograms</em> record the distribution of observed values, such as request latency. They let you calculate percentiles (p99, p50) rather than just averages.</li>
+</ul>
+<p>Once you know which type fits your signal, choose a name that follows the convention <code>&lt;namespace&gt;_&lt;name&gt;_&lt;unit&gt;</code> in <code>snake_case</code>. A job processor might expose <code>worker_jobs_processed_total</code> (counter), <code>worker_queue_depth</code> (gauge), and <code>worker_job_duration_seconds</code> (histogram). Clear names save everyone debugging time later.</p>
+<h2>Setting up the project</h2>
+<p>The Go Prometheus client is the most common choice for exporters in the Kubernetes ecosystem, largely because the same library powers most of the official Kubernetes components. Start by creating a module and pulling in the dependency:</p>
+<pre><code>mkdir my-exporter &amp;&amp; cd my-exporter
+go mod init example.com/my-exporter
+go get github.com/prometheus/client_golang/prometheus
+go get github.com/prometheus/client_golang/prometheus/promhttp
+</code></pre>
+<h2>Registering metrics</h2>
+<p>Create <code>main.go</code>. The first thing to do is declare the metrics and register them with Prometheus's default registry. Registration tells the library that these metrics exist so they appear in the output even before the first observation is recorded:</p>
+<pre><code>package main
+
+import (
+    "log"
+    "net/http"
+
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+var (
+    jobsProcessed = prometheus.NewCounterVec(
+        prometheus.CounterOpts\{
+            Name: "worker_jobs_processed_total",
+            Help: "Total number of jobs processed, partitioned by status.",
+        },
+        []string\{"status"},
+    )
+
+    queueDepth = prometheus.NewGauge(prometheus.GaugeOpts\{
+        Name: "worker_queue_depth",
+        Help: "Current number of jobs waiting in the queue.",
+    })
+
+    jobDuration = prometheus.NewHistogram(prometheus.HistogramOpts\{
+        Name:    "worker_job_duration_seconds",
+        Help:    "Time spent processing a single job.",
+        Buckets: prometheus.DefBuckets,
+    })
+)
+
+func init() \{
+    prometheus.MustRegister(jobsProcessed, queueDepth, jobDuration)
+}
+</code></pre>
+<p><code>prometheus.MustRegister</code> panics on a duplicate registration, which makes misconfigurations obvious at startup rather than silently at runtime. If you are embedding this exporter inside a library that other packages will also instrument, prefer <code>prometheus.Register</code> and handle the error yourself.</p>
+<h2>Collecting real values</h2>
+<p>With the metrics registered, the next step is to keep them current. You can either continually update the data as the data change, or run your own internal refresh loop. The pattern below shows a polling loop — a goroutine that periodically reads from whatever data source your application owns and updates the registered metrics. Replace the simulated values with real calls to your database, internal API, or message broker:</p>
+<pre><code>import (
+    "math/rand"
+    "time"
+)
+
+func collectMetrics() \{
+    for \{
+        // Replace these with real reads from your application.
+        depth := float64(rand.Intn(50))
+        queueDepth.Set(depth)
+
+        start := time.Now()
+        time.Sleep(time.Duration(rand.Intn(200)) * time.Millisecond)
+        jobDuration.Observe(time.Since(start).Seconds())
+        jobsProcessed.WithLabelValues("success").Inc()
+
+        time.Sleep(5 * time.Second)
+    }
+}
+</code></pre>
+<p>The polling interval (here five seconds) should be shorter than Prometheus's scrape interval so that each scrape sees a fresh value. The default scrape interval in most cluster deployments is fifteen seconds, which gives you comfortable headroom.</p>
+<h2>Exposing the endpoint</h2>
+<p>Wire the collection loop and the HTTP handler together in <code>main</code>. A <code>/healthz</code> path alongside <code>/metrics</code> gives Kubernetes a liveness probe target without exposing metric data on the health route:</p>
+<pre><code>func main() \{
+    go collectMetrics()
+
+    http.Handle("/metrics", promhttp.Handler())
+    http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) \{
+        w.WriteHeader(http.StatusOK)
+    })
+
+    log.Println("Listening on :8080")
+    if err := http.ListenAndServe(":8080", nil); err != nil \{
+        log.Fatalf("server error: %v", err)
+    }
+}
+</code></pre>
+<p>Verify the output locally before building the image:</p>
+<pre><code>go run .
+curl http://localhost:8080/metrics | grep worker_
+</code></pre>
+<p>You should see three <code># HELP</code> and <code># TYPE</code> blocks followed by the current metric values. If those lines appear, the exporter is working correctly and is ready to be containerized.</p>
+<h2>Build a container image</h2>
+<p>A multi-stage build keeps the final image small and avoids shipping a Go toolchain to production. The first stage compiles a statically linked binary; the second stage copies only that binary into a minimal base. The example below uses Docker, but the same pattern works with any OCI-compatible build tool such as Buildah or Podman:</p>
+<pre><code>FROM golang:1.21-alpine AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /exporter .
+
+FROM gcr.io/distroless/static:nonroot
+COPY --from=builder /exporter /exporter
+EXPOSE 8080
+ENTRYPOINT ["/exporter"]
+</code></pre>
+<p><code>distroless/static:nonroot</code> contains no shell, no package manager, and runs as a non-root user by default, which satisfies most cluster security policies without extra configuration.</p>
+<h2>Deploying to the cluster</h2>
+<p>Two manifests are enough to run the exporter: a Deployment that manages the pod lifecycle, and a Service that gives Prometheus a stable address to scrape. The Deployment sets conservative resource limits appropriate for a lightweight sidecar-style process, and uses the <code>/healthz</code> route for its liveness probe:</p>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: my-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: my-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: my-exporter
+    spec:
+      containers:
+      - name: exporter
+        image: &lt;registry&gt;/my-exporter:v1.0.0
+        ports:
+        - name: metrics
+          containerPort: 8080
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 50m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+</code></pre>
+<p>The Service names the port <code>metrics</code>, which the ServiceMonitor will reference:</p>
+<pre><code>apiVersion: v1
+kind: Service
+metadata:
+  name: my-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: my-exporter
+spec:
+  selector:
+    app.kubernetes.io/name: my-exporter
+  ports:
+  - name: metrics
+    port: 8080
+    targetPort: metrics
+</code></pre>
+<h2>Telling Prometheus where to look</h2>
+<p>If you installed Prometheus using the Prometheus Operator or the <code>kube-prometheus-stack</code> Helm chart, use a <code>ServiceMonitor</code>:</p>
+<pre><code>apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: my-exporter
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: my-exporter
+  endpoints:
+  - port: metrics
+    interval: 15s
+    path: /metrics
+</code></pre>
+<h2>Verifying the scrape</h2>
+<p>Port-forward to the Prometheus service and open the targets page to confirm the exporter has been discovered:</p>
+<pre><code>kubectl port-forward svc/prometheus-operated 9090 -n monitoring
+</code></pre>
+<p>Navigate to <code>http://localhost:9090/targets</code>. The <code>my-exporter</code> target should appear with state <strong>UP</strong>. Once the target is healthy, run a quick query in the expression browser to confirm data is flowing:</p>
+<pre><code>rate(worker_jobs_processed_total\{status="success"}[2m])
+</code></pre>
+<h2>What comes next</h2>
+<p>A working exporter is the foundation, not the destination. The natural next step is surfacing these metrics to the HorizontalPodAutoscaler so that your workload scales on the signals that actually drive load, not just CPU. That requires a metrics adapter — the Prometheus Adapter is the most widely deployed option — which registers your custom metrics with the Kubernetes Custom Metrics API.</p>
