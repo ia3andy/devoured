@@ -1,0 +1,91 @@
+<h1>ModelExpress: Distributing Model Artifacts at the Speed of Light</h1>
+<p>Every byte moved has a cost. As model checkpoints grow to hundreds of gigabytes or even a terabyte, that cost adds up quickly. To make things even worse, moving these model weights around the cluster is extremely common. For instance, a cold start may pull weights from remote storage into GPU memory; autoscaling and rolling updates must populate each new replica; and RL post-training continuously moves updated weights from trainers to roll out workers. These may look like different workflows, but they impose the same recurring tax: time spent moving weights before useful work can begin.</p>
+<h2>ModelExpress: Accelerating the model weight lifecycle</h2>
+<p>NVIDIA ModelExpress (MX) is built around a simple idea: Before loading a model, first ask where a compatible copy of its weights already lives. Rather than treating every replica as an independent cold start, MX chooses the fastest available source and transfer path.</p>
+<p>When a serving peer already holds compatible weights in GPU, MX transfers them directly from GPU to GPU over P2P RDMA via NVIDIA Inference Xfer Library (NIXL), bypassing redundant access to object storage, local disk, and host memory. When no peer is available, MX bootstraps from the fastest supported path by streaming from an object store without landing on disk or reading local files directly into GPU memory.</p>
+<p>MX transfers DeepSeek-V4 Pro weights and JIT Kernel cache artifacts from a serving replica into a fresh replica in under 10 seconds, reducing the total startup time to 1 minute 44 seconds from 8 minutes. The rest of the post shows how MX selects the fastest available path to GPU memory, prioritizing P2P RDMA from a serving replica and eliminating redundant downloads and copies along the way. It then extends the same approach to reusing kernel caches and distributing RL weight updates.</p>
+<figure>
+ <img src="https://developer-blogs.nvidia.com/wp-content/uploads/2026/07/image2-14.webp" alt="An overview of ModelExpress.">
+ <figcaption>
+  <em>Figure 1. Overview of ModelExpress</em>
+ </figcaption>
+</figure>
+<h2>Accelerating every stage from remote storage to GPU memory</h2>
+<p>Every new worker must get its weights from one of three places: remote storages (e.g. HF or S3), local storage, or another worker already serving the model. For the first worker, there is no peer yet, so it must bootstrap from storage. MX can stream the checkpoints from object storage or load it from fast local storage, removing avoidable copies along either path.</p>
+<p>Once that first worker is serving, the preferred source changes. Its weights are already resident, post-processed, and laid out in GPU memory, so every compatible worker after it should load directly from that peer over P2P RDMA. MX makes this transition automatically: bootstrap once from storage, then scale out GPU to GPU, falling back to storage only when no compatible peer is available.</p>
+<h3>Starting the first worker: Bootstrap from storage</h3>
+<p><strong>Remote object storage to GPU: Avoiding local disk</strong></p>
+<p>When the checkpoint lives in a cloud bucket and you would rather not provision and manage a disk cache tier, MX uses the Model Streamer to pull safetensors through a reusable CPU staging buffer and into GPU. The checkpoint never lands on local disk, eliminating the intermediate download, reload, and storage volume.</p>
+<p>Model Streamer uses a multithreaded tensor reader to fetch tensor ranges concurrently across checkpoint shards. As tensors arrive, it pipelines remote reads with GPU placement: completed tensors are passed to the inference engine while later tensors are still being fetched. This keeps the storage, network, and GPU copy paths busy while reusing a bounded amount of host memory.</p>
+<p>In tensor-parallel deployments, the participating ranks divide the remote reads and share the results, typically over NCCL, instead of having every rank download the full checkpoint independently. MX connects this distributed stream directly to the inference engine’s weight loader, preparing the first worker to become the P2P source for every compatible replica that follows.</p>
+<p><strong>Cluster ingress: Download once, not N times</strong></p>
+<p>When a cluster maintains a shared disk cache tier (e.g. persistent volumes in K8s), MX ensures that the fleet populates it only once. If 10 replicas concurrently want to fetch the 806 GiB DeepSeek-V4 Pro model, they will need to pull roughly 8 TiB of identical data across the network while competing for the same ingress bandwidth. The MX Model Cache Service collapses those requests into one coordinated download: an atomic claim in Metadata Store selects a downloader, while the remaining replicas track its progress and reuse the cached copy. The cluster pays the external download cost once, then every replica can begin from the same cached checkpoint.</p>
+<p><strong>Local storage to GPU: Bypassing host-memory staging</strong></p>
+<p>When GPUDirect Storage (GDS) is supported in the system, MX reads checkpoint files directly from local storage into GPU memory through NIXL’s multithreaded GDS backend. NIXL executes batched tensor reads in parallel directly into GPU memory, bypassing host memory and the staging copy required by a conventional loader. Users don’t need to enable GDS explicitly: MX detects the capability automatically and falls back to another loading strategy when it is unavailable.</p>
+<p><strong>Local storage to GPU: Pipelining local reads with ModelStreamer</strong></p>
+<p>MX can also load local checkpoints through ModelStreamer. Multiple OS threads read safetensors concurrently into a configurable CPU buffer while completed tensors move to the GPU and later reads continue in parallel. Unlike GDS, this path still stages through host memory, but it overlaps disk I/O with GPU placement, benefits from the OS page cache, and provides a portable fast path when direct storage-to-GPU access is unavailable.</p>
+<h3>Starting every worker after the first: Fetch from a serving peer</h3>
+<p>This is the key feature of MX. Once another replica is already serving the same model, the weights have completed most of their journey: they are resident in GPU memory, post-processed, and laid out for the inference engine. MX treats that replica as a live weight source. After confirming compatibility, it transfers the tensors directly from the source GPU to the target GPU. Once its weights are loaded, the new replica joins the source pool, giving subsequent replicas another peer to load from. With every successful transfer, that pool grows alongside the deployment, turning scale-out into GPU-to-GPU fan-out instead of repeated cold loads.</p>
+<p>The MX control plane discovers compatible peers, exchanges transfer metadata, and tracks source readiness, but never handles the weight bytes themselves. On the data plane, MX uses NIXL as a default transfer engine whose pluggable backends allow for peak performance across a variety of networks, such as Infiniband, RoCE, NVLink, EFA, etc. MX has a first-class transport interface that allows libraries such as <code>fabric-lib</code> and standalone Mooncake to integrate with MX.</p>
+<figure>
+ <img src="https://developer-blogs.nvidia.com/wp-content/uploads/2026/07/image4-14.webp" alt="A diagram illustrating peer-to-peer GPUDirect RDMA weight transfer.">
+ <figcaption>
+  <em>Figure 2. Peer-to-peer GPUDirect RDMA weight transfer via NIXL</em>
+ </figcaption>
+</figure>
+<p>Before any transfer begins, MX computes an <code>mx_source_id</code> from the model and runtime settings that determine tensor layout, then considers only peers with a matching ID. The control plane discovers those peers through Redis, Kubernetes CRDs, or <code>k8s-service</code> (serverless) metadata backends.</p>
+<h3>Optimizing NIXL memory registration overhead</h3>
+<p>Before NIXL can RDMA a tensor, the GPU memory backing it has to be registered: an <code>ibv_reg_mr</code> call that returns the Remote Key (rkey) used for remote access. A large model has tens of thousands of tensors, and registering them one at a time is slow enough to show up in the budget. By default, MX registers each tensor individually. Two opt-in strategies reduce that registration cost:</p>
+<ul>
+ <li><strong>Pool registration</strong> registers each underlying <code>cudaMalloc</code> allocation once instead of each tensor, cutting registration count by 80 to 99 percent on typical models with no change to transfer semantics.</li>
+ <li><strong>VMM arena registration</strong> goes further. It installs a <code>CUDAPluggableAllocator</code> that routes every load-time allocation into a single 16 TiB virtual-address arena, then registers the whole used range as one dmabuf-backed memory region at end of load. Registration collapses from one call per tensor to one call, total; each tensor descriptor simply carries an offset into that single region.</li>
+</ul>
+<figure>
+ <img src="https://developer-blogs.nvidia.com/wp-content/uploads/2026/07/image3-13.webp" alt="A bar chart comparing NIXL memory registration times.">
+ <figcaption>
+  <em>Figure 3. NIXL memory registration optimization</em>
+ </figcaption>
+</figure>
+<h3>Runtime path selection and safe fallback</h3>
+<p>At startup, MX probes the available capabilities, automatically skipping any path the environment does not support. The first applicable strategy runs in the current priority order: <code>P2P RDMA -&gt; ModelStreamer -&gt; GDS -&gt; default loader (host-staged POSIX I/O)</code>. If a path is unavailable or fails before modifying the model state, MX falls through automatically. If a failure occurs after weights have begun landing, it reinitializes the model before continuing, so partially written weights are never served.</p>
+<h3>End-to-end results</h3>
+<p>We ran DeepSeek-V4-Pro on an 8xB200 GPU node with NVIDIA ConnectX-7 NICs and compared the total model loading time across different cold start scenarios. Each replica used vLLM 0.23.0 with TP=8 and <code>--enable-flashinfer-autotune</code>.</p>
+<figure>
+ <img src="https://developer-blogs.nvidia.com/wp-content/uploads/2026/07/image1-13.webp" alt="A bar chart comparing total model loading time for DeepSeek-V4-Pro.">
+ <figcaption>
+  <em>Figure 4. End-to-end cold start model loading time comparing HF vs ModelStreamer (S3) vs Disk vs P2P RDMA</em>
+ </figcaption>
+</figure>
+<h2>Warm, not just loaded: Inheriting the compiled kernels</h2>
+<p>Getting weights into GPU memory is critical, but a loaded model is not yet ready to serve. During its first forward passes, the engine JIT-compiles and autotunes kernels (e.g. torch.compile, Triton, DeepGEMM, TileLang, and etc.) and captures CUDA graphs for the exact model, dtype, quantization, and GPU. For models such as DeepSeek-V4 Pro, this can take several minutes and can become the dominant startup cost once MX reduces weight-loading latency.</p>
+<figure>
+ <img src="https://developer-blogs.nvidia.com/wp-content/uploads/2026/07/image8-1.webp" alt="Startup time breakdown of DeepSeek-V4 Pro.">
+ <figcaption>
+  <em>Figure 5. Startup time breakdown of DeepSeek-V4 Pro (TP=8 vLLM)</em>
+ </figcaption>
+</figure>
+<p>That repeated warmup is avoidable. When the model, software stack, and GPU architecture match, one replica can pay the compilation cost and the rest can inherit the resulting caches. MX’s Artifact Transfer API packages these file-backed artifacts, transfers them directly between registered host-memory buffers over NIXL’s CPU-to-CPU RDMA path, then verifies and installs them in the target engine’s cache directory.</p>
+<figure>
+ <img src="https://developer-blogs.nvidia.com/wp-content/uploads/2026/07/image6-8.webp" alt="Total startup time reduction with ModelExpress.">
+ <figcaption>
+  <em>Figure 6. Total startup time reduction with ModelExpress</em>
+ </figcaption>
+</figure>
+<h2>When the weights change every Step: RL post-training</h2>
+<p>Everything so far assumes a model’s weights are fixed once loaded. RL post-training breaks that assumption. A trainer updates the policy every step, and the inference actors generating rollouts must pick up those weights before the next round of generation.</p>
+<figure>
+ <img src="https://developer-blogs.nvidia.com/wp-content/uploads/2026/07/image7-4.webp" alt="Diagram of the ModelExpress RL refit flow.">
+ <figcaption>
+  <em>Figure 7. ModelExpress makes RL refit receiver-driven</em>
+ </figcaption>
+</figure>
+<p>MX drives the refit through the following four stages:</p>
+<ol>
+ <li><strong>Publish:</strong> Each trainer rank advertises the tensors or shards it already owns, together with metadata describing their shape, dtype, placement, and parameter mapping to MX.</li>
+ <li><strong>Discover:</strong> A rollout worker looks up the requested weight version and its available sources through MX.</li>
+ <li><strong>Plan:</strong> The receiver maps the published ownership information onto its own target layout and identifies which sources contain the required tensors or ranges.</li>
+ <li><strong>Pull, convert, and load:</strong> The receiver issues one-sided reads directly against those sources.</li>
+</ol>
+<h2>Contributing to Dynamo and our roadmap</h2>
+<p>MX has native integrations with vLLM and SGLang and supports serving frameworks including Dynamo and llm-d.</p>
+<p>The Dynamo open source community is actively working toward deeper TensorRT-LLM integration and broader inference capabilities.</p>

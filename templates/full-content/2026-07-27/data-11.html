@@ -1,0 +1,72 @@
+<h1>How we built a DuckDB transpiler</h1>
+<h2>Overview</h2>
+<p>As a data practitioner, it’s common that you’ll encounter the use of multiple databases. Maybe you’ll work with Postgres for one task, and ClickHouse for another. The subtle differences between each dialect let errors and inconsistencies slip through the cracks. One slight difference or error can cause your entire analysis to be wrong.</p>
+<p>We ship a dialect-subset of DuckDB that transpiles to other dialects, which we call CocoSQL. This article will focus on how we built it.</p>
+<h2>Why build a transpiler?</h2>
+<p>Our core driving principle is to <strong>Make working with data effortless</strong>. As part of our product, we allow our customers to combine visual transformations – such as renaming a column, applying an Excel-style filter, or editing values inline – with custom SQL to fit their every need.</p>
+<p>We also want customers to be able to work with their data, wherever it lives. Most of the time that means in a database or data warehouse that we don’t control.</p>
+<p>Being able to offer both of these requires building a unified execution layer. We also didn’t want to create our own <em>custom</em> query solution that customers would have to learn. SQL is ubiquitous and extremely flexible.</p>
+<p>The only reasonable solution was to use a single ANSI SQL dialect, and create a transpiler.</p>
+<h2>Why choose DuckDB?</h2>
+<p>On top of the most obvious reason – <em>performance</em> – DuckDB’s dialect is arguably the most ergonomic and forgiving in the world. It’s runnable locally, extremely well-written internally, and easy to extend. We designed our whole product with DuckDB as the core execution engine for these very reasons.</p>
+<h3>Ergonomics</h3>
+<p>DuckDB’s dialect rocks! Common “gotchas” that occur in other dialects, like trailing-comma errors, do not exist. Niceties like function <code>.dot()</code> chaining are built in, and quick shortcuts like <code>FROM table</code> make most operations extremely quick.</p>
+<p>Most of these benefits translate nicely into other dialects as well.</p>
+<h3>Type system &amp; flexibility</h3>
+<p>DuckDB’s type system is rich, and forgiving. Compare <code>1</code> to <code>1.0</code>, concatenate a number onto a string, cast a messy string to a date – DuckDB does what you’d expect, and without a bunch of hacks or workarounds. The software is designed to work for you, not against you.</p>
+<p>Additionally, there are a ton of helpful built-in types. Because DuckDB’s types are a <em>superset</em> of most target dialects, we can always represent the user’s intent locally, and then decide how to lower it into the target dialect’s, usually narrower, type system.</p>
+<h3>Extensibility</h3>
+<p>DuckDB exposes its Parser, Binder, and function catalog directly through its C++ API.</p>
+<p>With the internals, we’re able to plug right into the Parser, Binder, create our own functions, override existing functionality, etc., all using the native DuckDB types.</p>
+<h2>What does the transpiler actually do?</h2>
+<p>In simple terms, the transpiler converts provided CocoSQL (DuckDB) into an equivalent query in the target dialect. Statement keywords, functions, casts, comparisons, offsets, null handling, etc. are converted to produce a result that is semantically identical to the DuckDB statement.</p>
+<h3>Additional considerations</h3>
+<p>In certain cases, the transpilation is not enough. Certain databases or warehouses have settings that produce different results for the same query. The most prominent example is ClickHouse, which has about 1 million different “Session Settings”. In cases like these, we create the transpiled query, and then set the correct settings at the session level before executing the query.</p>
+<h2>How does the transpiler work?</h2>
+<p>We structure our transpiler at the core of our product. It drives visual interface changes, as well as custom SQL, and custom columns. Anything that you do in Coco Alemana will inevitably be passed through our transpiler.</p>
+<p>We extend DuckDB’s internals using C++ to make use of two critical components – the parsed abstract syntax tree (AST), and the Binder. Specifically, we parse the query tree once, maintaining the user’s query structure, then we run it through the Binder to attach types to each expression and column. This comes in handy when specific edge cases are not solvable without knowing the types.</p>
+<h3>Traversing the AST</h3>
+<p>We built a base class that gives us structure to walk each node in the AST. It also gives us default implementations that exist for DuckDB. This means that for most extensions, we simply create a new <code>DialectTranspiler</code>, such as <code>RedshiftTranspiler</code>, and only override virtual methods when we absolutely need to.</p>
+<p>Internally, the query is structured as a tree of <code>ParsedExpression</code>s, with each node having children, or constants, depending on its type. This allows us to re-walk the tree, and expose methods like <code>std::string ConvertExpression(const duckdb::ParsedExpression&amp; expr)</code> on a per-dialect basis.</p>
+<h3>Applying type-based corrections</h3>
+<p>Not all conversions can occur via looking at the parsed node alone. For some dialects, additional checks are needed at transpile time in order to prevent runtime issues that wouldn’t throw an error, but would produce incorrect results. This is where the importance of traversing the Binder comes into play. It allows us to have not only expression-based logic, but also expression-type-based logic.</p>
+<p>A perfect example is BigQuery’s finicky modulo support (<code>%</code>). BigQuery doesn’t have a <code>%</code> operator at all – the closest thing is <code>MOD()</code>, which only accepts exact numeric types, refuses to mix them, and throws on a zero divisor. DuckDB’s <code>%</code> has none of these restrictions, so the correct translation depends entirely on the operand types.</p>
+<h4>Floats</h4>
+<p>If either side is a float, <code>MOD()</code> can’t be used at all. We fall back to an injected custom function, which matches DuckDB’s IEEE math bit-for-bit:</p>
+<pre><code>-- price is a DOUBLE
+SELECT price % 2.4 AS result FROM my_table
+
+-- becomes
+SELECT CUSTOM_FMOD(CAST(price AS FLOAT64), CAST(2.4 AS FLOAT64)) AS result FROM my_table</code></pre>
+<h4>Integers</h4>
+<p>If both sides are plain integers, <code>MOD()</code> works natively. The <code>NULLIF</code> matches DuckDB’s behavior of returning <code>NULL</code> on a zero divisor, instead of erroring:</p>
+<pre><code>-- price is an INTEGER
+SELECT price % 3 AS result FROM my_table
+
+-- becomes
+SELECT MOD(price, NULLIF(3, 0)) AS result FROM my_table</code></pre>
+<h4>Mixed integers &amp; decimals</h4>
+<p>If an integer is mixed with a decimal, <code>MOD()</code> refuses to reconcile the two types, so we promote both sides to <code>BIGNUMERIC</code>:</p>
+<pre><code>-- price is an INTEGER
+SELECT price % 2.4 AS result FROM my_table
+
+-- becomes
+SELECT MOD(CAST(price AS BIGNUMERIC), NULLIF(CAST(2.4 AS BIGNUMERIC), 0)) AS result FROM my_table</code></pre>
+<h3>IEEE-754 conformance</h3>
+<p>The IEEE Standard for Floating-Point Arithmetic, IEEE 754, defines how floating-point numbers (FLOAT, DOUBLE) are represented, and more importantly for our case, how they’re operated on.</p>
+<p>For whatever reason, many database providers don’t have consistent arithmetic logic. Part of this may be due to legacy implementations, performance, or other platform specific decisions like storage formats. DuckDB <em>mostly</em> conforms to this standard, and our transpiler matches its functionality.</p>
+<h3>Handling null values</h3>
+<p>Each system has its own way of handling NULLs, in places like LISTS, arguments of functions, offsets, etc. Some systems like ClickHouse can’t even represent NULL when you have a LIST type.</p>
+<h2>How we chose what to build</h2>
+<h3>Value equality</h3>
+<p>Obviously the most important single point. This means that the result of a query yields the same cell values, columns, and order (if applicable) across systems.</p>
+<h3>Order equality</h3>
+<p>This means that the rows come in the order that is expected based on the input query. This takes into account differences like <code>NULLS FIRST</code> or <code>NULLS LAST</code> defaults, etc.</p>
+<h3>One-to-many conversion</h3>
+<p>We realized quickly that we really only need to convert DuckDB into target dialects, instead of having a many-to-many, or a bi-directional solution. This drastically simplified the problem, and made development quicker.</p>
+<h3>Type encapsulation</h3>
+<p>Results should come back with DuckDB’s types, no matter which backend produced them. A <code>BOOLEAN</code> column should stay a <code>BOOLEAN</code> – even when the warehouse’s wire protocol quietly erases it. Because the Binder already computed the expected type of every output column at transpile time, we can restore that fidelity at the executor level after the results arrive.</p>
+<h3>SELECT statements only</h3>
+<p>We decided that statements outside of <code>SELECT</code> didn’t make sense to replicate, because for the majority of analytical tasks, reading is the whole job.</p>
+<h2>Testing</h2>
+<p>To guarantee we get the results we expect, we make extensive use of E2E testing as well as individual unit testing. As it stands, we have over <strong>3,500</strong> test cases that cover all parts of the query – from structure, to functions, types, null handling, division consistency, and more.</p>

@@ -1,0 +1,65 @@
+<h2>Background</h2>
+<p>We are the Ad Platform team at Zalando Marketing Services (ZMS). We build the data pipelines that power Sponsored Products, the paid placements that advertisers use to promote their items across Zalando's catalog and product card pages.</p>
+<p>When a customer sees or clicks a sponsored item, that interaction needs to be matched against the original auction that placed it. The auction record carries the ad server's delivery decision context; the interaction event carries the result. Joining the two is what turns a raw click into a billable charge and closes the feedback loop to our ad serving system.</p>
+<p>This join has to happen in near-real time and within a bounded window. We limit it to 15 minutes: interactions that arrive after that are dropped. Missing an event means an advertiser action goes unbilled, so the match rate is a business-critical metric.</p>
+<p>This article focuses on the near-real-time stream that supports ad server logic. Correct billing and campaign reporting also rely on a separate batch data pipeline. Together they form a near-classical lambda architecture, but that is a topic for another post.</p>
+<p>The homegrown solution was developed more than 7 years ago at an ad-tech startup later acquired by Zalando. It was simple and worked, but accumulated limitations that improvements alone couldn't fix.</p>
+<h2>Homegrown solution</h2>
+<p>It was a distributed Java application, which consumed Kinesis and Nakadi (abstraction on top of Kafka) streams, storing bid events in a basic in-memory cache. On each user interaction event, it searched for the corresponding bid event by key in the cache and tried to match, enrich, and produce a billing event. Since we had quite a heavy load, up to 200MB/s, we used multiple pods for this application.</p>
+<p>Because it was very straightforward, it worked fine, but with some caveats that should have been addressed:</p>
+<ol>
+ <li>Pods couldn't be cleanly partitioned across both streams, so each pod had to read all interaction events in addition to its share of bid events.</li>
+ <li>It didn't have any memory state backup or checkpointing, losing stored events on each deploy or rescale operation.</li>
+</ol>
+<p>Those issues led to overprovisioning of pods, to avoid re-scaling operations.</p>
+<h2>Alternatives</h2>
+<p><strong>Option 1. Keeping the old application</strong>: We could improve it by implementing checkpointing and aligned stream partitioning, but better tools already existed.</p>
+<p><strong>Option 2. Nakadi SQL</strong>: Zalando's internal stream processing framework. A PoC showed only ~50% event match rate, which was not viable. The pipeline dropped a significant portion of events without a clear explanation, and we didn't invest further in diagnosing it.</p>
+<p><strong>Option 3. Apache Spark</strong>: Has adoption at Zalando, but other teams who had evaluated both reported better latency and autoscaling behavior with Flink, and that was enough to rule Spark out.</p>
+<p><strong>Option 4. Flink</strong>: Already in production at Zalando across multiple teams. Fits our use case well: keyed state, event-time joins, checkpointing, horizontal partitioning.</p>
+<p>The Tech Radar TRIAL status and limited team experience were real risks, but the Zalando Flink guild and existing production deployments across other teams made the risk acceptable.</p>
+<h2>Architecture: What We Built</h2>
+<p>The join logic stayed the same: consume two streams, match events within a 15-minute window, produce billing events. We made two improvements over the homegrown solution.</p>
+<p>We added a RocksDB state backend with incremental 3-minute checkpoints. On any restart or rescale, the pipeline recovers from the last checkpoint instead of losing up to 15 minutes of buffered events. This is what made safe autoscaling possible.</p>
+<p>We also buffer state for both streams instead of just bid events. The homegrown solution dropped any interaction event that arrived before its corresponding bid. Buffering both sides handles this out-of-order case and increased the event match rate by 0.5%.</p>
+<h2>The Road to Production: What Actually Happened</h2>
+<h3>Infrastructure: AWS managed vs K8s</h3>
+<p>We chose the AWS managed deployment option for faster prototyping and quickly discovered it was simple but not flexible or transparent. Later we migrated to K8s deployment, using Zalando application templates.</p>
+<h3>API Choice</h3>
+<p>There are 4 levels of abstractions in Flink API. We chose Datastream API since we had deep Java knowledge and could solve potential issues, and we needed configuration flexibility.</p>
+<h3>Join choice</h3>
+<p>For our scenario, applicable high-level options are Sliding and Interval join, where Sliding is overkill by definition, because we don't need the sliding feature.</p>
+<h3>Interval join</h3>
+<h4>First approach</h4>
+<p>Initially we thought interval join would be a good fit for our use case: It supports keyed partitioning and the same time boundaries we needed.</p>
+<pre><code>orangeElem.ts + lowerBound &lt;= greenElem.ts &lt;= orangeElem.ts + upperBound</code></pre>
+<p>The system worked but used quite a lot of workers and resources, more than our status quo application.</p>
+<h4>Flame graph and seeks</h4>
+<p>The critical finding was in the Flame Graph in the Flink UI. Interval join used about 15-30% of CPU just on seek operations. Looking at the interval join implementation, the matching path opens a RocksDB iterator and performs a seek before reading any records, regardless of how many entries the partition contains. Since our bid IDs are unique, each partition holds exactly one entry, but the seek fires on every element processed. A seek requires locating the starting position across sorted files on disk, making one seek per element a significant overhead at our throughput.</p>
+<p>Interval join also uses expiration timers stored in a RocksDB-backed sorted set with an in-memory cache. With a 15-minute window at our throughput, this queue grows to ~70 million entries permanently. When the cache is drained, Flink seeks into RocksDB to reload the next batch, generating a second source of constant scans.</p>
+<h4>Why KeyedCoProcessFunction solves it</h4>
+<p>To solve this, we wrote our own matching logic using KeyedCoProcessFunction. We created two ValueStates, one for bid events and one for interaction events, both partitioned by bid ID. Since bid IDs are unique, each lookup is a direct point lookup in RocksDB with no iterator and no seek.</p>
+<p>State expiry is handled by RocksDB's TTL compaction in background instead of explicit timers, so there is no per-element timer registration and no ~70 million entry queue to maintain. Watermark advancement no longer needs to scan a timer queue at all, eliminating the second source of seeks.</p>
+<h3>RocksDB full state increase</h3>
+<p>After migration from the Interval join to low-level Process join we had problems with growing state and cleaning up the cache. Since there were no timers, we needed other options for cleanup. We also used incremental checkpoints with a state backend, and the only available out-of-the-box cleanup option is during state compaction. Otherwise, we would need to manually create timers.</p>
+<p>We increased write buffer and compaction file sizes so compaction runs less frequently but processes more data per run, giving the TTL filter more opportunity to collect expired keys.</p>
+<h3>Infrastructure: Kinesis streaming</h3>
+<h4>Connector</h4>
+<p>The Kinesis Flink connector library surprisingly had no support for reading aggregated events using Protobuf. We had to write our own deaggregation layer inside Flink to be able to read such events.</p>
+<h3>Pod evictions</h3>
+<p>Karpenter (the K8s node autoscaler) evicted our pods during rescaling operations before they were ready to consume from streams. Flink has its own autoscaler and K8s shouldn't interfere with it. Adding the appropriate annotation to block K8s from interfering resolved it. A PodDisruptionBudget is an alternative way to enforce the same protection.</p>
+<h3>OOM kills</h3>
+<p>Memory tuning wasn't straightforward either. We needed to find out the required CPU to Memory ratio, because the load type was different due to checkpoints. Flink used much more CPU than our status quo. The OOM kills were not Java OutOfMemoryError exceptions. The Linux kernel was terminating the process. We increased pod memory from 16GB to 20GB, creating a 4GB buffer above the JVM process size.</p>
+<h2>Migration</h2>
+<p>We built a full shadow pipeline for the migration, with dedicated input and output streams for convenient analysis. In the downstream service that consumes traffic events, we integrated a Nakadi client to also read the shadow stream and write to a shadow table in parallel with the main pipeline. This let us compare real production data without any customer impact.</p>
+<h2>Results</h2>
+<p>The most important improvement was checkpointing. Previously, any restart or rescale lost up to 15 minutes of buffered events. With 3-minute incremental checkpoints, the pipeline recovers from the last checkpoint instead, making aggressive autoscaling safe without state loss and eliminating the need to overprovision pods.</p>
+<p>This reduced average pod count from a constant 20 to 5 on average (range 1-8). The reduced pod count drove three improvements:</p>
+<ol>
+ <li>CPU reduced from 30 to ~20 cores.</li>
+ <li>Memory reduced from 320GB to ~100GB.</li>
+ <li>EC2 costs reduced from ~€80 to ~€30 daily.</li>
+</ol>
+<p>The two-way matching algorithm also increased event enrichment success rate by ~0.5%.</p>
+<h2>What's Next</h2>
+<p>This was just a first step. We plan to move event aggregation directly into Flink, eliminating a downstream service that currently does this after the fact. We also plan to migrate the Sponsored Brands equivalent of this pipeline, which has the same homegrown join architecture.</p>
