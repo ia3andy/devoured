@@ -1,0 +1,98 @@
+<h1>Gemini API Managed Agents: 3.6 Flash, hooks, and more</h1>
+<p>Managed Agents in Gemini API now default to Gemini 3.6 Flash. New environment hooks let you block, lint, or audit tool calls inside the sandbox. Also, we’ve added budget controls, scheduled triggers, and free tier access.</p>
+<p><a href="https://ai.google.dev/gemini-api/docs/agents">Managed Agents in Gemini API</a> are getting <a href="https://ai.google.dev/gemini-api/docs/agent-hooks">environment hooks</a>, <a href="https://ai.google.dev/gemini-api/docs/antigravity-agent#model-selection">model selection</a>, and <a href="https://ai.google.dev/gemini-api/docs/pricing#pricing-for-agents">free tier access</a>. These capabilities build on our previous release introducing <a href="https://blog.google/innovation-and-ai/technology/developers-tools/expanding-managed-agents-gemini-api/">background tasks and remote MCP server integration</a>.</p>
+<p>With managed agents in the <a href="https://ai.google.dev/gemini-api/docs/interactions-overview">Gemini Interactions API</a>, a single API call coordinates, reasoning, code execution, package installation, file management, and web retrieval inside an isolated cloud sandbox.</p>
+<p>If you're using an AI coding assistant, drop this in your terminal to give it access to the Interactions API skill: <code>npx skills add google-gemini/gemini-skills --skill gemini-interactions-api.</code></p>
+<p>Below are examples using the <code>@google/genai</code> TypeScript/JavaScript SDK. For Python or cURL, check out the <a href="https://ai.google.dev/gemini-api/docs/antigravity-agent">Antigravity agent documentation</a>.</p>
+<pre><code>npm install @google/genai</code></pre>
+<h2>Gemini 3.6 Flash is now the default</h2>
+<p>The <code>antigravity-preview-05-2026</code> agent now runs <a href="https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-3-6-flash-3-5-flash-lite-3-5-flash-cyber/">Gemini 3.6 Flash</a> by default. No code changes are required. Your next interaction picks it up automatically.</p>
+<p>You can also explicitly select models by passing <code>agent_config.model</code> when creating an interaction or managed agent. Use Gemini 3.5 Flash-Lite for lower cost, or pin to your model of preference.</p>
+<pre><code>import \{ GoogleGenAI } from "@google/genai";
+
+const client = new GoogleGenAI(\{});
+
+const interaction = await client.interactions.create(\{
+  agent: "antigravity-preview-05-2026",
+  input: "Audit all dependencies in package.json, upgrade outdated packages, and verify the build by running npm test.",
+  environment: "remote",
+  agent_config: \{
+    type: "antigravity",
+    model: "gemini-3.5-flash-lite",
+  },
+});
+
+console.log(interaction.output_text);</code></pre>
+<p>Supported models include:</p>
+<ul>
+ <li><strong>Gemini 3.6 Flash</strong> (<code>gemini-3.6-flash</code>, default): Balanced model for reasoning, coding, and tool use.</li>
+ <li><strong>Gemini 3.5 Flash</strong> (<code>gemini-3.5-flash</code>): Previous generation for general agentic workflows.</li>
+ <li><strong>Gemini 3.5 Flash-Lite</strong> (<code>gemini-3.5-flash-lite</code>): Lowest latency and cost on the Gemini 3.5 family.</li>
+</ul>
+<h2>Environment hooks: block, lint, and audit tool calls inside the sandbox</h2>
+<p><a href="https://ai.google.dev/gemini-api/docs/agent-hooks">Environment hooks</a> let you run your custom scripts before or after every tool call the agent makes inside its sandbox. Add a <code>.agents/hooks.json</code> into your environment and the runtime executes your handlers on <code>pre_tool_execution</code> or <code>post_tool_execution</code> events.</p>
+<p>The <code>matcher</code> field supports regular expressions, allowing you to target multiple tools with <code>|</code> or catch everything with <code>*</code>:</p>
+<pre><code>\{
+  "security-gate": \{
+    "pre_tool_execution": [
+      \{
+        "matcher": "code_execution|write_file",
+        "hooks": [
+          \{
+            "type": "command",
+            "command": "python3 /.agents/hooks-scripts/gate.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "auto-format": \{
+    "post_tool_execution": [
+      \{
+        "matcher": "*",
+        "hooks": [
+          \{
+            "type": "command",
+            "command": "python3 /.agents/hooks-scripts/auto_lint.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}</code></pre>
+<p>In this configuration:</p>
+<ul>
+ <li>The <code>security-gate</code> group runs <code>gate.py</code> before every <code>code_execution</code> or <code>write_file</code> call. If the script returns <code>\{"decision": "deny", "reason": "..."}</code>, the tool call is skipped and the rejection reason is passed into the model’s context.</li>
+ <li>The <code>auto-format</code> group runs <code>auto_lint.py</code> after every tool finishes to enforce code styling.</li>
+ <li>Hooks also support <code>http</code> type handlers that POST directly to an external endpoint.</li>
+</ul>
+<p>For complete HTTP hook definitions and failure handling semantics, refer to the <a href="https://ai.google.dev/gemini-api/docs/agent-hooks">hooks documentation</a>.</p>
+<p>Teams are already using hooks to build production-grade validation pipelines. For example, AI-native investment bank Offdeal uses <code>post_tool_execution</code> hooks to run automated image verification inside the remote sandbox.</p>
+<blockquote>
+ "OffDeal is an AI-native investment bank, and Archie is the AI analyst our bankers use every day. A requirement for banker-ready decks is company logos: buyer tables, sponsor columns, tombstone grids, often 30+ logos in a single deck, every one of which must be the right company, the appropriate size and aspect ratio, contain the name, have a transparent background, and have a high contrast when placed on a white slide. Before agent hooks, we couldn’t do this on Gemini’s managed agents: the sandbox is remote, so our validation code had nowhere to run. With hooks, a post_tool_execution hook triggers our pipeline inside the sandbox the moment Archie writes its company list, fetching candidates, enforcing pixel-level quality checks, verifying each logo with Gemini vision, and publishing a manifest of approved files that are the only images allowed into the deck."
+</blockquote>
+<p>- Alston Lin, Founder &amp; CTO of OffDeal</p>
+<h2>Cost control and automation features</h2>
+<h3>Free tier availability</h3>
+<p>Managed agents are now available on <a href="https://ai.google.dev/gemini-api/docs/pricing#pricing-for-agents">free tier projects</a>. Developers can experiment with agentic workflows using an <a href="https://ai.google.dev/gemini-api/docs/api-key">API key from a project without active billing</a>.</p>
+<h3>Budget controls</h3>
+<p>Because managed agents execute multi-turn autonomous loops, complex tasks can consume significant token budgets. To prevent runaway tasks, you can pass <code>max_total_tokens</code> inside <code>agent_config</code> to cap total consumption (input + output + thinking).</p>
+<p>When the agent reaches the limit, execution safely pauses and the interaction returns <code>status: "incomplete"</code>. The environment state is preserved, enabling you to <a href="https://ai.google.dev/gemini-api/docs/antigravity-agent#continuing-incomplete-interaction">continue where it stopped</a> by passing <code>previous_interaction_id</code> with a fresh budget.</p>
+<pre><code>const interaction = await client.interactions.create(\{
+  agent: "antigravity-preview-05-2026",
+  input: "Audit all modules in this repo and generate a migration report.",
+  agent_config: \{
+    type: "antigravity",
+    max_total_tokens: 10000,
+  },
+  environment: "remote",
+});</code></pre>
+<h3>Scheduled execution with triggers</h3>
+<p>Automate recurring agent tasks with <a href="https://ai.google.dev/gemini-api/docs/antigravity-agent#triggers">scheduled triggers</a>. A trigger binds an agent, environment, prompt, and cron schedule into a persistent resource that fires without manual intervention. Each run reuses the same sandbox, so files persist across executions.</p>
+<h3>Environments API</h3>
+<p>The <a href="https://ai.google.dev/gemini-api/docs/agent-environment#environments-api">Environments API</a> lets you list, inspect, and delete sandbox sessions from code. Recover environment IDs after a disconnect, or clean up sandboxes when your pipeline finishes instead of waiting for the 7-day TTL.</p>
+<h2>Get started with managed agents</h2>
+<p>These updates turn managed agents into cost-controlled, scheduled workers that operate autonomously inside real development environments without breaking your budget or requiring external orchestration.</p>
+<p>Check out the <a href="https://ai.google.dev/gemini-api/docs/interactions-overview">Gemini Interactions API overview</a> and the <a href="https://ai.google.dev/gemini-api/docs/managed-agents-quickstart">managed agents quickstart</a> to explore custom agent definitions, environment configurations, network rules, and advanced streaming patterns.</p>

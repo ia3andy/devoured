@@ -1,0 +1,108 @@
+<p>Every multi-region setup eventually meets the same awkward moment: a whole cluster goes away, and the identical copy of your service running two regions over might as well not exist, because nothing is wired to treat them as one thing. Failover becomes a runbook: restore, repoint DNS, and wait for an outage that, on paper, you’d already paid to survive.</p>
+<p>Linkerd’s multicluster extension closes that gap by letting several clusters present a service as a single, load-balanced endpoint. The part that the official tasks gloss over is that a real platform almost never picks <em>one</em> multicluster mode. Some services want federation (same service everywhere, one endpoint, automatic failover). While others want mirroring (reach a specific remote service by name). And you frequently want both patterns living on the same set of links. The docs walk through each mode on its own. This post wires all three together across three GKE clusters, with a full-mesh link topology, a chaos test that takes out an entire cluster, and scripts you can clone and run on a fresh GCP project.</p>
+<p><strong>Companion repo</strong>: Every script referenced here lives in <a href="https://github.com/dtaskai/linkerd-multicluster-demo">this repository</a>. Feel free to clone it, set your project ID, and run it.</p>
+<h2>Linkerd multicluster modes: Gateway, flat, and federated</h2>
+<p>Linkerd’s multicluster extension supports three modes. The nice thing is they’re not mutually exclusive: on the same set of linked clusters, the mode is chosen per service via a label.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Mode</th>
+   <th>Label</th>
+   <th>What happens</th>
+   <th>Network Requirement</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Hierarchical (gateway)</strong></td>
+   <td><code>mirror.linkerd.io/exported=true</code></td>
+   <td>Service mirrored as <code>&lt;svc&gt;-&lt;cluster&gt;</code>, traffic routed through a gateway</td>
+   <td>Gateway IP reachable</td>
+  </tr>
+  <tr>
+   <td><strong>Flat (pod-to-pod)</strong></td>
+   <td><code>mirror.linkerd.io/exported=remote-discovery</code></td>
+   <td>Service mirrored as <code>&lt;svc&gt;-&lt;cluster&gt;</code>, traffic goes directly to remote pods</td>
+   <td>Flat network (pod IPs routable)</td>
+  </tr>
+  <tr>
+   <td><strong>Federated</strong></td>
+   <td><code>mirror.linkerd.io/federated=member</code></td>
+   <td>All same-name services unioned into<code> &lt;svc&gt;-federated</code>, load balanced across all clusters</td>
+   <td>Flat network (pod IPs routable)</td>
+  </tr>
+ </tbody>
+</table>
+<p>The distinction that matters operationally is that hierarchical mirroring works on <em>any</em> network. Only the gateway IP needs to be reachable, while flat and federated modes need real pod-to-pod connectivity. On GCP, VPC-native GKE clusters on peered VPCs give you that flat network for free. So, you can run federated services for your core workloads over a flat network and still mirror a specialized service through a gateway from a cluster that isn’t on that network. Most platform teams I’ve seen end up with exactly this kind of mix.</p>
+<h2>Multi-region architecture: GKE cluster setup</h2>
+<p>We have three GKE clusters across three regions, fully linked to each other (six directional links total). Three demo services, each using a different multicluster mode:</p>
+<p><strong>frontend</strong> is federated and runs in all three clusters. A single federated frontend service in each cluster load-balances across all nine pods (3 replicas × 3 clusters). When a cluster goes down, the remaining six pods absorb the traffic with no application changes.</p>
+<p><strong>api</strong> is flat-mirrored and runs in <em>west</em> and <em>east</em>. The <em>north</em> cluster consumes it as <em>api-west</em> and <em>api-east</em>, which are explicit remote service names with traffic sent straight to the remote pods. This is what you reach for when the client needs to decide which backend it talks to, for example, to keep a request in-region for data locality.</p>
+<p><strong>analytics</strong> is gateway-mirrored and runs only in <em>east</em>. Exported through the Linkerd gateway so <em>west</em> and <em>north</em> reach it as <em>analytics-east-gw</em> without needing flat-network connectivity to <em>east</em>’s pods. It’s here mainly to prove that gateway mode coexists with flat and federated modes on the same links.</p>
+<h2>Deployment prerequisites: GKE, Linkerd, and CLI tools</h2>
+<ul>
+ <li>A GCP account (free-tier credits cover this. Use three standard clusters with small node pools)</li>
+ <li>`gcloud` CLI, authenticated (`gcloud auth login`)</li>
+ <li>`kubectl` v1.28+</li>
+ <li>`step` CLI, `brew install step` (for certificate generation)</li>
+ <li>`helm` v3</li>
+ <li>~30 minutes for the full setup</li>
+</ul>
+<h2>Step 0: Configure</h2>
+<p>Clone the repo, create a local .env file from the example file, and customize it for your GCP project.</p>
+<pre><code>git clone &lt;your-repo-url&gt;
+cd blog-linkerd-federation
+cp env.example .env</code></pre>
+<p>Load the variables into your current shell so the scripts can read them:</p>
+<pre><code>source .env</code></pre>
+<h2>Step 1: Provision three GKE clusters with VPC peering</h2>
+<p>Run the infrastructure script to create the networks and clusters.</p>
+<pre><code>./scripts/01-infra.sh</code></pre>
+<p>This script sets up three VPCs with full-mesh peering, creates three GKE Standard clusters, and renames the kubectl contexts.</p>
+<h2>Step 2: Install Linkerd with a shared trust anchor</h2>
+<p>Install Linkerd into all three clusters using a shared trust anchor.</p>
+<pre><code>./scripts/02-linkerd-install.sh</code></pre>
+<h2>Step 3: Install multicluster and create a full-mesh link topology</h2>
+<p>Set up the multicluster components and create a full-mesh topology between the clusters.</p>
+<pre><code>./scripts/03-multicluster-setup.sh</code></pre>
+<h2>Step 4: Deploy the demo services</h2>
+<p>Deploy the demo workloads and apply the necessary labels for federation, flat mirroring, and gateway mirroring.</p>
+<pre><code>./scripts/04-deploy-app.sh</code></pre>
+<h2>Step 5: Verify all three modes</h2>
+<p>Generate traffic against all three service patterns and verify that each resolves the way you expect.</p>
+<pre><code>./scripts/05-verify.sh</code></pre>
+<h2>Step 6: The chaos test, kill a cluster</h2>
+<p>Simulate a full cluster failure and watch how each service type reacts.</p>
+<pre><code>./scripts/06-chaos-test.sh</code></pre>
+<h2>Step 7: Teardown</h2>
+<p>When you’re finished with the demo, run the teardown script to remove all the infrastructure.</p>
+<pre><code>./scripts/99-teardown.sh</code></pre>
+<h2>Selecting your Linkerd multicluster architecture strategy</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Question</th>
+   <th>→ Mode</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Should the client be cluster-agnostic?</td>
+   <td><strong>Federated</strong></td>
+  </tr>
+  <tr>
+   <td>Does the client need to pick a specific cluster?</td>
+   <td><strong>Flat mirror</strong></td>
+  </tr>
+  <tr>
+   <td>Is there no flat network between clusters?</td>
+   <td><strong>Gateway mirror</strong></td>
+  </tr>
+  <tr>
+   <td>Do you need automatic failover with no app changes?</td>
+   <td><strong>Federated</strong></td>
+  </tr>
+ </tbody>
+</table>
+<h2>Key takeaways: Mastering multi-region Linkerd deployments</h2>
+<p>The docs show each multicluster mode in isolation; real platforms need all three at once. Federation covers the common case: The same service everywhere, automatic failover, and nothing to change in the app. Flat mirrors give you explicit, cluster-aware routing when data locality matters. Gateway mirrors get you cross-cluster reach when a flat network isn’t on the table.</p>
