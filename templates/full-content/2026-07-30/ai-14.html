@@ -1,0 +1,85 @@
+<h1>Deep Agents v0.7</h1>
+<p>Today we're shipping deep agents v0.7. This release simplifies the base harness, resulting in 65% fewer base input tokens at comparable performance.</p>
+<p>Building effective agents comes down to context engineering: a model is only as powerful as the context you give it, and that context comes down to what's in the prompt. Assembling that prompt well is the harness's job. But the guidance on how to do it changes constantly: <a href="https://developers.openai.com/api/docs/guides/prompt-engineering">OpenAI</a>, <a href="https://claude.com/blog/the-new-rules-of-context-engineering-for-claude-5-generation-models">Anthropic</a>, and <a href="https://cloud.google.com/discover/what-is-prompt-engineering">Google</a> all publish their own prompting guides, and all three have rewritten them as models got more capable. Harnesses need to keep pace, or they end up carrying prompting the model has outgrown.</p>
+<p>Anthropic just published an updated <a href="https://claude.com/blog/the-new-rules-of-context-engineering-for-claude-5-generation-models">guide</a> on context engineering for modern models, alongside a report that they cut over 80% of Claude Code's system prompt for models like Opus 5 and Fable 5, with no measurable drop in coding evals. A couple of their findings mirror what we saw building v0.7:</p>
+<ul>
+ <li><strong>Interfaces beat examples:</strong> good tool schemas teach usage better than the once popular few shot examples, which can narrow how the model explores.</li>
+ <li><strong>Avoid repetition:</strong> repeating an instruction in both the system prompt and a tool's description doesn't offer meaningful reinforcement.</li>
+</ul>
+<p>Deep Agents v0.7 offers a leaner, more configurable base harness that's more token and cost-efficient.</p>
+<h2>Leaner base harness</h2>
+<p>Our hypothesis: trimming unnecessary tokens from the base input prompt would boost token and cost efficiency while holding performance steady. We made three changes to test this:</p>
+<ul>
+ <li><strong>Removed base system prompt:</strong> We cut the system prompt that Deep Agents used under the hood, which included general guidelines and tool-usage prose (<a href="https://github.com/langchain-ai/deepagents/pull/4859">#4859</a>).</li>
+ <li><strong>Trimmed tool descriptions:</strong> We trimmed builtin tool descriptions by 43% (<a href="https://github.com/langchain-ai/deepagents/pull/5009">#5009</a>).</li>
+ <li><strong>Opt-in todos:</strong> <code>create_deep_agent</code> no longer includes <code>TodoListMiddleware</code> by default. Our evals showed the planning prompt and <code>write_todos</code> tool did not significantly improve performance (<a href="https://github.com/langchain-ai/deepagents/pull/4929">#4929</a>).</li>
+</ul>
+<p>Together, these changes drop <em>base input tokens</em>* on a default-agent turn by 65% (~6k → ~2k).</p>
+<p>*<em>base input tokens</em>: <em>tokens associated with the builtin prompt, tools, and middleware</em></p>
+<h3>How we validated these changes</h3>
+<p>We validated that performance didn't drop using a <a href="https://www.langchain.com/blog/how-we-benchmark-deep-agents">new eval suite</a> built around three categories of benchmarks. Each targets a different kind of agent work:</p>
+<ul>
+ <li><strong>Autonomous:</strong> end-to-end tasks like coding and data analysis</li>
+ <li><strong>Conversational:</strong> multi-turn conversation with a simulated user</li>
+ <li><strong>Long-context:</strong> tasks that require retrieval and reasoning over long-context</li>
+</ul>
+<p>We ran the new v0.7 harness against the old baseline (v0.6.12) through a matrix of all three eval categories across four models: <code>gpt-5.6-luna</code>, <code>gemini-3.6-flash</code>, <code>claude-sonnet-4-6</code>, and <code>claude-opus-4-8</code>.</p>
+<p>Reward held steady overall, and tokens/cost generally dropped*. Most notably <code>gpt-5.6-luna</code> was down 34% on tokens and 15% on cost with reward up 4%. <code>claude-sonnet-4-6</code> was the exception; analyzing the LangSmith traces showed that a significant cost increase was largely from two challenging autonomous tasks.</p>
+<p>*Reward confidence intervals span zero for every model. Luna and Opus show statistically clear token reductions, and Luna also shows a statistically clear cost reduction. Our full report can be found <a href="https://github.com/langchain-ai/deepagents/pull/5009">here</a>.</p>
+<p>For more information, see our recent blog on <a href="https://www.langchain.com/blog/how-we-benchmark-deep-agents">how we run evals</a> for Deep Agents.</p>
+<h3>A note on todo lists</h3>
+<p><code>TodoListMiddleware</code> is now opt-in. Our evals across three categories and three models showed slightly better rewards and lower cost with todos disabled, so we removed the <code>write_todos</code> tool from the base harness. The changes and full experiment results can be found <a href="https://github.com/langchain-ai/deepagents/pull/4929">here</a>.</p>
+<p>That said, it still earns its keep in a few cases:</p>
+<ol>
+ <li><strong>Long, multi-step tasks</strong>, where an agent benefits from an explicit plan to stay on track across many turns.</li>
+ <li><strong>Less capable models</strong>, which need more scaffolding to avoid dropping steps or losing the thread.</li>
+ <li><strong>UI-facing use cases</strong>, where a visible plan and progress matter as much as the underlying execution.</li>
+</ol>
+<p>If your use case is one of the three above, <a href="https://docs.langchain.com/oss/python/deepagents/overview#task-planning">turning it back on</a> is one line: <code>middleware=[TodoListMiddleware()]</code>.</p>
+<h2>More configurability</h2>
+<p>Configurability was <a href="https://github.com/langchain-ai/deepagents/issues/3783">the top ask</a> from Deep Agents users over the last six months, including requests to override <code>FilesystemMiddleware</code>, customize <code>SummarizationMiddleware</code> thresholds, and override the base prompt globally. They all hit the same wall: there was no supported way to change what the default harness stack does. v0.7 fixes that in two ways.</p>
+<p><strong>Full control over your prompts.</strong> Removing hidden prompting has a side effect: your own custom prompting gets more effective, since there’s not prompting under the hood that might cause bloating at best and conflicts at worst.</p>
+<p><strong>Full control over the middleware stack.</strong> v0.7 makes <a href="https://app.notion.com/p/TodoListMiddleware-Analysis-39f808527b1781ce96e8e1755f0889ba?pvs=21">overriding built-in middleware</a> first-class: pass a <code>middleware=</code> instance whose <code>.name</code> matches a default, and it replaces that default in place instead of erroring on a duplicate. (<a href="https://github.com/langchain-ai/deepagents/pull/4251">#4251</a>)</p>
+<p>As one power user shared:</p>
+<blockquote>
+ "We [used to do] some hacky stuff to remove some of the default middleware. Overriding middleware is a very welcome addition."
+</blockquote>
+<p><code>SummarizationMiddleware</code> is a good example. By default it kicks in once a conversation crosses 85% of the context window, using a generic summarization prompt. Different applications call for different prompting, and developers want to trigger summarization at different thresholds too, to stay ahead of context rot and the <a href="https://random.qmx.me/posts/2026/01/14/escaping-the-dumb-zone-with-rlms/">"dumb zone"</a>. You can now drop in a summarization middleware with your own settings:</p>
+<pre><code>from deepagents import create_deep_agent
+from deepagents.middleware import SummarizationMiddleware
+
+agent = create_deep_agent(
+    model="anthropic:claude-sonnet-5",
+    middleware=[
+        SummarizationMiddleware(
+            model="fireworks:accounts/fireworks/models/kimi-k3",
+            # summarize at 50% of the context window instead of the default
+            trigger=("fraction", 0.5),
+            summary_prompt="Summarize the conversation so far, keeping any file paths and decisions verbatim...",
+        ),
+    ],
+)</code></pre>
+<p>The same pattern works for any other builtin default you want to retune, like prompt-caching TTLs.</p>
+<h2>Filesystem performance</h2>
+<p>The filesystem is Deep Agents' core context management layer: the environment agents read, write, and navigate state through. This release makes some optimizations driven by the same eval suite plus trajectory optimizations identified from real <code>dcode</code> usage, with open and closed models.</p>
+<p><code>write_file</code> now overwrites an existing file instead of erroring (<a href="https://github.com/langchain-ai/deepagents/pull/4109">#4109</a>), paginated <code>read_file</code> reports total and remaining lines plus the next <code>offset</code> (<a href="https://github.com/langchain-ai/deepagents/pull/4540">#4540</a>), and <code>grep</code>/<code>glob</code> return partial results with a <code>truncated</code> flag instead of hanging on large trees, with <code>grep</code> also gaining a 1,000-match cap, streamed output, and optional context lines (<a href="https://github.com/langchain-ai/deepagents/pull/4063">#4063</a>, <a href="https://github.com/langchain-ai/deepagents/pull/4570">#4570</a>, <a href="https://github.com/langchain-ai/deepagents/pull/4706">#4706</a>).</p>
+<h2>Breaking changes</h2>
+<p>This release removes some compatibility shims and changes a few default behaviors:</p>
+<ol>
+ <li><code>TodoListMiddleware</code> is no longer on by default (<a href="https://github.com/langchain-ai/deepagents/pull/4929">#4929</a>), though it's opt-in with <code>TodoListMiddleware()</code>.</li>
+ <li>Support for backend factories, deprecated in v0.5, is removed in favor of concrete <code>BackendProtocol</code> instances (<a href="https://github.com/langchain-ai/deepagents/pull/4541">#4541</a>). Other file format / backend protocol deprecations from v0.5 are also removed.</li>
+ <li>The <code>delete</code> tool was added to the default filesystem tool list. <code>FilesystemMiddleware</code> accepts a <a href="https://docs.langchain.com/oss/python/deepagents/overview#virtual-filesystem-access">tool allowlist</a> so you can opt out of this if desired (<a href="https://github.com/langchain-ai/deepagents/pull/4325">#4325</a>, <a href="https://github.com/langchain-ai/deepagents/pull/4698">#4698</a>).</li>
+</ol>
+<p>Full details, including migration notes and an “upgrade” prompt for coding agents, are in the <a href="https://docs.langchain.com/oss/python/releases/changelog#jul-24-2026">changelog</a>.</p>
+<h2>Try it</h2>
+<pre><code>uv pip install -U deepagents</code></pre>
+<pre><code>npm install deepagents@latest</code></pre>
+<p>Give the latest <code>deepagents</code> a try, and let us know what you think via GitHub <a href="https://github.com/langchain-ai/deepagents/issues">issues</a>, the <a href="https://forum.langchain.com/">forum</a>, or on X / LinkedIn.</p>
+<h2>References</h2>
+<ul>
+ <li><a href="https://docs.langchain.com/oss/python/releases/changelog#jul-24-2026">Release notes: <code>deepagents</code> v0.7.0</a></li>
+ <li><a href="https://docs.langchain.com/oss/python/deepagents/customization">Docs: customizing and overriding built-in middleware</a></li>
+ <li><a href="https://docs.langchain.com/oss/python/deepagents/overview#virtual-filesystem-access">Docs: filesystem tools and virtual filesystem access</a></li>
+ <li><a href="https://docs.langchain.com/oss/python/deepagents/overview#task-planning">Docs: opt in todos</a></li>
+ <li><a href="https://www.langchain.com/blog/how-we-benchmark-deep-agents">Eval suite blog: how we benchmark Deep Agents</a></li>
+</ul>

@@ -1,0 +1,177 @@
+<h1>Scaling StreamHub: Transitioning from Kinesis to Kafka for 145 Billion Daily Events</h1>
+<p>Multi-year architectural evolution: Moving from Amazon Kinesis to Managed Streaming for Apache Kafka (MSK), using Kafka Tiered Storage to cut costs, the critical outages that tested our resilience.</p>
+<h2>Scaling StreamHub: From Kinesis to Kafka and Beyond</h2>
+<p>At Atlassian, event streaming powers our entire product suite. Most of the clicks, impressions, API calls, CDC events, and telemetry flows through our real time data pipelines.</p>
+<p>Not so long ago, our streaming infrastructure handled a respectable <strong>22 billion events per day</strong>. As our user base grew and new real time analytics features launched, data volume surged. Today, StreamHub ingests and processes <strong>150 billion events per day</strong>, delivers over <strong>225 billion events per day </strong>— averaging about 1.68 million events per second with peak traffic exceeding 3.2 million events per second.</p>
+<p>Operating at this scale exposes every micro inefficiency in your code, every limitation in cloud providers’ offerings, and every subtle defect in managed services.</p>
+<p>In this post, we share our multi year architectural evolution: why and how we moved from Amazon Kinesis to Apache Kafka (via AWS Managed Streaming for Apache Kafka, or MSK), how we used Kafka Tiered Storage to cut costs, the critical outages that tested our resilience, and the design patterns that keep StreamHub robust.</p>
+<h2>The Starting Line: Why We Outgrew Amazon Kinesis</h2>
+<p>For years, Amazon Kinesis powered our data ingestion layer. This zero ops service served us well up to 20-30 billion events.</p>
+<p>Facing a 5x scale increase, Kinesis revealed three fundamental bottlenecks:</p>
+<table>
+ <tbody>
+  <tr>
+   <td></td>
+   <th><strong>Bottleneck</strong></th>
+   <th><strong>Description</strong></th>
+  </tr>
+  <tr>
+   <td>1</td>
+   <td><strong>API reliability</strong></td>
+   <td>StreamHub API barely supported 99.99% reliability, and Kinesis throttling during spikes affected producers. With increased scale, we aimed for 99.999% reliability.</td>
+  </tr>
+  <tr>
+   <td>2</td>
+   <td><strong>The Cost of High Partitioning</strong></td>
+   <td>Kinesis scales via “shards,” each with a throughput limit of 1 MB/sec ingress and 2 MB/sec egress. To handle peak loads, we needed thousands of shards. Since Kinesis pricing depends heavily on active shards, our monthly cloud bill grew linearly with traffic. Kinesis autoscaling (on demand) at StreamHub’s scale was prohibitively expensive.</td>
+  </tr>
+  <tr>
+   <td>3</td>
+   <td><strong>Retention Limits &amp; Cost Penalties</strong></td>
+   <td>Storing data in Kinesis beyond 24 hours required costly extended retention add ons. We aimed to keep event history for up to 7 days to let consumers replay data safely during downstream failures or model retraining.</td>
+  </tr>
+  <tr>
+   <td>4</td>
+   <td><strong>Delivery SLOs</strong> <strong>&amp; Consumer Throughput Exhaustion</strong></td>
+   <td>With Kinesis, multiple independent consumer groups share the same shard egress capacity, and Enhanced Fan Out (EFO) carries a steep premium. StreamHub required a local delivery SLO under 2 seconds and cross region delivery latency under 3 seconds. To meet these latency guarantees for two high volume, low latency services, we used EFO to fan out and push events directly to our consumers’ external streaming infrastructures or across regions.</td>
+  </tr>
+ </tbody>
+</table>
+<h3>The Decision: Self Managed vs. Managed Apache Kafka</h3>
+<p>We needed an architecture that supported cost effective multi day retention, scaled without significant cost for additional consumer groups, and could support multi cloud. Apache Kafka was the clear choice.</p>
+<p>To reduce operational overhead, we migrated to <strong>AWS MSK (Managed Streaming for Apache Kafka)</strong>. This allowed our small platform team to focus on stream architecture, client libraries, and reliability rather than provisioning zookeepers, managing OS patches, or replacing failed hardware.</p>
+<h2>Decoupling Storage and Compute: The Magic of Tiered Storage</h2>
+<p>Our migration to Kafka was more than an API change; it fundamentally altered how we stored and accessed stream data.</p>
+<p>Storing billions of events on high performance EBS (Elastic Block Store) volumes would be costly. This made <strong>Kafka Tiered Storage</strong> our key architectural feature.</p>
+<p>Tiered Storage splits the storage of Kafka topic data into two tiers:</p>
+<table>
+ <tbody>
+  <tr>
+   <th><strong>Tier</strong></th>
+   <th><strong>Description</strong></th>
+   <th><strong>Details</strong></th>
+  </tr>
+  <tr>
+   <td><strong>Local Tier (Tier 1)</strong></td>
+   <td>Utilizes local EBS volumes on the brokers to store “hot” data.</td>
+   <td>Configured for the last 5 minutes. Ensures real time consumers read directly from fast, low latency storage. Consumers reading beyond this window are not latency sensitive by definition.</td>
+  </tr>
+  <tr>
+   <td><strong>Remote Tier (Tier 2)</strong></td>
+   <td>Asynchronously offloads closed log segments to a highly durable, low cost object store (Amazon S3).</td>
+   <td>Stores historical data with a 7 day retention configured for our target. Reading from S3 adds a few hundred milliseconds of latency, which is acceptable if the consumer is already over 5 minutes behind.</td>
+  </tr>
+ </tbody>
+</table>
+<p>By moving to Tiered Storage, we reduced infrastructure costs significantly. We stopped over provisioning costly EBS volumes for worst case retention. Historical data reads now come entirely from S3, preventing heavy backfills from starving IOPS for our hot, real time consumers.</p>
+<h2>Managed Streaming Challenges: What Broke at Scale</h2>
+<p>Operating at 150 billion events per day means every architectural assumption gets tested. Managed streaming gave us the operational simplicity of a managed Kafka service, but at our scale we also encountered limits that were easy to underestimate: broker networking ceilings, S3 request rate behavior, tiered storage offload throughput, and managed service control plane dependencies.</p>
+<p>The following challenges shaped the next phase of StreamHub’s resilience.</p>
+<h3>Challenge 1: Broker network limits and instance sizing</h3>
+<p>When teams size Kafka clusters, it is natural to start with CPU and memory. For us, the more important constraint was often broker level throughput. Each broker instance type has practical ingress, egress, EBS, and network limits. A cluster can look healthy on average while a subset of brokers or partitions is already running close to saturation.</p>
+<p>Kafka traffic is also amplified. Producer ingress is only one part of the picture; replication, consumer fan out, cross region relay traffic, retries, and tiered storage remote copy all compete for broker resources. A broker shape that is sufficient for steady state writes may still be under provisioned once these secondary workloads are included.</p>
+<p>This became especially visible during traffic spikes. Smaller broker instances could accept incoming data faster than they could replicate, serve consumers, and offload closed log segments to S3. As CPU and I/O pressure increased, background Kafka work slowed down, consumer lag grew, and local disk utilization began climbing.</p>
+<h3>Challenge 2: Tiered storage still needs local headroom</h3>
+<p>Tiered Storage dramatically reduced our storage cost, but it did not eliminate the need for strong local broker capacity. Kafka writes data locally first and background workers copy closed log segments to S3 async.</p>
+<p>During heavy inbound traffic, those background workers compete with producer writes, replication, reads, and broker housekeeping. If the instance is too small, remote copy can fall behind. Once remote copy falls behind, local disks begin to accumulate data that should have been offloaded. At high ingest rates, that disk growth can become linear from an operations perspective: every minute of delay adds more data that the cluster must later catch up on.</p>
+<p>The key lesson was simple: tiered storage is not a substitute for broker headroom. It is a cost and retention strategy, not a license to run minimal local capacity.</p>
+<h3>Challenge 3: S3 request rate limits during retention changes</h3>
+<p>S3 is effectively unlimited in capacity, but its APIs still have request rate behavior that matters at scale. With thousands of Kafka partitions, Tiered Storage continuously writes segment files, index files, and metadata to S3.</p>
+<p>We encountered a painful edge case when temporarily increasing tiered storage retention from 7 days to 21 days for a production investigation and then reverting to 7 days. The retention reduction triggered a large wave of deletes for older remote data. That delete storm competed with regular tiered storage writes and caused remote writes to slow down. As remote writes paused, broker local disk utilization increased quickly.</p>
+<p>The issue was not that S3 lacked capacity; it was that a large operational change created a burst of control plane and data plane API activity that interfered with the steady remote copy path.</p>
+<h3>Challenge 4: Storage scaling cooldowns during incidents</h3>
+<p>When broker disks fill up, the natural response is to add disk. Storage modification is a managed operation and can introduce a cooldown window before another storage change is allowed.</p>
+<p>That matters during an incident. If disks are filling quickly and the first expansion is too small, the cluster may need another expansion before the cooldown expires. In our case, this extended recovery time. We had to wait for the managed service operation window to clear before adding enough storage to recover safely.</p>
+<p>The lesson was to avoid small, incremental storage increases during a crisis. If storage must be expanded under active pressure, the safer move is to add enough headroom to survive the full cooldown window and the expected backlog.</p>
+<h3>Challenge 5: Availability Zone failure and managed control plane behavior</h3>
+<p>All of our clusters are deployed across multiple Availability Zones so that the Kafka data plane can continue operating when a single zone has problems. During a localized AZ degradation, we expected clients to shift toward healthy brokers and for the cluster to degrade gracefully.</p>
+<p>The data plane was not the only dependency, instead the control plane reported inaccurate status, degrading all our services. Due to the zone outage, the cluster was healing and blocked any changes. That meant we could not quickly reboot broker, scale the cluster, increase disk, or complete some automated reassignment actions at the exact moment we needed those controls most.</p>
+<p>This changed how we think about managed services. A managed service can reduce day to day operational burden, but critical recovery workflows still need to account for control plane unavailability.</p>
+<h3>Challenge 6: Scaling is slow, and storage only grows</h3>
+<p>MSK scaling operations are not instantaneous, and they are not symmetric. Increasing broker storage gives the cluster more breathing room, but that disk allocation cannot be reduced later. Once storage has been expanded, the only practical way to return to a smaller disk footprint is to create a new cluster with the desired size and re route producers and consumers to it.</p>
+<p>Broker instance upgrades also require a rolling restart. In practice, this can take roughly 15 minutes per broker, so rolling instance upgrades across a large cluster can take hours, making them unsuitable as incident mitigation. That is useful for planned scaling, but it is rarely fast enough to be the primary mitigation during an active incident.</p>
+<p>Scaling out by adding brokers has a similar limitation. New brokers increase theoretical cluster capacity, but they do not immediately help existing hot topics. Until partitions and leaders are rebalanced onto the new brokers, the overloaded brokers continue carrying the same traffic. Because rebalancing adds additional network, disk, and replication load, scaling out during an incident was not a realistic recovery option for our most severe failure modes.</p>
+<h2>Solutions: How We Hardened StreamHub</h2>
+<p>After these incidents, we changed both our architecture and our operating model. The goal was not only to make Kafka faster; it was to make failure modes smaller, recovery paths clearer, and capacity boundaries explicit.</p>
+<h3>Solution 1: Capacity planning around broker level bottlenecks</h3>
+<p>We now plan capacity using broker level peak ingress, egress, EBS throughput, CPU, partition placement, and remote copy behavior not only aggregate cluster throughput. The cluster average is useful for trend analysis, but incidents usually begin when a few brokers become hot.</p>
+<p>In practice, this means:</p>
+<ul>
+ <li>Choosing broker instances for network and EBS headroom, not just CPU utilization.</li>
+ <li>Keeping sustained CPU below a conservative threshold so background Kafka and tiered storage work can continue during spikes.</li>
+ <li>Monitoring per broker <code>BytesIn</code>, <code>BytesOut</code>, disk growth, remote copy lag, partition skew, and consumer lag together.</li>
+ <li>Load testing with realistic producer, consumer, replication, retry, and cross region traffic patterns.</li>
+</ul>
+<p>One of the most important changes was cultural: we stopped treating unused broker capacity as waste. For a system this critical, headroom is a reliability feature.</p>
+<h3>Solution 2: Over provisioning network limits intentionally</h3>
+<p>Over provisioning does not mean guessing high. It means treating documented and observed per broker limits as hard boundaries, then designing the cluster so normal peak traffic uses only a safe fraction of those limits.</p>
+<p>Our approach includes four layers:</p>
+<ol>
+ <li><strong>Use larger broker shapes where network is the bottleneck.</strong> If CPU looks low but network or EBS is close to saturation, the instance is still too small.</li>
+ <li><strong>Scale out in Availability Zone multiples.</strong> Adding brokers increases aggregate network capacity, but it only helps existing hot traffic after partitions and leaders are rebalanced.</li>
+ <li><strong>Balance partitions and leaders continuously.</strong> Hot partitions can break a cluster before total capacity is exhausted. We use round robin partition assignment, but keyed partitions require frequent rebalancing.</li>
+ <li><strong>Protect the shared broker budget with quotas.</strong> Producer and consumer quotas prevent one workload from consuming all available network bandwidth.</li>
+</ol>
+<p>This strategy gives us room to absorb retries, failover traffic, and temporary consumer slowdowns without immediately pushing brokers into resource exhaustion.</p>
+<h3>Solution 3: Safer tiered storage operations</h3>
+<p>Tiered Storage remains a major win for StreamHub, but we now treat retention and segment management changes as production risk operations.</p>
+<p>We reduced risk by generating fewer, larger segment files where appropriate, staggering operational changes, and watching remote copy metrics closely during any retention adjustment. We size local disks with enough emergency buffer to survive temporary S3 offload delays and configure sufficient tiered storage offload threads to handle peak traffic spikes.</p>
+<p>The principle is that remote storage should reduce steady state cost, while local storage should provide operational shock absorption.</p>
+<h3>Solution 4: Ingress rate limiting and quarantine</h3>
+<p>We built controls on StreamHub API and the delivery layer to protect Kafka from sudden spikes, malformed traffic, and external exceptions.</p>
+<p>The two important controls:</p>
+<ul>
+ <li><strong>Rate limiting:</strong> We can enforce dynamic limits by tenant, topic, producer, or traffic class before events reach Kafka.</li>
+ <li><strong>Quarantine:</strong> Traffic that is malformed or repeatedly failing can be diverted to a safe holding path instead of being retried indefinitely through the hot path.</li>
+</ul>
+<p>This moved a critical protection boundary closer to producers. Instead of asking Kafka to absorb every spike, we can shed, slow, or quarantine traffic before it threatens shared broker capacity.</p>
+<h3>Solution 5: Kafka client quotas for noisy neighbors</h3>
+<p>Inside Kafka, we use client quotas to enforce producer and consumer bandwidth budgets. This protects critical streams from lower priority workloads and prevents a single misconfigured pipeline from monopolizing broker resources.</p>
+<p><code># Example: enforce producer and consumer bandwidth for a client identity kafka configs.sh bootstrap server $BOOTSTRAP alter entity type users entity name analytics consumer group add config 'producer_byte_rate=52428800,consumer_byte_rate=104857600'</code></p>
+<p>Quotas are not only a cost control mechanism. At StreamHub scale, they are a blast radius control.</p>
+<h3>Solution 6: Sharding and Failover clusters for faster failover</h3>
+<p>We split large clusters into multiple shards to reduce blast radius. During an incident, we quickly route traffic to a healthy cluster.</p>
+<p>When a managed control plane is unhealthy, waiting for recovery can extend outages. We created a “failover cluster” runbook: if a primary cluster shows severe sustained degradation, we provision a clean parallel Kafka cluster while continuing incident response.</p>
+<p>The runbook has four stages:</p>
+<table>
+ <tbody>
+  <tr>
+   <th><strong>Stage</strong></th>
+   <th><strong>What happens</strong></th>
+  </tr>
+  <tr>
+   <td><strong>Shard Fail over</strong></td>
+   <td>Update routing from affected shard to healthy shard. Adjust rate limits and add quarantine to maintain processing within target shard capacity. (ETA: ~15 mins)</td>
+  </tr>
+  <tr>
+   <td><strong>Prepare</strong></td>
+   <td>Provision a new cluster and apply our infrastructure as code templates for topics, tiered storage, access controls, and client configuration. (ETA: ~2 hours)</td>
+  </tr>
+  <tr>
+   <td><strong>Evaluate</strong></td>
+   <td>Continue mitigating the primary cluster while the clean environment becomes ready in parallel.</td>
+  </tr>
+  <tr>
+   <td><strong>Cluster Fail over</strong></td>
+   <td>If the primary cluster remains unhealthy beyond our decision threshold, update routing so producers and consumers move to the clean cluster.</td>
+  </tr>
+ </tbody>
+</table>
+<p>This gives on call an escape hatch. Even if the primary cluster is stuck behind a managed service operation, recovery no longer depends entirely on that control plane becoming healthy.</p>
+<h3>Solution 7: Companion regions for compliant regional failover</h3>
+<p>StreamHub operates globally, and failover must respect data residency requirements. We cannot simply move traffic from one geography to another if that violates customer or regulatory commitments.</p>
+<p>To solve this, we established companion regions: pre approved regional zones that stay within the same compliance boundary. Producers and consumers can be configured to fail over to the companion region when the primary region becomes unhealthy, while preserving residency constraints.</p>
+<p>This turns disaster recovery from an improvised decision into a pre vetted path.</p>
+<h2>Lessons for Teams Adopting Managed Streaming at Scale</h2>
+<ul>
+ <li><strong>Managed does not mean unlimited.</strong> Managed streaming services remove a lot of operational work, but broker, network, EBS, S3, and control plane limits still matter.</li>
+ <li><strong>Plan for the hottest broker, not the average broker.</strong> Partition skew and hot leaders are often where incidents begin.</li>
+ <li><strong>Tiered storage reduces cost, not operational responsibility.</strong> Remote copy needs CPU, EBS, network, and local disk headroom.</li>
+ <li><strong>Do not make small emergency storage increases.</strong> If a managed service cooldown applies, add enough capacity to survive the whole window.</li>
+ <li><strong>Rate limits and quotas are reliability tools.</strong> They protect shared infrastructure and reduce blast radius.</li>
+ <li><strong>Have a failover path that does not depend on the failing control plane.</strong> Failover clusters and companion regions give operators options when managed operations are unavailable.</li>
+</ul>
+<h2>Looking Forward</h2>
+<p>Scaling StreamHub from 22 billion to 150 billion events per day taught us that streaming reliability is built in layers. Kafka gave us the foundation we needed for throughput, retention, and cost efficiency. But the system became truly resilient only after we added traffic control, capacity guardrails, operational playbooks, and compliant failover paths.</p>
+<p>The biggest lesson is that reliability at this scale is not one feature or one service. It is the combination of conservative capacity planning, explicit blast radius controls, tested recovery paths, and a willingness to learn from every failure.</p>
+<p>We are continuing to evolve StreamHub as Atlassian’s event volumes grow, and we are excited to share more about the next phase of that journey.</p>

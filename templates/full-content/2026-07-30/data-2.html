@@ -1,0 +1,62 @@
+<h1>Indexing the Data Lake for Online Point Queries</h1>
+<p>Companies like Spotify need vast quantities of data accessible at low latency for online services and, increasingly, AI Agents acting on behalf of users. Online services — such as portals and personalization features that use or display a user's listening history — need to look up and paginate through per-user data at interactive speeds. AI Agents answering questions like, "what was I listening to last summer?" need to retrieve a user's data quickly so they can reason over it — filtering, aggregating, or even running SQL locally — to build context for LLM prompts. Both patterns share the same underlying primitive: fast point queries by key over datasets that are often far too large to economically keep resident in a key-value (KV) store like Bigtable or DynamoDB.</p>
+<p>At Spotify, petabytes reside in Bigtable for online use-cases — but exabytes sit in the GCS data lake. The underlying storage for lakes is fast and getting faster — GCS delivers 30–100ms per request, and S3 Express One Zone and GCS Rapid Storage now offers single-digit millisecond latency. The bottleneck is increasingly not the storage layer itself, but the query engines on top: distributed SQL engines like Trino and BigQuery add seconds of job scheduling and query planning overhead, even for a single-row lookup. They are designed for analytical throughput, not interactive point queries.</p>
+<p><strong>Random Access Parquet (RAP)</strong> bridges this gap. An external index maps keys directly to file locations, and precise ranged reads fetch exactly the bytes needed. RAP operates on the same Parquet files already shared by ML pipelines, notebooks, experimentation platforms, and batch analytics — storing once and paying once, rather than maintaining separate copies in specialized serving systems.</p>
+<h2>How a distributed SQL engine finds the needle in the haystack</h2>
+<p>A user asks an AI agent what they listened to last summer. Just the listening history data spans billions of users across thousands of large daily files, and summer is roughly 90 days. With, let’s say, 1,000 files per day, that is 90,000 individual Parquet files. It is prohibitive to read even a little bit of each within any reasonable time or compute budget for an online use case.</p>
+<p>There are standard ways to reduce the candidate set. Within each daily partition, files can be further partitioned by key — a technique commonly used to speed up joins that benefits point lookups too when the key is right. From the filename alone, the engine knows whether a given user ID can possibly be in that file. With 1,000 buckets per day, the candidate set drops from 90,000 to 90. Bloom filters on the user ID column can discard files without opening them — cached in a metadata store, they narrow 90 candidates to perhaps the 12 days the user was actually active.</p>
+<p>We still have to read those 12 files. Each file is large, and finding one user's data within it requires a chain of dependent reads: fetch the footer, parse row group metadata, scan the key column to locate matching rows, then use column and page indexes to find the corresponding pages in each value column. That is multiple, round-trip dependent-fetches to cloud storage per file, per column — and every round-trip contends for IOPS with all the other concurrent queries. Partitioning by key and Bloom filters help select files, but they don't solve the within-file problem.</p>
+<h2>The RAP Approach</h2>
+<p>The chain of dependent reads is the fundamental bottleneck, and it applies at every storage tier. Each link costs latency (one round-trip before the next can start) and bandwidth (bytes read just to discover where to read next). On cloud storage, each I/O link costs tens of milliseconds; on local SSD, microseconds; in memory, nanoseconds. The absolute numbers change, but the structure is the same: each step depends on the result of the previous one. Collapsing that chain — replacing dependent reads with a single precomputed lookup — saves both latency and bandwidth regardless of the storage tier. We illustrate the approach over cloud object storage because the per-round-trip cost makes the benefit most dramatic, but the principle is general.</p>
+<p>Instead of scanning, RAP looks up. An <strong>external index</strong> maps each key directly to each file and row number where its data resides. Given a key, the reader looks up the index, resolves the row number to page locations using cached file metadata, and issues ranged reads to fetch exactly the pages needed. The index lookup is O(1), the cached page mapping is a low-latency operation, and the data retrieval is a small number of precise ranged reads. Importantly, these reads can be issued in parallel — there are no dependent load chains.</p>
+<h3>The External Index</h3>
+<p>RAP can operate on <strong>any existing Parquet files with no special preparation</strong>. The index builder reads footers and page locations for the columns that will be retrieved, scans key columns to build the key-to-location mapping, and writes it out. As new data arrives, each pipeline run produces corresponding index entries. The index grows by appending fragments, not modifying existing ones.</p>
+<p>The index is a multimap — a single key can have entries across many files and partitions. Each entry is compact:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Field</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>key</strong></td>
+   <td>The lookup key (e.g. user ID, possibly compound)</td>
+  </tr>
+  <tr>
+   <td><strong>file</strong></td>
+   <td>Which Parquet file (dictionary-encoded ordinal)</td>
+  </tr>
+  <tr>
+   <td><strong>row numbers</strong></td>
+   <td>The rows within that file</td>
+  </tr>
+  <tr>
+   <td><strong>value count</strong> (optional)</td>
+   <td>Number of values, enabling pagination</td>
+  </tr>
+ </tbody>
+</table>
+<p>As a rule of thumb, indexing terabytes produces gigabytes of index; indexing petabytes produces terabytes. Large indexes distribute naturally by hash bucketing.</p>
+<p>This is fundamentally different from Parquet's built-in PageIndex or Bloom filters: those are probabilistic and narrow a scan. The external index is definitive — given a key, it returns the exact files and rows, eliminating the scan entirely.</p>
+<p>On unmodified files, RAP reads the entire page containing the target row — potentially a 4MB page to extract 100 bytes. For latency- or cost-sensitive workloads, write-time preparation makes reads smaller and more precisely targeted. This means getting into the details of Parquet internals and data processing pipelines — but that is where the real wins are.</p>
+<h2>Optimizations for Prepared Parquet Files</h2>
+<p>An external index changes what the reader knows before it touches a file — the exact file, row, and columns needed. The optimizations below apply to those columns that serve point queries; other columns in the same file can retain whatever layout best suits batch analytics.</p>
+<h3>Concentrating Key Data</h3>
+<p><strong>Sorting by key</strong> ensures all rows for the same key are contiguous within each file, concentrating them into as few pages as possible. Many pipelines already produce sorted output. Hash bucketing goes further by guaranteeing each key maps deterministically to one file per partition.</p>
+<p><strong>Co-grouping</strong> — structuring the schema so each key appears once with values in repeated or nested columns, e.g: <code>SELECT user_id, ARRAY_AGG(STRUCT(timestamp, track_uri, duration_ms)) FROM streams GROUP BY user_id</code> gives one row per key per file without relying on sort order and is often natural.</p>
+<p><strong>Coarser partitioning</strong> reduces the number of files a key spans. Daily partitioning produces 365 files per key per year; weekly reduces this to 52 — fewer index entries, fewer parallel reads, smaller index. This trades off against partition pruning granularity for batch queries.</p>
+<h3>Reducing Bytes Read</h3>
+<p><strong>One page per key.</strong> The writer flushes pages at key boundaries — a page break whenever the key changes. The entire decompressed page belongs to the target key; no row extraction needed. Since each page now belongs to a single key, the page locations can be stored directly in the index entry — no separate page index needed.</p>
+<p><strong>ZSTD frame resets within pages.</strong> When one-page-per-key would bloat the PageIndex, an alternative keeps conventional page sizes but compresses each key's rows as a separate ZSTD frame within the page. The index stores each frame's byte offset and size per column, addressing the data directly without a separate page index.</p>
+<p><strong>Storage alignment.</strong> ZSTD skippable frames can pad between keys to align fetches to storage block boundaries (e.g. 4KB or 16KB). This avoids unnecessary block reads.</p>
+<h3>Reducing Read Operations</h3>
+<p><strong>Reducing the read count is the biggest single win.</strong></p>
+<p><strong>Blobs and Variants.</strong> Storing the fields needed for random access as a single column — JSON, Protobuf, or Parquet Variant — means one read per file.</p>
+<p><strong>Interleaving columns.</strong> When multiple columns are needed — some for point queries, others for batch analytics — the writer can interleave them physically. Each key's data from different columns is written adjacent. A RAP reader issues a single contiguous ranged read spanning all columns for a key.</p>
+<p><strong>Covering indexes and hoisted values.</strong> The index builder visits every row at build time. For small values, it can <strong>hoist</strong> the value directly into the index entry — a covering index that eliminates the storage read entirely, reducing the read count to zero.</p>
+<h2>Secondary Indexes</h2>
+<p>A dataset may have multiple lookup dimensions — for example, a transaction dataset queried by both buyer_id and seller_id. RAP supports this by building multiple access structures over the same index entries, one per dimension. Hash tables give O(1) exact lookups; sorted indexes enable range queries.</p>
+<h2>Conclusion</h2>
+<p>The key property of RAP is that it operates on the same Parquet files already in the lake. The files that BigQuery scans for weekly aggregate reports are the same files that an AI agent reads for context retrieval. No copy, no ETL, no second storage bill. This changes the economics of which data can be served online. With RAP, the cost of a point query drops to the cost of a cloud storage read. The data lake is no longer batch-only. The same storage serves both analytical and interactive workloads — one dataset, two access patterns.</p>

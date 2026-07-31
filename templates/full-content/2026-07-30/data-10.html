@@ -1,0 +1,61 @@
+<p><strong>The central data team problem?</strong></p>
+<p>It’s a knowledge coordination problem. In a central warehouse or lake, one data team owns the data for the whole company. But that team does not know what the data means. The domain teams know: the people in payments, in product, in finance.</p>
+<p>So the fix has always been about decentralization. If meaning lives in the domains, then ownership has to live there too. Put another way: decentralization is not a nice-to-have added on top. It is the direct answer to the knowledge problem. From embedded analysts to data mesh, everyone proposed some level of data and tech in the domain team to help convey the meaning to the central team.</p>
+<p>Embedded analysts are common in most companies. Other companies go as far as creating an API-based contract between domain and core teams and forcing the domain teams to serve data through the contract-api. That’s expensive and complex, and complexity is often a sibling of failure.</p>
+<p>Today, we have a new tool at our disposal - one that can shift technical capabilities into domain teams, or coordinate the knowledge transfer from domain to core teams: LLMs, of course.</p>
+<p>I previously described how canonical models coupled with a description of the concepts and their relationships creates agentic-native canonical meaning units.</p>
+<p>In this post, we move from concept to architecture that you can apply to a data. stack.</p>
+<h2>Composable canonicals</h2>
+<p>The idea of this post is to take these self documented canonical knowledge blocks and combine them into a business canonical block</p>
+<p>To recap, the idea of a canonical block was to create a machine readable “tribal knowledge” or domain knowledge that can survive across departments and people and that can be used to generate reporting from raw data</p>
+<p>The way we build the blocks:</p>
+<ol>
+ <li>Grab raw data and infer its schema with dlt. This creates a technical profile about the structure of the data and what is contained.</li>
+ <li>Bootstrap an ontology - the agent searches its memory, the internet, and asks you questions to understand what the data is about.</li>
+ <li>Generate a data model, review and possibly refine the original ontology.</li>
+</ol>
+<p>This gives you a raw data pipeline, a transformation to canonical, and a knowledge document (the ontology) that instructs the agent what the data means.</p>
+<p>The same way that we create a data source canonical model, we can also use these models as sources for creating the business canonical.</p>
+<h2>What a business canonical is, and how it differs from a source canonical</h2>
+<p>Let's make this concrete with three systems many teams actually run, and a real flow between them.</p>
+<p>Suppose HubSpot is our source of truth for who a customer is. Slack is where people get support and chat with us. Luma is where we run events and collect guests — new people show up there first, and we later add them into HubSpot as contacts. So a single human can appear in all three, at different stages, under different names, with no shared ID.</p>
+<h3>Each source is its own canonical</h3>
+<p>A <strong>source canonical</strong> models one system in that system's own language. It has three parts: the raw tables we load, the transformation that shapes them, and the ontology that says what the entities mean <em>inside that system</em>.</p>
+<p><strong>Luma canonical — top of the funnel.</strong> Raw Luma gives us events, registrations, and guests. The ontology says: a Guest is a person who registered for or attended an event, keyed by the email they signed up with. In Luma's world, "customer" doesn't exist yet — there are only Guests, some of whom we'll later decide are worth pulling into the CRM.</p>
+<ul>
+ <li><code>events</code> — an event we hosted (name, date, capacity)</li>
+ <li><code>registrations</code> — a guest signed up for an event (email, name, RSVP status, attended y/n)</li>
+ <li><code>guests</code> — the deduplicated person as Luma knows them (email, name, first-seen date)</li>
+</ul>
+<p><strong>HubSpot canonical — the source of truth.</strong> Raw HubSpot gives us contacts, companies, and deals. The ontology says: a Contact is a person the company has a real relationship with; the lifecycle stage (lead, MQL, customer) is HubSpot's opinion of where they are. This is the system that gets to say the word "customer" officially.</p>
+<ul>
+ <li><code>contacts</code> — the person of record (email, name, lifecycle_stage, owner)</li>
+ <li><code>companies</code> — the account a contact belongs to</li>
+ <li><code>deals</code> — revenue attached to a contact/company</li>
+</ul>
+<p><strong>Slack canonical — the support and community surface.</strong> Raw Slack gives us members, channels, and messages. The ontology says: a Member is a person in our community/support workspace, keyed by the email on their Slack profile; their activity is a signal of engagement and support load, not of sales stage.</p>
+<ul>
+ <li><code>members</code> — a person in the workspace (email, display name, joined date)</li>
+ <li><code>channels</code> — support, onboarding, general</li>
+ <li><code>activity</code> — messages, joins, reactions per member</li>
+</ul>
+<p>Each of these three is complete and correct on its own. The Luma team can decide what "attended" means without asking anyone. HubSpot owns "lifecycle stage." Slack owns "active member." Nobody has to negotiate, because each definition is true only inside its own system.</p>
+<h3>The business canonical composes them into one Customer</h3>
+<p>Now the VP of Growth asks the question no single system can answer: <em>"Which Slack members who joined in Q1 became qualified leads after attending a couple of our events?"</em></p>
+<p>Lucky, you have your business canonical layer that resolved the identity - in this layer lives the “customer” table which is created with some logic from the other 3 - for example, let’s say email is the customer’s identifier, and we merge all 3 sources into a master that contains some common columns such as <code>email</code>, <code>first_seen</code>, <code>last_seen</code>, <code>events_attended</code>, <code>qualified_at</code> etc. By having a customer table, you might be able to answer the question directly from the table or within a join or 2. Without it, you’d be defining the customer on the fly, eventually leading to multiple sources of truth.</p>
+<p>An example of business canonical rules - how do we define a customer?</p>
+<ul>
+ <li><strong>Identity / match key.</strong> The same Person is matched across systems on email, but as users change emails over time, we sometimes edit records or re-map them.</li>
+ <li><strong>Precedence.</strong> When two systems disagree on a field, we declare a winner. Name and lifecycle come from HubSpot (source of truth). First-touch date comes from whichever system saw them first — usually Luma. Support engagement comes from Slack. This coalesce logic is the seam, written down.</li>
+ <li><strong>Stage mapping.</strong> The ontology encodes the journey: a Luma Guest who gets added to HubSpot becomes a Contact; a Contact who crosses HubSpot's threshold is a Qualified Lead; a Slack Member active in support channels is an Engaged customer. The business canonical is where "Guest → Contact → Qualified Lead" is defined once, not re-derived in every query.</li>
+</ul>
+<p>The resulting <strong>Customer</strong> is the company-wide customer and the VP's question becomes a filter over that one table.</p>
+<h3>do it with dltHub</h3>
+<p>The dlthub layers support this workflow from ingestion to production</p>
+<ul>
+ <li>Ingestion with dlt, the ingestion standard for data engineers</li>
+ <li>Transformation with dlthub’s composable transformations</li>
+ <li>Via the AI harness, model to canonical or let anyone on the team build ingestion like a senior.</li>
+ <li>The context catalog enables end to end automation of building, deployment, and maintenance.</li>
+ <li>And when deployed the pipelines are orchestrated and run on our managed infrastructure which ensures low cost of operation.</li>
+</ul>

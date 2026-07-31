@@ -1,0 +1,235 @@
+<h2>How MVCC and Transactions Work in RocksDB</h2>
+<p>RocksDB is built on an LSM-tree, which never modifies data in-place - every write creates a new version of the key. That's half of what you need to implement Multi-Version Concurrency Control (MVCC).</p>
+<p>Real-world databases serve many clients reading and writing the same data at the same time. The simplest way to make concurrent access safe is locking (think of a hash map protected with a mutex). This works from the correctness perspective, but makes readers and writers block each other, which can quickly become a performance bottleneck. MVCC solves this problem, allowing readers and writers to proceed concurrently. The idea is that:</p>
+<ol>
+ <li>Writers never modify or delete keys in-place, instead they create new versions of the keys</li>
+ <li>Readers see a consistent view of the data as it existed when the read started - they access older versions of the keys, while writers keep creating new versions independently</li>
+</ol>
+<p>MVCC is used in many DBs including PostgreSQL, CockroachDB, FoundationDB, MongoDB WiredTiger, and LMDB. Today we'll see how RocksDB implements the other half of MVCC - snapshots that give readers that consistent view, atomic updates and transactions built on top.</p>
+<h3>Versioning Keys</h3>
+<p>All inserts, updates and deletes go through a write buffer (<em>memtable</em>) and then get flushed to disk into an immutable <em>SST</em> (Static Sorted Table) file - you naturally have multiple versions of the same key. Compaction is the garbage collection process that merges SSTs and removes older versions of keys.</p>
+<p>Let's pretend our database is an insert-only list ordered by key. If we add these key-value pairs dog,a, chipmunk,a, cat,a, raccoon,a, we'll end up with a list that looks like this.</p>
+<p>It's a toy database, so point lookup queries run by scanning the entire list. Now a query starts, trying to look up dog. While the query is running, a writer proceeds more quickly and overwrites dog with b before the reader reaches it. The reader is still at chipmunk, but the writer already finished inserting dog,b.</p>
+<p>Should the reader see dog,b since it's the latest value inserted, or see dog,a because that was the value when the reader started the query? "Readers see a consistent view" clearly answers this - the reader should see dog,a.</p>
+<p>Earlier I said the LSM-tree already does half of what's needed to implement MVCC, <em>half</em> because having immutable memtables and SSTs alone is not enough. You also need a way to provide readers a snapshot of the database, and the GC process needs some way of knowing which tables are being accessed by in-flight queries.</p>
+<p>Internally, RocksDB assigns each inserted key a monotonically increasing number, which it calls a <em>sequence number</em>. When you insert a key into RocksDB, what actually gets into the memtable and SST files on disk is a triplet of <em>(user_key, sequence_number, value_type)</em>, stored together with the value. The <em>user key</em> is the key you provided, the <em>sequence number</em> is a counter incremented on every write, and finally the <em>value type</em> is whether it's an insert or a delete (or other operations, which are irrelevant for this blog post).</p>
+<p>RocksDB tracks two sequence numbers - the <em>last allocated sequence</em> (the last number assigned on write), and the <em>published sequence</em> (the number visible to readers, advanced after a write completes).</p>
+<p>In our example, the last allocated sequence number is 5 - the number that was assigned to dog,b. The published sequence when the reader R started was 4, and it will be 5 after the write completes.</p>
+<p>When a read query starts, RocksDB captures the published sequence number. This sequence is then used for querying the memtables and the SSTs on disk. The reader R, when it sees dog,b with the sequence number 5, will skip over it, as it is allowed to see only keys with a sequence number of 4 or below.</p>
+<p>The memtable implementation in RocksDB is not that far from our toy example. As in the example we used, it's based on a linked list, specifically on a skip list. The data structure adds layers of links that allow fast search and insertion in sorted order.</p>
+<p>Layer 0 contains every entry - like the linked list from the example before. Each next layer contains a subset of the previous layer's entries. The search starts at the sparsest layer, descending to the full linked list. This structure gives O(log n) average time complexity for search.</p>
+<p>When comparing internal keys, RocksDB first orders by the user-provided key ascending and then by the sequence number descending, so that when two keys share the same user key, the one with the larger sequence number comes first. A read query that captured the published sequence number 4 translates into a skip list seek to dog 4. The seek starts with cat 3 at layer 1, skips to dog 5 on layer 1, descends to dog 5 on layer 0 and finally lands on dog 1. The search can stop there since in the internal key order dog 4 is larger than dog 5, but smaller than dog 1. In Rust this could be expressed with the Ord trait this way:</p>
+<pre><code>impl Ord for InternalKey \{
+    fn cmp(&amp;self, other: &amp;Self) -&gt; Ordering \{
+        if self.user_key == other.user_key \{
+            // Reversed - the larger sequence number comes first.
+            other.sequence_number.cmp(&amp;self.sequence_number)
+        } else \{
+            self.user_key.cmp(&amp;other.user_key)
+        }
+    }
+}</code></pre>
+<p>The skip list in RocksDB is concurrent, meaning it doesn't require locking, so reads and writes can truly happen concurrently. The implementation uses atomic operations on pointers. Garbage collection in concurrent algorithms in non-GC languages is a hard problem, which RocksDB solves elegantly by relying on an arena allocator - individual entries are never freed, deletes are inserts with a DELETE value type and the memory for the entire memtable is freed after the memtable is no longer in use.</p>
+<h3>Atomic Updates</h3>
+<p>The write batch API provides <em>atomicity</em> - keys written in the same batch become visible together:</p>
+<pre><code>let mut wb = WriteBatch::new();
+wb.put("a", "1");
+wb.put("b", "2");
+wb.put("c", "3");
+db.write(wb)?;</code></pre>
+<p>Atomicity becomes straightforward to implement with the key versioning and sequencing mechanism we discussed above. When the batch is applied to the database (the db.write call), sequence numbers for all keys are allocated atomically by incrementing the sequence number by 3 (the number of keys in the batch) and then publishing that number only after all three keys are inserted into the memtable. This ensures no reader can see a partial batch - they either see all three keys, or none of them.</p>
+<h3>Snapshots</h3>
+<p>Every get implicitly captures the latest published sequence number. The snapshot API pins it explicitly, so multiple reads can see the database at the same point in time:</p>
+<pre><code>db.put("a", "1")?;
+let snapshot = db.snapshot();
+db.put("a", "2")?;
+snapshot.get("a")?; // Returns "1" - the value at the time the snapshot was taken.
+db.get("a")?; // Returns "2" - the latest value.</code></pre>
+<p>A snapshot is just the published sequence number recorded when db.snapshot() is called - reads through the snapshot skip keys with higher sequence numbers. RocksDB also registers the snapshot in a list of active snapshots. Compaction checks the list and drops an older version of a key only if no live snapshot can still see it.</p>
+<h3>Versioning Tables</h3>
+<p>Going back to GC, older key versions are removed by compactions, but how does the database know when an SST file or a memtable is safe to delete? What if there is an in-flight reader still accessing an already flushed memtable, or reading an SST that compaction is supposed to remove?</p>
+<p>RocksDB maintains a structure called SuperVersion, which is a reference-counted view of everything needed for reads:</p>
+<pre><code>struct SuperVersion \{
+    active_memtable: ReferenceCounter&lt;Memtable&gt;,          // memtable accepting writes
+    immutable_memtables: Vec&lt;ReferenceCounter&lt;Memtable&gt;&gt;, // memtables ready to be flushed or just flushed
+    ssts: ReferenceCounter&lt;SstLevels&gt;,                    // on-disk SSTs, each reference-counted individually
+}</code></pre>
+<p>When a read starts, it acquires a reference to the structure. The reference is released only after the read is done. When the number of references to SuperVersion drops to zero, it releases its child fields, decrementing their reference counts. This way neither the structure itself nor any of its children can be freed mid-read. The cleanup - freeing the memtable memory or scheduling files for deletion is performed only when a child's own reference count reaches zero.</p>
+<p>The Wikipedia definition of MVCC says it's a "non-locking concurrency control method". In the database literature there is a distinction between locks and latches. Locks are logical - over keys, key ranges, or rows. When a lock is held on a key, nobody else can modify it until the lock is released. Latches are physical, e.g. mutexes that protect the database structures from data races during concurrent access.</p>
+<p>By this definition, the core of RocksDB doesn't take logical key locks, and the read and write paths are designed to not hold latches in the common hot cases. Some less frequently exercised code paths, however, do require latches - e.g. there is a coarse-grained per-DB mutex held briefly after a flush or compaction to replace the current SuperVersion.</p>
+<h3>Transactions</h3>
+<p>Let's see how we can implement a classic balance transfer example with RocksDB, where Alice sends $10 to Bob:</p>
+<pre><code>// For simplicity, balances are stored as strings parsed to integers, e.g. "30" for $30.
+let alice_balance = parse_balance(db.get("alice.balance")?); // $30
+if alice_balance &lt; 10 \{
+    return Err("not enough money".into());
+}
+
+let bob_balance = parse_balance(db.get("bob.balance")?); // $0
+
+// Another writer sets Alice's balance to $40
+
+db.put("alice.balance", (alice_balance - 10).to_string())?; // Set to $20
+db.put("bob.balance", (bob_balance + 10).to_string())?; // Set to $10</code></pre>
+<p>Never do anything like this! The code snippet has major correctness issues when there is more than a single writer. Alice's balance should have been $30 (40 - 10), but ended up being set to $20 (30 - 10). $10 is lost because another concurrent writer modified Alice's balance between get and put calls.</p>
+<p>Transactions exist to solve exactly this kind of problem by providing a way to execute a sequence of operations in isolation, detecting conflicts between concurrent writers. RocksDB builds a transactional layer on top of versioning. Writes are staged in the transaction buffer and get applied to the database only after the transaction commits. Reading from the uncommitted transaction merges the transaction buffer with the rest of the tree. This way transactions can read their own writes.</p>
+<p>Transactions in RocksDB come in optimistic and pessimistic flavors. The pessimistic flavor checks for conflicts between transactions when updating a key - calling put or delete. In the optimistic flavor, conflict checks are moved to commit time. The API for both flavors looks the same - the flavor is picked when opening the database as either TransactionDB or OptimisticTransactionDB:</p>
+<pre><code>let t1 = db.transaction();
+t1.put("a", "1")?;
+t1.get("a")?; // Returns "1" - the transaction reads its own uncommitted write.
+t1.put("b", "1")?;
+t1.put("c", "1")?;
+t1.commit()?; // Updates to keys "a", "b" and "c" are applied to the memtable.</code></pre>
+<h4>Pessimistic Transactions</h4>
+<p>When using pessimistic transactions, keys involved in write operations are locked to perform conflict detection - the lock manager puts each updated key in a per-DB map, associating it with the transaction ID.</p>
+<pre><code>key_locks = \{
+    "a": T1,
+    "b": T1,
+    "c": T1,
+}</code></pre>
+<p>If another transaction tries to update one of the locked keys concurrently, the conflicting transaction T2 blocks until T1 commits or rolls back - if that doesn't happen before the lock timeout, the operation returns an error:</p>
+<pre><code>let t2 = db.transaction();
+// T1 has not committed yet.
+t2.put("c", "2")?; // T2 is blocked waiting until it times out, or until T1 commits.
+t2.put("d", "2")?;
+// T1 committed.
+t2.commit()?;</code></pre>
+<p>Locks are released when a transaction commits or rolls back. A third transaction, running at the same time as T1, but modifying a different set of keys, could proceed without being blocked.</p>
+<p>By default, the conflict checks are done right when the operation is performed, which doesn't guarantee that no one else has updated the key since the transaction started:</p>
+<pre><code>let t1 = db.transaction();
+\{
+    let t2 = db.transaction();
+    t2.put("a", "2")?;
+    t2.commit()?;
+}
+t1.put("a", "1")?; // Succeeds since T2 committed before this call.
+t1.commit()?;</code></pre>
+<p>Setting a snapshot at the beginning of the transaction makes conflict detection catch updates made since the transaction started:</p>
+<pre><code>let mut opts = TransactionOptions::default();
+// Setting a snapshot is the only difference compared to the previous example.
+opts.set_snapshot(true);
+let t1 = db.transaction_opt(&amp;WriteOptions::default(), &amp;opts);
+\{
+    let t2 = db.transaction();
+    t2.put("a", "2")?;
+    t2.commit()?;
+}
+t1.put("a", "1")?; // Fails because T2 modified key "a" after the snapshot was set for T1.
+t1.commit()?;</code></pre>
+<p>After T1 acquires a lock on key a, it checks whether the key was updated after the snapshot was set - whether there is a version of the key in the database with a sequence number higher than the snapshot sequence number. If there is, the write returns an error.</p>
+<h4>Optimistic Transactions</h4>
+<p>Optimistic transactions don't check for conflicts on write operations, so put or delete never block or fail. Conflict checking happens on commits.</p>
+<p>At a high level, commit-time validation is similar to how it's done in pessimistic transactions, but the implementation is more lightweight. Instead of tracking individual locked keys in a shared map, the lock manager hashes keys into 1M pre-allocated mutexes. Each operation on a key records the published sequence number at the time of the call.</p>
+<p>While the mutexes are held for all keys involved in the commit, the transaction checks the memtable. If it contains a key with a sequence number larger than the recorded one, it means another transaction already committed the same key - the commit fails. The mutexes are released after all keys are validated and all updates are applied to the memtable.</p>
+<p>Optimistic transactions limit validation to memtables (pessimistic transactions check the whole tree). If the memtable is flushed mid-transaction, there is nothing left to validate against, so the commit fails and the transaction has to be retried.</p>
+<h4>Mapping to Isolation Levels</h4>
+<p>Isolation levels in databases define semantics of concurrent access - what happens when two concurrent transactions access the same data. I'll cover the most common levels used in modern databases. In SQL databases you can set the isolation level explicitly per transaction. There is no similar high-level API in RocksDB, but you can build different levels yourself with lower-level APIs.</p>
+<p><em>Read uncommitted</em> - the lowest isolation level, where the only guarantee is that concurrent transactions won't physically corrupt the database. This permits <em>dirty reads</em> - a transaction seeing uncommitted data from another transaction. Impossible in RocksDB because transaction writes sit in a buffer that gets applied to the database atomically on commit.</p>
+<p><em>Read committed</em> - a transaction sees only committed data, including data committed by other transactions after it started. You get this with a plain db.get, or when transactions don't use snapshots for reads. Two consecutive gets can see different values mid-transaction:</p>
+<pre><code>db.put("a", "1")?;
+let t1 = db.transaction();
+t1.get("a")?; // Returns "1"
+\{
+    let t2 = db.transaction();
+    t2.put("a", "2")?;
+    t2.commit()?;
+}
+t1.get("a")?; // Returns "2"</code></pre>
+<p><em>Snapshot isolation</em> - all reads in the transaction see a consistent snapshot of the database, and the transaction succeeds only if no updates it made conflict with updates made by other transactions since the snapshot was created. Can be achieved by enabling snapshots for both reads and write conflict detection - set_snapshot covers only conflict detection, and reads have to go through the transaction's snapshot(). You avoid non-repeatable reads, but the write skew anomaly is possible.</p>
+<p>The snippet below illustrates the anomaly that happens when two transactions read the same data, then each updates a different key based on what it read. Alice has two bank accounts, $100 in each. The bank allows a single account to go negative, as long as the total across both accounts stays non-negative. Two concurrent transactions each withdraw $200 from a different account:</p>
+<pre><code>db.put("alice.checking", "100")?;
+db.put("alice.savings", "100")?;
+
+let mut opts = TransactionOptions::default();
+opts.set_snapshot(true);
+
+// T1 withdraws $200 from checking. T2 concurrently runs the same code,
+// withdrawing $200 from savings.
+let t1 = db.transaction_opt(&amp;WriteOptions::default(), &amp;opts);
+let t2 = db.transaction_opt(&amp;WriteOptions::default(), &amp;opts);
+
+let checking = parse_balance(t1.snapshot().get("alice.checking")?); // $100
+let savings = parse_balance(t1.snapshot().get("alice.savings")?); // $100
+if checking + savings - 200 &gt;= 0 \{ // $100 + $100 - $200 = $0, the check passes.
+    t1.put("alice.checking", (checking - 200).to_string())?; // Set to -$100.
+}
+
+// T2 passes the same check against its own snapshot and sets alice.savings to -$100.
+
+// The transactions updated different keys, so conflict validation passes for both.
+t1.commit()?;
+t2.commit()?;
+
+// Both accounts are now at -$100, the total is -$200.</code></pre>
+<p><em>Serializable</em> - concurrent transactions run as if they were executed in serial order. You can get something close if you use get_for_update with <em>snapshot isolation</em> when transactions involve only point reads - you avoid dirty and non-repeatable reads and write skew. get_for_update is a special version of get used in transactions to avoid read-write conflicts e.g. when updating a key depends on the result of a read. get_for_update triggers conflict checks the same way as put and delete do. Here is the write skew example fixed by reading the balances with get_for_update, the rest of the code stays the same:</p>
+<pre><code>// Unlike snapshot reads, get_for_update reads participate in conflict detection.
+let checking = parse_balance(t1.get_for_update("alice.checking", true)?); // $100
+let savings = parse_balance(t1.get_for_update("alice.savings", true)?); // $100
+
+// With pessimistic transactions, get_for_update blocks until it times out, then
+// fails - the key is locked by T1. With optimistic transactions, the call
+// succeeds and T2 aborts at commit.
+t2.get_for_update("alice.checking", true)?;</code></pre>
+<p>The <em>phantom reads</em> anomaly is possible for transactions running range scans:</p>
+<pre><code>// Alice has a single account alice.checking.
+db.put("alice.checking", "100")?;
+
+let mut opts = TransactionOptions::default();
+opts.set_snapshot(true);
+let t1 = db.transaction_opt(&amp;WriteOptions::default(), &amp;opts);
+
+// T1 computes the total across Alice's accounts, locking every key the scan returns.
+let mut total = 0;
+for item in t1.snapshot().iterator(IteratorMode::From(b"alice.", Direction::Forward)) \{
+    let (key, _) = item?;
+    total += parse_balance(t1.get_for_update(key, true)?);
+}
+// total = $100.
+
+// T2 opens a new account with a $50 deposit.
+// The put doesn't conflict with T1 - T1 never read or locked alice.savings.
+let t2 = db.transaction();
+t2.put("alice.savings", "50")?;
+t2.commit()?; // Succeeds.
+
+t1.commit()?; // Succeeds.</code></pre>
+<p>T1 commits believing the total is $100, while Alice's accounts now hold $150. The new account is a phantom - get_for_update locked the keys the scan returned, but alice.savings didn't exist yet, so there was nothing to lock.</p>
+<p>RocksDB has a range lock manager that locks key ranges instead of individual keys to prevent phantom reads. It was contributed in 2020, but it's not documented anywhere on the RocksDB wiki and not exposed through the C or Java APIs, so the feature is usable only from C++.</p>
+<h4>Fixing the Transfer</h4>
+<p>With all we learned we can finally fix the $10 transfer bug between Alice and Bob. Transactions (either pessimistic or optimistic) with a snapshot set, using get_for_update instead of plain get, are what we need - another transaction can't change a balance between the read and the write without triggering a conflict:</p>
+<pre><code>let mut opts = TransactionOptions::default();
+opts.set_snapshot(true);
+let tx = db.transaction_opt(&amp;WriteOptions::default(), &amp;opts);
+
+let Ok(alice_balance) = tx.get_for_update("alice.balance", true) else \{
+    // Can happen with pessimistic transactions.
+    return Err("another transaction updated Alice's balance".into());
+};
+let alice_balance = parse_balance(alice_balance);
+if alice_balance &lt; 10 \{
+    return Err("not enough money".into());
+};
+
+let Ok(bob_balance) = tx.get_for_update("bob.balance", true) else \{
+    // Can happen with pessimistic transactions.
+    return Err("another transaction updated Bob's balance".into());
+};
+let bob_balance = parse_balance(bob_balance);
+
+tx.put("alice.balance", (alice_balance - 10).to_string())?;
+tx.put("bob.balance", (bob_balance + 10).to_string())?;
+
+if tx.commit().is_err() \{
+    // Can happen with optimistic transactions.
+    return Err("another transaction updated Bob's or Alice's balance or the memtable was flushed".into());
+}</code></pre>
+<h4>Optimistic vs Pessimistic Performance</h4>
+<p>From the user perspective, the only difference between pessimistic and optimistic transactions is where a transaction can abort on a conflict. Pessimistic transactions acquire locks on every write operation and abort early on conflicts (after exceeding the lock timeout). Optimistic transactions require no per-key locks on writes - coarse-grained locks are taken for the duration of a commit. Optimistic transactions typically provide higher throughput on workloads where conflicts between transactions are rare and where retrying the entire transaction on a conflict is cheap.</p>
+<p>I benchmarked two workloads - one where pessimistic transactions win and one where optimistic transactions win.</p>
+<p>In the "mostly read" workload, every transaction reads a shared key with get_for_update and writes a unique key - roughly one transaction in 1024 replaces the shared key instead. Starting from 2 threads, the throughput of optimistic transactions stays flat, while pessimistic transactions queue on the shared key's lock.</p>
+<p>In the "contended key" workload, every transaction reads the same key with get_for_update, does CPU-bound work and writes the key back. Pessimistic transactions wait on the lock without consuming CPU, so the work runs once per commit. Optimistic transactions discover the conflict only at commit, after the work is done, redoing the expensive work on retry.</p>
+<h4>Who Uses RocksDB-native Transactions</h4>
+<p>MyRocks - the MySQL storage engine built on RocksDB, and ArangoDB are the only large projects I'm aware of that rely on RocksDB transactions. Facebook's MyRocks repository was archived on GitHub on Mar 1, 2026, but the engine is still available as a part of MariaDB or Percona Server.</p>
+<p>TiDB/TiKV and YugabyteDB, which run on RocksDB, don't use RocksDB-native transactions. CockroachDB's RocksDB-inspired key-value store Pebble doesn't support transactions at all. TiDB, YugabyteDB and CockroachDB implement their own distributed transactional layer above the key-value stores. The reason for this is that RocksDB-native transactions are node-local, i.e. the locks are held per key-value store instance running on a single node, and with a distributed database you have to coordinate transactions across multiple nodes.</p>
+<h3>Conclusion</h3>
+<p>While LSM-trees give half of MVCC for free, there is a lot of practical complexity in implementing the other half. Concurrent algorithms are hard to get right, and making them efficient requires low-level techniques like using atomic operations on pointers. If you are implementing a database from scratch (I hope this blog post convinces you not to do that!), you are on your own with these techniques - in Rust, code built on raw pointers gets no protection from the borrow checker, and even memory-safe concurrent code paths covered entirely by the borrow checker are not free from logical races. The hard part is the concurrency, not the MVCC itself. Snapshots, atomic batches and conflict detection in both transaction flavors all come down to the same primitive - comparing sequence numbers.</p>
