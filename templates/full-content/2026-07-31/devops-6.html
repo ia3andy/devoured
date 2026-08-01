@@ -1,0 +1,281 @@
+<h1>Delightful integration tests in Rust</h1>
+<p>When I first learned about testing in Rust I was surprised by the lack of what I consider a basic feature: test setup and teardown. Many other popular testing frameworks have it: jest, pytest fixtures, and so on.</p>
+<p>Global setup and teardown are especially useful in integration tests. In integration tests, as well as in similar component tests or end-to-end tests, the code runs against a complete or partial set of the application infrastructure. In this important class of tests we don't mock out database access or skip message brokers. Setup and teardown are good candidates for provisioning that infrastructure so we can reuse it across multiple tests.</p>
+<p>But alas, Rust does not provide built-in setup and teardown, and what's more, by default all tests run concurrently on different threads, so creating and reusing global state is a bit clunky. Seems that writing integration tests in Rust is a miserable experience. Or is it?</p>
+<p>Some crates provide similar capabilities. For example test-context and rstest.</p>
+<p>Despite my initial skepticism I now think that integration tests in Rust are actually a delight. The delightful Rust concept i'm refering to is RAII, and the crate I now reach for is testcontainers-rs. The core idea is simple: make Docker container creation easy and ergonomic, and clean containers up automatically. This idea, leveraging RAII for automatic cleanup, removes the need for global setup and teardown and paves a direct path to completely isolated tests that can comfortably run in parallel.</p>
+<h2>Resource Acquisition Is Infrastructure</h2>
+<p>Rust heavily uses the RAII (Resource Acquisition Is Initialization) pattern. RAII's main goal is to automatically clean up memory and resources, removing the need for manual management in many common use cases.</p>
+<p>This useful pattern can be exploited a bit, and extended to automatically manage out-of-process resources. In our use case we wish to make a Docker container a resource and use Rust's ownership rules and <code>Drop</code> trait to clean it up automatically.</p>
+<p>To demonstrate RAII relevance, in this first example we'll use the bollard crate to start a RabbitMQ Docker container. We'll create a <code>RabbitMqContainer</code> struct that manages the running container for our test:</p>
+<pre><code>struct RabbitMqContainer \{
+    docker: Docker,
+    container_id: String,
+}
+
+impl RabbitMqContainer \{
+    async fn start() -&gt; anyhow::Result&lt;Self&gt; \{
+        let docker = Docker::connect_with_local_defaults()?;
+
+        let container = docker
+            .create_container(
+                Option::&lt;CreateContainerOptions&gt;::None,
+                ContainerCreateBody \{
+                    image: Some("rabbitmq:3.8.22-management".to_string()),
+                    exposed_ports: Some(
+                        HashMap::from([("5672/tcp".to_string(), HashMap::new())]),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        docker
+            .start_container(&amp;container.id, Some(StartContainerOptions::default()))
+            .await?;
+
+        Ok(Self \{
+            docker,
+            container_id: container.id,
+        })
+    }
+}</code></pre>
+<h3>Using Drop to cleanup running containers</h3>
+<p>Our next step is to implement <code>Drop</code> to stop and remove the container automatically:</p>
+<pre><code>impl Drop for RabbitMqContainer \{
+    fn drop(&amp;mut self) \{
+        let docker = self.docker.clone();
+        let container_id = self.container_id.clone();
+
+        async_drop(async move \{
+            docker
+                .remove_container(
+                    &amp;container_id,
+                    Some(RemoveContainerOptions \{
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("Failed to remove container");
+        });
+    }
+}</code></pre>
+<h3>The async drop caveat</h3>
+<p>As you can see in the example, stopping a container is an async operation, but async drop is a nightly-only, WIP, feature. At first glance this puts a stick in the spokes of our plan, but we can hack our way out of this. Let's borrow this helper from <code>testcontainers-rs</code>. The hack runs the cleanup in a different thread and blocks <code>drop</code> until the cleanup is done. Not ideal, but good enough for tests.</p>
+<p>We can now write a test that utilizes <code>RabbitMqContainer</code></p>
+<pre><code>#[tokio::test]
+async fn test_with_rabbitmq() -&gt; anyhow::Result&lt;()&gt; \{
+    let _rabbitmq = RabbitMqContainer::start().await?;
+
+    // run your tests over the resources defined in RabbitMqContainer
+    let rabbitmq_channel = get_rabbitmq_channel("amqp://localhost:5672").await?;
+    //...
+    
+    // No need to cleanup manually. Sweet!
+
+    Ok(())
+}</code></pre>
+<h3>Drop caveat</h3>
+<p>Relying on <code>Drop</code> to clean up resources is pretty sweet, but we need to keep in mind that in some cases <code>drop</code> is not called. A relevant example is forceful program termination using SIGINT (<code>ctrl+c</code>), SIGTERM, SIGKILL, or OOM. Some of these can be caught and handled, some less so. <code>testcontainers-rs</code> Watchdog can mitigate some of these issue</p>
+<h1><code>testcontainers-rs</code></h1>
+<p>Now that we're familiar with the usefulness of RAII in tests, let's look at a crate that elevates the previous example and offers a utility I really enjoy: testcontainers-rs.</p>
+<h2>Toy example</h2>
+<p>Examples in posts such as this tend to be simplistic. I've tried to create something a bit more realistic than a tiny toy example. So I give you the "Toy analytics" app. This app includes two RabbitMQ message consumers, <code>ToyOrder</code> and <code>ToyReview</code>, and an HTTP server that provides analytical endpoints backed by a Postgres database and a Redis caching layer.</p>
+<p>As you can see, even this small app requires several infrastructure servers to be created and managed.</p>
+<h2>Setting up the tests</h2>
+<p>First order of business is to start a RabbitMQ node. To achieve this we will create a <code>RabbitMqImage</code> struct that implements the Image trait. The <code>Image</code> trait allows us to define container properties, such as tag, cmd, mounts and more.</p>
+<pre><code>pub struct RabbitMqImage;
+
+impl Image for RabbitMqImage \{
+    fn name(&amp;self) -&gt; &amp;str \{
+        "rabbitmq"
+    }
+
+    fn tag(&amp;self) -&gt; &amp;str \{
+        "3.8.22-management"
+    }
+}</code></pre>
+<p>We can now implement a <code>TestEnv</code> struct. <code>TestEnv</code> will hold and manage all infrastructure needed for our tests. Just rabbitMq for now.</p>
+<pre><code>pub struct TestEnv \{
+    _rabbitmq_container: ContainerAsync&lt;RabbitMqImage&gt;,
+    // channel to our newly created RabbitmqNode. Will be useful in following tests
+    pub rabbitmq_channel: Channel,
+}
+
+impl TestEnv \{
+    pub async fn start() -&gt; anyhow::Result&lt;Self&gt; \{
+        let rabbitmq_container = RabbitMqImage.start().await?;
+        let amqp_port = rabbitmq_container.get_host_port_ipv4(5672).await?;
+        let amqp_url = format!("amqp://127.0.0.1:\{}", amqp_port);
+
+        let rabbitmq_channel = get_rabbitmq_channel(&amp;amqp_url).await?;
+
+        Ok(Self \{
+            _rabbitmq_container: rabbitmq_container,
+            rabbitmq_channel,
+        })
+    }
+}</code></pre>
+<p>With <code>TestEnv</code> we can now start to write our first integration test. The test will send several <code>ToyOrdered</code> messages and verify that the <code>top_toys</code> endpoint returns the expected result.</p>
+<pre><code>#[tokio::test]
+async fn toy_order_received_top_toys_returns_top_results() -&gt; anyhow::Result&lt;()&gt; \{
+    let env = TestEnv::start().await?;
+
+    for event in [
+        ToyOrdered::new(TEST_TIME, GI_JOE_ID, CUSTOMER1_ID),
+        ToyOrdered::new(TEST_TIME + Duration::minutes(5), GI_JOE_ID, CUSTOMER2_ID),
+        ToyOrdered::new(TEST_TIME + Duration::minutes(10), GI_JOE_ID, CUSTOMER3_ID),
+        ToyOrdered::new(TEST_TIME + Duration::minutes(15), BARBIE_ID, CUSTOMER1_ID),
+        ToyOrdered::new(TEST_TIME + Duration::minutes(20), BARBIE_ID, CUSTOMER2_ID),
+    ] \{
+        publish_toy_ordered(&amp;env.rabbitmq_channel, &amp;event).await?;
+    }
+
+    // coming up
+}</code></pre>
+<h2>Wait for containers startup</h2>
+<p>We didn't assert anything yet, but we're already running into an error:</p>
+<pre><code>Toy orders consumer error: IO error: Connection reset by peer (os error 104)
+
+Caused by:
+    Connection reset by peer (os error 104)</code></pre>
+<p>The reason for this error is two-fold:</p>
+<ol>
+ <li>We've published a message to RabbitMQ before the node had a chance to fully initialize.</li>
+ <li>I lied to you, there's an additional method we should implement on <code>Image</code>: <code>fn ready_conditions(&amp;self) -&gt; Vec&lt;WaitFor&gt;;</code>. This is a key feature for making the process delightful. Each piece of infrastructure has an initialization process that we must wait for. <code>ready_conditions</code> gives us a nice API to define it. We'll wait for a string to appear in RabbitMQ's stdout that indicates startup has completed.</li>
+</ol>
+<pre><code>impl Image for RabbitMqImage \{
+    // ...
+
+    fn ready_conditions(&amp;self) -&gt; Vec&lt;WaitFor&gt; \{
+        vec![WaitFor::message_on_stdout("Server startup complete")]
+    }
+}</code></pre>
+<h2>Out-of-the-box images</h2>
+<p>Before we move on to writing the rest of the test, let's introduce the testcontainers-modules crate. This crate has lots of popular image definitions. In fact we did not have to implement <code>RabbitMqImage</code> ourselves; we could have just used the RabbitMQ module. Similarly, images for Postgres and Redis are available.</p>
+<p>Let's update our <code>TestEnv</code> to include Postgres and Redis instances. In addition we'll start our App to spin up all consumers and API endpoints. This would make <code>TestEnv</code> a complete, and isolated execution of our program.</p>
+<pre><code>pub struct TestEnv \{
+    _rabbitmq_container: ContainerAsync&lt;RabbitMqImage&gt;,
+    _pg_container: ContainerAsync&lt;postgres::Postgres&gt;,
+    _redis_container: ContainerAsync&lt;Redis&gt;,
+    pub rabbitmq_channel: Channel,
+    pub postgres_pool: PgPool,
+    pub redis_conn: MultiplexedConnection,
+    pub api_address: SocketAddr,
+}
+
+impl TestEnv \{
+    pub async fn start() -&gt; anyhow::Result&lt;Self&gt; \{
+        let (
+            (_rabbitmq_container, rabbitmq_url),
+            (_pg_container, postgres_url),
+            (_redis_container, redis_url),
+        ) = tokio::try_join!(start_rabbitmq(), start_postgres(), start_redis())?;
+
+        let app = App::new(AppConfig \{
+            postgres_url: postgres_url.clone(),
+            rabbitmq_url: rabbitmq_url.clone(),
+            redis_url: redis_url.clone(),
+            api_port: 0,
+        })
+        .await?;
+
+        let api_address = app.api_server.local_address()?;
+
+        tokio::spawn(async move \{
+            if let Err(error) = app.run().await \{
+                eprintln!("Error running app: \{:?}", error);
+            }
+        });
+
+        let rabbitmq_channel = get_rabbitmq_channel(&amp;rabbitmq_url).await?;
+        let postgres_pool = get_pg_pool(&amp;postgres_url).await?;
+        let redis_conn = get_redis_conn(&amp;redis_url).await?;
+
+        Ok(Self \{
+            _rabbitmq_container,
+            _pg_container,
+            _redis_container,
+            rabbitmq_channel,
+            postgres_pool,
+            redis_conn,
+            api_address,
+        })
+    }
+}</code></pre>
+<h2>Full test</h2>
+<p>Finally, we can create a test that:</p>
+<ol>
+ <li>starts RabbitMQ, Postgres, and Redis</li>
+ <li>starts all our app consumers and API servers</li>
+ <li>publishes <code>ToyOrdered</code> messages to our app</li>
+ <li>calls our analytics API endpoints and asserts the response</li>
+ <li>cleans up everything automatically</li>
+</ol>
+<p>All this in a rather ergonomic package:</p>
+<pre><code>#[tokio::test]
+async fn toy_order_received_top_toys_returns_top_results() -&gt; anyhow::Result&lt;()&gt; \{
+    let env = TestEnv::start().await?;
+
+    for event in [
+        ToyOrdered::new(TEST_TIME, GI_JOE_ID, CUSTOMER1_ID),
+        ToyOrdered::new(TEST_TIME + Duration::minutes(5), GI_JOE_ID, CUSTOMER2_ID),
+        ToyOrdered::new(TEST_TIME + Duration::minutes(10), GI_JOE_ID, CUSTOMER3_ID),
+        ToyOrdered::new(TEST_TIME + Duration::minutes(15), BARBIE_ID, CUSTOMER1_ID),
+        ToyOrdered::new(TEST_TIME + Duration::minutes(20), BARBIE_ID, CUSTOMER2_ID),
+    ] \{
+        publish_toy_ordered(&amp;env.rabbitmq_channel, &amp;event).await?;
+    }
+
+    /// Since we're using an async message queue, we cannot assume that the data is immediately available after publishing an event.
+    /// This function utilize the worst solution for this issue - just wait a few seconds. For simplicity, we'll stick with this.
+    wait_for_consistency().await;
+
+    let top_response = request_top_toys(
+        env.api_address,
+        TEST_TIME + Duration::minutes(3),
+        TEST_TIME + Duration::minutes(17),
+    )
+    .await?;
+
+    assert_eq!(
+        top_response,
+        TopToysResponse \{
+            toys: vec![
+                TopToyResponse \{
+                    toy_id: GI_JOE_ID,
+                    orders: 2,
+                },
+                TopToyResponse \{
+                    toy_id: BARBIE_ID,
+                    orders: 1,
+                },
+            ],
+        }
+    );
+
+    Ok(())
+}</code></pre>
+<h3>Eventual Consistency Caveat</h3>
+<p>Sharp-eyed readers might have noticed the sneaky <code>wait_for_consistency().await</code> call. This function sweeps an important caveat of full integration tests under the carpet. We publish messages into our system, but we have no natural, external way to verify that all messages have been processed. Without waiting for a consistent state, our tests might assert too early and fail, or worse, occasionally pass. This is the dreaded flaky integration test problem.</p>
+<p>For the sake of simplicity in this post, I've settled on the worst possible solution: a static one-second sleep. This is a mediocre approach because it relies on an arbitrary amount of waiting time. If the duration is too long, we'll add unnecessary seconds to our test runtime; if it's too short, our tests will become flaky.</p>
+<h2>Key benefits</h2>
+<p>Now that our app infrastructure is created and controlled from code, we get some useful capabilities.</p>
+<h3>Natural isolation leads to simple concurrency</h3>
+<p>With each test getting its own test environment, including its own message broker, database, and database schema, we achieve complete isolation between tests. It becomes impossible for one test to pollute another test's database tables or for messages from one test to reach another.</p>
+<p>This emerging isolation allows us to run as many concurrent tests as we would like.</p>
+<h3>Fine-grained infrastructure control from code</h3>
+<p>Testing a Redis outage? Just:</p>
+<pre><code>env.stop_redis().await?</code></pre>
+<p>Testing for a database performance issue? One possible extension is:</p>
+<pre><code>env.start_postgres_with_cpu_limit(...)</code></pre>
+<h3>No external tools needed</h3>
+<p>A popular alternative approach for setting up infrastructure is to define a docker-compose.yaml, and use an external script or harness to <code>docker compose up</code>. This can work well, but requires your team to introduce an alternative test running command. Using test-containers allows us to retain the good, old, <code>cargo test</code>.</p>
+<h2>Simplicity and isolation vs speed</h2>
+<p>We've talked about the benefits of the proposed strategy, but this post would be incomplete without mentioning the main drawback: speed. Having each test start up a complete environment does carry a time penalty. Each test needs to wait for containers to start, wait for them to become ready, run full database migrations, and so on.</p>
+<p>You can offset some of that penalty by running tests concurrently, but only up to a point: the machine running the tests has limited resources.</p>
+<p>This is a tradeoff each project must evaluate: stronger isolation in exchange for a potential time penalty. Furthermore, while this post is about integration or end-to-end tests, these kinds of tests are only one part of a healthy test suite alongside unit tests, which are not bound by infrastructure startup costs.</p>
+<h2>Final thoughts</h2>
+<p>RAII is at the core of Rust's memory management strategy. I've demonstrated its usefulness for resource cleanup in the context of integration tests, but of course this is a general-purpose technique. For example, <code>tempfile</code> uses RAII to clean up generated files at runtime is a great demonstration of this technique.</p>
+<p>In the context of testing, I keep coming back to this idea and to testcontainers-rs. In the “real infrastructure” vs “mocks” debate, I tend to lean toward the real-infrastructure side of the spectrum. Having an easy way to spin up dependencies makes the whole experience much more ergonomic.</p>

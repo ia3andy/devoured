@@ -1,0 +1,63 @@
+<h1>Teaching an Open Model to Do Science</h1>
+<p>Post-training an open model for tool use, biological reasoning, and auditable research workflows</p>
+<p>Our earlier Trinity Mini work taught a compact model to classify drug–protein relations from biomedical abstracts. This project asked more of the same open model: investigate a scientific question with tools, reason across incomplete evidence, and return work another researcher can check.</p>
+<p>Loka, AWS, Arcee, and Prime Intellect built two reinforcement-learning environments around that goal. One teaches the model to seek evidence across biomedical tools. The other teaches it to infer Gene Ontology annotations from protein evidence and return strict JSON. We then ran 21 controlled post-training experiments and promoted the configuration that performed well on both tasks.</p>
+<h3>Results at a glance</h3>
+<p>Run 120 was the selected checkpoint.</p>
+<ul>
+ <li>On the held-out Drug Tool evaluation, its score rose from 70.8% to 81.2%, increasing at every evaluation point.</li>
+ <li>On held-out BioReason, it reached 0.863 on the reported combined score, which includes GO term F1, GO tree similarity, aspect coverage, and JSON validity.</li>
+ <li>Before reinforcement learning, one GEPA prompt-search pass improved base-model validation by about 84% on BioReason and 7.7% on Drug Tool.</li>
+</ul>
+<p>Scientific work rarely begins as a clean classification problem. A researcher may start with a disease and a target rather than an answer set. The first query may fail. A protein may have several identifiers. One paper may support a hypothesis while another weakens it. A useful system has to decide what evidence to seek next, distinguish missing evidence from negative evidence, and leave a record of how it reached its conclusion.</p>
+<h3>From prompting to learned scientific behavior</h3>
+<p>A prompt can describe a procedure, but it does not make that procedure reliable across a multi-step run. Instructions to prefer primary evidence, resolve identifiers, use tools, and return valid JSON compete with partial results and formatting constraints. Models also tend to produce a helpful-looking answer when the evidence is weak.</p>
+<p>That failure mode is especially costly in science. Invalid JSON is easy to catch. A polished synthesis about the wrong protein can pass quietly into the next stage of a workflow.</p>
+<p>We therefore focused the research on two questions:</p>
+<ol>
+ <li>What feedback would reward the scientific behavior we wanted?</li>
+ <li>What held-out evaluations would show whether that behavior improved?</li>
+</ol>
+<p>Reward design followed from those questions. Drug Tool evaluated tool choice, arguments, retrieved facts, completion, efficiency, and concision alongside the final prose. BioReason evaluated biological content, output structure, and JSON validity.</p>
+<p>There is also an operational reason to specialize an open model. A compact model and a small LoRA adapter can run inside an organization’s cloud boundary, remain pinned to a known policy version, and be updated against that organization’s evidence and standards. The team controls the data path, reward, evaluation, serving cost, and incident response.</p>
+<h3>Two environments, two kinds of scientific work</h3>
+<p>The training mixture used two published Prime RL environments in equal proportion. Together they cover investigation and conclusion.</p>
+<h3>Drug Tool RL: learning to investigate</h3>
+<p>The Loka Drug Tool SFT dataset came from the prompt bank used by Loka’s drug-discovery application. Arcee Trinity Large Thinking generated assistant and tool trajectories through OpenRouter’s OpenAI-compatible interface. Each example preserves the biomedical question, tool schemas, assistant actions, and serialized tool results.</p>
+<p>The dataset contains 800 training prompts and 200 held-out prompts across 17 workflow categories, with 5,049 structured tool calls in total. The categories include disease–pathway evidence, literature triage, contradiction checking, GEO biomarker screening, KEGG resolution, protein records, interaction networks, ortholog comparison, molecular generation, protein folding, and docking planning.</p>
+<p>The <code>lokahq/drug-tool-rl@3</code> environment presents a biomedical question, a tool catalog, and a completion contract. The model must choose and parameterize tools, recover when retrieval fails, and finish with a concise synthesis. Seven retrieval tools cover PubMed, GEO, KEGG, UniProt, and STRING.</p>
+<h3>BioReason: learning to conclude</h3>
+<p>The BioReason RL corpus contains 8,630 curated records across training and held-out splits. It builds on BioReason-Pro and combines protein metadata and sequence with InterPro, interaction, and subcellular-location evidence. Each record also includes GO-GPT candidate terms. The model must evaluate these noisy hypotheses rather than copy them as labels.</p>
+<p>In <code>lokahq/bioreason-go-rl@1</code>, the model must infer a functional summary and lists of Gene Ontology identifiers for Molecular Function, Biological Process, and Cellular Component. It must return exactly one JSON object.</p>
+<h3>Improve the task before training the policy</h3>
+<p>The system prompt is part of an RL environment. It changes the actions a policy considers and the errors a verifier can observe. Before GRPO post-training, we ran one GEPA prompt-optimization pass on each environment.</p>
+<p>Trinity Mini produced the base-model rollouts. A Claude Sonnet 5 reflection model used those rollouts and verifier feedback to propose revised task instructions. The selected prompts improved base-model validation by about 84% on BioReason and 7.7% on Drug Tool.</p>
+<h3>Model and training setup</h3>
+<p>Trinity Mini is a 26-billion-parameter mixture-of-experts model with 3 billion active parameters and a 128k native context window. Training used GRPO with LoRA adapters. Prime Intellect’s <code>prime-rl</code> separated policy optimization from rollout inference and connected both to the two verifiable environments.</p>
+<h3>Twenty-one runs, one change at a time</h3>
+<p>A promotion bar, a bounded search space, and persistent experiment records guided the 21 runs. The loop was simple:</p>
+<ol>
+ <li>Inspect held-out curves, component metrics, and representative rollouts.</li>
+ <li>State one hypothesis about a failure mode or opportunity.</li>
+ <li>Change a bounded part of the configuration or environment.</li>
+ <li>Re-run both evaluations and separate model behavior from infrastructure failures.</li>
+ <li>Keep, reject, rerun, or retune the change, then record the decision.</li>
+</ol>
+<h3>Why run 120 was promoted</h3>
+<p>Run 120 met the promotion bar on both environments. Drug Tool increased from 70.8% to 81.2% during training. BioReason reached 0.863 on its combined held-out metric.</p>
+<p>Scores narrowed the candidates, but deployment required three checks. First, held-out evaluation measured the behaviors encoded by the environments. Second, trace and verifier review tested whether the scores came from grounded tool use and valid structured outputs. Third, candidates ran inside the scientific application for qualitative workflow testing.</p>
+<h3>Putting the adapter in a scientific application</h3>
+<p>The promoted adapter runs in a companion AI Scientist application built with Strands, FastAPI, and React. Specialist tasks route to the run 120 adapter. Base Trinity Mini remains available for orchestration and routing that benefit from its larger context window.</p>
+<h3>A reusable post-training method</h3>
+<p>This project offers a practical route for teams that need specialized model behavior but do not want to pretrain a foundation model. Start with a workflow that matters. Define what useful behavior looks like in that workflow. Build held-out tests and inspectable rewards around it. Then train a small adapter, review the traces, and deploy it inside an operating boundary the organization controls.</p>
+<h3>Collaboration</h3>
+<p>Arcee supplied Trinity Mini, an adaptable open model with a practical active-parameter footprint. Prime Intellect supplied the open-source <code>prime-rl</code> training system. AWS supplied infrastructure for accelerated training, artifact storage, model serving, application services, security, and observability. Loka built the biomedical datasets, environments, verifiers, research process, and scientific application.</p>
+<h3>Citation</h3>
+<pre><code>@misc\{jakimovski2026teachingopenmodel,
+title        = \{Teaching an Open Model to Do Science},
+author       = \{Jakimovski, Bojan and Kovachovska, Sara and Panahi, Maziyar},
+year         = \{2026},
+month        = jul,
+howpublished = \{Blog post},
+url          = \{https://github.com/LokaHQ/prime-rl-drug-discovery-copilot}
+}</code></pre>

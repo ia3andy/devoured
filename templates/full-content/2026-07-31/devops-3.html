@@ -1,0 +1,97 @@
+<h1>Automate CI/CD troubleshooting with AWS DevOps Agent and GitHub</h1>
+<h2>Introduction</h2>
+<p>Every development team knows the frustration: a GitHub Actions workflow fails, a notification fires, and an engineer begins the manual triage loop; read the logs, identify the root cause, write a fix, open a pull request, wait for review, merge, re-run the workflow, and hope it passes.</p>
+<p>For organizations running dozens or hundreds of GitHub Actions workflows across multiple repositories, this manual triage compounds quickly. A single type error can block an entire release. A misconfigured deployment path can cascade across environments. The investigative work which includes correlating logs, reading code, understanding what changed consumes hours that could be spent on innovation.</p>
+<p>AWS DevOps Agent fundamentally changes this equation. As an autonomous, always-on AI agent, it investigates CI/CD failures the moment they occur, correlating build logs, source code, deployment history, and infrastructure state to identify root causes and recommend specific mitigations. Rather than waiting for an engineer to manually sift through logs, the agent performs the same investigative reasoning an experienced SRE would, but in minutes instead of hours.</p>
+<p>This post demonstrates how to integrate AWS DevOps Agent with GitHub for read access to repositories, workflow runs, and deployment events. It also covers integrating the GitHub MCP Server for push-based resolutions such as creating fix pull requests and updating files. Together, these integrations enable a fully autonomous, closed-loop CI/CD troubleshooting pipeline. When a workflow fails, the agent investigates. When it finds the root cause, it pushes the fix directly back into your repository as a pull request.</p>
+<h2>Solution overview</h2>
+<p>This solution integrates AWS DevOps Agent with GitHub to create an autonomous CI/CD troubleshooting system. The following architecture and event flow demonstrate how the components work together.</p>
+<h3>Architecture</h3>
+<p>The following diagram illustrates how AWS DevOps Agent integrates with GitHub to create an autonomous CI/CD troubleshooting system. The architecture has five main components that work together: a GitHub source repository and GitHub Actions pipelines emit workflow events; a webhook routes failure incidents to AWS DevOps Agent; an Agent Space hosts the agent’s capability providers, namely the GitHub App for read access and the GitHub MCP Server for write actions; and Amazon CloudWatch supplies application logs that the agent correlates during root-cause analysis.</p>
+<h3>Event flow</h3>
+<ol>
+ <li>A developer pushes code → GitHub Actions pipeline runs.</li>
+ <li>A pipeline stage fails such as build errors, test failures, or deployment crashes.</li>
+ <li>A webhook notification fires the AWS DevOps Agent with incident details.</li>
+ <li>The agent begins an autonomous investigation: 
+  <ol>
+   <li>Reads the workflow run logs via the GitHub App integration.</li>
+   <li>Inspects source code, configurations, and recent commits.</li>
+   <li>Correlates the failure with deployment history and infrastructure state.</li>
+  </ol></li>
+ <li>The agent also correlates the Amazon CloudWatch logs for detailed analysis.</li>
+ <li>Using the GitHub MCP Server, the agent pushes a fix, typically as a pull request.</li>
+</ol>
+<h3>Why the MCP server is needed</h3>
+<p>The GitHub App integration provides read-only access. The agent can inspect repositories, read workflow logs, view commit history, and receive deployment events. This is sufficient for investigation and root cause analysis.</p>
+<p>However, to push resolutions, the agent needs a write channel. The Model Context Protocol (MCP) server provides this capability, enabling AI agents to interact with external tools through a standardized interface. By registering the GitHub MCP Server with your Agent Space, you give the agent the ability to take corrective action, closing the loop from investigation to remediation.</p>
+<h2>Prerequisites</h2>
+<ul>
+ <li>AWS Account: With access to AWS DevOps Agent.</li>
+ <li>GitHub Repo: With existing GitHub Actions workflows.</li>
+ <li>GitHub Personal Access Token: For instructions, see Managing your personal access tokens.</li>
+</ul>
+<h2>Implementation steps</h2>
+<h3>Step 1: Create an Agent Space</h3>
+<p>An Agent Space defines the scope of what AWS DevOps Agent can investigate. It contains your AWS account associations, tool integrations (GitHub, observability platforms), and access permissions. Each Agent Space operates as an isolated investigation context.</p>
+<h4>Option A: Create via the AWS Console</h4>
+<ol>
+ <li>Log in to the AWS Management Console, navigate to AWS DevOps Agent.</li>
+ <li>Choose Create Agent Space.</li>
+ <li>Enter a descriptive name for the Agent Space.</li>
+ <li>Select one of the supported Regions.</li>
+ <li>Note that the console automatically creates the required AWS Identity and Access Management (IAM) roles.</li>
+ <li>Associate your AWS account with the Agent Space.</li>
+</ol>
+<h4>Option B: Create via AWS Cloud Development Kit (AWS CDK)</h4>
+<p>For infrastructure-as-code workflows using AWS CDK, clone the sample AWS DevOps Agent CDK project.</p>
+<h3>Step 2: Connect GitHub to the Agent Space</h3>
+<h4>Register GitHub (account-level, one-time)</h4>
+<ol>
+ <li>In the DevOps Agent console, navigate to the Capability Providers tab.</li>
+ <li>In the Pipeline section, choose Register option in front of GitHub.</li>
+ <li>Choose your connection type (User or Organization).</li>
+ <li>Choose Submit to initiate the OAuth flow.</li>
+ <li>The system redirects you to GitHub to install the AWS DevOps Agent GitHub App.</li>
+ <li>Select which repositories to grant access to.</li>
+ <li>Choose Install to complete the installation.</li>
+</ol>
+<h4>Connect repositories to the Agent Space</h4>
+<ol>
+ <li>In your Agent Space, navigate to Capabilities → Pipeline.</li>
+ <li>Choose Add Source.</li>
+ <li>In the dialog that appears, select your GitHub pipeline.</li>
+ <li>Choose Add.</li>
+ <li>Select the repositories relevant to this Agent Space.</li>
+ <li>Choose Save to complete the connection.</li>
+</ol>
+<h3>Step 3: Register the GitHub MCP server</h3>
+<ol>
+ <li>In your Agent Space, navigate to Capability Providers.</li>
+ <li>In the Registration section, choose Register for MCP server.</li>
+ <li>Configure the connection using your GitHub PAT.</li>
+ <li>After the MCP Server is registered, navigate back to Agent Spaces and add the source.</li>
+ <li>Select the tools to enable (e.g., create_pull_request, create_or_update_file, etc.).</li>
+ <li>Choose Save. Record the Webhook URL and Webhook Secret in a secure location.</li>
+</ol>
+<h3>Step 4: Configure the webhook</h3>
+<p>To trigger investigations automatically when GitHub Actions workflows fail, add a failure notification job to your GitHub Actions workflow file that uses the DevOps Agent webhook URL and secret.</p>
+<h3>Step 5: Configure permissions (least privilege)</h3>
+<p>Best practice: Use a fine-grained personal access token scoped to only the repositories the agent should remediate.</p>
+<h2>Walkthrough: Automated troubleshooting in action</h2>
+<h3>Scenario 1: Build failure</h3>
+<p>When a build fails, the agent reads the logs, identifies the compiler error, inspects source files and interfaces, identifies the commit that introduced the issue, and creates a fix pull request via the GitHub MCP server.</p>
+<h3>Scenario 2: Deployment failure</h3>
+<p>When a deployment fails (e.g., an incorrect secret path), the agent cross-references deployment logs, CloudWatch logs, and infrastructure code to identify the misconfiguration and push a corrective pull request.</p>
+<h3>Additional pattern: Flaky test detection</h3>
+<p>AWS DevOps Agent can identify non-deterministic test failures by analyzing history, documenting them as issues, or suggesting/implementing fixes like retry logic.</p>
+<h2>Best Practices</h2>
+<ul>
+ <li><strong>Scope repository access:</strong> Grant access only to the repositories the Agent Space should investigate.</li>
+ <li><strong>Limit MCP Server tool permissions:</strong> Only enable the tools necessary for the agent's tasks.</li>
+ <li><strong>Human-in-the-Loop for production:</strong> Require human review for all agent-generated pull requests.</li>
+ <li><strong>Monitor agent activity:</strong> Use the investigation journal and CloudWatch to track performance and actions.</li>
+ <li><strong>Authenticate webhooks:</strong> Always use HMAC-signed payloads to secure webhook communications.</li>
+</ul>
+<h2>Conclusion</h2>
+<p>This post demonstrated how to build a closed-loop CI/CD troubleshooting system by integrating AWS DevOps Agent with GitHub and the GitHub MCP Server. By automating the investigation and remediation of CI/CD pipeline failures, organizations can reduce the burden on engineers and resolve incidents significantly faster.</p>

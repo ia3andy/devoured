@@ -1,0 +1,55 @@
+<h1>NVIDIA Exemplar Cloud: Lessons for Unlocking Full Performance on AI Infrastructure</h1>
+<p>Two AI computing clusters built from identical NVIDIA H100, GB200 NVL72, or GB300 NVL72 systems can deliver materially different training throughput. We routinely see 8% to 12% gaps between partner deployments and the corresponding NVIDIA reference architecture (RA) on the same workload, same model, same global batch size.</p>
+<p>The cause is often a stack of configuration choices in the kernel, hypervisor, BIOS, and NVIDIA Collective Communications Library (NCCL) settings, each costing a few percent, that compound into a gap large enough to miss the 95% threshold required for NVIDIA Exemplar Cloud validation.</p>
+<p>This post walks through four debugging investigations from real partner clusters. Each diagnostic isolates a distinct layer of the stack: system memory management unit (SMMU) and page-table behavior on NVIDIA Grace CPU; power management and non-uniform memory access (NUMA) placement on x86-based CPU; NVIDIA NCCL queue-pair concurrency on 1.6 Tbps fabrics; and silent hardware-installation defects. The post also shows the specific signal in <code>perf</code>, NVIDIA Nsight Systems, or NVIDIA NCCL tests that pointed to the root cause, alongside the tuning change that closed the gap.</p>
+<p>Infrastructure engineers and performance architects who already run these benchmarks can benefit from these diagnostic patterns we use internally to run against their own clusters before formal RA validation.</p>
+<h3>Prerequisites</h3>
+<p>To reproduce the diagnostics in this post, you will need:</p>
+<ul>
+ <li>An NVIDIA HGX H100, HGX H200, HGX B200, GB200 NVL72, or GB300 NVL72 systems cluster with NVIDIA Quantum InfiniBand or RoCE interconnect.</li>
+ <li>A distributed training workload with stable iteration timing—NVIDIA NeMo on Llama 3 model, NVIDIA Nemotron, or DeepSeek configuration is a reasonable reference.</li>
+ <li>Root access on at least one node for <code>perf</code>, BIOS/UEFI changes, and kernel parameter changes.</li>
+ <li><code>nccl-tests</code> built against the same NCCL version your training stack uses, NVIDIA Nsight Systems, and Linux perf with kernel symbols available.</li>
+</ul>
+<h2>Common patterns behind training performance gaps</h2>
+<p>Recent Exemplar training engagements show that performance gaps rarely come from a single obvious failure. More often, they come from configuration details that become visible only under workload pressure. Some recurring patterns include:</p>
+<ol>
+ <li><strong>Grace and virtualization readiness:</strong> Missing platform capabilities, SMMU overhead, IOMMU behavior, or page-size settings that don’t match the expected configuration.</li>
+ <li><strong>CPU power and process placement:</strong> Cores running below expected turbo frequency, ranks or helper threads placed on the wrong cores, or NUMA/PCT bindings that don’t match the platform topology.</li>
+ <li><strong>Runtime topology:</strong> Host topology files or NCCL settings that are correct on the node but missing inside the workload container or launcher environment.</li>
+ <li><strong>Fabric and collective behavior:</strong> NCCL settings that don’t match the target fabric, message size, or scale of the training workload.</li>
+ <li><strong>Application-to-platform binding:</strong> Training processes binding by core ID or rank order instead of topology-aware affinity.</li>
+</ol>
+<h2>Case study 1: NVIDIA GB200 NVL72 FP8 pre-training, 12% slower in a virtual machine (VM) than on bare metal</h2>
+<p><strong>Layer: Virtualization and SMMU</strong></p>
+<p>A GB200 NVL72 partner deployment running DeepSeek-V3 Mixture-of-Experts (MoE) FP8 pre-training inside a VM was producing iteration times 12% to 14% longer than the bare-metal RA. Pre-training recipes for dense models like Llama 3 70B ran within 3% of RA performance, while DeepSeek-V3 MoE, which issues many small kernels per iteration, was the outlier.</p>
+<p>Nsight Systems traces captured on the partner cluster showed significantly higher CPU overhead for tiny kernel regions of the workload. Microbenchmarks targeting just the CPU single thread performance demonstrated near identical performance on the partner and RA cluster nodes. This indicated that a 30-second <code>perf record -a -g </code>capture on the host, viewed with <code>perf report</code>, surfaced an unexpected top frame: 24% of CPU cycles spent on <code>arm_smmu_cmdq_issue_cmdlist</code>.</p>
+<p><code>arm_smmu_cmdq_issue_cmdlist</code> is the function that submits invalidation commands to the Arm SMMU’s command queue. Under virtualization, every map/unmap resulting in guest invalidation traps the host and serializes through a single command queue, producing the spinlock contention visible in the profile. Virtual Command Queue (VCMDQ) is a feature available through the Command Queue Virtualization extension to the standard Arm SMMUv3 and allows the guest to issue SMMU invalidation commands directly to hardware without VM exits.</p>
+<p><strong>The fix: </strong>Enable CMDQV/VCMDQ in the host kernel on the partner cluster and expose it to the guest. This requires a kernel built with the <code>tegra241-cmdqv</code> driver and the corresponding hypervisor support; recent QEMU/libvirt versions have added a <code>cmdqv</code> IOMMU attribute to expose it to guests.</p>
+<h2>Case study 2: H100 cluster losing 12% to CPU contention and NUMA misbinding</h2>
+<p><strong>Layer: CPU power and process placement.</strong></p>
+<p>A partner’s H100 SXM5 cluster, running the same NCCL version and NeMo container as NVIDIA’s HGX RA, was running Llama 3 70B pre-training 12% slower than reference. Unlike the GB200 NVL72 case, this wasn’t a kernel-level issue; everything happened in user space and BIOS.</p>
+<p><strong>Root cause:</strong></p>
+<ul>
+ <li>The CPU on the partner cluster was configured with C-states limited to C1 in BIOS. Allowing the idle cores to drop to C6 freed power headroom, enabling the busy cores to climb to 3.8 GHz and recover roughly 4% on this workload.</li>
+ <li>The hypervisor housekeeping threads were pinned to the same physical cores as the training process’s data loader workers. The fix was a <code>cpuset</code> separation.</li>
+</ul>
+<h2>Case study 3: GB300 NVL72 with NVIDIA ConnectX-8 SuperNIC under-utilizing 1.6 Tbps fabric</h2>
+<p><strong>Focus: ConnectX-8 SuperNIC collective tuning</strong></p>
+<p>A GB300 NVL72 deployment with NVIDIA ConnectX-8 SuperNICs (1.6 Tbps per node) showed a 31% training performance gap on Nemotron-4 15B pre-training. Single-node throughput looked healthy; the gap appeared at 512 GPUs, where the profiler showed exposed AllGather and ReduceScatter time.</p>
+<p><strong>The fix:</strong> Increasing <code>NCCL_IB_QPS_PER_CONNECTION</code> to 4 from the default value of 1.</p>
+<h2>Case study 4: The environment variable that never made it inside</h2>
+<p>In a virtualized B200 deployment, training throughput was 13%–53% below the NVIDIA reference. Inside the <code>enroot</code> workload container, AllGather and ReduceScatter were 2–4× slower.</p>
+<p><strong>Root cause:</strong> <code>NCCL_TOPO_FILE</code> was set on the VM but neither the variable nor the topology file was mounted into the enroot container.</p>
+<p><strong>The fix:</strong> <code>--mount type=bind,source=/etc/nccl/topo.xml,target=/etc/nccl/topo.xml</code> and verifying the variable from inside the job container.</p>
+<h2>Preflight checks before full-scale training debug</h2>
+<p>When a cluster underperforms relative to its NVIDIA reference architecture specifications, these checks help rule out common platform issues before full-scale workload tuning:</p>
+<ul>
+ <li><strong>GPU and hardware health:</strong> Check clock, power, thermal, and NVLink bandwidth consistency (using <code>nvidia-smi</code>, <code>DCGM</code>).</li>
+ <li><strong>Grace and VM readiness:</strong> Confirm CMDQV support, guest page size, IOMMU passthrough behavior.</li>
+ <li><strong>CPU power and placement:</strong> Monitor busy-core turbo, cpuset isolation, and NUMA/PCT binding.</li>
+ <li><strong>Runtime topology:</strong> Verify topology files, NCCL environment variables, and HCA visibility inside the job container.</li>
+ <li><strong>Fabric collectives:</strong> Test AllGather and ReduceScatter behavior at workload message sizes using <code>nccl-tests</code>.</li>
+</ul>
+<h2>Debug early, debug less</h2>
+<p>Performance gaps between a cloud training deployment and the corresponding NVIDIA reference architecture are often cumulative. Practical goal is to remove known platform risks early, then use the training workload traces to debug the gaps that only appear at scale.</p>

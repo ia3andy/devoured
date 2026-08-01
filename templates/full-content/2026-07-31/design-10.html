@@ -1,0 +1,140 @@
+<p>Interfaces teleport all the time. Remove an item from a list and everything below it snaps upward; insert a row and the existing content jumps down. Expand a panel and the neighbouring blocks instantly reflow around it. The layout is technically correct, but for one frame the reader loses the connection between the state change and the objects that moved.</p>
+<p>Layout choreography gives that reflow a visible path.</p>
+<h2>The jump</h2>
+<p>The simplest version of a dynamic list is just state:</p>
+<pre><code>const [items, setItems] = useState(initialItems);
+
+return (
+  &lt;ul&gt;
+    \{items.map((item) =&gt; (
+      &lt;li key=\{item.id}&gt;
+        \{item.label}
+        &lt;button onClick=\{() =&gt; remove(item.id)}&gt;Remove&lt;/button&gt;
+      &lt;/li&gt;
+    ))}
+  &lt;/ul&gt;
+);
+</code></pre>
+<p>React removes the item. The browser recalculates layout. The siblings appear in their new positions on the next paint.</p>
+<p>Nothing is wrong in the DOM; the problem is perceptual. The user saw four objects, removed the second, and expected the third and fourth to move into the empty space. Instead they simply arrive there, so the layout lacks continuity.</p>
+<h2>FLIP</h2>
+<p>FLIP is the standard model for animating layout changes:</p>
+<ol>
+ <li><strong>First</strong>: record the element’s current bounding box.</li>
+ <li><strong>Last</strong>: apply the state change and record the new bounding box.</li>
+ <li><strong>Invert</strong>: offset the element back to where it used to be with <code>transform</code>.</li>
+ <li><strong>Play</strong>: animate that transform back to zero.</li>
+</ol>
+<p>The browser still does layout in one step. The trick is to visually invert the result so the element appears to start from its old position, then animate through the gap.</p>
+<p>In raw terms, the important part looks like this:</p>
+<pre><code>const first = element.getBoundingClientRect();
+
+updateLayout();
+
+const last = element.getBoundingClientRect();
+const dx = first.left - last.left;
+const dy = first.top - last.top;
+
+element.animate(
+  [
+    \{ transform: `translate($\{dx}px, $\{dy}px)` },
+    \{ transform: "translate(0, 0)" },
+  ],
+  \{ duration: 260, easing: "cubic-bezier(0.2, 0.8, 0.2, 1)" },
+);
+</code></pre>
+<p>You do not animate <code>top</code>, <code>left</code>, <code>height</code>, or <code>margin</code>. Those are layout properties. They make the browser recalculate geometry while the animation runs.</p>
+<p>You animate <code>transform</code>, because the layout has already happened. The motion is a visual reconciliation between the old geometry and the new one.</p>
+<h2>The practical version</h2>
+<p>Most of the time, I do not write FLIP by hand. Motion’s <code>layout</code> prop gives each item the behaviour directly:</p>
+<pre><code>&lt;AnimatePresence mode="popLayout" initial=\{false}&gt;
+  \{items.map((item) =&gt; (
+    &lt;motion.div
+      key=\{item.id}
+      layout
+      initial=\{\{ opacity: 0, x: -20, scale: 0.95 }}
+      animate=\{\{ opacity: 1, x: 0, scale: 1 }}
+      exit=\{\{ opacity: 0, scale: 0.5, filter: "blur(6px)" }}
+      transition=\{\{ type: "spring", stiffness: 400, damping: 30 }}
+    &gt;
+      \{item.label}
+    &lt;/motion.div&gt;
+  ))}
+&lt;/AnimatePresence&gt;
+</code></pre>
+<p><code>layout</code> handles sibling movement. <code>AnimatePresence</code> keeps removed items alive long enough to animate out before unmounting. <code>mode="popLayout"</code> lets exiting items leave the document flow so the remaining siblings can move immediately instead of waiting for the exit to finish.</p>
+<p>The list reads as one surface rearranging itself, rather than a stack of independent rows.</p>
+<h2>Exit is not the same as reflow</h2>
+<p>There are two separate animations in that example.</p>
+<p>The removed item exits:</p>
+<pre><code>exit=\{\{
+  opacity: 0,
+  scale: 0.5,
+  filter: "blur(6px)",
+  transition: \{ duration: 0.2, ease: "easeIn" },
+}}
+</code></pre>
+<p>The surviving siblings move:</p>
+<pre><code>layout
+transition=\{\{ type: "spring", stiffness: 400, damping: 30 }}
+</code></pre>
+<p>Tune those jobs separately.</p>
+<p>The exiting item can be quick and decisive because it is leaving. A short fade, scale, or blur tells the eye it has been dismissed.</p>
+<p>The siblings need enough time to make their path legible. Too fast and they still feel like they jumped. Too slow and the interface starts waiting on its own animation. For small layout changes, I usually want this somewhere around 200-350ms, or a spring with enough damping that it settles without wobbling.</p>
+<h2>Choreography is sequencing</h2>
+<p>Layout animation gets messy when everything moves with equal importance.</p>
+<p>If a card expands, the card should lead and the surrounding content should yield. If a row is removed, the row should leave and the rest should close the gap. If a filter changes a grid, the disappearing items should exit before the survivors settle into their new positions.</p>
+<p>Use this sequence:</p>
+<ol>
+ <li>The user’s action changes one thing.</li>
+ <li>That thing responds first.</li>
+ <li>The surrounding layout adapts.</li>
+ <li>The system settles.</li>
+</ol>
+<p>That order keeps a busy layout change legible.</p>
+<h2>Scale needs correction</h2>
+<p>FLIP often uses scale to fake width and height changes. That is efficient, but it can distort children.</p>
+<p>Text can stretch, borders can fatten, and border radii can look wrong. Shadows may scale in a way that makes depth feel rubbery.</p>
+<p>This is one reason component-level layout animation can need more care than page-level transitions. You are animating the real element and its children, not a screenshot. That gives you interruptibility and better interaction, but it also means every child has to survive the transform.</p>
+<p>The fixes are small:</p>
+<ul>
+ <li>Keep scale changes modest.</li>
+ <li>Put text in an inner wrapper that does not scale when needed.</li>
+ <li>Animate border radius explicitly if it looks wrong.</li>
+ <li>Prefer translate-only layout motion when the size change is not the point.</li>
+ <li>Use opacity for entering content so text does not stretch into place.</li>
+</ul>
+<p>The new layout should arrive without distorting the component’s material quality.</p>
+<h2>View Transitions are a different tool</h2>
+<p>View Transitions can move things between layouts by animating snapshots. That suits route changes and shared elements across pages, but dense interactive lists benefit from live elements while items enter, leave, and reorder.</p>
+<p>For lists, grids, accordions, filters, and drag-adjacent UI, I usually want live elements. I want pointer events, interruption, springs, and per-item timing. That points to Motion’s <code>layout</code>, a FLIP utility, or a small custom implementation.</p>
+<p>For navigation, screenshots can be a feature. For local layout changes, they often get in the way.</p>
+<h2>Reduced motion</h2>
+<p>Layout choreography still moves objects through space, so it needs a reduced-motion path.</p>
+<p>The reduced-motion version can keep opacity and colour changes while dropping the transform:</p>
+<pre><code>const prefersReducedMotion = useReducedMotion();
+
+&lt;motion.div
+  layout=\{!prefersReducedMotion}
+  initial=\{\{ opacity: 0 }}
+  animate=\{\{ opacity: 1 }}
+  exit=\{\{ opacity: 0 }}
+&gt;
+  \{item.label}
+&lt;/motion.div&gt;
+</code></pre>
+<p>The content, order, and controls stay intact with less spatial movement.</p>
+<p>The reduced-motion version should remain complete and clear.</p>
+<h2>When to steal this</h2>
+<p>Reach for layout choreography when a state change moves neighbouring elements:</p>
+<ul>
+ <li>removing or inserting list items</li>
+ <li>filtering a grid</li>
+ <li>expanding cards</li>
+ <li>opening accordions</li>
+ <li>changing density</li>
+ <li>switching between compact and detailed views</li>
+ <li>reordering direct-manipulation surfaces</li>
+</ul>
+<p>Do not animate every reflow by default. Some changes are small enough to snap. Some should be instant because the user is trying to move quickly. Some layouts are too dense for every element to perform its own journey.</p>
+<p>Use it where readers need to track where objects went. Give the layout a visible path instead of a cut.</p>
