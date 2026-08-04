@@ -1,0 +1,166 @@
+<p>In event-driven Kubernetes architectures, CPU and memory utilization often fail to reflect real system pressure. A worker pod may sit idle from a CPU perspective while thousands of messages pile up in an Amazon SQS queue. In other cases, pods may continue running long after a traffic spike has passed.</p>
+<p>For asynchronous, queue-based workloads, backlog is the true scaling signal – not infrastructure utilization.</p>
+<p>In this article, you’ll learn:</p>
+<ul>
+ <li>How Amazon SQS queue depth can work as an autoscaling metric for event-driven workers</li>
+ <li>How to scale workloads on Amazon EKS using KEDA with AWS pod identity</li>
+ <li>How KEDA calculates desired replicas from queue depth</li>
+ <li>How to tune queueLength, activationQueueLength, cooldowns, and HPA behavior</li>
+ <li>How to validate scaling behavior and troubleshoot common issues</li>
+</ul>
+<p><strong>Why this matters:</strong> In queue-driven systems, delayed message processing directly impacts users and downstream systems. Scaling based on SQS depth aligns autoscaling with actual demand, enabling faster burst handling and lower idle costs when queues are empty.</p>
+<h3>1. Prerequisites</h3>
+<p>Before implementing KEDA-based autoscaling with Amazon SQS, ensure you have:</p>
+<ul>
+ <li>An Amazon EKS cluster running a supported Kubernetes version</li>
+ <li>KEDA installed in the cluster (for example, via the kedacore Helm chart)</li>
+ <li>An AWS authentication method selected (IRSA or EKS Pod Identity)</li>
+ <li>An existing Amazon SQS queue</li>
+ <li>A worker deployment designed to consume messages from the queue</li>
+</ul>
+<h3>2. Architecture and Request Flow</h3>
+<p>This architecture relies on KEDA observing Amazon SQS queue metrics and managing a Kubernetes Horizontal Pod Autoscaler (HPA) based on backlog.</p>
+<p><strong>Request flow:</strong></p>
+<ol>
+ <li>Producers send messages to the Amazon SQS queue</li>
+ <li>KEDA polls queue attributes to determine backlog</li>
+ <li>KEDA updates the target metrics in the HPA</li>
+ <li>The HPA scales the worker Deployment</li>
+ <li>Kubernetes schedules additional Pods to process messages</li>
+ <li>As the queue drains, replicas scale back down</li>
+</ol>
+<p>This model keeps autoscaling decisions tied directly to outstanding work.</p>
+<h3>3. Implementation Steps</h3>
+<h4>Install KEDA via Helm</h4>
+<p>The recommended way to install KEDA is via Helm:</p>
+<pre><code># Add the KEDA Helm repository
+helm repo add kedacore https://kedacore.github.io/charts
+helm repo update
+
+# Install KEDA into a dedicated namespace
+helm install keda kedacore/keda \
+  --namespace keda \
+  --create-namespace
+</code></pre>
+<p><strong>What this does:</strong> Deploys the KEDA operator and metrics API server, along with CRDs such as ScaledObject and TriggerAuthentication.</p>
+<h4>Deploy the Worker with AWS Identity Attached</h4>
+<p>An SQS consumer typically requires permissions such as:</p>
+<ul>
+ <li>GetQueueAttributes</li>
+ <li>GetQueueUrl</li>
+ <li>ReceiveMessage</li>
+ <li>DeleteMessage</li>
+ <li>ChangeMessageVisibility</li>
+</ul>
+<p><strong>Example IAM policy:</strong></p>
+<pre><code>\{
+  "Version": "2012-10-17",
+  "Statement": [
+    \{
+      "Sid": "ConsumeFromQueue",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:GetQueueAttributes",
+        "sqs:GetQueueUrl",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:ChangeMessageVisibility"
+      ],
+      "Resource": "arn:aws:sqs:us-east-1:123456789012:orders-queue"
+    }
+  ]
+}
+</code></pre>
+<p><strong>What this does:</strong> Enforces least-privilege access by granting permissions only for the required SQS queue.</p>
+<h4>Configure KEDA Authentication and ScaledObject</h4>
+<p>KEDA connects the deployment to the SQS queue using TriggerAuthentication and ScaledObject. Using queueURLFromEnv avoids hardcoding the queue URL.</p>
+<pre><code>apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: sqs-processor-auth
+  namespace: workers
+spec:
+  podIdentity:
+    provider: aws
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: sqs-processor
+  namespace: workers
+spec:
+  scaleTargetRef:
+    name: sqs-processor
+  pollingInterval: 10
+  cooldownPeriod: 120
+  minReplicaCount: 0
+  maxReplicaCount: 30
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 60
+  triggers:
+    - type: aws-sqs-queue
+      authenticationRef:
+        name: sqs-processor-auth
+      metadata:
+        queueURLFromEnv: QUEUE_URL
+        awsRegion: us-east-1
+        queueLength: "10"
+        activationQueueLength: "1"
+</code></pre>
+<p><strong>What this does:</strong> Defines how KEDA authenticates with AWS and how replicas are calculated. Each pod targets 10 messages, and scale-to-zero is enabled when the queue is empty.</p>
+<h3>4. Replica Calculation Logic</h3>
+<p>KEDA calculates outstanding work as:</p>
+<p>ApproximateNumberOfMessages + ApproximateNumberOfMessagesNotVisible (+ delayed messages, if enabled)</p>
+<p>Replica calculation:</p>
+<p>desired replicas = ceil(outstanding messages / queueLength)</p>
+<p><strong>Example (queueLength: “10”):</strong></p>
+<ul>
+ <li>0 messages → 0 pods</li>
+ <li>8 messages → 1 pod</li>
+ <li>25 messages → 3 pods</li>
+ <li>95 messages → 10 pods</li>
+</ul>
+<p>Final replica counts are bounded by minReplicaCount and maxReplicaCount.</p>
+<h3>5. Verification</h3>
+<p>After applying the manifests:</p>
+<p>1. Send 50 messages to the SQS queue</p>
+<p>2. Inspect the ScaledObject:</p>
+<p>kubectl get scaledobject sqs-processor -n workers</p>
+<p>3. Watch pod scaling:</p>
+<p>kubectl get pods -n workers -w</p>
+<p>4. Confirm pods scale back to zero after processing completes</p>
+<h3>6. Troubleshooting Common Issues</h3>
+<p><strong>No scale-out</strong></p>
+<ul>
+ <li>Cause: Incorrect queue URL or IAM permissions</li>
+ <li>Check: kubectl describe scaledobject, KEDA operator logs</li>
+</ul>
+<p><strong>Too many pods</strong></p>
+<ul>
+ <li>Cause: In-flight messages counted</li>
+ <li>Check: scaleOnInFlight, SQS visibility timeout</li>
+</ul>
+<p><strong>Never scales to zero</strong></p>
+<ul>
+ <li>Cause: Delayed or unacknowledged messages</li>
+ <li>Check: Queue attributes and application behavior</li>
+</ul>
+<p><strong>HPA exists but no scaling</strong></p>
+<ul>
+ <li>Cause: Authentication or metric fetch errors</li>
+ <li>Check: KEDA logs and fallback status</li>
+</ul>
+<h3>7. Production Tuning Tips</h3>
+<ul>
+ <li><strong>Choose queueLength based on throughput</strong>, not guesswork</li>
+ <li><strong>Tune cooldown and HPA behavior separately</strong> – they control different scale-down paths</li>
+ <li><strong>Enable fallback replicas</strong> for resilience if metrics become unavailable</li>
+ <li><strong>Decide whether in-flight messages should count</strong> based on visibility timeout behavior</li>
+</ul>
+<h2>Conclusion</h2>
+<p>Queue-based workloads benefit most when autoscaling is driven by the amount of work waiting to be processed rather than traditional infrastructure metrics. Backlog-aware scaling enables applications to react more quickly to changing demand while reducing unnecessary resource consumption during quieter periods.</p>
+<p>Although this article demonstrated the approach using Amazon SQS, Amazon EKS, and KEDA, the same design pattern applies across many event-driven architectures and messaging platforms. The key is selecting a scaling signal that accurately represents workload demand and tuning the autoscaling behaviour to match the characteristics of the application.</p>
+<p>As organisations increasingly adopt asynchronous, event-driven systems, workload-aware autoscaling becomes an important part of building resilient, efficient, and cost-effective Kubernetes deployments.</p>

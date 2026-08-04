@@ -1,0 +1,106 @@
+<h2>TL;DR</h2>
+<p>Opendata <em>Log</em> maintains millions of individually keyed, ordered logs and scales to tens of thousands of active readers on a single instance. It is MIT-licensed, built directly on Object Storage, and deployed as a single Rust binary.</p>
+<p>Create your first logs in 2 minutes with our quickstart: <a href="https://www.opendata.dev/docs/log/quickstart">https://www.opendata.dev/docs/log/quickstart</a></p>
+<h2>There is No Goldilocks Log</h2>
+<p>In late 2013, Jay Kreps published one of the most influential blog posts in data engineering. He explained why <em>The Log</em> is the universal building block underneath nearly all data systems. It can replicate a state machine across a network, feed a firehose of data into downstream systems, and serve as efficient storage for real-time processing.</p>
+<p>He was correct about the abstraction, but incorrectly assumed that this single abstraction could also be implemented by a single system (called Kafka).</p>
+<p>A decade of working on logging systems has taught us that logging, as it turns out, is split into two types:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Type</th>
+   <th>Description</th>
+   <th>Examples</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Funneling</td>
+   <td>Collecting data from high-cardinality sources and coalescing them onto a low-cardinality pipe.</td>
+   <td>Telemetry pipelines, clickstream collection, warehouse dumps</td>
+  </tr>
+  <tr>
+   <td>Routing</td>
+   <td>Delivering events from addressable sources to addressable destinations.</td>
+   <td>Messaging, feeds, agent traces</td>
+  </tr>
+ </tbody>
+</table>
+<p>Both of these patterns require a durable log, but they have quite different nonfunctional characteristics that make a system designed for one a poor fit for the other. Some use cases just need the biggest, cheapest pipe they can get. Others need to scale to the millions of small logs.</p>
+<h3>Funnels</h3>
+<p>When Kafka was released in 2011, fifteen years ago, it was built to funnel telemetry (clickstream, page views, metrics) data from all of LinkedIn’s servers to Hadoop and/or an online metrics database.</p>
+<p>An intriguing similarity across the initial Kafka use cases at LinkedIn was that messages sent to Kafka were keyless. In fact, the initial Kafka implementation discarded the partitioning key after computing a partition, leaving only the payload on storage (it wasn’t until later that Kafka supported keys and compaction).</p>
+<p>In the context of funneling, this isn’t surprising. If what you want is to shuttle data from source to destination then a simple pipe that’s optimized for well-balanced throughput is ideal.</p>
+<h3>Routers</h3>
+<p>The other use case for logs is routing, which is often seen in messaging applications, feeds and microservice communication. It takes events from input sources and delivers them to specific, addressed destinations or records them for future replay.</p>
+<p>The defining characteristic of routers is that destinations are only interested in a particular subset of keys. If you think of the funnel as a dumb broker, then routers need smart logic to distribute the messages in the log to their respective destinations.</p>
+<h2>Why Kafka is an Excellent Funnel, But a Bad Router</h2>
+<p>We like to reason about storage systems in terms of read, write and space amplification. The only way to improve all three in a system is to restrict the usage pattern.</p>
+<p>When the engineers at LinkedIn designed Kafka, they restricted the API to make it particularly well suited as a funnel with low write amplification. Since data is written to disk via append-only, immutable files which are only cleaned up wholesale when they fall out of retention, the write amplification α_write is ~1x.</p>
+<p>The consequence of this low write-amplification design is that reads are heavily restricted. The only read API provided is to scan the data in the order that it was written, but if that’s what you want then your read amplification α_read is also 1x.</p>
+<p>Routers need a different access pattern on the underlying log. Instead of one massive log, routers want to store hundreds of thousands or even millions of individual logs.</p>
+<p>Since Kafka partitions are isolated from one another, it’s not feasible to store each routing log in its own partition. This means that to find a <em>specific</em> message by key in a funnel like Kafka, your read amplification is the ratio of the entire partition size divided by the size of the record:</p>
+<pre><code>              |partition|
+  α_read  =  ─────────────
+               |record|</code></pre>
+<p>This is nearly worst case read amplification, and makes it impractical to use Kafka as a router.</p>
+<h2>OpenData Log: The right primitive for Routing</h2>
+<p>Today we’re announcing OpenData <em>Log</em>, a superior mechanism for the Routing log use cases.</p>
+<p><em>Log</em> is an MIT-Licensed, object-native, key-oriented log built on SlateDB. Breaking that down, in reverse:</p>
+<ol>
+ <li><strong>Key-Oriented</strong>: Unlike Kafka, <em>Log</em> organizes data by key instead of topic-partition. You’re encouraged to have hundreds of thousands to millions of keys on a single log node.</li>
+ <li><strong>Object-Native</strong>: The only requirement for durability is Object Storage. This makes it strongly consistent and absurdly durable.</li>
+ <li><strong>MIT-Licensed</strong>: It’s open source and made for hosting yourself.</li>
+</ol>
+<h3>Keys, not Topic-Partitions</h3>
+<p><em>Log</em> allows you to read ordered records for a specific key, even if the key cardinality is high:</p>
+<pre><code>let log = LogDb::open(...);
+
+// Scan user-123's log
+let mut iter = log.scan(Bytes::from("user-123"), ..).await?;
+while let Some(entry) = iter.next().await? \{
+	println!("seq=\{}, value=\{:?}", entry.sequence, entry.value);
+}</code></pre>
+<p>Notice that there’s no partition in the parameters for <code>log.scan()</code>, you address the log by the key and get the values in return.</p>
+<p>For Routing use cases, partitioning is a poor data model. Instead, the right level of abstraction is a “key” that can support orders of magnitude more values than Kafka can partitions.</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>Partitions (Kafka)</th>
+   <th>Keys (<em>Log</em>)</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Point reads</strong></td>
+   <td>Finding the values for a specific key requires a needle-in-a-haystack scan of the whole partition to find one key’s data</td>
+   <td>Individual keys can efficiently be scanned by prefix on an LSM index</td>
+  </tr>
+  <tr>
+   <td><strong>Isolation</strong></td>
+   <td>One problematic key causes head-of-blocking for an entire partition.</td>
+   <td>Position metadata can be tracked per key so poison-pill message effects are localized</td>
+  </tr>
+  <tr>
+   <td><strong>Rescaling</strong></td>
+   <td>Changing partition counts is a nightmare that requires arbitrary amounts of data shuffles and disrupts all consumers. Hot partitions are hard to work around.</td>
+   <td>Keys are assigned with range partitions, no consumer offsets need to be changed when splitting and merging <em>Log</em>. Readers can scale to the individual key granularity.</td>
+  </tr>
+ </tbody>
+</table>
+<p>To support this, <em>Log</em> is designed as a segmented LSM tree keyed by <code>(key, sequence)</code> and segmented by sequence ranges.</p>
+<p>If you’re not familiar with LSM trees, the ten-second version is that they are a data structure that stores recent data as a log and compacts older data into a sorted array.</p>
+<p>In practice, this architecture means you can append new data quickly and still access old data efficiently with a binary-search. The result is that <em>Log</em> can support millions of independent keyed logs without increasing the latency for fetching data for a specific log.</p>
+<h3>Scaling without Partitions</h3>
+<p>While partitions are a suboptimal data modeling concept, some type of data distribution is a requirement for scaling out beyond a single machine. The first strategy available for scaling <em>Log</em> horizontally is deploying multiple readers. You can spin up as many read replicas as you want since data is pulled directly from S3.</p>
+<p>Deploying readers that are scoped to a single target key range has the extra benefit of improving the cache locality of reads, thus reducing read amplification.</p>
+<h3>Cost</h3>
+<p><em>Log</em> inherits some of the excellent properties of object storage in its operational costs. We were able to sustain 50,000 concurrent followers tailing their own keyed logs with an 8GB cache and 1 million keys at &lt;50ms p50 latency.</p>
+<h3>Tradeoffs</h3>
+<p>There are a few decisions we made to get <em>Log</em> to the point where it can process high cardinality keys and nothing comes for free. In particular, the poll latencies scale with the rate of ingestion. Increased ingestion rates cause the cache to evict hot data before compaction has the opportunity to collocate keys for efficient querying.</p>
+<p>The workaround to this, discussed above, is scoping read replicas to smaller ranges to avoid thrashing the cache with blocks that contain data from other ranges.</p>
+<p>In addition <em>Log</em> inherits the limitations of object storage latencies, but in practice you can get p50 and p99 poll latencies of ~30ms and ~300ms respectively with 25 MiB/s of throughput.</p>
+<p>Finally, <em>Log</em> does not track consumer offsets directly. This separation of metadata and data allows for more flexible deployment mechanisms, and we recommend you use a Key-Value store like SlateDB for offset tracking on the consumer.</p>
+<h2>Get Started Today</h2>
+<p><em>Log</em> is MIT-licensed and available today as part of OpenData and you can run through the quickstart in a couple of minutes.</p>

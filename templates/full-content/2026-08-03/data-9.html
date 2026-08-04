@@ -1,0 +1,177 @@
+<h1>Asynchronous I/O in DuckDB: Work, Thread, Work</h1>
+<p><em>TL;DR: Starting with v2.0, scheduled for fall 2026, DuckDB will support asynchronous reads of Parquet and CSV files. This can significantly speed up queries when synchronous I/O does not saturate the available bandwidth, as is typical in EC2/S3 compute-storage setups.</em></p>
+<p>It doesn't matter how fast query operators are in a database system if we can't pull in the data quickly. For most of DuckDB's history, however, this problem was largely avoided by pruning data early. By pushing down filters and projections, we could ensure that we only read what we actually needed.</p>
+<p>This worked particularly well because DuckDB primarily ran locally, with its main use case being as a quick-draw database engine for querying data directly from your machine's SSD. We could split the data into several partitions, such as row groups for Parquet files or fixed-size buffers for CSV files, and load them with low latency and high bandwidth. As a result, the main bottlenecks were elsewhere: subqueries, joins, aggregations, and so on. The actual data access path received less attention because synchronous access was perfectly suitable for this use case.</p>
+<p>As usual, things changed. We realized that DuckDB's architecture was a great fit for querying remotely stored large-scale datasets, such as data lakes. Since May this year, we can even run DuckDB as a server using the Quack protocol. The original expectation of data files sitting on a local SSD therefore no longer always holds.</p>
+<p>The practical implication of these changes is that many current DuckDB setups need to transfer files from remote storage to the machine that will actually process them. For data lakes, for example, a typical setup is to store the data in blob storage, such as S3, and process it on an EC2 machine in the same region. In this setup, latency and bandwidth play a much more significant role. If we cannot issue enough concurrent requests to use the available network bandwidth, performance can suffer drastically, with threads spending a large amount of their time waiting for remote reads instead of processing data.</p>
+<p>As an example, let's consider a simple query over a remote Parquet file. For simplicity, let's assume we only have a single thread executing.</p>
+<pre><code>FROM read_parquet('s3://bucket/file.parquet');</code></pre>
+<p>A Parquet scan is partitioned into row-group-based jobs, with each job containing one or more fetch tasks that issue byte-range requests. With synchronous I/O, the worker thread will be blocked, waiting for the data to arrive at the machine before performing actual work, such as decoding, aggregating, and so on.</p>
+<p>To address this, we have been implementing asynchronous I/O pipelines in DuckDB. They are currently implemented for Parquet and for uncompressed, seekable UTF-8 CSV files, with support for other formats, such as DuckDB's native format and JSON, still to come. In the remainder of this blog post, we will give a simple explanation of how asynchronous I/O is implemented in DuckDB and provide benchmarks for both Parquet and CSV files.</p>
+<blockquote>
+ <p>If you would like to try asynchronous I/O now, you can do so by using DuckDB's v2.0.0-dev preview builds. Asynchronous I/O will be used by default from the next major DuckDB version, v2.0, released in the fall.</p>
+</blockquote>
+<h2>Asynchronous I/O</h2>
+<p>The conceptual idea of asynchronous I/O is rather simple: we should be able to start an I/O operation without blocking the worker thread that requested it.</p>
+<p>In this example, we have two <code>ASYNC</code> threads and one regular worker thread. The <code>ASYNC</code> threads keep <em>fetch tasks</em> in flight while the worker thread decodes data. During the initial warm-up, the scan task parks, leaving the worker thread free to run other pipeline tasks. Once the first job is ready, fetching and decoding can overlap.</p>
+<p>In DuckDB, we implemented two separate thread pools:</p>
+<ul>
+ <li><code>REGULAR</code> – This pool contains our worker threads (by default: one for each available CPU thread). These are the ones that do real work, like decoding, joins, and aggregations. They prioritize regular work but can also perform I/O tasks when idle.</li>
+ <li><code>ASYNC</code> – A pool of threads intended for asynchronous tasks, primarily blocking I/O.</li>
+</ul>
+<p>The main reason we have these two different pools is that, for remote I/O, these threads can spend almost all their time blocked, waiting for an HTTP response, for example, and hence have very little CPU utilization. Because of that, we have many more <code>ASYNC</code> workers than system threads, with the default setting being <code>4 * system threads</code> and the total being capped at 256.</p>
+<p>It's of utmost importance to keep as many of our <code>ASYNC</code> threads busy as possible. To ensure that, we implement a read-ahead strategy instead of issuing reads on demand. This means scheduling fetch tasks ahead of what our regular worker threads currently need.</p>
+<p>One thing we need to be attentive to is that read-ahead buys throughput by holding memory. If decoding is slow and the network is fast, prefetched data can accumulate and lead to out-of-memory issues. To mitigate this, we also implemented asynchronous memory governance.</p>
+<h3>Read-Ahead Queue</h3>
+<p>The idea of read-ahead is also straightforward. Instead of starting a read at the exact moment a regular worker needs the data, we schedule fetch tasks for work that lies further ahead. While a regular worker decodes the current job, the ASYNC threads are already pulling in data for the next jobs. The goal is to keep enough fetch tasks in flight to hide the latency of remote storage.</p>
+<p>The jobs are units of work that can be scheduled and processed independently, and they can be different depending on the underlying file format. For a Parquet file, a job is one row group of one file. For a CSV file, a job is a scan boundary that generally covers a fixed byte range within the file.</p>
+<p>Filling the queue requires no dedicated producer thread. Any regular worker that comes looking for scan work first tops up the queue as far as it is allowed to. The limit is either given by a user-specified number of slots or by a memory budget. If there is space, a job and its fetch tasks are created. The fetch tasks are scheduled immediately on the <code>ASYNC</code> pool, while the job is admitted to the read-ahead queue in batch order.</p>
+<p><code>ASYNC</code> threads execute individual fetch tasks independently of the job queue's claim order. Fetch tasks from the same job can run concurrently, although no particular assignment to <code>ASYNC</code> threads is guaranteed. All fetch tasks of a job share a countdown, and the fetch task that brings it to zero completes the job's I/O.</p>
+<h3>Memory Management</h3>
+<p>Keeping more fetch tasks in flight consumes more memory. To determine a budget and avoid out-of-memory issues, we introduced the <code>read_ahead_depth</code> configuration option.</p>
+<ul>
+ <li><code>-1</code> (default): unlimited depth, bounded by memory.</li>
+ <li><code>N &gt; 0</code>: at most <code>N</code> jobs ahead, with no memory budget.</li>
+ <li><code>0</code>: read-ahead is off, each scan task schedules I/O only for its own job.</li>
+</ul>
+<p>To configure it, use the <code>SET</code> clause, e.g.:</p>
+<pre><code>SET read_ahead_depth = 5;</code></pre>
+<p>In the default mode, the budget is negotiated with the temporary memory manager, which is the same manager that splits memory between concurrent joins, sorts, and window operators. When there is a lot of memory pressure, for example, because an operator is using a large amount of memory, queue reservations might instantly be over budget. In practice, this means that the queue will only allow one job at a time, and the scan will behave close to a synchronous scan.</p>
+<h2>Benchmarks</h2>
+<p>Asynchronous I/O should have the largest effect when the latency of synchronous requests prevents us from using the available remote bandwidth. To measure this effect, we ran TPC-H Query 6 at SF100, with the data sitting on S3. For compute, we used an EC2 r7i.16xlarge machine (64 vCPUs and 512 GB of RAM), with both the machine and the S3 bucket with the data located in the same region.</p>
+<h3>Parquet</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Version</th>
+   <th>Q6 runtime</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>v1.5.5 (synchronous)</td>
+   <td>8.230 s</td>
+  </tr>
+  <tr>
+   <td>v2.0.0-dev (asynchronous I/O)</td>
+   <td>2.844 s</td>
+  </tr>
+ </tbody>
+</table>
+<h4>Local Disk</h4>
+<p>Remote storage is the main target for asynchronous I/O, but cold local reads give us a useful contrast. We cleared the OS caches between runs.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Version</th>
+   <th>Q6 runtime</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>v1.5.5 (synchronous)</td>
+   <td>1.321 s</td>
+  </tr>
+  <tr>
+   <td>v2.0.0-dev (asynchronous I/O)</td>
+   <td>0.883 s</td>
+  </tr>
+ </tbody>
+</table>
+<h4>Small Files</h4>
+<p>We generated 976 files with five row groups each.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Version</th>
+   <th>Q6 runtime</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>v1.5.5 (synchronous)</td>
+   <td>9.344 s</td>
+  </tr>
+  <tr>
+   <td>v2.0.0-dev (asynchronous I/O)</td>
+   <td>2.945 s</td>
+  </tr>
+ </tbody>
+</table>
+<h4>Large Row Groups</h4>
+<table>
+ <thead>
+  <tr>
+   <th>Rows / RG</th>
+   <th>RGs</th>
+   <th>Approx. RG size (MB)</th>
+   <th>Total file size (MB)</th>
+   <th>Time</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>122,880</td>
+   <td>4,886</td>
+   <td>~4 MB</td>
+   <td>~21,600 MB</td>
+   <td>2.74 s</td>
+  </tr>
+  <tr>
+   <td>1,966,080</td>
+   <td>306</td>
+   <td>~70 MB</td>
+   <td>~21,400 MB</td>
+   <td>2.11 s</td>
+  </tr>
+  <tr>
+   <td>9,375,593</td>
+   <td>64</td>
+   <td>~320 MB</td>
+   <td>~20,500 MB</td>
+   <td>2.27 s</td>
+  </tr>
+  <tr>
+   <td>62,914,560</td>
+   <td>10</td>
+   <td>~1,500 MB</td>
+   <td>~14,700 MB</td>
+   <td>3.69 s</td>
+  </tr>
+  <tr>
+   <td>150,009,476</td>
+   <td>4</td>
+   <td>~3,200 MB</td>
+   <td>~12,800 MB</td>
+   <td>8.01 s</td>
+  </tr>
+  <tr>
+   <td>600,037,902</td>
+   <td>1</td>
+   <td>~12,300 MB</td>
+   <td>~12,300 MB</td>
+   <td>25.26 s</td>
+  </tr>
+ </tbody>
+</table>
+<h3>CSV</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Version</th>
+   <th>Q6 runtime</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>v1.5.5 (synchronous)</td>
+   <td>877.563 s</td>
+  </tr>
+  <tr>
+   <td>v2.0.0-dev (asynchronous I/O)</td>
+   <td>45.264 s</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Conclusion</h2>
+<p>In this blog post, we presented the recent work on asynchronous I/O for Parquet and CSV files. Most of its benefit comes from accessing remote data, but cold local reads can also benefit, albeit less. Next, we plan to add async reads for JSON and DuckDB-native files. We will also investigate <code>io_uring</code>, Linux's asynchronous I/O interface, which could reduce system-call overhead and the number of threads blocked on I/O.</p>

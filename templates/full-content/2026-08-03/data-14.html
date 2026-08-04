@@ -1,0 +1,151 @@
+<h1>Postgres Index Types Explained: B-tree, GIN, BRIN, and Operators</h1>
+<p>In my post about JSON and JSONB I told you to create a GIN index with <code>jsonb_path_ops</code> and moved on, because that post was about a column type and not about indexing. This one pays the debt. What a GIN index actually is, why Postgres ships five other index types.</p>
+<p>Every example below runs as written on a stock Postgres 17. The plans and sizes are real output from my machine.</p>
+<h2>An index is a bet</h2>
+<p>An index is a separate data structure that trades write speed and disk for read speed. Every insert and update has to maintain every index on the table, and every index occupies real space, which you will see measured at the end of this post. That framing matters because the question is never “should I index this table” but “which reads are worth taxing my writes for”. An index that no query uses is a pure tax.</p>
+<h2>Indexes accelerate operators, not columns</h2>
+<p>When the planner considers an index, it does not ask “is there an index on this column”. It asks “is there an index whose type knows how to answer this operator”. A B-tree knows how to answer <code>=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;=</code>, <code>&gt;</code> and <code>BETWEEN</code>, because it keeps values in sorted order. It has no idea what to do with the array containment operator <code>@&gt;</code>. A GIN index answers <code>@&gt;</code> natively and cannot help you with <code>&lt;</code>.</p>
+<p>The glue between an index type and the operators it serves is called an operator class. Most of the time the default class is what you want and you never type its name. The moment it becomes practical is when one index type offers a choice, which is exactly the <code>jsonb_ops</code> versus <code>jsonb_path_ops</code> decision from the JSONB post: same GIN machinery, different set of supported operators, different size.</p>
+<p>Keep that lens for the rest of the post. Each index type below is just a different answer to the question “which operators do you need to be fast”.</p>
+<h2>The demo table</h2>
+<p>One table, one million rows, shaped like an event log because that is where indexing decisions get interesting: a user id to look up, a status that is almost always <code>ok</code>, a tags array, and a timestamp that grows with insert order.</p>
+<pre><code>CREATE TABLE events (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  user_id    int    NOT NULL,
+  status     text   NOT NULL,
+  tags       text[] NOT NULL,
+  created_at timestamptz NOT NULL
+);
+
+INSERT INTO events (user_id, status, tags, created_at)
+SELECT
+  i % 50000,
+  CASE WHEN i % 211 = 0 THEN 'failed' ELSE 'ok' END,
+  ARRAY['app' || i % 7, (ARRAY['auth', 'billing', 'search', 'export', 'sync'])[1 + i % 5]]
+    || CASE WHEN i % 397 = 0 THEN ARRAY['beta'] ELSE '\{}' END,
+  timestamptz '2026-01-01 00:00:00+00' + i * interval '2 seconds'
+FROM generate_series(0, 999999) AS i;
+
+ANALYZE events;</code></pre>
+<h2>Life without an index</h2>
+<p>Ask for one user’s events with nothing but the primary key in place:</p>
+<pre><code>EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+SELECT * FROM events WHERE user_id = 12345;
+
+Gather (actual rows=20 loops=1)
+   Workers Planned: 2
+   Workers Launched: 2
+   -&gt;  Parallel Seq Scan on events (actual rows=7 loops=3)
+         Filter: (user_id = 12345)
+         Rows Removed by Filter: 333327
+ Planning Time: 0.083 ms
+ Execution Time: 15.696 ms</code></pre>
+<p>Postgres read the entire table and threw two parallel workers at it to make that less painful. Twenty matching rows required inspecting a million. A sequential scan is the baseline, and on small tables it is often the genuinely fastest plan. On a million rows, for twenty matches, it is the thing indexes exist to avoid.</p>
+<h2>B-tree, the default for a reason</h2>
+<p><code>CREATE INDEX</code> with no <code>USING</code> clause gives you a B-tree, a balanced tree of sorted values. Sorted order is why it covers the widest set of operators: equality, every comparison, <code>BETWEEN</code>, and it can feed <code>ORDER BY</code> without a sort step.</p>
+<pre><code>CREATE INDEX events_user_id_idx ON events (user_id);
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+SELECT * FROM events WHERE user_id = 12345;
+
+Bitmap Heap Scan on events (actual rows=20 loops=1)
+   Recheck Cond: (user_id = 12345)
+   Heap Blocks: exact=20
+   -&gt;  Bitmap Index Scan on events_user_id_idx (actual rows=20 loops=1)
+         Index Cond: (user_id = 12345)
+ Planning Time: 0.087 ms
+ Execution Time: 0.046 ms</code></pre>
+<p>From 15.7 milliseconds to 0.046. Same query, same data, three hundred times faster.</p>
+<blockquote>
+ <p>A bitmap scan is a two-phase strategy. The Bitmap Index Scan walks the index and collects the locations of every matching row into a bitmap in memory. The Bitmap Heap Scan then sorts those locations by page and visits each table page exactly once. When matches are scattered across the table, as they are here, this beats jumping back and forth between index and table row by row. You will meet this plan shape with every index type in this post, because GIN and BRIN produce their results as bitmaps by nature.</p>
+</blockquote>
+<p>The same B-tree serves range queries for free:</p>
+<pre><code>EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+SELECT * FROM events WHERE user_id BETWEEN 100 AND 199;
+
+Bitmap Heap Scan on events (actual rows=2000 loops=1)
+   Recheck Cond: ((user_id &gt;= 100) AND (user_id &lt;= 199))
+   Heap Blocks: exact=41
+   -&gt;  Bitmap Index Scan on events_user_id_idx (actual rows=2000 loops=1)
+         Index Cond: ((user_id &gt;= 100) AND (user_id &lt;= 199))
+ Planning Time: 0.048 ms
+ Execution Time: 0.137 ms</code></pre>
+<p>If your predicate is equality or ordering on a scalar, the B-tree is almost always the answer, which is why it is the default.</p>
+<h2>GIN, the inverted index</h2>
+<p>A B-tree stores one entry per row. That model collapses when a single value contains many searchable elements: an array of tags, the keys of a <code>jsonb</code> document, the words of a text document. You do not want an entry per row, you want an entry per element, pointing back at every row containing it. That structure is an inverted index, and in Postgres it is called GIN, for Generalized Inverted Index.</p>
+<pre><code>CREATE INDEX events_tags_idx ON events USING gin (tags);
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+SELECT * FROM events WHERE tags @&gt; ARRAY['beta'];
+
+Bitmap Heap Scan on events (actual rows=2519 loops=1)
+   Recheck Cond: (tags @&gt; '\{beta}'::text[])
+   Heap Blocks: exact=2519
+   -&gt;  Bitmap Index Scan on events_tags_idx (actual rows=2519 loops=1)
+         Index Cond: (tags @&gt; '\{beta}'::text[])
+ Planning Time: 0.105 ms
+ Execution Time: 1.712 ms</code></pre>
+<p>The <code>@&gt;</code> containment operator asks "does this array contain these elements", the GIN index looks up <code>beta</code> in its element catalog, and 2,519 rows come back without touching the other 997,481. Swap the array for a <code>jsonb</code> column and this is exactly the index and operator pair from the JSONB post. Full-text search runs on the same machinery.</p>
+<p>The cost side: GIN is the most expensive index here to maintain on writes, because one row insert may add many index entries. It earns that cost only when your queries genuinely ask containment-style questions.</p>
+<h2>BRIN, the index that is barely there</h2>
+<p>BRIN, Block Range Index, does not store row locations at all. It stores a summary per range of table pages, by default the minimum and maximum value found in each range of 128 pages. A query for a value range lets Postgres skip every block range whose summary cannot contain a match.</p>
+<p>That only works when the physical layout correlates with the values, which is precisely the situation of a timestamp on an append-only table: rows arrive in time order, so each block range covers a narrow slice of time.</p>
+<pre><code>CREATE INDEX events_created_brin ON events USING brin (created_at);
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+SELECT count(*) FROM events
+WHERE created_at &gt;= '2026-01-10' AND created_at &lt; '2026-01-11';
+
+Aggregate (actual rows=1 loops=1)
+   -&gt;  Bitmap Heap Scan on events (actual rows=43200 loops=1)
+         Recheck Cond: ((created_at &gt;= '2026-01-10 00:00:00+00'...)
+         Rows Removed by Index Recheck: 13120
+         Heap Blocks: lossy=640
+         -&gt;  Bitmap Index Scan on events_created_brin (actual rows=6400 loops=1)
+               Index Cond: (...)
+ Planning Time: 0.093 ms
+ Execution Time: 3.755 ms</code></pre>
+<p>Note <code>lossy=640</code> and the recheck removing 13,120 rows. BRIN cannot say "row 5 matches", only "something in these pages might match", so Postgres visits the candidate pages and filters. That imprecision is the price of the headline number:</p>
+<pre><code>CREATE INDEX events_created_btree ON events (created_at);
+
+SELECT relname AS index_name, pg_size_pretty(pg_relation_size(oid)) AS size
+FROM pg_class
+WHERE relname IN ('events_created_brin', 'events_created_btree');
+
+index_name      | size
+----------------------+-------
+ events_created_brin  | 24 kB
+ events_created_btree | 21 MB</code></pre>
+<p>Twenty-four kilobytes against twenty-one megabytes for the same column, a factor of nearly a thousand. On logging, metrics, and event tables that only grow, <strong>BRIN buys you most of the benefit for a rounding error of disk and near-zero write overhead. On columns with no physical correlation it buys you nothing</strong>, which is the trade in one sentence.</p>
+<h2>Partial and expression indexes</h2>
+<p>These are not index types but modifiers that apply to any of the above, and they solve extremely common problems.</p>
+<p>A partial index carries a <code>WHERE</code> clause and only indexes matching rows. My <code>status</code> column is <code>failed</code> in less than half a percent of rows, and <code>failed</code> rows are the only ones I ever look up by status:</p>
+<pre><code>CREATE INDEX events_failed_idx ON events (created_at) WHERE status = 'failed';
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)
+SELECT * FROM events
+WHERE status = 'failed' AND created_at &gt;= '2026-01-20';
+
+Index Scan using events_failed_idx on events (actual rows=849 loops=1)
+   Index Cond: (created_at &gt;= '2026-01-20 00:00:00+00'...)
+ Planning Time: 0.226 ms
+ Execution Time: 0.515 ms</code></pre>
+<p>The index is 120 kB against 21 MB for its full-table equivalent, and every insert of an <code>ok</code> row skips it entirely. This plan is also a plain Index Scan rather than a bitmap: few enough rows, so Postgres walks the index and fetches rows directly.</p>
+<p>An expression index indexes the result of an expression instead of a raw column, which is how you index <code>lower(email)</code>, or a single hot key extracted from a <code>jsonb</code> document:</p>
+<pre><code>CREATE INDEX chunks_source_type_idx ON chunks ((metadata -&gt;&gt; 'source_type'));</code></pre>
+<h2>The bill</h2>
+<p>Everything above, measured. This is the table and every index this post created on it:</p>
+<pre><code>relname               |    size
+----------------------+------------
+ events               | 89 MB
+ events_pkey          | 21 MB
+ events_created_btree | 21 MB
+ events_user_id_idx   | 7600 kB
+ events_tags_idx      | 2360 kB
+ events_failed_idx    | 120 kB
+ events_created_brin  | 24 kB</code></pre>
+<p>The indexes together add up to more than half the size of the table itself, and every row written pays maintenance on all of them. This is why “just add an index” is not free advice, and why the sizes span three orders of magnitude for the same job on the same data.</p>
+<h2>Let the operator choose</h2>
+<p>After all of this, the decision procedure is short, because the operator in your <code>WHERE</code> clause has already made it. Equality and ranges on scalars want a B-tree. Containment questions against arrays, <code>jsonb</code>, or text search want GIN. Time ranges over huge append-only tables want BRIN. Then partial and expression modifiers narrow whichever one you picked to the rows and expressions you actually query.</p>
+<p>When a plan surprises you, read it with the operator lens: <code>EXPLAIN ANALYZE</code> tells you which index answered which condition, and a sequential scan usually means no index on the table speaks the operator you used, or the table is small enough that speaking it does not matter.</p>
+<p>If the GIN line in my JSONB post sent you here, you now have the whole picture: the column type decides which operators exist, and the operators decide which index earns its disk.</p>

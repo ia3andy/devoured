@@ -1,0 +1,107 @@
+<h1>Faster floating point math with Rust’s new API</h1>
+<p>Floating point math is often slower than integer math because the compiler is being conservative about how it optimizes your code. While some programming languages already had solutions of a sort, until now Rust did not have a good stable way to deal with this limitation. But now, starting in version 1.98, Rust will allow telling the compiler it can optimize your code further—but with extra control so that you can still write numeric algorithms with minimal rounding errors.</p>
+<p>In this article you will learn:</p>
+<ul>
+ <li>Why by default the compiler won’t optimize floating point math as much as it does integer math.</li>
+ <li>Rust’s new API to solve this limitation.</li>
+ <li>Examples of using this new API, its speed impact, and how you can control where it is used.</li>
+</ul>
+<h2>Summing integers is fast</h2>
+<p>I’m going to start with an example using integers, as a baseline of what sort of performance is possible.</p>
+<p>To get the fastest code generation, I’m telling Rust that it’s not 2004 anymore, and that it can generate CPU instructions that require modern hardware, namely x86-64 machines from the past 10 years or so. Specifically, all the code in this article is being compiled with <code>RUSTFLAGS="-C target-cpu=x86-64-v3"</code>. (For maximum compatibility, in real-world usage you could provide a fallback implementation for older computers.)</p>
+<p>Here’s a Rust function to sum a slice of int64 numbers:</p>
+<pre><code>fn naive_sum_i64(values: &amp;[i64]) -&gt; i64 \{
+    let mut total = 0;
+    for value in values \{
+        total += value;
+    }
+    total
+}
+</code></pre>
+<p>To benchmark it, I’ll create an array of integers in NumPy:</p>
+<pre><code>import numpy as np
+
+DATA_INT = np.ones((1_000_000,), dtype=np.int64)
+assert naive_sum_i64(DATA_INT) == 1_000_000
+</code></pre>
+<p>And now I can measure the speed of summing this array:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Code</th>
+   <th>Elapsed µ-seconds</th>
+   <th>CPU instructions per value</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>naive_sum_i64(DATA_INT)</code></td>
+   <td>168.1</td>
+   <td>0.5</td>
+  </tr>
+ </tbody>
+</table>
+<p>That’s 0.5 CPU instructions per value! How does that even work?</p>
+<p>Probably the compiler is using specialized Single Instruction, Multiple Data (SIMD) CPU instructions, that do batch operations on multiple values at once. The i7-12700K CPU I’m using here has 256-bit SIMD instructions, meaning it can do some specific operations on four 64-bit integers at a time. If there’s a specialized SIMD summing CPU instruction, the CPU would only need to loop 250,000 times and then sum 4 integers in each iteration.</p>
+<h2>Summing floats is slow?!</h2>
+<p>But what about floats—are they fast too?</p>
+<p>Again, I’ll create a million floating point values:</p>
+<pre><code># Array of 1M float64 values between 0 and 1.
+DATA = np.random.random((1_000_000,))
+</code></pre>
+<p>I’ll implement a simple floating point sum function:</p>
+<pre><code>fn naive_sum(values: &amp;[f64]) -&gt; f64 \{
+    let mut total = 0.0;
+    for value in values \{
+        total += value;
+    }
+    total
+}
+</code></pre>
+<p>The floating point sum is much slower than the integer sum, and the compiler didn’t use SIMD float operations. Why the difference?</p>
+<h3>Floating point operations aren’t associative</h3>
+<p>Like most compilers, when Rust compiles your code in release mode it optimizes your code, transforming it in a variety of ways to (hopefully) make it faster. But there’s a promise compilers make when they do this: the optimized code will behave <em>exactly the same</em> as the unoptimized code.</p>
+<p>If I add three integers <code>a</code>, <code>b</code>, and <code>c</code>, <code>a + (b + c) == (a + b) + c</code>. That gives the compiler plenty of scope to optimize how the code runs, for example by using SIMD operations that might slightly change the order of additions.</p>
+<p>Floating point numbers are different. For example, because floating point numbers span such a range of values, from tiny to huge, adding a sufficiently large number to a sufficiently small number results in that same large number.</p>
+<h2>Rust’s new algebraic operators: telling the compiler when to be flexible</h2>
+<p>While conservatism on the part of the compiler is the right default, sometimes you as the programmer know that re-ordering operations isn’t a problem. In that situation, it would be good to be able to tell the compiler that while over <em>here</em> it should not change the order of operations, over <em>there</em> it’s actually fine.</p>
+<p>Starting in Rust 1.98 there is a new feature that allows just that. In addition to the normal arithmetic operations you can do on floating point numbers, there are new set of so-called “algebraic” arithmetic operators that per the documentation “allow the compiler to optimize floating point operations using all the usual algebraic properties of real numbers”, including changing the order of operations.</p>
+<h3>An example: Optimized pairwise summation</h3>
+<p>Let’s see these operators in action, and how they allow for fast code.</p>
+<p>Let’s implement this algorithm in Rust. When adding those top two floating point numbers, I’m going to use normal addition, where the compiler can’t reorder operations or otherwise do anything that would change the output. Once the function hits the threshold of doing normal summing, I’ll switch to algebraic adds because at this point I don’t care what the order of addition is, I just want speed.</p>
+<pre><code>fn pairwise_sum(values: &amp;[f64]) -&gt; f64 \{
+    let n = values.len();
+    if n &gt; 128 \{
+        let half = n / 2;
+        pairwise_sum(&amp;values[0..half])
+            + pairwise_sum(&amp;values[half..n])
+    } else \{
+        let mut total: f64 = 0.0;
+        for value in values \{
+            total = total.algebraic_add(*value);
+        }
+        total
+    }
+}
+</code></pre>
+<h2>Another example: Sum of squared differences</h2>
+<p>You can do more than just add numbers with algebraic operators. In the following examples I will calculate the sum of squared differences between two arrays.</p>
+<pre><code>fn ssd_optimized(arr1: &amp;[f64], arr2: &amp;[f64]) -&gt; f64 \{
+    assert_eq!(arr1.len(), arr2.len());
+    let mut total: f64 = 0.0;
+    for (val1, val2) in arr1.iter().zip(arr2) \{
+        let diff = val1.algebraic_sub(*val2);
+        let squared_diff = diff.algebraic_mul(diff);
+        total = total.algebraic_add(squared_diff);
+    }
+    total
+}
+</code></pre>
+<h2>Go speed up some numeric code!</h2>
+<p>The pairwise summation algorithm is a great example of why you want both kinds of operators, strict and lenient:</p>
+<ul>
+ <li>If you only use strict in-order operations, the code is slower.</li>
+ <li>If you only use lenient algebraic optimize-as-you-like operations, the compiler might optimize the algorithm out of existence, losing the accuracy the algorithm aims for.</li>
+</ul>
+<p>The implementation I showed above benefits from using both normal addition—for accuracy—and algebraic addition—for speed—in different parts of the algorithm.</p>
+<p>If you are writing numeric code with Rust, your code may benefit too—give it a try once you can use Rust 1.98. And if you’re not using Rust yet, this is another good reason to switch.</p>

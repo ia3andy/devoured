@@ -1,0 +1,58 @@
+<h2>Docker OIDC connections for GitHub Actions available for Docker Orgs</h2>
+<p>TL;DR: Docker now supports <a href="https://openid.net/developers/how-connect-works/">OpenID Connect</a> (OIDC) for GitHub Actions. Your workflows can authenticate with short-lived, per-run tokens instead of stored PATs or OATs. No secrets to rotate, no credentials to leak.</p>
+<p>GitHub OIDC connections are available to organizations with Docker Team, Docker Business, or <a href="https://docs.docker.com/dhi/">Docker Hardened Images (DHI)</a> subscriptions, as well as organizations enrolled in the <a href="https://docs.docker.com/docker-hub/repos/manage/trusted-content/dsos-program/">Docker Sponsored Open Source Program (DSOS)</a>.</p>
+<p><em>OIDC token exchange flow between GitHub Actions and Docker</em></p>
+<h2>The problem with stored credentials</h2>
+<p>Every GitHub Actions workflow that pushes or pulls images from Docker Hub authenticates with a personal access token (PAT) or organization access token (OAT) stored as a GitHub secret. These credentials are long-lived. Someone has to remember to rotate them. A leaked token grants access to your registry — pulling private images, pushing malicious ones — and that access persists until someone discovers and revokes it. Rotation is manual and does not scale. As pipelines multiply, so do the credentials that need tracking, and stale tokens are a common audit finding.</p>
+<h2>Who should use this</h2>
+<ol>
+ <li>GitHub issues a signed identity token (a JWT) that encodes the repository, branch, environment, and other metadata about the workflow run.</li>
+ <li>The workflow calls <a href="https://github.com/docker/oidc-action">docker/login-action</a>, which presents this token to Docker.</li>
+ <li>Docker verifies the token’s signature against GitHub’s public key registry and checks it against rulesets configured in the Admin Console.</li>
+ <li>If the token matches a ruleset, Docker returns a short-lived access token scoped to the resources defined in that ruleset.</li>
+ <li><a href="https://github.com/docker/login-action">docker/login-action</a> uses this token to authenticate to Docker Hub. From there, docker pull, docker push, and docker build commands work as usual.</li>
+</ol>
+<p>The entire exchange happens without any stored secrets, API keys, or access tokens. The short-lived Docker access token expires in minutes and cannot be reused.</p>
+<p>This is the same pattern that AWS and GCP already use for cloud resource access, Docker is applying it to container registry access.</p>
+<h2>Getting started</h2>
+<p>Setup is a one-time connection in <a href="https://app.docker.com/">Docker Home</a> plus a small update to your workflow YAML.</p>
+<h3>Step 1: Create a connection</h3>
+<p>Sign in to <a href="https://app.docker.com/">Docker Home</a>, select your organization, and navigate to OIDC connections. Select Create OIDC connection and configure the rulesets that control which repositories, branches, and workflows can access which Docker Hub resources. You can create up to five rulesets per connection. When a workflow triggers an OIDC exchange, Docker checks the token against every ruleset defined in your connection. If a ruleset’s conditions are satisfied, Docker grants access based on the parameters set by that ruleset.</p>
+<p>Rulesets use OIDC subject claims to match incoming tokens. You can pin to specific repos and branches as a recommended security best practice:</p>
+<ul>
+ <li>repo:my-org/my-repo:ref:refs/heads/main — only the main branch of a specific repo</li>
+ <li>repo:my-org/my-repo:ref:refs/heads/release-* — all release branches</li>
+ <li>repo:my-org/my-repo:* – all branches of this repo</li>
+ <li>repo:my-org/* — any repo in the organization (not recommended)</li>
+</ul>
+<p>Copy the connection ID when you are done.</p>
+<h3>Step 2: Update your workflow</h3>
+<p>Update your GitHub Actions workflow. Replace <code>&lt;YOUR_CONNECTION_ID&gt; </code>with the ID from the previous step and <code>&lt;YOUR_ORG_NAME&gt;</code> with your Docker organization name:</p>
+<pre><code>permissions:
+  contents: read
+  id-token: write
+
+steps:
+    - name: Docker login                                                                                                                                                                 
+      uses: docker/login-action@v4 # v4.5.0+                                                                                                                                                                
+      with:                           
+        username: &lt;YOUR_ORG_NAME&gt;
+      env:                                                                                                                                                                               
+        DOCKERHUB_OIDC_CONNECTIONID: &lt;YOUR_CONNECTION_ID&gt;</code></pre>
+<p>The <code>id-token</code>: write permission lets the workflow request a GitHub OIDC token. The <code>docker/login-action</code> handles the token exchange and Docker login in a single step when <code>DOCKERHUB_OIDC_CONNECTIONID</code> is set. From there, docker pull, docker push, and docker build commands work as usual.</p>
+<h3>Step 3: Verify the OIDC connection works</h3>
+<p>Run your workflow and confirm it completes successfully. If you encounter an error, the Failures tab of the OIDC connection page will show the details of the incoming claim sub value, which you can use to diagnose why the connection failed.</p>
+<h3>Step 4: Remove the stored credential</h3>
+<p>After verifying your workflow runs successfully with OIDC, remove the old PAT or OAT from your GitHub repository secrets. You no longer need it.</p>
+<h2>What doesn’t change</h2>
+<ul>
+ <li>Existing PATs and OATs keep working. Organizations can migrate workflows to OIDC connections at their own pace.</li>
+ <li>Images, registries, and build workflows are unchanged. OIDC connections only replace the authentication step; everything downstream is the same.</li>
+ <li>Local development and non-GitHub CI still use PATs and OATs. OIDC connections are the recommended replacement for GitHub Actions specifically. Other CI providers will follow based on demand.</li>
+</ul>
+<h2>Learn more</h2>
+<ul>
+ <li>Learn more about <a href="https://openid.net/developers/how-connect-works/">OpenID Connect</a></li>
+ <li>Visit <a href="https://app.docker.com/">Docker Home</a> to get started</li>
+ <li>Read the <a href="https://docs.docker.com/enterprise/security/oidc-connections/">documentation</a></li>
+</ul>

@@ -1,0 +1,163 @@
+<p>You have a PowerShell module that started as a helpful script and then became business-critical. Now every admin workstation, build agent, and jump box needs the same version at the same time.</p>
+<p>Copying module folders to file shares works for a while. But file shares do not give you clean version history, feed permissions, pipeline publishing, or a nice <code>Install-PSResource</code> experience. Azure Artifacts does.</p>
+<p>In this tutorial, you will build a private NuGet feed for enterprise PowerShell modules, publish modules from Azure DevOps, stamp them with GitVersion, sign script files using an Azure Key Vault-backed signing workflow, and expose the module through Just-Enough-Administration (JEA).</p>
+<h2>Prerequisites</h2>
+<p>To follow along, you will need the following:</p>
+<ul>
+ <li>An Azure DevOps organization and project.</li>
+ <li>Permission to create or administer an Azure Artifacts feed.</li>
+ <li>A PowerShell module with a <code>.psd1</code> manifest.</li>
+ <li>PowerShell 7.x with the <code>Microsoft.PowerShell.PSResourceGet</code> module available.</li>
+ <li>An Azure Key Vault certificate or signing process approved by your security team.</li>
+ <li>A Windows host if you plan to configure JEA endpoints.</li>
+</ul>
+<p>This tutorial uses placeholders such as <code>&lt;ORGANIZATION_NAME&gt;</code>, <code>&lt;PROJECT_NAME&gt;</code>, and <code>&lt;FEED_NAME&gt;</code>. Replace those values with your environment names before running the commands.</p>
+<h2>Creating an Azure Artifacts Feed for PowerShell Modules</h2>
+<p>Azure Artifacts feeds can store NuGet packages, and PowerShell modules published with PSResourceGet use a NuGet-based repository model. That combination makes Azure Artifacts a solid private PowerShell repository for internal modules.</p>
+<p>In Azure DevOps, open <strong>Artifacts</strong>, create a new feed, and choose the visibility you want. For a central enterprise module feed, start with project-scoped permissions unless you intentionally need the feed available across the entire organization.</p>
+<p>After creating the feed, open <strong>Connect to feed</strong>, choose <strong>NuGet.exe</strong>, and copy the v3 feed URL.</p>
+<h2>Registering the Feed with PSResourceGet</h2>
+<p>PSResourceGet replaces the older PowerShellGet v2 publishing and installation cmdlets with commands such as <code>Register-PSResourceRepository</code>, <code>Publish-PSResource</code>, and <code>Install-PSResource</code>.</p>
+<p>On an administrator workstation, register the Azure Artifacts feed as a trusted repository. If you have already configured a compatible NuGet credential provider or your shell is authenticated through your enterprise process, the repository registration is only the feed metadata.</p>
+<pre><code>Register-PSResourceRepository -Name 'EnterpriseModules' `
+    -Uri 'https://pkgs.dev.azure.com/&lt;ORGANIZATION_NAME&gt;/&lt;PROJECT_NAME&gt;/_packaging/&lt;FEED_NAME&gt;/nuget/v3/index.json' `
+    -Trusted</code></pre>
+<p>If your organization stores feed credentials in a vault supported by PSResourceGet, register credential information with the repository:</p>
+<pre><code>$credentialInfo = [Microsoft.PowerShell.PSResourceGet.UtilClasses.PSCredentialInfo]::new(
+    'SecretStore',
+    'EnterpriseModulesFeed'
+)
+
+Register-PSResourceRepository -Name 'EnterpriseModules' `
+    -Uri 'https://pkgs.dev.azure.com/&lt;ORGANIZATION_NAME&gt;/&lt;PROJECT_NAME&gt;/_packaging/&lt;FEED_NAME&gt;/nuget/v3/index.json' `
+    -Trusted `
+    -CredentialInfo $credentialInfo `
+    -Force</code></pre>
+<p>Verify the repository registration:</p>
+<pre><code>Get-PSResourceRepository -Name 'EnterpriseModules'</code></pre>
+<p>Installing from the feed is now a normal PowerShell resource operation:</p>
+<pre><code>Install-PSResource -Name 'Contoso.Operations' -Repository 'EnterpriseModules'</code></pre>
+<h2>Preparing the Module Manifest for CI/CD</h2>
+<p>Your module manifest is the contract between your code and the package consumers. At minimum, confirm the manifest has a module version, root module, author, description, exported functions, and compatible PowerShell edition details.</p>
+<p>Before packaging, validate the manifest locally:</p>
+<pre><code>Test-ModuleManifest -Path .\Contoso.Operations\Contoso.Operations.psd1</code></pre>
+<h2>Adding Semantic Versioning with GitVersion</h2>
+<p>GitVersion calculates semantic versions from your Git history. In Azure DevOps, GitVersion’s current guidance calls out an important setting: disable shallow fetch by setting <code>fetchDepth: 0</code>, or GitVersion can fail because the pipeline did not clone enough history.</p>
+<p>Add a <code>GitVersion.yml</code> file to the repository root:</p>
+<pre><code>mode: ContinuousDelivery
+branches:
+  main:
+    regex: ^main$
+    increment: Patch
+  pull-request:
+    regex: ^(pull|pull-requests|pr)[/-]
+    increment: Inherit</code></pre>
+<h2>Signing Module Scripts with Azure Key Vault</h2>
+<p>Code signing gives consumers confidence that the module files came from your pipeline and were not modified after publishing. For enterprise modules, sign the <code>.ps1</code>, <code>.psm1</code>, and other script files before calling <code>Publish-PSResource</code>.</p>
+<p>One practical option is AzureSignTool, which signs Authenticode content using a certificate in Azure Key Vault.</p>
+<pre><code>dotnet tool install --global --version 7.0.0 AzureSignTool</code></pre>
+<p>A signing step can sign all PowerShell script files in the module folder:</p>
+<pre><code>$files = Get-ChildItem -Path '.\Contoso.Operations' -Include '*.ps1','*.psm1' -Recurse
+
+foreach ($file in $files) \{
+  AzureSignTool sign -kvu 'https://&lt;KEY_VAULT_NAME&gt;.vault.azure.net/' `
+  -kvc '&lt;CERT_NAME&gt;' -kvm `
+  -tr 'http://timestamp.digicert.com' -td sha384 `
+  -fd sha384 -v `
+  $file.FullName 
+  }</code></pre>
+<h2>Publishing from Azure DevOps</h2>
+<p>Create an <code>azure-pipelines.yml</code> file to wire the feed, versioning, signing, and publishing together:</p>
+<pre><code>trigger:
+  - main
+
+pool:
+  vmImage: 'windows-latest'
+
+steps:
+  - checkout: self
+    fetchDepth: 0
+
+  - task: GitVersion@3
+    displayName: 'Install GitVersion'
+    inputs:
+      versionSpec: '6.7.x'
+
+  - task: GitVersion@3
+    displayName: 'Calculate GitVersion'
+    name: gitversion
+
+  - task: NuGetAuthenticate@1
+
+  - pwsh: |
+      $manifestPath = '.\Contoso.Operations\Contoso.Operations.psd1'
+      Update-ModuleManifest -Path $manifestPath -ModuleVersion '$(GitVersion.SemVer)'
+      Test-ModuleManifest -Path $manifestPath
+    displayName: 'Stamp and validate module manifest'
+
+  - pwsh: |
+      # (Signing logic here)
+    displayName: 'Sign module files'
+
+  - pwsh: |
+      $pat = $env:SYSTEM_ACCESSTOKEN
+      $securePat = ConvertTo-SecureString $pat -AsPlainText -Force
+      $credential = [pscredential]::new('AzureDevOps', $securePat)
+
+      Register-PSResourceRepository -Name 'EnterpriseModules' `
+        -Uri 'https://pkgs.dev.azure.com/&lt;ORGANIZATION_NAME&gt;/&lt;PROJECT_NAME&gt;/_packaging/&lt;FEED_NAME&gt;/nuget/v3/index.json' `
+        -Trusted `
+        -Force
+
+      Publish-PSResource -Path '.\Contoso.Operations' `
+        -Repository 'EnterpriseModules' `
+        -Credential $credential `
+        -ApiKey 'AzureArtifacts'
+    displayName: 'Publish module to Azure Artifacts'
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)</code></pre>
+<h2>Installing the Module on Servers</h2>
+<p>Once the pipeline publishes the package, servers and admin workstations install the module from the private feed:</p>
+<pre><code>Register-PSResourceRepository -Name 'EnterpriseModules' `
+  -Uri 'https://pkgs.dev.azure.com/&lt;ORGANIZATION_NAME&gt;/&lt;PROJECT_NAME&gt;/_packaging/&lt;FEED_NAME&gt;/nuget/v3/index.json' `
+  -Trusted
+
+Install-PSResource -Name 'Contoso.Operations' -Repository 'EnterpriseModules' -Scope AllUsers</code></pre>
+<h2>Restricting Module Actions with JEA</h2>
+<p>Publishing a module securely is only half the story. You still need to control who can run privileged functions from that module. JEA lets you expose a constrained PowerShell endpoint with only the commands a role needs.</p>
+<p>Create a role capability file:</p>
+<pre><code>$roleParameters = @\{
+  Path = 'C:\Program Files\WindowsPowerShell\Modules\Contoso.Operations\RoleCapabilities\ServiceOperator.psrc'
+  Author = 'Contoso IT'
+  CompanyName = 'Contoso'
+  Description = 'Allows service operators to restart approved Contoso services.'
+  ModulesToImport = 'Contoso.Operations'
+  VisibleFunctions = 'Restart-ContosoService'
+  }
+
+New-PSRoleCapabilityFile @roleParameters</code></pre>
+<p>Next, create and register a session configuration:</p>
+<pre><code>$roleDefinitions = @\{
+  'CONTOSO\Service Operators' = @\{ RoleCapabilities = 'ServiceOperator' }
+  }
+
+New-PSSessionConfigurationFile -Path 'C:\JEA\ContosoService.pssc' `
+  -SessionType RestrictedRemoteServer `
+  -RunAsVirtualAccount `
+  -RoleDefinitions $roleDefinitions
+
+Register-PSSessionConfiguration -Name 'ContosoService' `
+  -Path 'C:\JEA\ContosoService.pssc' `
+  -Force</code></pre>
+<h2>Operational Tips for Enterprise Module Distribution</h2>
+<ul>
+ <li>Publish only from CI/CD. Do not let humans publish production module versions from workstations.</li>
+ <li>Treat the module manifest as a build artifact. Stamp it, validate it, and publish that exact folder.</li>
+ <li>Use semantic versions and never overwrite released versions.</li>
+ <li>Require valid Authenticode signatures before publishing.</li>
+ <li>Give feed readers broad access, but feed publishers limited access.</li>
+ <li>Separate development, test, and production feeds if release approvals matter.</li>
+ <li>Add JEA endpoints for privileged functions instead of granting broad local administrator rights.</li>
+</ul>
+<h2>Conclusion</h2>
+<p>You built a private PowerShell module distribution flow using Azure Artifacts and PSResourceGet. You created a NuGet feed, registered it as a PowerShell repository, published modules through Azure DevOps, stamped versions with GitVersion, signed files with an Azure Key Vault-backed signing workflow, and restricted privileged operations with JEA.</p>
