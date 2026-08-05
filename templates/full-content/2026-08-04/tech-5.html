@@ -1,0 +1,156 @@
+<p>The most capable agents have something simple in common: they are given their own computer to work with.</p>
+<p>Coding agents work this way. You give them a filesystem, a shell, tools, packages, and the ability to run code. They inspect the environment, make changes, test their work, and keep going. The computer gives the model a familiar way to act on the world. At Cloudflare, we’re working hard to provide the right primitives on which to build the most capable agents.</p>
+<p><strong>Today we’re introducing an early preview of <a href="https://github.com/cloudflare/workspace">@cloudflare/computer</a>.</strong> The @cloudflare/computer package provides an agent runtime where the details and mechanics of what code runs in an isolate, a container sandbox, or a web browser are handled by the platform. Each agent gets a computer, the runtime optimizes for efficiency, and scalability.</p>
+<p>We believe that in order to meet the growing demand for compute required by agentic systems we need to look to solutions beyond traditional containerization.</p>
+<h2>Changing how agents are built</h2>
+<p>We’ve seen a subtle evolution of this story over the past six months. At the start of the year, spinning up a container and running an agent inside of it was the norm. In recent months, we’ve seen a rapid move for agent harnesses to provide sandboxed code execution via tools. This separates the hands (the sandbox where work is done) from the brain (the agent loop).</p>
+<p>No matter where the harness runs, giving every agent a container presents a challenge — across all the clouds, all the hyperscalers, there’s nowhere near enough compute in the world for every company to give each of their users’ agents their own containerized compute environment. This will not scale to hundreds of millions, then billions, of concurrent agents. This is why there is desperate, panicked industry demand for CPU compute, not just GPU compute.</p>
+<p>We’ve been working on this problem for a long time at Cloudflare, creating a more efficient compute primitive: isolates. We made that out-of-consensus bet almost 10 years ago when we <a href="https://blog.cloudflare.com/introducing-cloudflare-workers/">introduced Cloudflare Workers</a>. We made it again when we <a href="https://blog.cloudflare.com/introducing-workers-durable-objects/">introduced Durable Objects</a> almost six years ago. We made this bet because isolates are infinitely horizontally scalable. They spin up and tear down incredibly quickly. They can <a href="https://developers.cloudflare.com/durable-objects/examples/websocket-hibernation-server/">hibernate</a> when the agent is idle, <a href="https://blog.cloudflare.com/sqlite-in-durable-objects/">store the agent’s own state</a>, and even <a href="https://blog.cloudflare.com/dynamic-workers/">spin up their own isolates</a> to run untrusted code. Isolates are the best way to scale horizontally, and horizontal scale is what agents demand.</p>
+<p>Last year, we <a href="https://blog.cloudflare.com/containers-are-available-in-public-beta-for-simple-global-and-programmable/">gave isolates the ability to spin up their own container sandboxes</a>. From day one, Cloudflare’s architecture has been designed to run the agent harness in the isolate (in a Durable Object) and call an attached container on-demand as a tool. This allows you to utilize heavier compute primitives only when required, optimizing performance and cost. Durable Objects scale infinitely horizontally, and the attached container lets it scale vertically to perform any task. This is how we build agents ourselves, and we’re seeing customers build incredible things this way too.</p>
+<p>But when we look at this need to have multiple underlying compute primitives to build agents (isolates and containers) and the need for our customers and developers to combine them themselves in userspace, we think we can do better. We think that we can provide a simpler abstraction.</p>
+<p>That’s why we’re starting this experiment by shipping @cloudflare/computer as an open-source library, to learn with our customers who are pushing the bounds of running agents at scale.</p>
+<h2>A shared filesystem across isolates and containers</h2>
+<p>The @cloudflare/computer package starts with a simple premise: what if we give an agent a primed filesystem, declaratively defined, containing everything required for the task at hand and a selection of execution environments to operate on those files, each with their own pros and cons regarding speed, capability and cost?</p>
+<p>It turns out that agents today are surprisingly capable of selecting the right environment for the task at hand. A job that only needs to manipulate files, process data, or manage a git repository can run inside an isolate. A command that needs Linux, <code>npm</code>, or a native binary can run inside a container. Both work against the same files that are kept in sync with the source filesystem.</p>
+<p>The @cloudflare/computer package provides a durable filesystem that you can use with git repositories, storage buckets or any files you choose. It provides tools that let you read, write and edit files using <a href="https://blog.cloudflare.com/code-mode/">Code Mode</a> or bash commands. All operations are gated, audited and observed, giving you fine-grained control over changes the agent is allowed to perform as well as a clear paper trail showing what the agent did.</p>
+<h2>How you use it</h2>
+<p>An instance of a @cloudflare/computer workspace can be instantiated on any Durable Object to provide a virtual filesystem and execution runtime.</p>
+<p>It is installed via npm:</p>
+<pre><code>npm install @cloudflare/computer</code></pre>
+<p>The primary use case is to provide that filesystem and tooling to an agent. For example, here’s how to instantiate the workspace on an agent powered by @cloudflare/think intended to triage bug reports.</p>
+<pre><code>import \{ Think } from "@cloudflare/think";
+import \{ Workspace, type DurableObjectStorageLike } from "@cloudflare/computer";
+import \{ createWorkersAI } from "workers-ai-provider";
+
+export class Agent extends Think \{
+  override workspaceBash = false;
+
+  override workspace = new Workspace(\{
+    storage: this.ctx.storage,
+    useThink: true, // soon will not be needed
+  });
+
+  override getModel() \{
+    return createWorkersAI(\{ binding: this.env.AI })("@cf/zai-org/glm-5.2");
+  }
+
+  override getSystemPrompt() \{
+    return `
+You are a bug triage agent.
+
+Use the project in /workspace/repo to reproduce the bug, inspect the
+code, make a focused fix when it is safe, and run verification. In your
+final answer, include what you changed, which commands you ran, and
+whether verification passed.`;
+  }
+}</code></pre>
+<p>Several execution backends are provided as part of the @cloudflare/computer package, or you can write your own. Here we wire up a Cloudflare Container.</p>
+<pre><code>import \{ Think } from "@cloudflare/think";
+import \{ Workspace, WorkspaceProxy } from "@cloudflare/computer";
+import \{
+  CloudflareContainerBackend,
+  withWorkspaceContainer,
+} from "@cloudflare/computer/backends/container";
+
+export \{ WorkspaceProxy };
+
+export class Agent extends withWorkspaceContainer(Think) \{
+  override workspaceBash = false;
+
+  override workspace = new Workspace(\{
+    storage: this.ctx.storage,
+    useThink: true, // soon will not be needed
+    backends: [
+      new CloudflareContainerBackend(\{
+        container: () =&gt; this,
+        workspace: \{
+          binding: "Agent",
+          id: this.ctx.id.toString(),
+        },
+      }),
+    ],
+  });
+
+  /* Example code truncated for readability... */
+}</code></pre>
+<p>Expose the file, git, and shell tools alongside product specific tools to reply to reported issues.</p>
+<pre><code>import \{ createAITools } from "@cloudflare/computer/tools";
+import type \{ ToolSet } from "ai";
+import \{ replyToIssue } from "./tools/github";
+
+export class Agent extends withWorkspaceContainer(Think) \{
+  override workspaceBash = false;
+
+  /* Example code truncated for readability... */
+
+  override getTools(): ToolSet \{
+    return \{
+      ...createAITools(\{
+        workspace: this.workspace,
+        shell: \{
+          defaultBackend: "container",
+          backends: \{
+            container: \{
+              description:
+                "Cloudflare Container with a full Linux userland: " +
+                "npm, node, package managers, test runners, and real " +
+                "binaries on $PATH. Use it when a task needs more than " +
+                "file manipulation.",
+            },
+          },
+        },
+      }),
+      replyToIssue,
+    };
+  }
+}</code></pre>
+<p>The model can use tools during the agent loop, but you can also use the workspace API directly, for example, to prepare the environment before prompting the agent.</p>
+<pre><code>export class Agent extends withWorkspaceContainer(Think) \{
+  override workspaceBash = false;
+
+  /* Example code truncated for readability... */
+
+  async startTriage(report: \{ title: string; body: string; repoUrl: string }) \{
+    await this.workspace.fs.mkdir("/workspace", \{ recursive: true });
+    await this.workspace.fs.writeFile(
+      "/workspace/BUG_REPORT.md",
+      `# $\{report.title}\n\n$\{report.body}\n`,
+    );
+
+    await this.workspace.git.clone(\{
+      url: report.repoUrl,
+      dir: "/workspace/repo",
+    });
+
+    return this.submitMessages([
+      \{
+        id: crypto.randomUUID(),
+        role: "user",
+        parts: [
+          \{
+            type: "text",
+            text: [
+              `Triage this bug: $\{report.title}`,
+              "The bug report is in /workspace/BUG_REPORT.md.",
+              "The repository is checked out at /workspace/repo.",
+            ].join("\n"),
+          },
+        ],
+      },
+    ]);
+  }
+}</code></pre>
+<p>Check out the <a href="https://github.com/cloudflare/computer">workspace repository</a> for more examples of how to use the different backends and tools including a <a href="https://github.com/cloudflare/computer/tree/main/examples/tutorial">step-by-step tutorial </a>walking through building an agent from scratch.</p>
+<h2>How it works</h2>
+<p>The central piece of @cloudflare/computer is the workspace. A virtual filesystem backed by SQLite that can be populated from various sources including cloud storage and source control.</p>
+<p>The workspace supports optional execution runtimes that allow code to be run against the file system. All runtimes support the same interface <code>exec(string, options)</code> and currently two are provided out of the box (but you can write your own):</p>
+<ul>
+ <li>An isolate-based runtime environment that uses <a href="https://justbash.dev/">just-bash</a> to translate shell code into JavaScript runs in a <a href="https://developers.cloudflare.com/dynamic-workers/">dynamic worker</a>. Here, the filesystem is available directly via worker bindings.</li>
+ <li>A container runtime that uses <a href="https://developers.cloudflare.com/containers/">Cloudflare Containers</a> to provide a full Linux environment. Here, the filesystem is provided via a Filesystem in Userspace (FUSE) mount, which ensures files are available to the container and changes are synced back.</li>
+</ul>
+<p>The <code>Workspace</code> class provides an API interface for manipulating the filesystem directly as well as a <code>node:fs</code> compatible wrapper so that it can be used easily with third-party JavaScript libraries.</p>
+<p>For use with agents, we provide an AI SDK compatible toolkit that provides the most common tools: read, write, edit, ls and exec. The exec tool is a little special as it works across the runtimes taking a <code>backend</code> argument. The tool description guides the agent into choosing the correct runtime for the task at hand: either a fast, cheap worker backend or the fully featured container. In our testing, the frontier models are very good at making the correct decision and falling back to using containers only when needed.</p>
+<h2>What’s next</h2>
+<p>Here at Cloudflare we’re already seeing agents exclusively using isolates to build, test, and deploy JavaScript applications with modern tooling, generate tailored documentation for each of our customers, and use web browsers to perform complex tasks.</p>
+<p>Our goal with @cloudflare/computer is to provide an agent with a runtime where a container is required for less than 10% of its work, and coding tasks, audio/video manipulation, and document creation can all be handled by isolates.</p>
+<p>Try out the <a href="https://github.com/cloudflare/computer">early preview today</a> - we can’t wait to hear your thoughts.</p>

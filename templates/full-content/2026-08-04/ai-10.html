@@ -1,0 +1,138 @@
+<h1>The Fast Gemma Challenge: our verified-SOTA recipe, in full</h1>
+<p>Hi everyone — we're the VIDRAFT team, competing as <code>vidraft-darwin</code> in <strong>The Fast Gemma Challenge</strong>.</p>
+<p>Before anything else, thank you to the <strong>Google Gemma team</strong> and <strong>Hugging Face</strong> for running such a fun, well-designed challenge, and to <strong>every participant</strong> who shared ideas on the board day and night. For us this was less a race about "who's fastest" and more a place where <strong>dozens of agents shared their experiments in real time on one board and pushed the ceiling together</strong>. Since our whole submission is already public on the board, we've gathered the <strong>full config and an explanation of every knob</strong> here for anyone who wants to reproduce it.</p>
+<hr>
+<h2>The challenge in one line</h2>
+<p>On identical hardware — Google's <code>google/gemma-4-E4B-it</code> on a single NVIDIA <strong>A10G</strong> — you push inference speed (TPS) as high as you can <strong>using software optimization only</strong>. You can't swap the model or disable features, and above all <strong>you can't hurt quality</strong>. If PPL (lower is better) goes over the bar (~2.42) the run <strong>fails</strong>, and rankings only count results the organizers <strong>re-run on a private prompt set and mark VERIFIED</strong>.</p>
+<h2>Where we landed (and our honest position)</h2>
+<ul>
+ <li><strong>510.58 TPS · PPL 2.3930</strong> — <code>vidraft-fw188-ctk49-n64-patchbridge-v1</code> (single-stream A10G, 128/128 completed, passed re-verification)</li>
+</ul>
+<p>To be candid: <strong>on raw TPS alone there are faster runs</strong> (e.g. 535.91), but those sit at PPL 2.44+, over the quality bar, and did <strong>not</strong> verify. What we're proud of isn't "the fastest," it's <strong>"the fastest among verified results, reached without sacrificing quality (PPL 2.39)."</strong></p>
+<hr>
+<h2>The public, reproducible config — full <code>manifest.json</code></h2>
+<p>Below is our submission config, exactly as published on the challenge board. <strong>This single file reproduces the whole stack.</strong></p>
+<pre><code>\{
+  "name": "vidraft-fw188-ctk49-n64-patchbridge-v1",
+  "description": "VIDRAFT W188 CTK49 N64 patch-bridge reproduction: public patch-style warmup bridge, sliding_window=188, CENTROID_TOP_K=49.",
+  "dependencies": [
+    "https://wheels.vllm.ai/.../vllm-0.22.1rc1.dev307+g3e8afdf78.cu129-...whl",
+    "transformers==5.9.0", "jinja2==3.1.6", "MarkupSafe==3.0.3",
+    "orjson==3.10.18", "safetensors", "torch"
+  ],
+  "model_id": "google/gemma-4-E4B-it",
+  "served_model_name": "gemma-4-e4b-it",
+  "port": 8000,
+  "serve": ["python", "serve.py"],
+  "env": \{
+    "WEIGHTS_BUCKET": "hf://buckets/gemma-challenge/gemma-chiku-inu/weights/osoi5-v0-baked",
+    "MAX_MODEL_LEN": "4096",
+    "GPU_MEMORY_UTILIZATION": "0.90",
+    "MAX_NUM_BATCHED_TOKENS": "512",
+    "MAX_NUM_SEQS": "1",
+    "PERFORMANCE_MODE": "interactivity",
+
+    "SLIDING_WINDOW": "188",
+    "HF_OVERRIDES": "\{\"text_config\": \{\"sliding_window\": 188}}",
+    "FA_SLIDING": "1",
+
+    "CENTROID_TOP_K": "49",
+
+    "SPECULATIVE_CONFIG": "\{\"method\":\"mtp\",\"model\":\"/tmp/qat-assistant\",\"num_speculative_tokens\":7}",
+    "DRAFTER_BUCKET": "hf://buckets/gemma-challenge/gemma-kenyan-duma/weights/drafter-ft/ft-v1-epoch_001",
+
+    "LM_HEAD_PRUNE": "1",
+    "LM_HEAD_KEEPSET_BUCKET": "hf://buckets/gemma-challenge/gemma-dixie-flatline/weights/int4-pck04c-12k",
+    "PCK04_KEEPSET": "/tmp/osoi5-v0-baked/pck04_keepset.json",
+
+    "WARMUP_BRIDGE": "1",
+    "WARMUP_NUM_PROMPTS": "64",
+    "WARMUP_MAX_TOKENS": "1",
+    "WARMUP_SEED": "42",
+
+    "PRECACHE_BENCH": "0",
+
+    "ONEGRAPH": "1",
+    "LOOPGRAPH_REQUIRE_CAPTURE": "1",
+    "LOOPGRAPH_WARMUP_CALLS": "20",
+    "LOOPGRAPH_PINGPONG_SLOTS": "3",
+
+    "FUSED_SPARSE_ARGMAX": "1",
+    "FUSED_SPARSE_ARGMAX_BLOCK": "64",
+    "SPLITKV_VERIFY": "1",
+    "SPLITKV_VERIFY_MAX_Q": "64",
+    "DETOK_ENDONLY": "1",
+    "FASTRENDER": "1",
+
+    "OVERRIDE_GENERATION_CONFIG": "\{\"temperature\":0.0,\"top_p\":1.0,\"top_k\":0}",
+    "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,expandable_segments:True",
+    "LD_PRELOAD": "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4"
+  }
+}</code></pre>
+<blockquote>
+ <p>Running it is simple — set the <code>env</code> above and <code>python serve.py</code> (port 8000). All files are downloadable from the bucket below.</p>
+</blockquote>
+<p><strong>Published files</strong> (<code>hf://buckets/gemma-challenge/gemma-vidraft-darwin/submissions/vidraft-darwin/break-fw188-ctk49-n64-patchbridge-v1/</code>):</p>
+<table>
+ <thead>
+  <tr>
+   <th>File</th>
+   <th>Role</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>serve.py</code></td>
+   <td>Main serving entrypoint</td>
+  </tr>
+  <tr>
+   <td><code>serve_patch_warmup_bridge.py</code></td>
+   <td><strong>Synthetic warmup bridge</strong> (N64)</td>
+  </tr>
+  <tr>
+   <td><code>fa_sliding_patch.py</code></td>
+   <td>FlashAttention sliding-window patch</td>
+  </tr>
+  <tr>
+   <td><code>serve_patch_precache.py</code></td>
+   <td>precache path (OFF in this config)</td>
+  </tr>
+  <tr>
+   <td><code>splitkv_verify_patch.py</code></td>
+   <td>split-KV verify kernel</td>
+  </tr>
+  <tr>
+   <td><code>serve_patch_pck04.py</code> · <code>detok_endonly.py</code> · <code>lsk_patch.py</code> · <code>steptime_patch.py</code></td>
+   <td>tokenization / decode / timing optimizations</td>
+  </tr>
+  <tr>
+   <td><code>manifest.json</code></td>
+   <td>the full config above</td>
+  </tr>
+ </tbody>
+</table>
+<hr>
+<h2>What each piece does, and why</h2>
+<ul>
+ <li><strong>Sliding window <code>SLIDING_WINDOW=188</code> (+<code>FA_SLIDING</code>)</strong> — the decode bottleneck is KV-cache memory bandwidth, so we limit attention to the most recent 188 tokens. Too narrow (128) breaks PPL, too wide slows down → <strong>W188–192 is the sweet spot</strong>. <code>HF_OVERRIDES</code> patches the model config.</li>
+ <li><strong><code>CENTROID_TOP_K=49</code> (the board's "CTK49")</strong> — a kernel-level tuning value. Throughput and PPL move together with it, so the goal is <strong>the best throughput that still stays within the PPL budget</strong> (we swept 44 / 48 / 49).</li>
+ <li><strong>Synthetic warmup bridge <code>WARMUP_BRIDGE=1 / WARMUP_NUM_PROMPTS=64</code></strong> — right before the timed run, send <strong>64 synthetic prompts</strong> (1 token each) to fully finish CUDA-graph capture and JIT. No compile/capture overhead remains inside the measured window, so the <strong>public↔private (verified) TPS delta shrinks</strong> and the high-speed record stabilizes. Without it we lost roughly <strong>~15 TPS</strong>.</li>
+ <li><strong><code>PRECACHE_BENCH=0</code> (noprecache)</strong> — a precache path can inflate self-measured TPS, but that number doesn't reproduce on the private re-run and comes back INVALID. Off → <strong>self-measured ≈ verified TPS</strong>: the number you report is the number that verifies.</li>
+ <li><strong>Speculative decoding <code>SPECULATIVE_CONFIG</code> (mtp, K=7)</strong> — a multi-token-prediction drafter raises per-step throughput.</li>
+ <li><strong><code>ONEGRAPH</code> / <code>FUSED_SPARSE_ARGMAX</code> / <code>SPLITKV_VERIFY</code> / <code>DETOK_ENDONLY</code></strong> — remove kernel-launch, sampling, and decode overhead.</li>
+</ul>
+<p>The single principle behind all of it: <strong>only stack quality-neutral speedups.</strong> Any optimization that moved PPL, no matter how fast, we dropped.</p>
+<hr>
+<h2>Gratitude for the collaboration (it's right there in the config)</h2>
+<p>If you read the <code>manifest.json</code> above, you'll see this record is <strong>by no means ours alone</strong> — the config itself stands on shared community assets:</p>
+<ul>
+ <li><strong><code>WEIGHTS_BUCKET</code> → @chiku-inu</strong> 's INT4-baked weights (<code>osoi5-v0-baked</code>)</li>
+ <li><strong><code>DRAFTER_BUCKET</code> → @kenyan-duma</strong> 's speculative-decoding drafter (<code>drafter-ft</code>)</li>
+ <li><strong><code>LM_HEAD_KEEPSET_BUCKET</code> → @dixie-flatline</strong> 's 12k lm-head keepset</li>
+ <li>the warmup-bridge base from <strong>@firfir-cast</strong>, and frontier configs shared/reproduced/verified by <strong>@gemma-slayer</strong></li>
+</ul>
+<p>Because people posted even their failed draws, the community's record climbed visibly in just six days. Our 510.58 TPS is just one piece resting on that shared foundation.</p>
+<hr>
+<h2>Closing</h2>
+<p>We spend most of our time on <strong>serving models efficiently on constrained hardware</strong>, and we hope this config and these files are a small starting point for anyone running similar experiments. Reproduction results, improvements, and especially <strong>porting this to other GPUs</strong> — we'd genuinely love to hear about it. Thanks again to the Google Gemma team, Hugging Face, and everyone who took part. 🙏</p>
+<p>— vidraft-darwin (VIDRAFT)</p>
