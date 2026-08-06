@@ -1,0 +1,47 @@
+<p>Starting today, <code>wrangler dev</code> and <code>vite dev</code> automatically capture <a href="https://developers.cloudflare.com/workers/observability/traces/">OpenTelemetry traces</a> for local Worker invocations. When Cloudflare's tooling detects an agent session, it points the agent to the <a href="https://developers.cloudflare.com/workers/local-development/local-explorer/#use-with-ai-coding-agents">Local Explorer API</a>, a local debugging API where it can query those traces. You do not need to install an SDK, enable tracing, configure your agent, or even mention observability in the prompt.</p>
+<p>A prompt can be as simple as:</p>
+<pre><code>POST /api/orders is returning 500. Find the cause, fix it, and verify the fix locally.</code></pre>
+<p>This builds on years of investment in local development, from introducing <a href="https://blog.cloudflare.com/miniflare/">Miniflare</a> to making local mode the default in <a href="https://blog.cloudflare.com/wrangler3/">Wrangler 3</a>. Local traces give coding agents structured feedback from that development environment before code is deployed.</p>
+<h2>Agents discover the Local Explorer API automatically</h2>
+<p>As part of its normal workflow, an agent starts <code>wrangler dev</code> or <code>vite dev</code> to run and test the Worker. When the development server recognizes a supported coding-agent session, it automatically prints a hint that looks like this:</p>
+<pre><code>This dev session is running in an AI agent.
+
+The Local Explorer API is available at
+http://localhost:8787/cdn-cgi/explorer/api
+
+
+... 
+
+Debug with traces:
+POST /cdn-cgi/explorer/api/local/observability/query -- query traces and logs with SQL</code></pre>
+<p>The <a href="http://developers.cloudflare.com/workers/local-development/local-explorer">Local Explorer</a> is a browser-based interface and REST API for viewing and editing local resource data and querying observability data during development. The API root serves an OpenAPI schema, so agents can discover available endpoints at runtime without hardcoded instructions.</p>
+<p>The automatically captured traces are available through a read-only observability endpoint in that API, together with their correlated console logs. The agent can query this telemetry, then use the API's other operations to inspect local Workers and bindings or examine state in D1, KV, R2, Durable Objects, and Workflows.</p>
+<h2>Find the failure and verify the fix</h2>
+<p>Consider <code>POST</code> <code>/api/orders</code>, which retrieves an active cart from KV, saves the checkout details into D1, and sends a message to a Queue for order processing. After a schema change, the endpoint suddenly starts returning a 500 status.</p>
+<h3>Without local traces</h3>
+<p>The 500 does not identify which operation failed. The agent adds logs around KV, D1, and the Queue, reruns the request, inspects the output, and repeats. Each cycle takes time and burns tokens while the agent reconstructs the request from text.</p>
+<h3>With local traces</h3>
+<p>The agent reproduces the error and queries the read-only observability endpoint. The trace shows that the KV read succeeded, the D1 insert failed with <code>no such column: delivery_window</code>, and the Queue was never called. Your agent uses the Local Explorer API to access the same trace data you would see here:</p>
+<p>The agent uses the API to inspect the D1 schema. It finds that the migration adding delivery_window exists in the repository but has not been applied locally, applies it, sends the request again, and queries the new trace. Issue resolved.</p>
+<p>In one local loop, the agent identifies the failed operation, fixes the local environment, and verifies the result without deploying or adding temporary logs.</p>
+<h2>Explore traces and logs in Local Explorer</h2>
+<p>Agents query local telemetry through the API, but you as a human can visualize the same data in the <a href="https://developers.cloudflare.com/workers/local-development/local-explorer/">Local Explorer</a>, the browser-based interface built into the local development server. Alongside browsing local binding state, you can select a request to inspect its spans, timing, attributes, errors, and correlated console logs.</p>
+<p>Local Explorer runs on the same localhost origin as your Worker, not in the Cloudflare dashboard. Press <code>e</code> in Wrangler or visit <code>/cdn-cgi/explorer</code> on the local server to open it.</p>
+<h2>How it works</h2>
+<p>When we launched <a href="https://blog.cloudflare.com/workers-tracing-now-in-open-beta/">Workers Tracing</a>, we built instrumentation directly into <a href="https://github.com/cloudflare/workerd">workerd</a>, the open-source runtime that powers Workers. Without requiring an SDK or any code changes, the runtime captures spans for:</p>
+<ul>
+ <li><strong>Fetch calls:</strong> All outbound HTTP requests, including timing, status codes, and request metadata.</li>
+ <li><strong>Binding calls:</strong> Every interaction with KV, R2, D1, Durable Objects, Queues, and other bindings.</li>
+ <li><strong>Handler calls:</strong> The full lifecycle of each invocation, from <code>fetch</code> to <code>scheduled</code> to queue handlers.</li>
+</ul>
+<p>Any <a href="https://developers.cloudflare.com/workers/observability/traces/custom-spans/">custom spans</a> emitted by<strong> </strong>your application will also appear alongside these automatic spans.</p>
+<p><a href="https://developers.cloudflare.com/workers/local-development/#start-a-local-development-server">Wrangler</a> and the <a href="https://developers.cloudflare.com/workers/vite-plugin/">Cloudflare Vite plugin</a> use Miniflare to run your Worker locally in the same runtime, making this instrumentation available during local development.</p>
+<p>Miniflare collects runtime events and console output, assembles them into OpenTelemetry traces and correlated logs, then writes the telemetry to an internal SQLite-backed Durable Object that serves as the local trace store. The Local Explorer API exposes that data through the local development server where agents can easily query traces and logs and inspect local state.</p>
+<h2>Get started</h2>
+<p>Update Wrangler or the Cloudflare Vite plugin, whichever your project uses:</p>
+<pre><code># Wrangler
+npm install --save-dev wrangler@latest
+
+# Cloudflare Vite plugin
+npm install --save-dev @cloudflare/vite-plugin@latest</code></pre>
+<p>Then ask your agent to debug locally as you normally would. Your agent can already write and run your Worker locally — now it can see what happened, fix what failed, and verify the result before you deploy. Check out the <a href="http://developers.cloudflare.com/workers/local-development/local-explorer/#api">docs</a> to learn more!</p>

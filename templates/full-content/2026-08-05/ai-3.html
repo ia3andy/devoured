@@ -1,0 +1,94 @@
+<h1>A unified API for AI model routing</h1>
+<p>When building AI applications, developers need the freedom to route traffic to the best model for the job without hardcoding endpoints or managing open-source proxies. Google Cloud API Gateway now offers model routing in Public Preview to solve this. It provides a lightweight, serverless ingress layer that accepts OpenAI-compatible requests and dynamically routes them to Gemini, Claude, or OpenAI OSS-GPT.</p>
+<p>API Gateway can be used standalone for simple rate limiting and token tracking, or paired seamlessly with the Gemini Enterprise Agent Platform. For example, you can route your agent's egress through Agent Gateway for strict security governance, and then pass the request to API Gateway to handle dynamic routing to Google-hosted LLMs. Here is a step-by-step guide on how to configure your routing logic.</p>
+<h3>Routing your traffic</h3>
+<p>Setting up your model routing logic takes just a few steps:</p>
+<ol>
+ <li><strong>Configure your routing rules:</strong> You can map virtual model names to specific backend targets directly in your OpenAPI 3.x specification using the new <code>x-google-api-management</code> extension block.</li>
+</ol>
+<pre><code>openapi: 3.0.4
+
+info:
+  title: OpenAPI 3.x spec using Model Routing
+  description: Using Model Routing in an OAS 3.x spec
+  version: 1.0.0
+
+x-google-api-management:
+  backends:
+    gemini-35-flashlite:
+      address: &gt;-
+        https://aiplatform.googleapis.com/v1/projects/YOUR_PROJECT_ID/locations/global/publishers/google/models/gemini-3.5-flash-lite:generateContent
+      deadline: 60.0
+      pathTranslation: CONSTANT_ADDRESS
+
+    anthropic-claude-opus-47:
+      address: &gt;-
+        https://aiplatform.googleapis.com/v1/projects/YOUR_PROJECT_ID/locations/global/publishers/anthropic/models/claude-opus-4-7:rawPredict
+      deadline: 60.0
+      pathTranslation: CONSTANT_ADDRESS
+
+    openai-gpt-oss-120b:
+      address: &gt;-
+        https://aiplatform.googleapis.com/v1/projects/YOUR_PROJECT_ID/locations/global/endpoints/openapi/chat/completions
+      deadline: 60.0
+      pathTranslation: CONSTANT_ADDRESS
+
+  ai:
+    models:
+      routing:
+        routers:
+          # Router 1: route between Gemini (default) and Claude.
+          gemini-claude-router:
+            defaultModel:
+              backend: gemini-35-flashlite
+              targetModel: google/gemini-3.5-flash-lite
+            rules:
+              - model: "claude-opus-4-7"
+                backend: anthropic-claude-opus-47
+                targetModel: anthropic/claude-opus-4-7
+
+          # Router 2: route between OpenAI GPT (default) and Gemini.
+          openai-gemini-router:
+            defaultModel:
+              backend: openai-gpt-oss-120b
+              targetModel: openai/gpt-oss-120b-maas
+            rules:
+              - model: "gemini-3.5-flash-lite"
+                backend: gemini-35-flashlite
+                targetModel: google/gemini-3.5-flash-lite
+
+servers:
+  - url: "https://my-gateway-url.com"
+
+paths:
+  /v1/chat/gemini-claude:
+    post:
+      summary: "Endpoint:defaults to Gemini &amp; Claude as an option."
+      operationId: "chatGeminiClaude"
+      x-google-model-router: gemini-claude-router
+      responses:
+        '200':
+          description: "OK"
+
+  /v1/chat/openai-gemini:
+    post:
+      summary: "Endpoint:defaults to OpenAI &amp; Gemini as an option."
+      operationId: "chatOpenAIGemini"
+      x-google-model-router: openai-gemini-router
+      responses:
+        '200':
+          description: "OK"</code></pre>
+<p><strong>Note:</strong> All backends referenced by a single router must share the same host (for example, aiplatform.googleapis.com). Routing selects a different model and path on that shared Vertex host — it does not route across different hosts.</p>
+<p>2. <strong>Deploy the Gateway:</strong> Deploy your updated API config so the Gateway is active and ready to process traffic.</p>
+<p>3. <strong>Send standard requests:</strong> Your application simply sends a standard OpenAI <code>POST /v1/chat/gemini-claude</code> or <code>POST /v1/chat/openai-gemini</code> request. The Gateway intercepts it, transcodes the payload to the native schema of the backend, and routes it on the fly. As an example (use appropriate values for <code>$API_KEY</code> and <code>my-gateway-url.com</code>) :</p>
+<pre><code>curl -X POST "https://my-gateway-url.com/v1/chat/gemini-claude" \
+  -H "content-type: application/json" \
+  -H "x-api-key: $API_KEY" \
+  -d '\{
+        "model": "claude-opus-4-7",
+        "messages": [
+          \{"role": "user", "content": "Introduce yourself in 5 words"}
+        ]
+      }'</code></pre>
+<h3>Get started</h3>
+<p>Model routing is now available in Public Preview for API Gateway. To stop managing proxies and start unifying your AI traffic, <a href="https://docs.cloud.google.com/api-gateway/docs/model-routing-overview">check out our documentation</a> to deploy your first model router today.</p>

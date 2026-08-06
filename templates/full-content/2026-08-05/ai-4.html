@@ -1,0 +1,303 @@
+<h1>What Codex Actually Sends to the Model</h1>
+<p>I recorded the requests Codex generated for a 16-character prompt, then measured what changed as it loaded instructions, exposed tools, read files, ran commands, received images, and compacted its history.</p>
+<p>When I typed Reply with pong., the prompt was 16 characters long.</p>
+<p>The request Codex sent was 42,980 bytes.</p>
+<p>Encoded locally as JSON with o200k_base, it came to roughly 9,435 tokens. The wrapped prompt accounted for about 25 of them, or 0.3%. The rest came from Codex itself: instructions, tool definitions, permissions, skill metadata, environment context, and request framing.</p>
+<p>Those token counts are local estimates, not API usage or billing. The captured request body itself is exact.</p>
+<p>File reads and command output are added later. When the accumulated history gets too large, Codex can send it through another model request, replace it with a summary, and continue.</p>
+<h2>How I recorded the requests</h2>
+<p>Codex supports custom model providers. I pointed it at a local HTTP server that saved each request, redacted sensitive headers, and returned a fixed fake response. The experiment did not call an external model.</p>
+<pre><code>Codex client → local recorder → deterministic fake response
+                       ↑
+                 request saved here
+</code></pre>
+<p>The recorder shows what the client sent. It cannot show what a real provider might change after receiving the request, whether any input would be cached, or how it would be billed.</p>
+<p>I measured two things:</p>
+<ul>
+ <li>Raw request bytes: the size of the HTTP JSON body before sanitization.</li>
+ <li>Approximate text tokens: the sanitized JSON encoded locally with o200k_base.</li>
+</ul>
+<p>The tests used Codex CLI 0.145.0 with the gpt-5.6-sol model.</p>
+<h2>The first request</h2>
+<p>I started Codex in an empty temporary Git repository, disabled project instructions, and pointed CODEX_HOME at an empty directory.</p>
+<p>The request still described five bundled system skills, so this was an isolated-home baseline rather than a minimum possible request.</p>
+<p>Three items accounted for 7,696 of the 9,435 tokens:</p>
+<table>
+ <thead>
+  <tr>
+   <th>&nbsp;</th>
+   <th>What it contained</th>
+   <th>Serialized size</th>
+   <th>Local estimate</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>additional_tools developer item</td>
+   <td>Four top-level tool entries</td>
+   <td>16,741 characters</td>
+   <td>3,942 tokens</td>
+  </tr>
+  <tr>
+   <td>Developer message</td>
+   <td>Main Codex instructions</td>
+   <td>17,730 text characters</td>
+   <td>3,729 tokens</td>
+  </tr>
+  <tr>
+   <td>User message</td>
+   <td>Reply with pong.</td>
+   <td>16 text characters</td>
+   <td>25 tokens</td>
+  </tr>
+ </tbody>
+</table>
+<p>The four tool entries were exec, wait, request_user_input, and a collaboration namespace. They represented more than four actions. collaboration contained six subtools, while exec described command execution, patching, image inspection, plan updates, and other nested tools.</p>
+<p>In this run, Codex placed the tool entries and base instructions inside the input array instead of using top-level instructions and tools fields.</p>
+<h2>Project instructions</h2>
+<p>Codex builds its project instruction chain from the repository root to the directory where it starts. It looks for AGENTS.md at each level, placing the closer instructions later.</p>
+<p>I created one root and one child AGENTS.md, each with 100 unique markers.</p>
+<ul>
+ <li>Starting at the repository root sent all 100 root markers and no child markers.</li>
+ <li>Starting in the child directory sent all 200 markers.</li>
+ <li>Starting at the root and later running ls child did not add the child instructions.</li>
+</ul>
+<p>The launch directory determined the automatic instruction chain. Reading the child file explicitly could still add its contents as ordinary tool history.</p>
+<p>For the size test I used synthetic high-entropy markers rather than natural prose. Each marker is a string like PAIRED_AGENTS_1000_0001, which o200k_base splits into 11 tokens on its own. Ordinary prose words do not. The table below shows that instructions are transmitted in full — it is not what your own AGENTS.md would cost.</p>
+<p>Larger files changed the first request directly:</p>
+<table>
+ <thead>
+  <tr>
+   <th>&nbsp;</th>
+   <th>Raw request bytes</th>
+   <th>Local estimate</th>
+   <th>Difference from baseline</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Isolated-home baseline</td>
+   <td>42,980</td>
+   <td>9,435</td>
+   <td>—</td>
+  </tr>
+  <tr>
+   <td>250 synthetic AGENTS markers</td>
+   <td>48,927</td>
+   <td>11,965</td>
+   <td>+5,947 bytes; +2,530 tokens</td>
+  </tr>
+  <tr>
+   <td>1,000 synthetic AGENTS markers</td>
+   <td>67,177</td>
+   <td>20,465</td>
+   <td>+24,197 bytes; +11,030 tokens</td>
+  </tr>
+ </tbody>
+</table>
+<p>In a two-request trace with 250 markers, all 250 appeared in both requests.</p>
+<h2>Skills loaded in two stages</h2>
+<p>Repository skills under .agents/skills/ initially contributed their name, description, and path. Their SKILL.md bodies were absent until read.</p>
+<p>Each synthetic skill had a 12-word description and a 200-word body with unique markers.</p>
+<ul>
+ <li>One skill added 481 bytes and approximately 125 tokens to the first request.</li>
+ <li>Ten skills added 4,810 bytes and approximately 1,250 tokens.</li>
+ <li>None of the body markers appeared in either first request.</li>
+</ul>
+<h2>MCP tool descriptions were deferred</h2>
+<p>I tested one local MCP server with three tools and two local servers with seven tools in total.</p>
+<p>In the initial-only runs, both requests were 46,582 bytes and approximately 10,410 local tokens. Neither contained the custom tool names or descriptions. Instead, the exec interface gained generic MCP discovery guidance. Disabling the configured server returned the request to the isolated-home baseline.</p>
+<p>The descriptions appeared after I made exec print the matching deferred tool entries:</p>
+<table>
+ <thead>
+  <tr>
+   <th>&nbsp;</th>
+   <th>Retained description markers</th>
+   <th>Added bytes</th>
+   <th>Added local estimate</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>One server, three tools (40 markers each)</td>
+   <td>120</td>
+   <td>5,894</td>
+   <td>1,522 tokens</td>
+  </tr>
+  <tr>
+   <td>Two servers, seven tools (three at 40 markers, four at 60)</td>
+   <td>360</td>
+   <td>15,970</td>
+   <td>4,210 tokens</td>
+  </tr>
+  <tr>
+   <td>One server allowlisted to one tool (40 markers)</td>
+   <td>40</td>
+   <td>2,288</td>
+   <td>578 tokens</td>
+  </tr>
+ </tbody>
+</table>
+<p>These deltas compare the request after discovery with the first request in the same trace, which was 46,589 bytes and 10,410 local tokens in a separate run.</p>
+<p>I also created one tool description containing 5,000 markers. After truncation, its retained head-and-tail sample still contained 1,046 markers. The next request grew by 40,607 bytes and approximately 9,631 local tokens.</p>
+<h2>A coding task, request by request</h2>
+<p>I created a small Python fixture with a configuration bug: an explicit false value was being replaced by a user default. The task was:</p>
+<blockquote>
+ <p>Fix the configuration precedence bug causing explicit false values to be replaced by user defaults. Add a regression test and run the relevant test suite.</p>
+</blockquote>
+<p>This trace measures request growth, not model reasoning. The actions were fixed in advance.</p>
+<table>
+ <thead>
+  <tr>
+   <th>&nbsp;</th>
+   <th>Action completed before it</th>
+   <th>Raw bytes</th>
+   <th>Local estimate</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>0</td>
+   <td>Initial task</td>
+   <td>44,189</td>
+   <td>9,815</td>
+  </tr>
+  <tr>
+   <td>1</td>
+   <td>Search</td>
+   <td>45,289</td>
+   <td>10,114</td>
+  </tr>
+  <tr>
+   <td>2</td>
+   <td>File reads</td>
+   <td>46,278</td>
+   <td>10,368</td>
+  </tr>
+  <tr>
+   <td>3</td>
+   <td>Initial tests</td>
+   <td>46,959</td>
+   <td>10,529</td>
+  </tr>
+  <tr>
+   <td>4</td>
+   <td>Regression added</td>
+   <td>47,635</td>
+   <td>10,701</td>
+  </tr>
+  <tr>
+   <td>5</td>
+   <td>Regression failed</td>
+   <td>48,832</td>
+   <td>10,968</td>
+  </tr>
+  <tr>
+   <td>6</td>
+   <td>Second inspection</td>
+   <td>49,953</td>
+   <td>11,254</td>
+  </tr>
+  <tr>
+   <td>7</td>
+   <td>Fix applied</td>
+   <td>50,471</td>
+   <td>11,386</td>
+  </tr>
+  <tr>
+   <td>8</td>
+   <td>Suite passed</td>
+   <td>51,170</td>
+   <td>11,554</td>
+  </tr>
+  <tr>
+   <td>9</td>
+   <td>Diff verified</td>
+   <td>52,389</td>
+   <td>11,889</td>
+  </tr>
+ </tbody>
+</table>
+<p>The final request was 8,200 bytes and approximately 2,074 tokens larger than the first. Search results, file contents, tests, the failure, the patch, and the final diff all remained available to later turns.</p>
+<h2>Files entered after they were read</h2>
+<p>I created five harmless files with unique markers: a normal source file, an ignored file, a fake .env, an ignored 20,000-line log, and a file named inside AGENTS.md.</p>
+<p>None of their contents appeared in the first request.</p>
+<p>Running rg –files -uu added their filenames, not their contents. After explicit reads, the normal file, ignored file, fake .env, and ignored log all appeared in later requests.</p>
+<table>
+ <thead>
+  <tr>
+   <th>&nbsp;</th>
+   <th>Raw bytes</th>
+   <th>Local estimate</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Before file operations</td>
+   <td>43,500</td>
+   <td>9,617</td>
+  </tr>
+  <tr>
+   <td>After filename listing</td>
+   <td>45,040</td>
+   <td>10,092</td>
+  </tr>
+  <tr>
+   <td>After normal-file read</td>
+   <td>45,445</td>
+   <td>10,196</td>
+  </tr>
+  <tr>
+   <td>After ignored-file read</td>
+   <td>45,846</td>
+   <td>10,303</td>
+  </tr>
+  <tr>
+   <td>After fake .env read</td>
+   <td>46,250</td>
+   <td>10,418</td>
+  </tr>
+  <tr>
+   <td>After large ignored-log read</td>
+   <td>87,561</td>
+   <td>20,350</td>
+  </tr>
+  <tr>
+   <td>After mentioned-file read</td>
+   <td>87,983</td>
+   <td>20,461</td>
+  </tr>
+ </tbody>
+</table>
+<p>The large log was truncated to a head-and-tail sample before the next request.</p>
+<p>Codex did not upload the repository automatically. But .gitignore did not block explicit reads or stop the resulting tool output from entering later requests.</p>
+<h2>Terminal output stayed in the history</h2>
+<p>Ten- and one-hundred-line command results survived verbatim into the next requests. A 10,000-line result was truncated to a head-and-tail sample, but the request still grew from 43,337 bytes and approximately 9,584 tokens to 88,480 bytes and 25,835 tokens.</p>
+<p>Repeated output was not deduplicated. ANSI-formatted text and a failing Python stack trace also stayed in the history.</p>
+<h2>Images crossed as data URLs</h2>
+<p>A synthetic 32×32 PNG appeared in the request as a 442-character data:image/png;base64,… URL.</p>
+<p>I then attached a larger synthetic gradient PNG. Codex resized and re-encoded it before transmission. The captured 71,666-character data URL decoded to a 1600×1600 PNG. A two-image request contained both data URLs.</p>
+<p>The raw request bodies were 43,955 bytes for the small image, 115,265 bytes for the transformed large image, and 115,886 bytes for both. Local text tokenization of base64 is not image-token accounting, so I did not use it to estimate cost.</p>
+<h2>Compaction sent the history through another request</h2>
+<p>Against OpenAI or Azure, Codex compacts through a dedicated endpoint. Against a custom provider like my recorder, it builds the summary request itself. That is the path I captured, and it had two stages. First, Codex sent the accumulated history with a summary prompt. It then rebuilt the conversation around retained user messages and the returned summary.</p>
+<p>I forced the trigger with synthetic usage: 13,000 reported input tokens, a 20,000-token context window, and a 12,000-token compaction threshold.</p>
+<p>That produced three requests:</p>
+<ul>
+ <li>Initial request: 42,030 bytes and approximately 9,378 tokens. It contained the normal tools and user request.</li>
+ <li>Compaction request: 68,375 bytes and approximately 21,408 tokens. It contained the accumulated history, a large retained tool result, and a summary prompt. The normal tool list was empty.</li>
+ <li>Resumed request: 42,646 bytes and approximately 9,500 tokens. The normal tools and original user message returned. The raw tool call and output were replaced by the synthetic summary.</li>
+</ul>
+<p>The resumed request was 25,729 bytes and approximately 11,908 tokens smaller than the compaction request. The summary was intentionally short.</p>
+<p>This shows how the history was replaced, not how well a real model would summarize it. After compaction, a detail may survive only through the generated summary rather than the original message or tool output.</p>
+<h2>What crossed the machine boundary</h2>
+<p>Some information was present before any tool use: Codex instructions, visible tool interfaces, the discovered AGENTS.md chain, skill metadata, environment context, and the user prompt.</p>
+<p>Other information appeared only after an action: file contents after a read, terminal output after a command, MCP descriptions after discovery, and images after attachment.</p>
+<p>Unread repository files, ignored files, and the fake .env did not appear automatically. The prompt was the seed. The request was the working state.</p>
+<h2>What this experiment did not measure</h2>
+<ul>
+ <li>A universal minimum request across every Codex version, model, operating system, or product surface.</li>
+ <li>Autonomous model reasoning. The multi-turn workflows used fixed fake responses, so real sessions carry more per turn than these traces show.</li>
+ <li>The quality of model-generated compaction summaries.</li>
+ <li>Provider-side transformations, cache hits, billing, or model internals.</li>
+</ul>
+<p>The companion artifact pack contains the recorder, sanitized request bodies, analysis files, tests, and figure sources.</p>

@@ -1,0 +1,89 @@
+<p>In vanilla Argo CD, “promoting to production” is really just editing a YAML file in a different folder and hoping you got it right. You bump an image tag in a production overlay, commit, and trust that what you just wrote matches what you verified in Development.</p>
+<p>This is great until an auditor asks, “Who promoted this, and when?” or an incident traces back to a tag nobody meant to change.</p>
+<p>Argo CD is excellent at keeping a cluster in sync with Git, but it has no concept of a release, i.e, no single, frozen artifact that moves from one environment to the next under policy.</p>
+<p>In this guide, you will connect Argo CD to Octopus Deploy and turn promotion into a governed release, using the same immutable snapshot to move from Development to Production, gated by approval.</p>
+<h2>Why “promotion” is hard in vanilla Argo CD</h2>
+<p>Argo CD treats each Application as an independent unit. The dev install of your app and the production install are two separate Applications with no codified relationship between them. Nothing in Argo CD knows that “web in production” should receive exactly what “web in dev” was verified with.</p>
+<p>Similarly, depending on your organization or team, promoting to an environment could mean a separate namespace or an entirely new cluster, both of which Octopus Deploy can handle.</p>
+<p>That fragmented trail is slow and painful to reassemble at exactly the moments you need it most. Like when an auditor asks who promoted what and when, or when you are mid-incident trying to work out what changed.</p>
+<p>Whereas, what you want is a single, frozen release that moves through environments under governance: verified once in Development, promoted unchanged to Production, with the who and when captured automatically.</p>
+<p>That leaves two do-it-yourself options for promotion, and both are ad-hoc:</p>
+<ul>
+ <li><strong>Hand-edit the image tag</strong> in each environment’s overlay folder, commit, and let Argo sync. This is fast, but there is no record of intent, no gate, and nothing stopping a typo from shipping a different tag to Production than the one you tested.</li>
+ <li><strong>Script a pull request per environment.</strong> This is more controlled, but now your promotion logic lives in CI YAML and shell, reinvented per team, drifting as the estate grows.</li>
+</ul>
+<h2>Prerequisites</h2>
+<p>This walkthrough builds on the cluster and Octopus connection from the EKS connection post. You do not need EKS specifically, but you do need these pieces in place before the promotion steps make sense:</p>
+<ul>
+ <li><strong>An Octopus Deploy instance with the Argo CD integration</strong> (Octopus Cloud or self-hosted). This is where the project, lifecycle, and release live.</li>
+ <li><strong>A Kubernetes cluster you can install into.</strong> A local kind cluster is enough. Because the Octopus gateway dials outbound, no ingress or public address is required.</li>
+ <li><strong>Argo CD running in that cluster, connected to Octopus through the gateway.</strong> If you followed the EKS connection post, reuse that same cluster and its gateway connection. If you are starting fresh, the next section installs Argo CD and registers the gateway from scratch.</li>
+ <li><strong><code>kubectl</code>, <code>helm</code>, and the <code>argocd</code> CLI</strong> installed locally.</li>
+ <li><strong>A Git repository for your manifests</strong> with Kustomize overlays per environment (the demo uses a public GitHub repo), plus a Git credential in Octopus that can push to it.</li>
+</ul>
+<h2>The architecture setup</h2>
+<p>For this demo, we’re aiming for a single Kubernetes cluster with two namespaces that serve as environments, <code>dev</code> and <code>production</code>, each with its own Argo CD Application.</p>
+<p>Octopus owns the release and promotion process, and Git remains the source of truth, while Argo CD applies manifests to the cluster.</p>
+<p>The <strong>Octopus gateway</strong> is a small component you install in the cluster with Helm; it dials <strong>outbound</strong> to Octopus over gRPC, so nothing in your cluster needs a public address. That means this entire demo can run on a local kind cluster with no ingress.</p>
+<p>Install Argo CD with a dedicated <code>octopus</code> account so the gateway has its own scoped identity rather than piggybacking on <code>admin</code>:</p>
+<pre><code>helm install argocd argo-cd \
+ --repo https://argoproj.github.io/argo-helm \
+  --create-namespace --namespace argocd --wait --timeout 10m \
+ --values - &lt;&lt; 'EOF'
+configs:
+  cm:
+    accounts.octopus: apiKey
+  rbac:
+    policy.default: "role:readonly"
+    policy.csv: |
+      g, admin, role:admin
+      p, octopus, applications, get, *, allow
+      p, octopus, applications, sync, *, allow
+      p, octopus, clusters, get, *, allow
+      p, octopus, logs, get, */*, allow
+EOF</code></pre>
+<p>With Argo CD running, register the instance in Octopus, paste an auth token for the <code>octopus</code> account, and Octopus generates a Helm command for the gateway.</p>
+<p>Run the generated Helm command against your cluster, and Octopus confirms the connection: the gateway registers, connects to Octopus, and connects to Argo CD.</p>
+<h3>Map the Applications with annotations</h3>
+<p>Octopus needs to know which Argo CD Applications belong to which project and environment. You declare that with two annotations on each Application manifest. No per-application configuration is needed in Octopus; the annotations handle the mapping.</p>
+<pre><code>apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: web-dev
+  namespace: argocd
+  annotations:
+    argo.octopus.com/project: argo-web-promotion
+    argo.octopus.com/environment: development
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/gitops-web-promotion
+    targetRevision: main
+    path: overlays/dev
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: dev
+  syncPolicy:
+    automated: \{ prune: true, selfHeal: true }
+    syncOptions: [ CreateNamespace=true ]</code></pre>
+<p>The <code>argo.octopus.com/project</code> annotation ties the Application to the Octopus project, and <code>argo.octopus.com/environment</code> ties it to an Octopus environment. The production Application is identical except <code>name: web-production</code>, <code>argo.octopus.com/environment: production</code>, <code>path: overlays/production</code>, and <code>namespace: production</code>.</p>
+<h2>Building the Octopus project with a Dev to Production lifecycle</h2>
+<p>Create an Octopus project and give it a lifecycle with two phases, Development and Production. The lifecycle is what makes promotion ordered, which simply means a release must pass through Development before it can reach Production.</p>
+<p>Then add the built-in <strong>Update Argo CD Application Image Tags</strong> step to the deployment process. For each Application matched by annotation, this step retrieves the Git location from the Application, updates the image tag in the manifests, commits the change, and triggers Argo CD to sync. Add a container image reference (the <code>nginx</code> image, from a Docker Hub feed) so the release knows which image to update and what version to pin.</p>
+<p>To make the governance visible, add one more step before it: a <strong>Manual intervention</strong> step scoped to the Production environment only. That is your approval gate. It runs when promoting to Production and is skipped for Development, so it stays fast while Production stays governed.</p>
+<h2>Create a release and deploy to Development</h2>
+<p>Create a release in Octopus and select the image version to promote, for example <code>nginx:1.27.2</code>. This release is a frozen snapshot of the process, variables, and package versions. Once created, it is immutable: the version that goes to Production later is the exact version you are about to verify in Development, not whatever happens to sit at Git HEAD.</p>
+<p>Deploy the release to Development. Octopus commits the new tag to the dev overlay, and Argo CD syncs the <code>dev</code> namespace.</p>
+<h2>Promote the same release to Production</h2>
+<p>Now promote the same release to Production. Because the process has a Production-scoped approval step, the deployment pauses and waits for a human before it touches anything.</p>
+<p>Approve it, and the same flow runs against the production overlay: Octopus commits the tag to <code>overlays/production</code>, and Argo CD syncs the <code>production</code> namespace. Production now gets exactly what was verified in dev, not a freshly hand-edited value.</p>
+<h2>The governance you got for free</h2>
+<ul>
+ <li><strong>An immutable release snapshot.</strong> Release <code>1.27.2</code> pinned the exact image version. Production could only ever receive what dev verified.</li>
+ <li><strong>A Git commit per environment.</strong> Each promotion is a commit in your history, attributable and reversible.</li>
+ <li><strong>An approval record.</strong> Production promotion required a named human to take responsibility and proceed, captured in the deployment history.</li>
+ <li><strong>One view of what is running where.</strong> The project dashboard shows every environment and the release it holds, with live health from Argo CD.</li>
+</ul>
+<h2>Going from overlay edits to audited releases</h2>
+<p>Promotion should not be a YAML edit you hope you got right. With Argo CD connected to Octopus, it becomes a release you can govern.</p>
+<p>Argo CD keeps doing what it does best: reconciling Git with your cluster, while Octopus adds a release model and an audit trail to that flow.</p>

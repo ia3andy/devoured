@@ -1,0 +1,62 @@
+<p>Over the past four months, our AI code reviewer has flagged nearly a quarter of a million deviations from Cloudflare engineering standards (what we’ll call “violations” in this post) and blocked 16,000 merges. Our spec reviewer agent has evaluated close to 600 technical designs against the same standards before implementation began. Both systems draw from the Cloudflare Codex, a shared source of engineering guidance built for people and agents. This post explains why we built the Codex, how it supports the engineering lifecycle, and what we plan to do next.</p>
+<p>Before the Codex (which we briefly introduced in a previous post about our AI engineering stack), developer guidance at Cloudflare lived in many places: formal documentation, repository files, chat threads, and the accumulated knowledge of individual engineers. Engineers often spent too much time searching for guidance instead of working on the problem they were trying to solve. Even after finding an answer, they could not always tell whether it was current, authoritative, or applicable to their situation.</p>
+<p>As Cloudflare grew, that model became increasingly difficult to sustain. No engineer could read every standard, and reviewers could not reliably check every requirement. Institutional knowledge became harder to recover when people moved between teams, and guidance that was not consistently surfaced or enforced led to drift between projects.</p>
+<p>We rebuilt this body of knowledge as the Cloudflare Codex: a governed set of engineering standards that agents can retrieve and apply at the point of work. The same guidance can now inform code review, technical design review, incident report review, and many other use cases, while engineers focus their time and judgment on the resulting findings.</p>
+<h2>Codex organization and workflow</h2>
+<p>A dedicated Codex governance model divides the Codex into distinct domains covering the engineering areas we care about. These include architectural matters (for example, frontend and control plane), cross-cutting concerns (security and reliability), specific languages (TypeScript and Rust), and several other areas. Each domain is led by an owner who is responsible for the content, consistency, and overall quality of the documents they oversee.</p>
+<p>Codex standards use a Request for Comments (RFC) format. Requirements use the SHOULD and MUST keywords defined by RFC 2119. We also expect a front matter header to hold metadata such as the domain and RFC status. Any Cloudflare employee with a key interest and domain competency can propose an RFC through a merge request that follows the prescribed structure. The proposal then passes through several rounds of feedback from an increasingly broad group of reviewers. Once the domain owner gives final approval, the RFC becomes part of the Codex and is published to an Astro-powered internal site.</p>
+<p>Approved RFCs can be consumed by Codex clients and agents, which may then start to flag Codex violations in code, configuration, or documentation immediately. However, they block based on Codex statements only after an RFC moves from the <em>approved</em> to the <em>enforced</em> lifecycle state. This separate promotion step gives teams time to absorb new requirements and accommodates cases where enforcement needs additional work.</p>
+<p>The following diagram illustrates the steps in the Codex workflow:</p>
+<p>Approved RFCs produce non-blocking findings; after explicit promotion, enforced RFCs block violations of MUST requirements</p>
+<p>A naive process could stop here and feed the entire Codex to a large language model (LLM) as is. Given the increasing number of RFCs we have already (60+ and counting), however, the corpus volume would put a lot of stress on the context window and impact LLM results negatively. To help guide models to the most relevant RFCs, we invoke a purpose-built agent to automatically extract and compact the SHOULD and MUST statements into a dedicated JSON structure and enrich it with metadata that supports lazy discovery and progressive disclosure. The following abridged excerpt shows the result for our control plane services RFC:</p>
+<pre><code>\{
+  "rfc": 14,
+  "title": "Control Plane Services",
+  "status": "approved",
+  "domain": "control-plane",
+  "statements": [
+    \{
+      "slug": "use-quicksilver-for-edge-configuration-propagation",
+      "section": ["Proposal", "Infrastructure"],
+      "level": "SHOULD",
+      "text": "If you need to propagate system or customer configuration to the edge, use Quicksilver via the outbox pattern",
+      "href": "/rfcs/014-control-plane-services/#infrastructure"
+    },
+    \{
+      "slug": "api-schemas-must-be-documented-in-openapi-spec",
+      "section": ["Proposal", "API Gateway"],
+      "level": "MUST",
+      "text": "API request and response schemas MUST be documented using an OpenAPI spec",
+      "href": "/rfcs/014-control-plane-services/#api-gateway"
+    }
+  ]
+}</code></pre>
+<p>Each statement receives a stable slug identifier that remains unchanged during the extraction process even when its RFC is updated. The identifier lets us track the same statement across different systems over time, which is essential for monitoring, analysis, and exception handling.</p>
+<p>Initially, we extracted the statements into another, more concise Markdown file rather than JSON. Over time, we moved to a richer structured format so that agents could filter the content they needed more accurately. We plan to include additional metadata for even tighter scoping, such as indicators for the software development life cycle (SDLC) stage a statement applies to (e.g., design, implementation, runtime).</p>
+<h2>Codex consumers</h2>
+<p>Several systems already use the Codex in day-to-day engineering work. Three agents show how the Codex works in practice: our AI code reviewer, spec reviewer, and incident report reviewer.</p>
+<h3>AI code reviewer</h3>
+<p>Our AI code reviewer agent, covered in a separate blog post, evaluates merge requests across several dimensions, including Codex compliance.</p>
+<p>For each review, the agent retrieves the RFCs and parses the Codex statements. It loads full RFC bodies only when the model or coordinator needs additional context. In most cases, the statements provide enough information to explain a reported violation.</p>
+<p>The distinction between SHOULD and MUST, together with an RFC’s status, determines how the reviewer responds. Findings from approved RFCs are non-blocking recommendations. Once an RFC is enforced, an unsatisfied MUST requirement causes the reviewer to withhold approval or block a merge request, depending on the severity.</p>
+<p>Since the Codex’s inception earlier this year, the AI code reviewer has flagged close to 230,000 violations. Among these, almost 16,000 caused approval to be withheld (i.e., they referred to MUST statements on enforced RFCs).</p>
+<h3>Code review alternatives</h3>
+<p>A single AI code reviewer run usually takes a couple of minutes to complete due to the coordinator framework and sub-agent execution. Although the wait is very often worth the money (or tokens), engineers were calling out the delay and extra round trip involved in remediating the findings. We looked into how we could improve the experience and came up with two additional options:</p>
+<ol>
+ <li>For language-specific Codex requirements that can be verified mechanically, we provide custom linter configuration packages. These are aligned with our Codex specification and make it possible to surface problems in milliseconds. TypeScript was the first language to receive Codex linter support while also standardizing on oxlint (maintained by the VoidZero team who joined Cloudflare recently) for performant linter execution. A linter for Rust projects is currently under development, and Go will eventually follow to complete coverage of Cloudflare’s most commonly used languages.</li>
+ <li>To cut out the continuous integration (CI) leg from the review cycle, we made it possible to run the AI code reviewer locally through a command-line interface (CLI). It matches the coordinator functionality from CI and runs the same (OpenCode-based) agents against an automatically determined diff set, with results presented in the terminal.</li>
+</ol>
+<p>We believe the linters would be useful to almost every developer and codebase, while the CLI remains an optional alternative for engineers who prefer it.</p>
+<h3>Spec reviewer</h3>
+<p>Engineers at Cloudflare regularly write design documents and technical specifications (or <em>specs</em> in short) before implementation. A significant subset of the Codex pertains to design, architecture, and other themes relevant to technical reviews. To catch architectural mistakes before implementation begins, we built the <em>spec reviewer</em>, an agent that discovers specs and evaluates them against relevant Codex requirements.</p>
+<p>The spec reviewer operates on the Developer Platform: it runs as a Cloudflare Worker, stores its results and state in D1, routes model requests through AI Gateway, and kicks off scanning for new specs via a Cron Trigger. It starts by filtering the Codex by domains and sections relevant to specs (for example, language features and implementation-focused RFCs are disregarded). Several guiding prompts instruct the model on how to run the assessment and frame the results. The findings get rated based on severity (influenced by SHOULD and MUST keywords) and include general quality and architectural advice. On completion of a review run, a note is left on the spec document linking to a custom dashboard where review details can be inspected.</p>
+<p>Since the beginning of May 2026, almost 600 unique open specs have been reviewed. Including reruns triggered on demand or by spec changes, we tracked over 3,200 review invocations to this date. The vast majority of findings had a “major” (65%) or “minor” (29%) severity, with “critical” findings being the minority (6%).</p>
+<p>The following image gives an impression of what the spec reviewer UI looks like:</p>
+<h3>Incident report reviewer</h3>
+<p>The <em>incident report reviewer</em> applies the same approach to incident reports (also known as postmortems). In addition to checking that each report is complete, it evaluates whether the report clearly explains what happened, identifies contributing factors, documents the resolution, and proposes meaningful follow-up actions. These expectations are defined in a dedicated Codex RFC.</p>
+<p>The incident report reviewer uses the same Developer Platform building blocks as the spec reviewer. This shared architecture is becoming a common pattern for our Codex agents.</p>
+<p>Since May 2026, the reviewer has assessed more than 200 incident reports and identified gaps such as missing follow-up action items, incomplete timelines, and omitted detection signals. Among those reports, 93% covered incidents that were low-impact, internal-only, or declared preemptively. For high-severity incidents, we’ve made the reviewer mandatory as part of our comprehensive central review process, and reports are not considered complete until all findings have been addressed.</p>
+<h2>Future work</h2>
+<p>The Codex already supports agents that review code, technical designs, and incident reports. We plan to extend that model throughout the SDLC, allowing agents to surface issues consistently across design, implementation, and operations. The longer-term goal is for agents to identify issues as well as propose fixes with increasing autonomy, while engineers remain responsible for reviewing and approving those changes.</p>
+<p>We are also expanding the Codex beyond engineering. Product, security, compliance, and trust and safety teams are beginning to add their own standards, allowing agents to evaluate work against considerations that extend beyond design and implementation alone.</p>
+<p>Across a number of engineering workflows, Codex-backed agents have helped us surface issues sooner and apply standards more consistently. We have found AI most useful when it brings the right guidance to engineers at the point of work, and plan to keep extending the approach across Cloudflare.</p>

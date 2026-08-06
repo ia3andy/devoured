@@ -1,0 +1,125 @@
+<h2>Gateway API v1.6: TCPRoute and UDPRoute Graduate to Standard</h2>
+<p>The Kubernetes SIG Network community is thrilled to share the release of <strong>Gateway API v1.6.0</strong>, which was released on June 30th of this year!</p>
+<p>Gateway API has become the standard for modern, role-oriented, and expressive service networking in Kubernetes. In previous releases, Gateway API established a production-grade foundation for HTTP and TLS layer 7 traffic. With version 1.6.0, Gateway API takes a major step forward by expanding standard layer 4 protocol routing and introducing cleaner API boundaries for experimental innovation.</p>
+<p>Here is a quick summary of what's new in Gateway API v1.6.0:</p>
+<ul>
+ <li><strong>TCPRoute and UDPRoute Graduate to Standard</strong>: Raw L4 TCP and UDP traffic routing reach GA stability in the <code>v1</code> API version.</li>
+ <li><strong>Experimental API Group Separation</strong>: Experimental resources transition to a distinct API group (<code>gateway.networking.x-k8s.io</code>) with an <code>X</code> prefix to make experimental vs. standard boundaries crystal clear.</li>
+</ul>
+<p>Let's dive into the details!</p>
+<h2>TCPRoute and UDPRoute graduate to Standard</h2>
+<p>Until now, Gateway API only offered a stable routing model for HTTP and TLS traffic. Workloads that speak a raw protocol over TCP or UDP - databases, DNS, VoIP, gaming, IoT telemetry - had no portable way to plug into a Gateway. Users either fell back to a plain Kubernetes Service, or to an implementation-specific CRD that doesn't travel between Gateway controllers.</p>
+<p>TCPRoute and UDPRoute close that gap: they route traffic to backends based on protocol and port alone, no L7 awareness required. With this release, both have graduated from the Experimental channel to Standard, and moved to the <code>v1</code> API version. The <code>v1alpha2</code> version of each was deprecated as of the v1.6 release, and will be removed in a future release.</p>
+<h3>How it works</h3>
+<p>A Gateway needs a listener that allows TCPRoute attachment:</p>
+<pre><code>apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: example-gateway
+spec:
+  gatewayClassName: example-gateway-class
+  listeners:
+    - name: foo
+      protocol: TCP
+      port: 12345
+      allowedRoutes:
+        kinds:
+          - kind: TCPRoute
+</code></pre>
+<p>A TCPRoute then attaches to that listener and forwards traffic to a backend:</p>
+<pre><code>apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata:
+  name: tcp-app
+spec:
+  parentRefs:
+    - name: example-gateway
+      sectionName: foo
+  rules:
+    - backendRefs:
+        - name: my-foo-service
+          port: 6000
+</code></pre>
+<p>Traffic arriving on the Gateway's port <code>12345</code> is proxied to the endpoints of <code>my-foo-service</code> on port <code>6000</code>. Omitting <code>sectionName</code> and <code>port</code> from <code>parentRefs</code> attaches the route to every TCP listener on the Gateway instead of a single one.</p>
+<p>UDPRoute follows the same pattern; swap the listener protocol and the route kind:</p>
+<pre><code>apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: example-gateway
+spec:
+  gatewayClassName: example-gateway-class
+  listeners:
+    - name: foo
+      protocol: UDP
+      port: 12345
+      allowedRoutes:
+        kinds:
+          - kind: UDPRoute
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata:
+  name: udp-app
+spec:
+  parentRefs:
+    - name: example-gateway
+      sectionName: foo
+  rules:
+    - backendRefs:
+        - name: my-foo-service
+          port: 6000
+</code></pre>
+<h2>XBackend arrives in Experimental</h2>
+<p>Gateway API v1.6 introduces the new <code>XBackend</code> resource, which is a general-purpose decorator for Service (and other backend types) within Gateway API.</p>
+<p>The Service resource is an amazing, stable, and flexible object, but that comes with some costs: The flexibility creates a lot of edge cases that Gateway API needs to handle, and the stability makes it impossible to add new concepts to Service.</p>
+<p>The XBackend resource builds on the ideas in the upstream EndpointSelector KEP, to add a Gateway API-native object that still targets the backend app, while allowing the community to extend it to handle use cases that are difficult or dangerous to handle with Service.</p>
+<p>The first version of XBackend includes support for ExternalHostname destinations, which are ruled out from Service support in Gateway API because of the possibility of confused deputy attacks.</p>
+<p>For XBackend, this support is an Extended/Optional feature, allowing implementations and users to opt in once they understand the security tradeoffs.</p>
+<p>This support is very useful for egress use cases (which are most commonly used for cluster-hosted agentic workloads), which the community is also working towards formalizing in GEPs about Gateways for Egress.</p>
+<p><strong>The XBackend API is experimental and its behavior can change, do not assume it is ready for production</strong></p>
+<p>An example of a Gateway with an ExternalName backend that can be used for egress to a cloud AI API is as follows:</p>
+<pre><code># Gateway-level TLS remains authoritative for incoming connections
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+spec:
+  listeners:
+  - name: https
+    protocol: HTTPS
+    tls:
+      certificateRefs:
+      - name: gateway-cert
+---
+# Backend resource for external destination
+apiVersion: gateway.networking.x-k8s.io/v1alpha1
+kind: XBackend
+metadata:
+  name: ai-provider-api
+  namespace: ai-apps
+spec:
+  type: ExternalHostname
+  externalHostname:
+    hostname: api.ai-provider.com
+
+---
+# HTTPRoute referencing XBackend
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+spec:
+  rules:
+  - backendRefs:
+    - name: ai-provider-api
+      kind: XBackend
+      group: gateway.networking.x-k8s.io
+</code></pre>
+<h2>Experimental resources move off the standard API group</h2>
+<p>Previously, experimental resources shared the same API group as standard ones - <code>gateway.networking.k8s.io</code> - distinguished only by a <code>v1alpha2</code>-style version. TCPRoute and UDPRoute were the last resources to graduate under that scheme.</p>
+<p>Going forward, new experimental resources are defined in a separate group, <code>gateway.networking.x-k8s.io</code>, and the names of their API types get an <code>X</code> prefix - for example XBackend and XMesh. When one of these graduates to Standard, it's renamed into the <code>gateway.networking.k8s.io</code> group and drops the <code>X</code> prefix, the same way XMesh is expected to become Mesh.</p>
+<p>This separation makes the experimental/standard boundary explicit at the API group level, rather than relying on version strings alone.</p>
+<h2>What's next &amp; getting involved</h2>
+<p>The graduation of TCPRoute and UDPRoute to Standard marks an essential milestone in making Gateway API a complete, universal ingress and mesh networking API for Kubernetes workloads across layer 4 and layer 7 protocols.</p>
+<h3>Try it out</h3>
+<p>You can start using Gateway API v1.6.0 today with your favorite Gateway controller implementation.</p>
+<h3>Get involved</h3>
+<p>Gateway API is an open, community-driven project built under Kubernetes SIG Network. We welcome contributions, feedback, and participation from everyone!</p>
+<h3>Acknowledgments</h3>
+<p>A huge thank you to all the contributors, reviewers, maintainers, and implementation authors whose hard work made Gateway API v1.6.0 possible!</p>
