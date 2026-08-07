@@ -1,0 +1,155 @@
+<p>Models have become excellent programmers. Flex hands them the program itself, so the optimizer rewrites your code and not just your prompt.</p>
+<p>The core position of DSPy is that you can define a task once, in a way that lets it be re-implemented as the AI ecosystem advances. The history of these re-implementations can be understood as a history of the models; of weaknesses we worked around and strengths we leveraged:</p>
+<ul>
+ <li>In 2022, models needed to be shown what a task looked like, so optimizers like BootstrapFewShot automated the picking of few-shot examples.</li>
+ <li>Models then grew to be capable prompt authors, so optimizers like MIPROv2 and GEPA could improve programs by rewriting their instructions.</li>
+ <li>Lately, models have become excellent programmers.</li>
+</ul>
+<p>This week, we're introducing <code>Flex</code> to DSPy, which leverages the coding skills of models to rewrite not just the instructions of your program, but the code itself.</p>
+<h2>Flex Lets GEPA Optimize the Code</h2>
+<p><code>dspy.Flex(YourSignature)</code> is a DSPy module, which can be dropped into any of your existing <code>Predict</code>, <code>ReAct</code>, or <code>RLM</code> programs. For example:</p>
+<pre><code>my_signature = "question -&gt; answer"
+my_program = dspy.Predict(my_signature)
+
+# Make it Flex!
+my_program = dspy.Flex(my_signature)</code></pre>
+<p>If we run either of these programs, we'd get the same result. Prior to optimization, Flex is just a Predict module (or RLM if you provide tools).</p>
+<p>What makes Flex different is what it exposes to an optimizer: <code>Flex</code> exposes its code, in addition to its instructions. Hand a Flex module to <code>dspy.GEPA</code> and the reflection model might decompose your program, write helper functions, implement routing logic, <em>and</em> rewrite your prompts. The output is an optimized program that performs best against the metric you gave it.</p>
+<pre><code>program = dspy.Flex(SamePlace)        # was: dspy.Predict(SamePlace)
+
+# cheap LM to use during inference
+dspy.configure(lm=dspy.LM("anthropic/claude-haiku-4-5"))
+
+# big LM to write the code and instructions
+big_lm = dspy.LM("anthropic/claude-opus-5")
+
+optimized = dspy.GEPA(
+    metric=make_metric(penalty=0.2),
+    reflection_lm=big_lm,
+    max_metric_calls=400,
+).compile(program, trainset=train, valset=val)</code></pre>
+<p>After optimization, <code>optimized.save("program.json")</code> persists the source and <code>dspy.Flex(SamePlace).load(...)</code> restores it. The artifact is a file you can open, read, diff, and reason about.</p>
+<p>What you get back is a program the reflection model wrote to score as high as it can against your metric. Two things tend to follow. Sometimes it doesn't call the model at all, because it found a case it could settle in code. And when it does call, the call is better aimed, because the module has already done the parsing and comparison and hands the model a narrower question. Fewer calls, better calls, and a program that outperforms the one you handed it.</p>
+<p>Code written by a model is still untrusted code, so by default <strong>it never runs in your process</strong>. Flex executes the generated source inside a sandboxed interpreter. Only predictor calls and the tools you explicitly provided bridge back to the host process, and a <code>max_predictor_calls</code> cap bounds how many times per forward that bridge can be crossed.</p>
+<h2>Location Conflation Task</h2>
+<p>Last year, Drew demonstrated prompt optimization at the Data + AI Summit with a geospatial conflation task: given two place listings, decide whether they're the same physical place. It's deceptively hard in the tail. KIN CAFE and KIN at the same address are the same place. CONCESSION #2 KEN MERCER SPORTS PARK and KEN MERCER SPORTS PARK at the same address are not.</p>
+<p>We replaced <code>Predict</code> with <code>Flex</code> and ran GEPA on this task: 1,029 labeled pairs, evaluated on 240 held-out records (class-balanced, so 50% is chance). Caches were disabled throughout, so the cost and latency figures below are what cold production traffic would pay.</p>
+<p>The <strong>baseline</strong> is the original <code>dspy.Predict</code>, one model call per record: 90.4% accuracy at $0.98 per thousand records.</p>
+<p><strong>Optimizing only the prompt</strong> with GEPA, no Flex, lifts accuracy to 92.5%. But the only lever a prompt optimizer has is the instruction, so it wrote a much longer one, and every record pays for those extra tokens at inference: $2.88 per thousand records, 2.9x the baseline cost, and 48% slower.</p>
+<p><strong>Flex gives the optimizer a second lever: the module code.</strong> Running GEPA, unchanged, on the Flex program lifted accuracy from 90.4% to 95.0% at a cost of $0.70 per thousand records. By optimizing the prompt <em>and</em> the code, Flex produced a program that is 28% cheaper and 40% faster than the baseline.</p>
+<p>How is this possible? For one, many of the places being compared can be evaluated using only code. Our reflection model wrote code to identify and route these easy matches to plain Python functions, resulting in <em>75% fewer LLM calls</em>.</p>
+<p>We can lean into this behavior by updating our metric. A GEPA metric returns a score plus natural-language feedback. With Flex, it can also see how many LM calls the generated program made on each record. We can use this value to penalize our feedback:</p>
+<pre><code>score = max(0.0, correct - PENALTY * n_llm_calls)</code></pre>
+<table>
+ <thead>
+  <tr>
+   <th>program</th>
+   <th>λ</th>
+   <th>accuracy</th>
+   <th>LM calls / record</th>
+   <th>$ / 1k records</th>
+   <th>mean latency</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>dspy.Predict baseline</td>
+   <td>n/a</td>
+   <td>90.4%</td>
+   <td>1.00</td>
+   <td>$0.98</td>
+   <td>1,924 ms</td>
+  </tr>
+  <tr>
+   <td>GEPA, prompt-only</td>
+   <td>n/a</td>
+   <td>92.5%</td>
+   <td>1.00</td>
+   <td>$2.88</td>
+   <td>2,841 ms</td>
+  </tr>
+  <tr>
+   <td>Flex + GEPA</td>
+   <td>0</td>
+   <td><strong>95.0%</strong></td>
+   <td>0.25</td>
+   <td>$0.70</td>
+   <td>1,155 ms</td>
+  </tr>
+  <tr>
+   <td>Flex + GEPA</td>
+   <td>0.05</td>
+   <td>94.6%</td>
+   <td>0.17</td>
+   <td>$0.45</td>
+   <td>726 ms</td>
+  </tr>
+  <tr>
+   <td>Flex + GEPA</td>
+   <td>0.1</td>
+   <td>90.8%</td>
+   <td>0.07</td>
+   <td>$0.18</td>
+   <td>347 ms</td>
+  </tr>
+  <tr>
+   <td>Flex + GEPA</td>
+   <td>0.2</td>
+   <td>91.7%</td>
+   <td>0.08</td>
+   <td>$0.09</td>
+   <td>135 ms</td>
+  </tr>
+  <tr>
+   <td>Flex + GEPA</td>
+   <td>0.4</td>
+   <td>92.1%</td>
+   <td>0.004</td>
+   <td><strong>$0.01</strong></td>
+   <td>65 ms</td>
+  </tr>
+ </tbody>
+</table>
+<p><strong>Even with calls free (λ=0), the optimizer wrote code.</strong> The metric function scored on accuracy only. The only nudge was in the metric's textual feedback asking for cases to be settled in code where possible. The best program it found routed 75% of records through deterministic Python and came out <em>more accurate</em> than calling the model every time at <strong>95.0%</strong> vs 90.4%, while being <strong>faster and cheaper</strong>.</p>
+<p><strong>At λ=0.4, the program called the model once across 240 records.</strong> Accuracy held at 92.1%, statistically indistinguishable from the always-call baseline, at roughly a hundredth of the cost and a thirtieth of the latency.</p>
+<h2>Reading the Code It Wrote</h2>
+<p>At λ=0.4, the program holds about two hundred lines of Python code, written by the reflection model. Condensed to its skeleton:</p>
+<pre><code>class SamePlaceModule(dspy.Module):
+    def __init__(self):
+        super().__init__()
+        self.judge = dspy.Predict(dspy.Signature(
+            "input_name: str, input_address: str, "
+            "match_name: str, match_address: str, "
+            "distance: float, name_similarity: float, "
+            "address_analysis: str -&gt; is_same: bool"
+        ))
+
+    def forward(self, **inputs):
+        import re, difflib
+        # ... 150 lines of logic ...
+        if decision is None:
+            out = self.judge(**inputs, name_similarity=round(nsim, 3),
+                             address_analysis=analysis)
+            decision = to_bool(out.is_same)
+
+        return dspy.Prediction(is_same=bool(decision))</code></pre>
+<ol>
+ <li><strong>Normalize:</strong> Names are uppercased, stripped of franchise numbers, legal suffixes, punctuation, and generic business words.</li>
+ <li><strong>Compare:</strong> The distinctive name tokens are scored zero to one with a fuzzy similarity, and binned into three buckets: confident matches, confident misses, and unsure.</li>
+ <li><strong>Decide:</strong> Each bucket gets its own rules combining the name verdict, the address data, and the distance between the two geocoded points.</li>
+</ol>
+<h2>Deterministic or Stochastic? Let the Metric Decide</h2>
+<p>With Flex, we can let a model explore this space as it gets feedback from the student model and the metric. We then ran GEPA on our Flex program on SWE-bench Pro. This optimized program resolved 4 out of 12 problems, after designing a software engineering workflow that mixed Python and LLM calls to research, draft, evaluate, repair, and submit a final answer.</p>
+<p>As we've watched GEPA rewrite programs across many types of tasks, four moves keep showing up:</p>
+<ol>
+ <li><strong>Decomposition.</strong> Noticing that a task has steps (parse, normalize, compare, decide) and giving each step its own implementation.</li>
+ <li><strong>Method selection.</strong> Choosing, for each step, between deterministic code and a model call.</li>
+ <li><strong>Routing.</strong> Recognizing that different <em>inputs</em> are different tasks: clear cases down the cheap path, ambiguous ones to the judge.</li>
+ <li><strong>Evolution.</strong> Refining what's inside the structure: the signatures, instructions, and the code itself.</li>
+</ol>
+<h2>Where This Comes From</h2>
+<ul>
+ <li><strong>GEPA.</strong> Lakshya Agrawal and team's reflective prompt evolution.</li>
+ <li><strong>Meta-Harness.</strong> Yoonho Lee and team's work on treating the harness around a model as a learnable object.</li>
+ <li><strong>RLM.</strong> Alex Zhang and team's work on Recursive Language Models at MIT.</li>
+</ul>

@@ -1,0 +1,159 @@
+<h1>smevals - a small eval suite for evaluating models, prompts, and harnesses</h1>
+<p>We've been building a new system for running evals against different models, prompts, and harnesses, with the goal of being able to identify the most appropriate small and inexpensive models for different categories of task.</p>
+<p>Frontier models continue to improve at an impressive rate, but those improvements are often accompanied by increases in price as well. GPT-5.5 and 5.6 Sol are twice the price of GPT-5.4. Claude Fable 5 is twice the price of Claude Opus 4.8. Even Google's inexpensive Gemini 3.5 Flash-Lite model has increased in price from Gemini 3.1 Flash-Lite.</p>
+<p>Meanwhile the options for inexpensive models have never been more abundant. Local models that run on small devices are exploding in capability, and the leading edge open weight models are improving at a dramatic rate, and at a price point significantly lower than their proprietary competitors.</p>
+<h2>The smevals vocabulary: evals, tasks, configs, runs, and grades</h2>
+<p><strong>smevals</strong> (for small evals) is a Python CLI tool that executes eval suites that are defined as a directory containing YAML configuration and executable scripts. Here are the key concepts of the smevals system:</p>
+<ul>
+ <li>An <strong>eval</strong> is a collection of challenges designed to answer a question about a model, for example, how good is that model at generating SVGs?</li>
+ <li>Each eval is a collection of <strong>tasks</strong>. A task is a specific challenge, for example "Generate an SVG of a pelican riding a bicycle".</li>
+ <li>When you run the eval you do so against one or more <strong>configs</strong>. Each config specifies a model to be evaluated, but may also include other parameters to test, such as different system prompts, model parameters, or agent harnesses.</li>
+ <li>A <strong>run</strong> records what happened when a specific config was used to execute a specific task. A <strong>runner</strong> is the script that executes a run.</li>
+ <li>Once you have collected one or more runs, you need to evaluate the results to see how well the model (or config) did. This is done by a <strong>grader</strong>, which produces a <strong>grade</strong>.</li>
+ <li>Each grader runs a sequence of <strong>checks</strong>. These can be simple operations, like checking for a specific string in the output, or confirming that the output is valid XML. They can also be more complicated custom operations (implemented as scripts called <strong>checkers</strong>), including using other models to answer questions about the run.</li>
+</ul>
+<h2>The smevals process</h2>
+<p>To run an eval using smevals you need to:</p>
+<ol>
+ <li>Design and implement the tasks for the eval</li>
+ <li>Decide how you will be grading the outputs of that eval</li>
+ <li>Run the tasks against one or more model configurations</li>
+ <li>Run the grader to determine scores for those runs</li>
+</ol>
+<p>The results of an eval can be examined either in the terminal or using a web application. The web reports can be baked out and published as static files.</p>
+<h2>Writing evals with a coding agent</h2>
+<p>The <a href="https://github.com/prime-radiant-inc/smevals/blob/main/README.md">smevals README</a> is designed for both humans and agents. A coding agent that reads that document should have everything it needs to know in order to construct an initial eval.</p>
+<p>That README is also bundled with the tool, and is available using the <code>smevals docs</code> command.</p>
+<p>This means you can start a session in Claude Code, or OpenAI Codex, or Pi, or your agent of choice, and prompt the following:</p>
+<blockquote>
+ <p><code>Run the command "uvx smevals docs"</code></p>
+</blockquote>
+<p>Then, once the agent has read the resulting documentation:</p>
+<blockquote>
+ <p><code>Now build an eval that tests how well models can write haikus, with two tasks - a haiku about a pelican and a haiku about two otters in love</code></p>
+</blockquote>
+<p>This should construct the eval in your current directory. You can then run it with this command:</p>
+<pre><code>uvx smevals run . -g</code></pre>
+<p>The <code>.</code> tells it to run the eval in the current directory. Adding <code>-g</code> causes it to grade the runs as soon as they have executed - without that you would need to run a separate <code>smevals grade .</code> command later on.</p>
+<p>Here's the output I got from running this for the first time:</p>
+<pre><code>otters-in-love / default / gpt-4.1-mini ... ok (5.0s) -&gt; runs/otters-in-love/default/gpt-4.1-mini/2026-07-24T01-07-45Z
+
+    grade: pass score=1.0
+
+pelican / default / gpt-4.1-mini ... ok (12.6s) -&gt; runs/pelican/default/gpt-4.1-mini/2026-07-24T01-07-50Z
+
+    grade: pass score=1.0</code></pre>
+<p>I ran it against two more models like this:</p>
+<pre><code>uvx smevals run . -g -m gpt-5.5 -m gpt-5.4-nano</code></pre>
+<p>That created four more runs, trying each of the two tasks against those two new models.</p>
+<p>The runner used here is a short shell script called <code>run-llm</code> that calls the <code>llm</code> CLI with the model and prompt supplied by smevals, then saves the corresponding LLM JSON log as an artifact alongside the output:</p>
+<pre><code>#!/usr/bin/env bash
+
+set -euo pipefail
+
+llm -m "$SMEVALS_MODEL" "$SMEVALS_PROMPT"
+llm logs -c --json &gt; log.json</code></pre>
+<p>The initial eval is a small directory of seven files:</p>
+<pre><code>haiku/
+├── eval.yaml
+├── tasks/
+│   ├── pelican.yaml
+│   └── otters-in-love.yaml
+├── configs/
+│   └── default.yaml
+├── graders/
+│   └── default.yaml
+├── checkers/
+│   └── three-lines
+└── run-llm</code></pre>
+<h2>Improving the grader</h2>
+<p>The first version of the grader that Codex built for me only checked that the response contained exactly three non-empty lines. Here's that <code>checkers/three-lines</code> file:</p>
+<pre><code>#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+
+
+output = Path(os.environ["SMEVALS_RUN_DIR"], "output.txt").read_text()
+lines = [line for line in output.strip().splitlines() if line.strip()]
+line_count = len(lines)
+passed = line_count == 3
+
+print(
+    json.dumps(
+        \{
+            "score": 1.0 if passed else 0.0,
+            "metrics": \{"line_count": line_count},
+            "notes": f"\{line_count} non-empty line(s); expected exactly 3",
+        }
+    )
+)
+raise SystemExit(0 if passed else 1)</code></pre>
+<p>Checker scripts run against the directory provided to them by the <code>SMEVALS_RUN_DIR</code> environment variable. They should output JSON with a <code>score</code>, optional <code>metrics</code>, and optional <code>notes</code>.</p>
+<p>I told Codex:</p>
+<blockquote>
+ <p><code>Improve the grader to check for the right consonants and vowels using gpt-5.5</code></p>
+</blockquote>
+<p>This caused it to add another checker - <code>checkers/haiku-judge</code> - which uses Python to execute <code>llm</code> prompts to evaluate the haikus. You can see <a href="https://gist.github.com/simonw/fdf3fea4e2b0d910a014339211ab5901">the full script here</a>. Here's the system prompt it used:</p>
+<blockquote>
+ <p><code>Evaluate the haiku below.</code></p>
+ <p><code>Count spoken syllables in each line using standard contemporary English pronunciation. Judge pronunciation, not the number of written vowel or consonant letters. A defensible common alternate pronunciation is acceptable. Also decide whether the poem clearly follows the subject requested by this task: \{task_prompt}</code></p>
+ <p><code>Score poetic quality from 0.0 to 1.0 based on imagery, coherence, economy, and whether it feels like a haiku rather than three arbitrary fragments. Do not reward or punish the poem for punctuation or capitalization.</code></p>
+ <p><code>Haiku:</code> <code>&lt;haiku&gt;</code> <code>\{haiku}</code> <code>&lt;/haiku&gt;</code></p>
+</blockquote>
+<p>The <code>task_prompt</code> was one of the two defined by the two tasks:</p>
+<blockquote>
+ <p><code>Write a haiku about two otters in love. Reply with only the haiku, exactly three lines.</code></p>
+</blockquote>
+<p>Or:</p>
+<blockquote>
+ <p><code>Write a haiku about a pelican. Reply with only the haiku, exactly three lines.</code></p>
+</blockquote>
+<p>The script also passes a schema describing and enforcing the shape of the JSON it wants to get back:</p>
+<pre><code>\{
+  "type": "object",
+  "properties": \{
+    "line_syllables": \{
+      "type": "array",
+      "items": \{"type": "integer"},
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "follows_575": \{"type": "boolean"},
+    "subject_present": \{"type": "boolean"},
+    "poetic_quality": \{"type": "number", "minimum": 0, "maximum": 1},
+    "notes": \{"type": "string"}
+  },
+  "required": [
+    "line_syllables",
+    "follows_575",
+    "subject_present",
+    "poetic_quality",
+    "notes"
+  ],
+  "additionalProperties": false
+}</code></pre>
+<p>Now <code>graders/default.yaml</code> looks like this, with a new <code>pass_threshold</code> that is checked against the grade's score - taken from the last check to emit one, in this case <code>haiku-judge</code>:</p>
+<pre><code>name: default
+checks:
+  - checker: ../checkers/three-lines
+    required: true
+  - checker: ../checkers/haiku-judge
+    model: gpt-5.5
+    required: true
+scoring:
+  pass_threshold: 0.8</code></pre>
+<p>The new checker script ends with this:</p>
+<pre><code>raise SystemExit(0 if pattern_correct and subject_present else 1)</code></pre>
+<p>This means it only exits successfully if both the full 5-7-5 pattern and the subject are present. The overall outcome is a fail if any check fails.</p>
+<p><code>smevals</code> deliberately separates running the evals from grading them, which means that after you have updated a grader you can run it against the existing logged results like this:</p>
+<pre><code>uvx smevals grade . --regrade</code></pre>
+<h2>Browsing the results</h2>
+<p><code>smevals</code> includes a web application for browsing the results of the runs and grades. You can run that against a project like this:</p>
+<pre><code>uvx smevals serve .</code></pre>
+<p>This defaults to running on port 7001, or you can set a different port using the <code>--port</code> option, e.g. <code>--port 8000</code>.</p>
+<p>The application lets you explore runs and grades, and see how the different models and configurations hold up against each other:</p>
+<p><img alt="Screenshot of an evaluation dashboard for a haiku-writing benchmark, testing whether models can reply with exactly three non-empty lines. A header describes the eval, with panels below showing a leaderboard ranking three GPT models by score, lists of recent runs and recent grades, tag pass rates, the two haiku prompts that were tested, and details of the graders used with a 0.8 pass threshold."></p>
+<p>You can also build a static site version of the report using this command:</p>
+<pre><code>uvx smevals build .</code></pre>
+<p>This will create a <code>build/</code> directory containing an <code>index.html</code> page and a copy of the files needed to render the report. Deploy that to static file hosting - or run <code>uv run python -m http.server</code> to start a local server - and you'll get a website that <a href="https://static.simonwillison.net/static/2026/smevals-haiku-build/">looks like this</a>.</p>

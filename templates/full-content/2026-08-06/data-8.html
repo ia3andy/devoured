@@ -1,0 +1,77 @@
+<h1>pgGraph</h1>
+<p><strong>Graph database superpowers for your existing Postgres data.</strong></p>
+<p>pgGraph is a PostgreSQL extension for running graph search, traversal, shortest path, and relationship queries directly against ordinary PostgreSQL tables.</p>
+<p>Your tables stay the source of truth. pgGraph builds a derived graph index and lets you query it from SQL using functions in the <code>graph</code> schema.</p>
+<p><strong>Looking for a managed version?</strong> We have launched a managed version of pgGraph on <a href="https://polygres.com">polygres.com</a> for full high performance GraphRAG on Postgres.</p>
+<h2>Why pgGraph?</h2>
+<p>PostgreSQL is great at relational queries, but graph-style questions often require custom recursive SQL for each schema:</p>
+<ul>
+ <li>“Find records related to Alice within 2 hops.”</li>
+ <li>“Find the shortest path between this person and this company.”</li>
+ <li>“Search nodes across registered tables.”</li>
+</ul>
+<p>pgGraph adds graph queries on top of your existing PostgreSQL tables, without requiring a separate graph database, graph-specific storage system, or a new query language.</p>
+<h2>Quickstart</h2>
+<p>The repository quickstart builds a disposable PostgreSQL 17 image:</p>
+<pre><code>git clone https://github.com/evokoa/pggraph.git
+cd pggraph
+scripts/quickstart.sh</code></pre>
+<p>The signed multi-architecture release image is <code>ghcr.io/evokoa/pggraph:1.0.0</code>. Verify its published digest before deployment.</p>
+<p>Verify the extensions are loaded (uses <code>psql</code> inside the container, so you don't need a local PostgreSQL client):</p>
+<pre><code>docker exec pggraph psql -U postgres -d graph \
+  -c "SELECT extname, extversion FROM pg_extension WHERE extname IN ('graph', 'pg_cron');"</code></pre>
+<p>If you have <code>psql</code> installed locally you can also connect directly:</p>
+<pre><code>psql -h localhost -U postgres -d graph</code></pre>
+<h2>Homebrew Installation</h2>
+<p>The <a href="https://github.com/Evokoa/homebrew-tap">Evokoa Homebrew tap</a> is the convenience channel for local PostgreSQL 17 extension installs.</p>
+<pre><code>brew tap Evokoa/tap
+brew install pggraph
+brew test pggraph</code></pre>
+<p>Create and verify the extension in a local database:</p>
+<pre><code>brew services start postgresql@17
+psql -d postgres -c "CREATE EXTENSION graph;"
+psql -d postgres -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'graph';"</code></pre>
+<p>The formula installs pgGraph 1.0.0 from the signed release bundle.</p>
+<h2>PGXN Source Installation</h2>
+<p>PGXN provides the verified source ZIP from the signed 1.0.0 release bundle. Because pgGraph is a Rust/pgrx extension, building from source requires the Rust toolchain.</p>
+<h3>Prerequisites</h3>
+<ul>
+ <li>PostgreSQL development headers and <code>pg_config</code></li>
+ <li>Rust toolchain (<code>1.96</code>, pinned by <code>graph/rust-toolchain.toml</code>)</li>
+ <li><code>cargo-pgrx</code> 0.19.1</li>
+</ul>
+<h3>Install with pgxn-client</h3>
+<pre><code>cargo install cargo-pgrx --version 0.19.1 --locked
+# Register the installed PostgreSQL with pgrx (auto-detects the major):
+PG_MAJOR=$(pg_config --version | sed -E 's/[^0-9]*([0-9]+).*/\1/')
+cargo pgrx init --pg$\{PG_MAJOR}="$(which pg_config)"
+pgxn install pgGraph</code></pre>
+<h3>Manual source install</h3>
+<pre><code>git clone https://github.com/evokoa/pggraph.git
+cd pggraph
+make install # may need sudo
+psql -d postgres -c "CREATE EXTENSION graph;"</code></pre>
+<h2>Documentation</h2>
+<p>More information is available in the pgGraph docs:</p>
+<p><strong><a href="https://docs.evokoa.com/pggraph/user_guide">Overview</a></strong> · <strong><a href="https://docs.evokoa.com/pggraph/quickstart">Quickstart</a></strong> · <strong><a href="https://docs.evokoa.com/pggraph/user_guide/installation">Installation</a></strong> · <strong><a href="https://docs.evokoa.com/pggraph/user_guide/playground">Playground</a></strong> · <strong><a href="https://docs.evokoa.com/pggraph/user_guide/querying">Querying</a></strong> · <strong><a href="https://docs.evokoa.com/pggraph/user_guide/api-reference">SQL API</a></strong></p>
+<h2>pgGraph: High-Speed Graph Execution Inside PostgreSQL</h2>
+<p>pgGraph is not "Postgres plus graph syntax." It is a cache-friendly graph execution layer for data that already lives in your ordinary relational tables.</p>
+<p>The core idea is simple but powerful: keep PostgreSQL as your system of record, but build a highly optimized, read-heavy graph runtime from that relational metadata.</p>
+<h3>The Tech: Why It's So Fast</h3>
+<ul>
+ <li><strong>O(1) adjacency via CSR.</strong> <code>graph.build()</code> compiles your relationships into forward and reverse compressed sparse row (CSR) edge stores.</li>
+ <li><strong>A tight traversal loop.</strong> Once inside, the engine streams CSR neighbors, checking compact <code>u8</code> edge-label IDs, typed <code>FilterIndex</code> values, tenant bitmaps, active bits, and sync overlays.</li>
+ <li><strong>Read-only artifact mapping.</strong> Persisted <code>.pggraph</code> artifacts are written atomically, allowing the operating system page cache to share those physical pages across isolated PostgreSQL backends.</li>
+ <li><strong>Predictable and safe.</strong> pgGraph includes explicit circuit breakers: depth limits, visited-node tracking, frontier limits, pagination, and strict OOM/memory safeguards.</li>
+</ul>
+<h3>PostgreSQL Remains Authoritative</h3>
+<p>Your application data does not move. Source tables, constraints, indexes, ACLs, RLS, backups, and app writes remain 100% standard PostgreSQL concerns.</p>
+<h3>How pgGraph Compares</h3>
+<h4>vs. Apache AGE: Execution Layer vs. Storage Layer</h4>
+<p>Apache AGE is a property graph database inside Postgres. pgGraph does not ask you to move your data or learn Cypher. Use AGE for a dedicated property graph model; use pgGraph to add bounded, high-speed graph traversal to an existing relational schema.</p>
+<h4>vs. PostgreSQL 19 SQL/PGQ</h4>
+<p>SQL:2023 and PostgreSQL 19 introduce <code>CREATE PROPERTY GRAPH</code>. pgGraph operates at a different layer by precomputing CSR adjacency stores for workloads that repeatedly traverse the same topology with bounded depth and path limits.</p>
+<h2>Community</h2>
+<p>pgGraph is built by <a href="https://evokoa.com">Evokoa</a>.</p>
+<h2>License</h2>
+<p>Apache-2.0.</p>

@@ -1,0 +1,162 @@
+<h1>Prototype on a laptop, scale to 16 billion rows: one Polars query</h1>
+<p>A pattern we often see at data teams: exploration happens on a laptop in one tool, and once the dataset outgrows the laptop, the pipeline is rewritten in a second tool that scales. From that point on the team maintains two implementations of the same logic, and the two tend to drift apart. Every change has to be made twice, and once the implementations drift, the dashboard and the notebook start disagreeing about the same number.</p>
+<p>This post shows a workflow without the rewrite. We take a subset of a large dataset, explore it locally, and build an ETL pipeline from what we find. Then we run the exact same Polars queries on the full month of Polymarket orderbook data, 16 billion rows, on Polars Cloud. What changes between the laptop and the cluster is the method call that decides where execution happens. The results feed a Plotly Dash dashboard hosted on Plotly Cloud.</p>
+<p>The dashboard the pipeline feeds, live to explore.</p>
+<h2>The workflow</h2>
+<p>Our example data comes from Polymarket, a prediction market where users trade on the outcomes of real-world events. It publishes its full orderbook as a public dataset: every price update, for every active market, logged with a millisecond timestamp. One hour of that data is around 30 million rows, and the three hours we prototype on total 97 million, which still runs comfortably on a laptop. One month is 16 billion rows in around 500 GB of compressed Parquet, which requires larger machines.</p>
+<p>Raw orderbook events land in S3 as hive-partitioned Parquet. Polars transforms that raw data into the smaller files that back each plot. A subset of a few hours has the same shape as the full month, so one LazyFrame serves both scales: collected locally while prototyping, then run distributed on Polars Cloud against the full month. Its output is a handful of small, pre-aggregated Parquet artifacts in S3. Plotly handles visualisation and serving: a Dash app on Plotly Cloud reads those artifacts to power the dashboard and an MCP endpoint. The two halves meet at the artifacts.</p>
+<p>We built this project together with the Plotly team, and the write-up spans two posts. This one covers the compute half: decoding, aggregating, and scaling the data with Polars.</p>
+<h2>Step 1: explore a subset locally</h2>
+<p>We scope to the first three hours of the month before writing any pipeline code. That is enough data to work out the schema, the payload format, and the transformations the dashboard needs, with the fast feedback of local execution. It is also deliberately more than one hour: an hour is a single leaf partition, while three hours span multiple partitions, so the subset has the same structure as the full month and the query already handles the multi-file scan it will meet at scale.</p>
+<pre><code>import polars as pl
+
+pl.Config.set_engine_affinity("streaming")
+
+storage_options = \{"aws_region": "us-east-1"}
+
+lf = pl.scan_parquet(
+    [
+        f"s3://bucket/raw/orderbook/year=2026/month=03/day=01/hour=\{h:02d}/*.parquet"
+        for h in range(3)
+    ],
+    storage_options=storage_options,
+)
+print(lf.collect_schema())</code></pre>
+<p><code>collect_schema</code> resolves column names and dtypes from the file metadata without reading any data, so it is the cheapest first look at an unfamiliar dataset. To see actual values, pull a single row and <code>glimpse</code> it:</p>
+<pre><code>lf.head(1).collect().glimpse()</code></pre>
+<p><code>glimpse</code> prints one row per column, so the wide <code>data</code> payload stays readable instead of being squashed into a table cell.</p>
+<p><strong>Tip: set <code>streaming</code> affinity once, affect all collects</strong></p>
+<p><code>set_engine_affinity</code> is a global config. Call it once at module load and every <code>.collect()</code> in that process uses the streaming engine, which processes data in chunks and keeps memory bounded on scans larger than RAM. It will become the default engine in an upcoming release.</p>
+<p>Each row is a raw event: two timestamps, a <code>market_id</code>, an <code>update_type</code>, and a <code>data</code> column holding a JSON payload. A <code>value_counts</code> shows two event types: <code>price_change</code>, which fires whenever the best bid or ask on a market moves, and the much rarer <code>book_snapshot</code>, which we only use for the dashboard’s depth chart. The <code>price_change</code> payload holds eight JSON keys, of which we need three. Polars decodes them inline with <code>str.json_decode</code> and a <code>pl.Struct</code> schema that declares only those three fields, so the rest is never parsed, and casts the string-quoted prices to <code>Float64</code> along the way. The <code>side</code> column becomes a <code>pl.Enum</code>, a categorical type with a fixed set of values that is safe to use across distributed workers. We build a single LazyFrame, <code>price_changes</code>, that filters, decodes, and computes the spread:</p>
+<pre><code>PRICE_CHANGE_SCHEMA = pl.Struct(\{
+    "side": pl.String,
+    "best_bid": pl.String,
+    "best_ask": pl.String,
+})
+
+price_change_expr = pl.col("data").str.json_decode(PRICE_CHANGE_SCHEMA)
+price_changes = (
+    lf.filter(pl.col("update_type") == "price_change")
+    .select(
+        "timestamp_received",
+        "market_id",
+        price_change_expr.struct.field("side").cast(pl.Enum(["YES", "NO"])),
+        price_change_expr.struct.field("best_bid").cast(pl.Float64),
+        price_change_expr.struct.field("best_ask").cast(pl.Float64),
+    )
+    .with_columns(
+        (pl.col("best_ask") - pl.col("best_bid")).alias("spread")
+    )
+)
+
+df = price_changes.collect()</code></pre>
+<p><strong>Prediction market prices</strong></p>
+<p>Prices are probabilities between 0 and 1. A <code>YES</code> price of 0.72 means the market prices a 72% chance the event resolves <code>YES</code>. Each market side has a best bid and a best ask, and the spread is the gap between them: narrow in active, liquid markets, wide where trading is thin.</p>
+<p>A few group-bys settle the design questions. Activity is heavily skewed: a small set of liquid markets accounts for most of the events, while thousands of markets barely trade. Users will want to drill into one liquid market’s history or scan across markets to compare them. Both views filter on <code>market_id</code> and a timestamp range, so those are the two axes the pipeline output has to be cheap to slice along.</p>
+<h2>Step 2: shape small artifacts for the app</h2>
+<p>The dashboard is a web app that could serve many concurrent users, and running a full scan of 16 billion raw events on every page load is not viable. So the heavy aggregation runs ahead of time as a batch job on Polars Cloud, and the dashboard reads only its output.</p>
+<p><strong>Tip: separate compute from serve</strong></p>
+<p>Run the heavy aggregation once, on a schedule or on demand, and write the results as small artifacts. The app reads only those artifacts, so a page load never scans the raw dataset. The cost of the big scan is paid once per refresh instead of once per visitor.</p>
+<p>The pipeline runs in two stages. Stage 1 is the decode we built while exploring: it filters, decodes, and casts the raw events, and sinks the typed result to an intermediate prefix on S3. Stage 2 scans those intermediates, so each aggregation job works with typed columns instead of re-parsing JSON strings:</p>
+<pre><code>price_changes = pl.scan_parquet(
+    "s3://bucket/artifacts/_intermediate/price_changes/",
+    storage_options=storage_options,
+)</code></pre>
+<p>From that one LazyFrame, Stage 2 writes six artifacts, one per dashboard view:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Artifact</th>
+   <th>Grain</th>
+   <th>Dashboard view</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>market_profile.parquet</code></td>
+   <td>one row per market: spread stats, mid volatility, activity rank</td>
+   <td>leaderboard and market stats</td>
+  </tr>
+  <tr>
+   <td><code>activity_pulse.parquet</code></td>
+   <td>global event counts per 1-minute bucket</td>
+   <td>activity timeline</td>
+  </tr>
+  <tr>
+   <td><code>activity_heatmap.parquet</code></td>
+   <td>event counts by hour-of-day, top 100 markets</td>
+   <td>activity heatmap</td>
+  </tr>
+  <tr>
+   <td><code>prices.parquet</code></td>
+   <td>1-minute bid/ask per market, <code>YES</code> side, sorted by <code>market_id</code></td>
+   <td>price and spread charts</td>
+  </tr>
+  <tr>
+   <td><code>depth_chart/</code></td>
+   <td>order book snapshots, flat rows per price level</td>
+   <td>depth chart replay</td>
+  </tr>
+  <tr>
+   <td><code>market_names.parquet</code></td>
+   <td>one row per market</td>
+   <td>human-readable names</td>
+  </tr>
+ </tbody>
+</table>
+<p>The heaviest artifact is under 5 MB, so clicking through markets never triggers a scan of the raw data. All six jobs are the same shape: filter, <code>group_by</code>, <code>agg</code>, <code>sink_parquet</code>. One is enough to show the pattern. Here is the activity pulse:</p>
+<pre><code>activity_pulse = (
+    price_changes.with_columns(
+        pl.col("timestamp_received").dt.truncate("1m").alias("minute_bucket")
+    )
+    .group_by("minute_bucket")
+    .agg(
+        pl.len().alias("events"),
+        pl.n_unique("market_id").alias("live_markets"),
+    )
+    .sort("minute_bucket")
+)
+
+activity_pulse.sink_parquet("artifacts/activity_pulse.parquet")</code></pre>
+<p><strong>Tip: <code>dt.truncate</code> + <code>group_by</code> instead of <code>group_by_dynamic</code></strong></p>
+<p><code>group_by_dynamic</code> requires the index column to be sorted, which on unsorted data means a global sort: expensive, and hard to distribute. Truncating a timestamp to a bucket and using a plain <code>group_by</code> produces the same result for non-overlapping tumbling windows, with one caveat: buckets without events are omitted instead of appearing as zero rows. It is fully partitionable: each worker can aggregate its own chunk independently.</p>
+<h2>Step 3: run the same query on the full dataset</h2>
+<p>The full dataset covers one month of trading: 16 billion raw events in 500 GB of compressed Parquet. This is too much for a laptop, so we scale up to a cluster. The pipeline code stays the same. The only difference is how the query executes.</p>
+<pre><code>import polars_cloud as pc
+
+pc.authenticate()
+
+ctx = pc.ComputeContext(workspace="my-workspace", name="polymarket-pipeline")
+ctx.start()</code></pre>
+<p>With the context running, moving a query to the cluster is one change to the call:</p>
+<pre><code>activity_pulse.remote(ctx).sink_parquet(
+    "s3://bucket/artifacts/activity_pulse.parquet",
+    sink_to_single_file=True,
+    storage_options=storage_options,
+)</code></pre>
+<p>The LazyFrame is the same object in both calls. <code>remote(ctx)</code> hands it to Polars Cloud, which distributes the scan and aggregation across the cluster. A distributed sink writes its output as multiple files by default, and <code>sink_to_single_file=True</code> merges it into one. The decode we wrote to eyeball three hours of data now processes 16 billion rows, and there is no second implementation to keep in sync with the prototype.</p>
+<h2>Step 4: hand the artifacts to Plotly Dash</h2>
+<p>The dashboard reads the manifest on startup and loads the global artifacts (market profile, activity pulse) into memory. Per-market data is fetched on demand. <code>prices.parquet</code> is written with <code>sink_to_single_file=True</code> and sorted by <code>market_id</code>, so filtering to a single market lets the Parquet reader skip row groups that cannot match. Results are cached on the Plotly Cloud instance with <code>@lru_cache</code> so each market is read from S3 at most once:</p>
+<pre><code>from functools import lru_cache
+
+@lru_cache(maxsize=128)
+def query_price_and_spread_data(market_id: str) -&gt; pl.DataFrame:
+    return (
+        pl.scan_parquet(artifact_url("prices.parquet"), storage_options=storage_options)
+         .filter(pl.col("market_id") == market_id)
+         .collect()
+    )</code></pre>
+<p><strong>Predicate pushdown</strong></p>
+<p>Parquet files store row-group statistics (min/max per column). When a query filters on <code>market_id</code>, the reader checks those statistics and skips row groups whose range cannot contain the target value, before reading any data. Sorting the file by <code>market_id</code> before writing concentrates each market’s rows into a few row groups, which maximises the skipping.</p>
+<p>Dash callbacks pass the resulting Polars DataFrame directly to Plotly figure constructors:</p>
+<pre><code>@app.callback(
+    Output("price-chart", "figure"),
+    Output("spread-chart", "figure"),
+    Input("market-dropdown", "value"),
+)
+def update_selected_market(market_id):
+    df = query_price_and_spread_data(market_id)
+    label = market_name(market_id)
+    return price_chart_figure(df, label), spread_chart_figure(df, label)</code></pre>
+<h2>The same work, scaled</h2>
+<p>Explore a subset locally, with fast feedback, until the decode and the aggregations are right. Run the same LazyFrames on the full dataset with <code>.remote(ctx)</code>, on Polars Cloud or on your own cluster. Serve small pre-aggregated artifacts to a Plotly Dash app, so no page load touches the raw data. Polars transforms the data, and Plotly Dash visualizes and serves it, with a handful of small Parquet files in S3 as the interface between them.</p>

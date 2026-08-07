@@ -1,0 +1,46 @@
+<p>Imagine typing this into a chat window: <em>who deleted the rows from <code>orders</code> on Tuesday night, and what exactly did they run?</em></p>
+<p>And getting a straight answer: “<strong>One account. Sixty-seven row changes”. </strong>Every one attributed, the statements quoted back verbatim, and a note about what could not be proven. No ssh, no log files, no query to write.</p>
+<p>You can. With DB Trail.</p>
+<h2>Why nobody answers this today</h2>
+<p>A row goes missing, somebody asks who deleted it, and in most teams nobody knows. Not for lack of evidence. Enterprise Audit gives you three ways to read it, and none of them is a query.</p>
+<ul>
+ <li>You grep the files on the database server.</li>
+ <li>Or you switch the log to JSON and page through <code>audit_log_read()</code>, which seeks to a timestamp and then hands you 32 KB at a time, with no way to say WHERE user = or WHERE table =.</li>
+ <li>Or you ship the files somewhere that does have a query engine, which means running a logging platform all year for a question you ask twice a year.</li>
+</ul>
+<p>On RDS it is not even that log. Amazon audits MySQL with the MariaDB plugin: plain text, no JSON, no <code>audit_log_read()</code>, and the statement truncated at 1,024 characters by default. The files live on the instance under a small rotation budget and come out one portion at a time through <code>DownloadDBLogFilePortion</code>, so the supported path is to publish them to CloudWatch, billed per gigabyte in and per gigabyte scanned.</p>
+<p>A consultancy wrote up a real client: 1 TB a month, five-year retention, roughly $6,500 a year in ingestion and storage and past $30,000 across the window. Their fix was to cut the CloudWatch window to 30 days and lifecycle the rest into Glacier Deep Archive. Readable, in the sense that a restore, a table definition and someone who remembers the schema make it readable. The audit log stays affordable as long as nobody asks it anything.</p>
+<p>So people stop asking. You pay to record evidence you never read, and what you recorded tells you which statements ran, not which rows left.</p>
+<h2>Keep the answer, not the log</h2>
+<p>Ask what an audit log is for, forensically. Its whole job is to prove one thing: <strong>which account held connection 58, and between which two instants.</strong> That proof is small, it stops changing when the session ends, and it does not need to sit in a log for five years.</p>
+<p>So a <strong>DB Trail</strong> capture daemon reads your live session list twice a second, reads the audit log once a minute if you have one, and writes down the sessions behind each indexed change. <strong>One row per session, not per event.</strong> A session that changed a million rows is one row. Audit logs grow with your statements; this grows with your connections, so it can be kept forever.</p>
+<p>Which flips the economics. The log only has to survive long enough to be read once, minutes, not years. The answer outlives it rotating, the events aging into Parquet on S3, and the source server being switched off.</p>
+<p>It also explains the no-plugin case. The poller alone gives you the name; the plugin adds the connect and disconnect records that bracket a session, which is the difference between very probably right and provably right.</p>
+<h2>Three ways to ask</h2>
+<h3>Ask Claude</h3>
+<p>The console exposes the engine as MCP tools, so Claude Desktop or Claude Code can ask in words.</p>
+<p>The tools take no DSN, so a client cannot point the daemon at another database, and they never fake a clean answer: ask about a window with no evidence and the reply names the sources it could not reach.</p>
+<h3>Click it</h3>
+<p>Schema, table, optional primary key. Every row comes back with the name, the source and the confidence.</p>
+<h3>From the terminal</h3>
+<p>Same engine, same filters, JSON output, for when you want to script it. The forensics documentation has the flags.</p>
+<h2>Reading the answer</h2>
+<p>Three labels, and they mean different things.</p>
+<ul>
+ <li><strong>exact</strong>: proven, the log shows that connection belonged to this account and its session was open at that moment.</li>
+ <li><strong>corroborated</strong>: the name matches the number, but nothing proves the session was open then. Strong evidence, not proof.</li>
+ <li><strong>heuristic</strong>: more than one candidate matched and dbtrail picked the likeliest, and says so.</li>
+</ul>
+<p>Some things no tool can tell you. Behind a connection pooler the database sees the pool’s session, so many users share one identity. A replica’s binlog carries the applier’s connection ids, not the client’s.</p>
+<h2><strong>And none of it needs an audit plugin</strong>, if you don’t want one</h2>
+<p>The connection behind every row change is already in your binlog. The name behind that connection is in <code><strong>performance_schema.threads</strong></code>, on by default in MySQL 8, which joins to the binlog on <code>PROCESSLIST_ID</code>. With one catch: that row disappears the moment the session ends.</p>
+<p>The mapping has to be captured while the connection is alive. Nobody has it three weeks later, in the middle of the incident, which is the only time anyone wants it. The original SQL is one dynamic flag away: <code><strong>binlog_rows_query_log_events</strong></code>, off by default, <code>SET GLOBAL</code> without a restart, and from then on the statement text rides along with the row events.</p>
+<h2>The part no audit log can do</h2>
+<p>Knowing who is half an incident. Every indexed event also carries the row as it was, so the same evidence that named the person reverses the damage:</p>
+<pre><code>-- Recovery SQL generated by bintrail
+-- 1204 statements. Review before applying.
+INSERT INTO `app`.`orders` (`id`, `customer_email`, `status`, `total`, ...)
+  VALUES (4821, 'maria.lopez@example.com', 'pending', 149.90, ...);</code></pre>
+<p>Nothing runs. You get the reversal SQL to review and apply in a transaction, rebuilt from the before images, scoped to that one transaction. The recovery guide has the rest.</p>
+<p>At any budget, an audit log ends at “here is who to blame”. This ends at “here is your data back”.</p>
+<p>Capture has to be running before the row goes missing, which makes the quick start a calm day job.</p>
