@@ -1,0 +1,254 @@
+<h1>Channels SDK</h1>
+<p><strong>Bring any AI agent into Slack, Microsoft Teams, and the channels where work happens — with native, interactive UI.</strong></p>
+<p>Your agent keeps its tools, model, and business logic. Channels gives it a native place to work with people.</p>
+<h2>Your agent belongs where work happens</h2>
+<p>Channels connects an AG-UI-compatible agent to the communication platforms your team already uses. The agent can understand the conversation, stream a response, call tools, work with files, render interactive UI, and pause for human approval.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Bring your agent</th>
+   <th>Render native UI</th>
+   <th>Keep people in control</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Use CopilotKit's built-in agent or connect LangGraph, CrewAI, Mastra, Pydantic AI, Google ADK, and other AG-UI agents.</td>
+   <td>Describe a message once and render it as native Slack Block Kit, Teams Adaptive Cards, and platform-specific UI.</td>
+   <td>Put buttons, choices, and approval gates directly into the conversation before an agent acts.</td>
+  </tr>
+ </tbody>
+</table>
+<h3>One interaction, native to every channel</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Slack</th>
+   <th>Microsoft Teams</th>
+   <th>Discord</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>An agent triages a bug report and asks for approval in Slack</td>
+   <td>An agent analyzes a spreadsheet and returns metrics in Microsoft Teams</td>
+   <td>An agent reads deployment logs and renders a chart in Discord</td>
+  </tr>
+ </tbody>
+</table>
+<p>Channels is built for a world where the same agent can meet users across every communication surface. Managed connections for Slack and Microsoft Teams are available through CopilotKit Intelligence, with more channels on the way.</p>
+<h2>Try it before you build it</h2>
+<p>Experience a real Channels agent in Slack or Microsoft Teams without configuring an app, runtime, or provider credentials.</p>
+<h3>Try Channels →</h3>
+<p>Choose a platform, join the experience, and see how an agent handles context, tool use, and native channel UI.</p>
+<h2>Build your first Channel</h2>
+<p>Your agent and application logic run in your infrastructure. CopilotKit Intelligence manages the platform connection and delivers each turn to your long-running Channels process.</p>
+<h3>Fastest path: let your coding agent drive</h3>
+<p>Building a Channels agent spans a project, an agent, a managed Channel, a provider app, and a long-running runtime. One guide walks your agent through all of it.</p>
+<pre><code>npx copilotkit@latest channels setup</code></pre>
+<p>That installs the <code>channels-setup</code> skill, prints a prompt, and copies it to your clipboard. Paste it into your coding agent.</p>
+<p>The skill is a pointer — it fetches the workflow from copilotkit.ai/channels-guide.md when your agent needs it, so the steps are current even if the installed skill is months old. The guide asks which platform you want, Slack or Microsoft Teams, and which agent framework.</p>
+<p>Your agent drives the Slack and Intelligence consoles itself, in your own signed-in session. If it has no browser or computer-use tool yet, it will ask you to add one first — that is the intended path, not a fallback. You type the secrets; it does the clicking.</p>
+<p><strong>Or install the Slack setup skill on disk</strong></p>
+<p>Skip the hosted guide and put the Slack workflow directly in the coding agent you are already running in:</p>
+<pre><code>npx copilotkit@latest skills install --skill setup-slack-channel -y</code></pre>
+<p><code>-y</code> installs that one skill without opening a picker. The skill is scoped to Slack — for Microsoft Teams, use the guide above.</p>
+<p>The CLI covers the Intelligence side: <code>copilotkit channels add --adapter slack</code> declares the Channel and attaches the adapter, and <code>copilotkit channels status</code> compares your configuration, your code, and the server. What stays in the browser is the provider side — creating the Slack app and installing it into a workspace — plus issuing the project API key. No CLI flag accepts a credential value, so the bot token and signing secret stay in your <code>.env</code> and with you.</p>
+<blockquote>
+ <strong><code>Unknown option '--skill'</code>?</strong> An older <code>copilotkit</code> — globally installed or left in the npx cache — is shadowing the current CLI. Keep the <code>@latest</code>; that is what forces npx to fetch the current version instead of reusing what it already has.
+</blockquote>
+<p>The steps below are the same path, done by hand.</p>
+<h3>1. Configure the connection</h3>
+<p>Create a Channel in CopilotKit Intelligence and connect Slack. Keep the Channel <strong>Code</strong> and project-scoped Intelligence API key for the next steps.</p>
+<p>You need Node.js 22 or later and a long-running Node process or container.</p>
+<h3>2. Install the SDK</h3>
+<pre><code>npm install @copilotkit/channels @copilotkit/runtime
+npm install --save-dev tsx typescript @types/node
+npm pkg set type=module</code></pre>
+<p>Channels and Runtime ship together as a tested pair. Upgrade both packages together.</p>
+<h3>3. Create the listener</h3>
+<p>The example below uses CopilotKit's built-in agent. Replace <code>makeAgent</code> with any AG-UI-compatible agent factory without changing the Channel lifecycle.</p>
+<pre><code>// channel.ts
+import \{ createServer } from "node:http";
+import \{ createChannel } from "@copilotkit/channels";
+import \{
+  BuiltInAgent,
+  CopilotKitIntelligence,
+  CopilotRuntime,
+} from "@copilotkit/runtime/v2";
+import \{ createCopilotNodeListener } from "@copilotkit/runtime/v2/node";
+
+function required(name: string): string \{
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing required environment variable: $\{name}`);
+  return value;
+}
+
+function makeAgent(threadId: string) \{
+  const agent = new BuiltInAgent(\{ model: "openai:gpt-5.4-mini" });
+  agent.threadId = threadId;
+  return agent;
+}
+
+const channel = createChannel(\{
+  name: required("CHANNEL_CODE"),
+  identifyUser: "platform",
+  agent: makeAgent,
+});
+
+channel.onMessage(async (\{ thread, message }) =&gt; \{
+  await thread.runAgent(\{
+    prompt: message.contentParts?.length
+      ? [
+          ...(message.text
+            ? [\{ type: "text" as const, text: message.text }]
+            : []),
+          ...message.contentParts,
+        ]
+      : message.text,
+    context: [\{ description: "Originating platform", value: message.platform }],
+  });
+});
+
+const intelligence = new CopilotKitIntelligence(\{
+  apiKey: required("INTELLIGENCE_API_KEY"),
+});
+
+const runtime = new CopilotRuntime(\{
+  agents: \{},
+  intelligence,
+  identifyUser: () =&gt; (\{
+    id: "channels-runtime",
+    name: "Channels Runtime",
+  }),
+  channels: [channel],
+});
+
+const listener = createCopilotNodeListener(\{
+  runtime,
+  basePath: "/api/copilotkit",
+});
+
+const channels = listener.channels;
+if (!channels) throw new Error("Channels control surface was not created.");
+
+const server = createServer(listener);
+const shutdown = async () =&gt; \{
+  await channels.stop();
+  if (server.listening) server.close();
+};
+process.once("SIGINT", shutdown);
+process.once("SIGTERM", shutdown);
+
+await channels.ready(\{ timeoutMs: 30_000 });
+
+const status = channels.status();
+if (status.overall !== "online") \{
+  throw new Error(`Channel is not online: $\{JSON.stringify(status)}`);
+}
+
+const port = Number(process.env.PORT ?? 3000);
+server.listen(port, () =&gt; \{
+  console.log(`Channel online; lifecycle server listening on :$\{port}`);
+});</code></pre>
+<h3>4. Start it</h3>
+<pre><code># .env
+OPENAI_API_KEY=&lt;openai-api-key&gt;
+INTELLIGENCE_API_KEY=&lt;project-api-key&gt;
+CHANNEL_CODE=&lt;channel-code-from-intelligence&gt;
+PORT=3000</code></pre>
+<pre><code>node --env-file=.env --import tsx channel.ts</code></pre>
+<p>When Intelligence reports <strong>Online</strong>, invite the app to a Slack channel and mention it. Your agent now receives the conversation and responds in the thread.</p>
+<blockquote>
+ Want Microsoft Teams, a different agent framework, interactive approvals, files, or production deployment guidance? Continue in the Channels documentation.
+</blockquote>
+<blockquote>
+ <strong>Rather have your agent do it?</strong> Run <code>npx copilotkit@latest channels setup</code> from Fastest path above. The guide covers this same setup plus the provider and verification steps.
+</blockquote>
+<h2>How it works</h2>
+<p>Every turn follows the same path:</p>
+<ol>
+ <li>A person messages your app in Slack or Microsoft Teams.</li>
+ <li>CopilotKit Intelligence receives the platform event and delivers it to your Channels process.</li>
+ <li>Channels runs your agent over AG-UI, executes tools, and renders the result.</li>
+ <li>Intelligence sends native platform UI back into the conversation.</li>
+</ol>
+<table>
+ <thead>
+  <tr>
+   <th>You run</th>
+   <th>CopilotKit Intelligence manages</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Your agent, model credentials, tools, and business logic</td>
+   <td>Slack and Microsoft Teams platform credentials</td>
+  </tr>
+  <tr>
+   <td>The long-running Channels listener</td>
+   <td>Platform ingress and credentialed delivery</td>
+  </tr>
+  <tr>
+   <td>Application state, deployment, and logs</td>
+   <td>Runtime registration, health, and reconnects</td>
+  </tr>
+ </tbody>
+</table>
+<p>The SDK is open source and MIT licensed. CopilotKit Intelligence can be hosted by CopilotKit or self-hosted for enterprise deployments.</p>
+<h2>See a complete Channels app</h2>
+<p><strong>OpenTag</strong> is an open-source, self-hosted on-call triage assistant built with Channels.</p>
+<p>Use it to study a complete application with:</p>
+<ul>
+ <li>a Python LangGraph agent connected over AG-UI</li>
+ <li>native Slack and Microsoft Teams experiences</li>
+ <li>file-aware prompts and generative UI</li>
+ <li>human approval before Linear or Notion writes</li>
+ <li>a production-shaped Node runtime and agent service</li>
+</ul>
+<h3>Explore the OpenTag source →</h3>
+<h2>Developer resources</h2>
+<table>
+ <thead>
+  <tr>
+   <th>I want to…</th>
+   <th>Start here</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Experience Channels without setup</td>
+   <td>Try Channels</td>
+  </tr>
+  <tr>
+   <td>Build a Channel with my coding agent</td>
+   <td><code>npx copilotkit@latest channels setup</code></td>
+  </tr>
+  <tr>
+   <td>Build my first Channel</td>
+   <td>Channels documentation</td>
+  </tr>
+  <tr>
+   <td>Inspect the SDK implementation</td>
+   <td>Channels source in CopilotKit</td>
+  </tr>
+  <tr>
+   <td>Install the package</td>
+   <td><code>@copilotkit/channels</code> on npm</td>
+  </tr>
+  <tr>
+   <td>Study a complete application</td>
+   <td>OpenTag</td>
+  </tr>
+  <tr>
+   <td>Connect an existing agent</td>
+   <td>AG-UI integrations</td>
+  </tr>
+  <tr>
+   <td>Understand the protocol</td>
+   <td>AG-UI</td>
+  </tr>
+ </tbody>
+</table>
+<h2>License</h2>
+<p>MIT © CopilotKit</p>

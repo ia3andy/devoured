@@ -1,0 +1,103 @@
+<p>GreptimeDB can serve as a remote read backend for Prometheus. The last step on that path converts the columnar <code>RecordBatch</code> produced by the query engine into the row-oriented <code>TimeSeries</code> of the Prometheus protocol: group rows by their label set, and collect the samples of each series together.</p>
+<p>This function (<code>recordbatches_to_timeseries</code>) had sat untouched in the repo for a long time, until our committer @lyang24 opened PR #8587 and rewrote it. The PR changes exactly one file, <code>src/servers/src/prom_store.rs</code>.</p>
+<blockquote>
+ <p><strong>Note:</strong> GreptimeDB v1.2.0-beta.1 is out and ships this optimization.</p>
+</blockquote>
+<p>I only read this code because the PR showed up. The description includes a diagram the author drew, and its lower right corner carries a CPU profile: with 300k series and 4 concurrent reads, the <code>RecordBatch</code> → <code>TimeSeries</code> step took 36.2% of CPU, and dictionary materialization alone took 8.9%. A function that neither decompresses nor touches disk, that only moves data around in memory, burning a third of the CPU: that number is not normal.</p>
+<p>The profile came from the author, and I did not reproduce that environment. To find out how much the change itself actually gained I needed a benchmark I could run, and the bench code did not land with the PR. So I rewrote one against the public entry point and ran it on both sides of the change. The numbers before the change were not good either: 10K rows took 3.7 ms per conversion, 100K rows took 44 ms, under 3M rows per second. After the change, the best cases run more than 10x faster.</p>
+<p>This post is my walkthrough of the PR, taking the same route as 5x Slower than Go? Optimizing Rust Protobuf Decoding Performance: write a benchmark to reproduce first, then read the code section by section.</p>
+<h2>Step 1: Reproduce the Case</h2>
+<p>First, pin down the state before the change. The bench drives the public entry point <code>recordbatches_to_timeseries</code> directly, through criterion:</p>
+<pre><code>fn bench_prom_read_convert(c: &amp;mut Criterion) \{
+    let mut group = c.benchmark_group("prom_read_convert");
+    group.measurement_time(Duration::from_secs(5));
+
+    // (series count, samples per series)
+    let sizes = [(10, 1000), (100, 100), (1000, 100), (5000, 20)];
+
+    for encoding in [Encoding::Dictionary, Encoding::Utf8] \{
+        for ordering in [Ordering::Adjacent, Ordering::Interleaved] \{
+            for (series, samples) in sizes \{
+                let rows = series * samples;
+                let (schema, batch) = build_recordbatch(series, samples, ordering, encoding);
+
+                group.throughput(Throughput::Elements(rows as u64));
+                group.bench_with_input(
+                    BenchmarkId::new(
+                        format!("\{}/\{}", encoding.name(), ordering.name()),
+                        format!("\{series}x\{samples}"),
+                    ),
+                    &amp;(schema, batch),
+                    |b, (schema, batch)| \{
+                        b.iter(|| \{
+                            let batches =
+                                RecordBatches::try_new(schema.clone(), vec![batch.clone()])
+                                    .unwrap();
+                            black_box(
+                                recordbatches_to_timeseries("bench_metric", batches).unwrap(),
+                            )
+                        });
+                    },
+                );
+            }
+        }
+    }
+
+    group.finish();
+}</code></pre>
+<p>The three dimensions the loops iterate over come from real scenarios. For encoding, <code>Utf8</code> is a plain string column, and <code>Dictionary&lt;UInt32, Utf8&gt;</code> is the label layout the PromQL read path actually returns. For ordering, <code>adjacent</code> means the samples of one series are contiguous in the result (query output is generally sorted by primary key, which produces this shape), and <code>interleaved</code> means the series alternate row by row. For size, it is series count times samples per series; a typical remote read request has few series with many points each. The labels are modeled on a real metric table: <code>host</code> differs for every series, while <code>datacenter</code>, <code>env</code> and <code>job</code> have only a handful of values.</p>
+<p>The results are as follows:</p>
+<pre><code>prom_read_convert/utf8/adjacent/100x100
+                        time:   [3.6421 ms 3.6581 ms 3.6759 ms]
+                        thrpt:  [2.7204 Melem/s 2.7337 Melem/s 2.7457 Melem/s]
+
+prom_read_convert/dict/adjacent/100x100
+                        time:   [4.9186 ms 4.9330 ms 4.9482 ms]
+                        thrpt:  [2.0209 Melem/s 2.0272 Melem/s 2.0331 Melem/s]
+
+prom_read_convert/dict/adjacent/1000x100
+                        time:   [55.435 ms 55.574 ms 55.719 ms]
+                        thrpt:  [1.7947 Melem/s 1.7994 Melem/s 1.8039 Melem/s]</code></pre>
+<p>The <code>thrpt</code> line is the throughput reported by criterion. One element here is one row, so this is around 2M rows per second.</p>
+<p>Something else looks off besides the absolute speed: the dictionary-encoded group is 35% slower than the plain string group (2.0272M vs 2.7337M). Dictionary encoding exists to save memory and copies, so why is it slower? We will come back to this.</p>
+<h2>Step 2: What the Function Does for Every Row</h2>
+<p>Open the old code and the first step is <code>collect_timeseries_ids</code>. The function had carried a self-deprecating comment from the start; whoever wrote it clearly knew it was bad and just had no better place to start:</p>
+<pre><code>/// Collect each row's timeseries id
+/// This processing is ugly, hope &lt;https://github.com/GreptimeTeam/greptimedb/issues/336&gt; making some progress in future.
+fn collect_timeseries_ids(table_name: &amp;str, recordbatch: &amp;RecordBatch) -&gt; Vec&lt;TimeSeriesId&gt; \{</code></pre>
+<p>It builds an owned label vector for every row. And <code>columns</code> here is every column materialized in full, up front.</p>
+<p>The code reads clearly enough. The problem is the magnitude of the cost. Let <code>R</code> be the row count, <code>S</code> the series count, and <code>L</code> the average number of labels. One pass costs: <code>R·L</code> calls to <code>to_string()</code> for the full-column materialization; one <code>Vec&lt;Label&gt;</code> per row, so <code>R</code> heap allocations; one clone each for every label name and value, another <code>R·L</code> string copies; and one <code>BTreeMap</code> lookup per row, each on the order of <code>log(S)</code> comparisons. The comparison short-circuits at the first differing label, but in the worst case it has to walk the whole vector.</p>
+<p>So all the cost scales with the row count, while the actual information in the result is only <code>S</code> series. A typical remote read request pulls tens or hundreds of points per series, making <code>R</code> tens of times <code>S</code>, and most of the allocation and copying goes into rebuilding the same label set over and over.</p>
+<h2>Step 3: Why Dictionary Columns Were Slower</h2>
+<p>Back to the question from Step 1. The label columns returned by the PromQL read path are <code>Dictionary&lt;UInt32, Utf8&gt;</code>. Across 1000 rows, <code>host</code> might have only 3 distinct values, so the dictionary stores 3 strings and each row stores a u32 index.</p>
+<p>But <code>iter_column_as_string</code> does not recognize dictionary columns. It falls back to the generic path and calls <code>to_string()</code> row by row. The 3 strings become 1000, every allocation upstream avoided is made again here, plus one extra dictionary lookup per row. That is where the slowdown against plain string columns comes from, and it is the 8.9% listed separately in the profile at the top of this post.</p>
+<p>At this point the direction of the PR is clear: grouping only needs to read a row's value and compare it, so do not copy; borrow straight from the Arrow array. Allocate only once you have confirmed this is a series you have never seen.</p>
+<h2>Step 4: Borrow from Arrow Arrays Instead of Materializing</h2>
+<p>Copies come first. The PR wraps label columns in a borrowed view:</p>
+<pre><code>enum LabelValues&lt;'a&gt; \{
+    Utf8(&amp;'a StringArray),
+    LargeUtf8(&amp;'a LargeStringArray),
+    Utf8View(&amp;'a StringViewArray),
+    DictionaryUtf8 \{
+        dictionary: &amp;'a DictionaryArray&lt;UInt32Type&gt;,
+        values: &amp;'a StringArray,
+    },
+    Other(Vec&lt;Option&lt;String&gt;&gt;),
+}</code></pre>
+<p>The four Arrow layouts a label column can actually have get one branch each. <code>value(row)</code> returns a <code>&amp;str</code> borrowed from the array, with no copy and no allocation. Since <code>LabelValues&lt;'a&gt;</code> holds nothing but <code>&amp;'a</code> references, the Rust compiler enforces that these <code>&amp;str</code> cannot outlive the <code>RecordBatch</code>, rather than relying on convention.</p>
+<p>The dictionary branch is what Step 3 was asking for: <code>dictionary.key(row)</code> gets the index, and <code>values.value(key)</code> borrows one of the few strings in the dictionary. That is still 1000 index lookups for 1000 rows, but they all reuse the same 3 strings and never expand into 1000 owned <code>String</code>s.</p>
+<h2>Step 5: Grouping Without a BTreeMap</h2>
+<p>With copies handled, what remains is one tree lookup and one <code>Vec</code> allocation per row. The new loop looks like this. <code>LabelColumn</code> below is a column name plus the <code>LabelValues</code> from above.</p>
+<p>The outer <code>Some(index) if matches_timeseries(...)</code> targets the shape of the data. Mito's <code>SeqScan</code> sorts by primary key and time within each <code>PartitionRange</code>, so the samples of one series are mostly contiguous. Comparing the current row against the series the previous row landed on is enough to reuse it on a hit, with no hash to compute. This only optimizes a common local ordering. It can break across partitions and across ranges, and correctness does not depend on it.</p>
+<p>When the fast path breaks, and the first time each series appears, the hash path takes over. The map value is a candidate list rather than a single index, because hashes collide and a candidate still has to pass a full label comparison. Merging two different series for the sake of speed is a mistake this function cannot make.</p>
+<h2>Step 6: Do Not Change the Observable Behavior</h2>
+<p>This is protocol-layer code, so a change should touch externally observable behavior as little as possible and avoid leaving compatibility problems downstream. Three parts of the PR are there for exactly that.</p>
+<p>The old implementation used a <code>BTreeMap</code>, so output was label-ordered for free. The new one uses a <code>Vec</code>, ordered by first appearance. So a sort was added at the end. One <code>S·log(S)</code> sort is negligible against what was saved.</p>
+<p>NULL semantics have to match too. Since NULL labels are skipped, one series' label sequence can be a prefix of another's, so the comparison has to be careful.</p>
+<h2>Results</h2>
+<p>Throughput went from 1.8M–3.2M rows per second to 9.6M–34.8M, and no case got slower.</p>
+<p>The adjacent groups are much faster, 10–16x, and that comes from the fast path in Step 5: only the first row of each series needs a hash, roughly <code>S/R</code> of them. The interleaved groups compute a hash, look it up and compare on every row, and still land at 4–5x. Real query results mostly have the adjacent shape.</p>
+<p>Dictionary columns improved the most because they had the most extra cost to begin with.</p>
+<h2>Summary</h2>
+<p>The data structures did change: a <code>BTreeMap</code> became a <code>Vec</code> plus a hash index, a previous-series fast path was added, and the ordered output became one sort at the end. But most of the gain does not come from any of that. It comes from two plain things: do not copy what you can borrow, and do not repeat per row what you can do once.</p>
+<p>The dictionary-column trap from Step 3 is the part worth remembering. Upstream deliberately kept the dictionary encoding to save memory, and one <code>iter_column_as_string</code> downstream expanded it anyway, into something slower than not using a dictionary at all. This is hard to find without a benchmark.</p>
