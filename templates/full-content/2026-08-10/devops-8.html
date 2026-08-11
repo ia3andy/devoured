@@ -1,0 +1,96 @@
+<h1>How Company 3 Streamlines Studio Image Management with EC2 Image Builder and AWS CDK</h1>
+<h2>Introduction</h2>
+<p>Company 3 provides specialized services for the entertainment industry, including post-production services, visual effects, and color grading for feature films, commercials, and television content. Their teams collaborate globally to Increase workflow efficiency and expand their roster of diverse movie-making talent.</p>
+<p>Company 3’s New Technology team uses Amazon EC2 Image Builder to vend Amazon Machine Images (AMIs) and container images for compute environments where artists create and render content. Image Builder is a fully managed AWS service that helps you automate the creation, management, and deployment of customized, secure, and up-to-date server images. Company 3 also uses the AWS Cloud Development Kit (CDK) to scale the creation of consistent Image Builder components and recipes.</p>
+<p>At scale, the respective concepts of versioning between Image Builder resources and CDK infrastructure as code made it challenging to reuse prior components and recipes, and update existing references with new version numbers over time. This challenge led to creative workarounds, collaborative problem-solving with AWS, and ultimately, product improvements that benefit the entire AWS community.</p>
+<p>This blog follows their journey from manual version management, through creative workarounds, to native EC2 Image Builder features that solved the problem for good. Along the way, we’ll show how auto-versioning and CDK L2 constructs can simplify your own image pipelines.</p>
+<h2>The Challenge: When Infrastructure-as-Code Gets Complicated</h2>
+<p>While Image Builder has historically supported semantic versioning for Components and Recipes, there was no mechanism to automatically detect version changes or update existing references to the latest version of a component using the CDK. This is because Image Builder only supported Layer 1 (L1) CDK constructs. Layer 1 constructs map directly to CloudFormation resources and their corresponding service APIs, but do not provide features that create a layer of abstraction above those foundational create / update / delete operations.</p>
+<p>Version changes to Components and Recipes are a frequent occurrence because these resources are immutable; every change to them requires a new version. Version numbers are a part of these resource’s Amazon Resource Name (ARN), so changes must be propagated throughout the associated CDK code to correctly reference the latest version of each resource.</p>
+<p>The required changes broken out by each of the comprising Image Builder resources:</p>
+<ol>
+ <li>Update the Component configuration</li>
+ <li>Increment the Component version</li>
+ <li>Update the Recipe with the new Component version ARN</li>
+ <li>Increment the Recipe version</li>
+ <li>Update the Recipe version ARN in the Pipeline.</li>
+</ol>
+<p>Manual version propagation across dozens of components via this multi-step process was error prone, wasn’t scalable, and created a risk of deployment failures and version churn due to version mismatches.</p>
+<p>The team needed to prevent unnecessary update requests to Image Builder when components didn’t change but the recipes they were associated with did, orchestrate version propagations when the versions did need to change, and track component versions as they deployed updates across their infrastructure.</p>
+<h2>Short-term Workaround: Using Hashes to Identify Changes</h2>
+<p>Faced with these limitations, the customer’s engineering team got creative. Their first approach involved appending MD5 hashes to component names. This allowed them to track changes and force CDK updates and version increments when content changed, while preventing unnecessary update calls when the content of the component didn’t change but the rest of the resources in the CDK Stack did.</p>
+<p>However, this approach had drawbacks. Component names became unwieldy and difficult to maintain. More importantly, the hash-based naming convention didn’t align with semantic versioning best practices that the rest of their infrastructure followed. The team knew they needed a better solution long-term.</p>
+<h2>Long-term Automation: Collaboration with AWS</h2>
+<p>Working with their AWS Solutions Architect and EC2 Image Builder Developer Support, Company 3 developed a more elegant solution using CDK Custom Resources. This approach eliminated hash-based naming and automated the propagation of version updates, but it came with technical debt.</p>
+<p>The version increments themselves were still manual, and the solution required custom resources to create and maintain the suite of resources being deployed. The mesh of custom resources required specialized knowledge to maintain, which made it difficult to onboard new team members, and distracted engineers from focus on core business value of delivering the right studio environments to artists.</p>
+<h2>Managed Abstraction: AWS Launches Product Improvements</h2>
+<h3>EC2 Image Builder auto-versioning</h3>
+<p>In November 2025, EC2 Image Builder introduced native auto-versioning capabilities that transformed how teams manage Component versions.</p>
+<p>Components with the same name and semantic version now auto-increment build versions. Additionally, Pipelines can resolve to the highest available version of Components and Recipes, which ensures they are using the latest compatible versions without manual updates.</p>
+<p>These enhancements eliminated the version propagation burden entirely, allowing Company 3 developers to focus only on the substantive changes to Components requested by Artists and Support Engineers.</p>
+<h3>CDK Layer 2 Constructs</h3>
+<p>The second major improvement came with comprehensive Layer 2 (L2) constructs for EC2 Image Builder. L2 Constructs provide a layer of abstraction that default to best practice configuration, automatic least-privilege IAM Role and Policy provisioning, and convenience methods that make it easier to create and link to other AWS resources.</p>
+<p>Before the L2 construct release, orchestrating an Image Builder Pipeline took over 50 lines of code, and required manual least-privilege IAM role creation, instance profile setup, and Pipeline configuration across 6 separate CloudFormation resources.</p>
+<pre><code>// Using L1 constructs
+const instanceProfileRole = new iam.Role(stack, 'EC2InstanceProfileForImageBuilderRole', \{
+  assumedBy: iam.ServicePrincipal.fromStaticServicePrincipleName('ec2.amazonaws.com'),
+  managedPolicies: [
+    iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore'),
+    iam.ManagedPolicy.fromAwsManagedPolicyName('EC2InstanceProfileForImageBuilder'),
+  ],
+});
+
+const instanceProfile = new iam.InstanceProfile(stack, 'EC2InstanceProfileForImageBuilder', \{
+  role: instanceProfileRole,
+});
+
+const bucket = new s3.Bucket(stack, 'ImageBuilderLoggingBucket', \{
+  bucketName: `ec2imagebuilder-logs-$\{stack.region}-$\{stack.account}`,
+  enforceSSL: true,
+});
+
+const l1InfrastructureConfiguration = new imagebuilder.CfnInfrastructureConfiguration(stack, 'L1InfrastructureConfiguration', \{
+  name: 'l1-infrastructure-configuration',
+  instanceProfileName: instanceProfile.instanceProfileName,
+  instanceMetadataOptions: \{ httpTokens: 'required' },
+  logging: \{
+    s3Bucket: bucket.bucketName,
+    s3KeyPrefix: 'imagebuilder-logging',
+  },
+});</code></pre>
+<pre><code>const l1ImageRecipe = new imagebuilder.CfnImageRecipe(stack, 'L1ImageRecipe', \{
+  name: 'l1-image-recipe',
+  version: '1.0.0',
+  parentImage: `arn:$\{stack.partition}:imagebuilder:$\{stack.region}:aws:image/amazon-linux-2023-x86/x.x.x`,
+  components: [
+    \{
+      componentArn: `arn:$\{stack.partition}:imagebuilder:$\{stack.region}:aws:component/update-linux/x.x.x`,
+    },
+  ],
+});
+
+const l1ImagePipeline = new imagebuilder.CfnImagePipeline(stack, 'L1ImagePipeline', \{
+  name: 'l1-image-pipeline',
+  imageRecipeArn: l1ImageRecipe.attrArn,
+  infrastructureConfigurationArn: l1InfrastructureConfiguration.attrArn,
+});</code></pre>
+<p>Using the ImagePipeline L2 construct allows the developer to provision a Pipeline in fewer than 10 lines of code while leveraging best practice configuration the construct sets by default.</p>
+<pre><code>// Equivalent, using L2 constructs
+const l2ImagePipeline = new imagebuilder.ImagePipeline(stack, 'L2ImagePipeline', \{
+  recipe: new imagebuilder.ImageRecipe(stack, 'L2ImageRecipe', \{
+    baseImage: imagebuilder.AwsManagedImage.amazonLinux2023(stack, 'AL2023'),
+    components: [
+      \{
+        component: imagebuilder.AwsManagedComponent.updateOS(stack, 'UpdateOS', \{
+          platform: imagebuilder.Platform.Linux,
+        }),
+      },
+    ],
+  }),
+});</code></pre>
+<h2>The Impact: From Workarounds to Best Practices</h2>
+<p>For Company 3, these improvements meant they could retire their custom constructs entirely. The L2 constructs provided everything their custom solution did, plus additional capabilities.</p>
+<p>The EC2 Image Builder service manages the complexity of version updates by default, and they gained enhanced security through AWS-managed secure defaults like IMDSv2 requirements and least-privileged IAM roles.</p>
+<p>Perhaps most importantly, new team members can understand the infrastructure code in minutes rather than hours, dramatically accelerating onboarding.</p>
+<h2>Conclusion</h2>
+<p>The impact extends far beyond one customer. Every AWS user working with EC2 Image Builder and CDK now benefits from simplified workflows, automatic version management, and security best practices by default. What started as one team’s challenge became a catalyst for improvements that make everyone’s work easier and more secure. The evolution of EC2 Image Builder’s CDK support demonstrates AWS’s commitment to listening to customers and continuously improving the developer experience.</p>

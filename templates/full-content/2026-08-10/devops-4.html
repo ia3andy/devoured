@@ -1,0 +1,124 @@
+<h2>TL;DR</h2>
+<p>We bundled an internal Azure Pipelines task extension into a single bundled JavaScript file using esbuild. The task package dropped from tens of megabytes and thousands of files to three files per task (<code>script.js</code>, <code>task.json</code>, and <code>icon.png</code>). The change took about 20 lines of build tooling. We measured the payoff across our production pipelines:</p>
+<ul>
+ <li>Per-task download + extract on the agent: ~4.5 s to ~0.25 s (about 17x faster)</li>
+ <li>Downloads taking longer than 10 seconds: down ~98%</li>
+</ul>
+<p>Spending less time downloading and extracting tasks means we can make more efficient use of our build infrastructure. If you publish a node-based Azure DevOps task extension that ships a large <code>node_modules</code> folder or thousands of small files, you can almost certainly benefit from this same change!</p>
+<h2>Why task package size matters more than you think</h2>
+<p>Every time a pipeline job runs your task, the agent does the following during ‘Initialize job’, before your task code ever executes:</p>
+<ol>
+ <li>Downloads the task’s content zip</li>
+ <li>Extracts it to disk.</li>
+</ol>
+<p>This happens on every job, on every agent, for every task in the job. On ephemeral hosted agents (which start from a clean VM), there is no cache to save you from this startup cost.</p>
+<p>Our task had grown the way node-based tasks tend to: the compiled TypeScript plus a full <code>node_modules</code> tree that our build copied into each task folder. The result, quoting our own build script:</p>
+<p><code>// package huge (tens of MB and thousands of files per task).</code></p>
+<p>Thousands of small files is the problem here. Task extensions are packaged in a vsix file which is really just a zip file that follows a specific packaging convention. Zipping and unzipping a package with thousands of files is costly. In this case it’s also completely unnecessary.</p>
+<h2>Bundling and pruning aren’t just for the browser</h2>
+<p>Bundlers and tree-shaking carry a reputation as front-end tools. We reach for them to ship less JavaScript to a browser over a slow network, and it’s easy to assume that a server-side or CLI-style program, where “it all runs on one machine anyway,” has nothing to gain.</p>
+<p>A pipeline task is a distributable artifact that each build agent downloads and unpacks from scratch on every run, often thousands of times a day across many agents. That is the problem bundling helps to solve. Front-end developers are familiar with optimizing assets to minimize the cost of transferring and processing files. The same cost applies here; the difference is the build agents pay the cost instead of browsers.</p>
+<p>The same logic applies to anything you distribute and load repeatedly: pipeline tasks, npm-published CLIs, serverless function packages, even container image layers. If your artifact drags an entire <code>node_modules</code> tree along for the ride, tree-shaking away the code you never call and collapsing what’s left into one file pays off wherever it lands. Treat your task like something you ship, not like a folder you develop in.</p>
+<h2>The fix: bundle everything into one file</h2>
+<p>We added a single esbuild build step that bundles each task’s entry point, together with the shared Common code and all of its npm dependencies, into one bundled, tree-shaken <code>script.js</code> per task. The task’s VSIX then only needs to ship, per task:</p>
+<pre>Tasks/\{taskname}/
+  script.js     (the entire bundled task)
+  task.json     (the task manifest)
+  icon.png</pre>
+<p>You no longer ship hundreds of transitive dependency files in multiple <code>node_modules</code> folders. You simply point <code>task.json</code>‘s execution target field at <code>script.js</code>, and that’s it.</p>
+<pre>\{
+  //...
+    "execution": \{
+        "Node20_1": \{
+            "target": "script.js",
+            "workingDirectory": "$(currentDirectory)"
+        }
+    }
+}
+</pre>
+<p>The essence of the build script:</p>
+<pre>import * as esbuild from "esbuild";
+
+await esbuild.build(\{
+  entryPoints: ["Tasks/MyTask/index.ts"], // one per task
+  outfile:     "Tasks/MyTask/script.js",
+  bundle:      true,
+  treeShaking: true,
+  platform:    "node",
+  target:      "node20",  // Target the lowest Node handler your task.json declares, or emit one bundle per handler
+  format: "cjs"
+});</pre>
+<h2>Two gotchas</h2>
+<p>We hit two subtle issues that other publishers might hit too:</p>
+<ol>
+ <li>Deduplicate stateful shared modules. If you install the same package (for example azure-pipelines-task-lib) in both a shared <code>Common/node_modules</code> and each task’s own <code>node_modules</code>, esbuild can bundle two separate copies. For libraries that hold module-level state, that state splits across the copies and silently disappears (for example with <code>azure-pipelines-task-lib</code>, the internal <code>\_vault</code> that holds secrets). We wrote a small esbuild resolver plugin that forces bare-specifier imports to resolve to a single, canonical <code>node_modules</code>.</li>
+ <li>Fix sibling-asset paths if your extension contains multiple tasks and they share common code. For example:</li>
+</ol>
+<pre>Common
+  moduleA.js
+  moduleB.js
+Task1
+   script.js
+   task.json
+   distribution.json (custom file needed by the task)
+Task2
+  script.js
+  task.json
+Task3
+</pre>
+<p>Bundling collapses the <code>Tasks/\{taskname}/Common/</code> subfolder, so the emitted <code>script.js</code> now lives one level up from where the source did. Update any runtime reads of sibling files (task.json, distribution.json) that use <code>__dirname</code> to drop the now-incorrect <code>../</code> prefix.</p>
+<p>These changes took a couple iterations to fix, but knowing about them up front might save you a confusing debugging session.</p>
+<h2>How we measured the impact</h2>
+<ol>
+ <li>Task file transfer time measures how long the Azure DevOps service spends streaming each task’s zip to the agent. Across all downloads, the average dropped from ~1.35 s to ~0.23 s, and downloads taking more than 10 seconds (slow network) fell by ~98%. Here we already saw a big improvement.</li>
+ <li>Agent-side download and package extraction time. This is the number that matters to customers because it means more efficient use of build agent compute.</li>
+</ol>
+<table>
+ <tbody>
+  <tr>
+   <th>Metric (per task, download + extract)</th>
+   <th>Before</th>
+   <th>After (bundled)</th>
+   <th>Change</th>
+  </tr>
+  <tr>
+   <td>Task1</td>
+   <td>~4.5s</td>
+   <td>~0.25s</td>
+   <td><strong>🔻−94%</strong></td>
+  </tr>
+  <tr>
+   <td>Task2</td>
+   <td>~4.6s</td>
+   <td>~0.26s</td>
+   <td><strong>🔻−94%</strong></td>
+  </tr>
+  <tr>
+   <td>Both tasks combined, per job</td>
+   <td>~9.2s</td>
+   <td>~0.5s</td>
+   <td><strong>~17x faster</strong></td>
+  </tr>
+ </tbody>
+</table>
+<p>Because this task runs across a huge number of pipelines every day, the small per-job saving compounds dramatically. Overall, we’re making much more efficient use of our build agent infrastructure which means we can run more builds on the same overall CPU quota.</p>
+<p>As a pipeline author, this change delivers real savings to your customers while requiring zero changes on the customer’s side.</p>
+<h2>Some Caveats</h2>
+<p>There are some potential drawbacks here that are worth mentioning.</p>
+<ul>
+ <li>Bundled files might make debugging more challenging since your stack traces won’t point you to the original source locations. (You can output sourcemaps to help with this.)</li>
+ <li>esbuild and other static bundlers can break dynamic requires. Make sure you thoroughly test your tasks after bundling. (You may need to use the external option for some dependencies)</li>
+ <li>Bundling is a tradeoff that can result in higher memory usage. With a single large, bundled JS file, the V8 engine now needs to load the entire file into memory at startup instead of loading smaller files as they are needed. If this is a concern, you could experiment with https://esbuild.github.io/api/#splitting.</li>
+</ul>
+<h2>Should you do this? (A checklist for task publishers)</h2>
+<p>If you publish a Node-based Azure Pipelines task, you can very likely get the same benefit:</p>
+<ul>
+ <li>Check your package. Does your published task ship a <code>node_modules</code> folder with hundreds or thousands of files? (Look at the .vsix contents by renaming it to .zip and extracting the contents)</li>
+ <li>Add a bundler (esbuild, ncc, or webpack) that emits a single <code>script.js</code> per task with bundle and treeShaking enabled, targeting the Node version your task declares. (You could enabling minify too but that makes debugging more challenging as your stack traces will be unreadable unless you also output sourcemaps)</li>
+ <li>Point <code>task.json</code> at the bundled entry file.</li>
+ <li>Watch for duplicated stateful modules (especially azure-pipelines-task-lib) and deduplicate to a single instance.</li>
+ <li>Fix any <code>__dirname</code>-relative asset reads if bundling changes your output’s folder depth.</li>
+ <li>Verify the task still runs, then compare your Initialize job log timestamps before and after.</li>
+</ul>
+<p>It’s a small, self-contained change, and as we found, the payoff scales with how often your task runs.</p>
+<p>Ask your coding agent to draft a PR and test the results.</p>

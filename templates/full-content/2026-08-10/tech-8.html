@@ -1,0 +1,45 @@
+<h2>The Problem that Revision Prompting solves</h2>
+<p>We prompt LLMs in two ways:</p>
+<h3>Ad-hoc prompting</h3>
+<p>Prompts LLMs manually, with a custom instruction per call. Examples:</p>
+<ul>
+ <li>Asking a coding agent to implement a new feature.</li>
+ <li>Asking a chatbot to draft an email.</li>
+</ul>
+<h3>Industrial prompting</h3>
+<p>Prompts LLMs as part of an automated process, with the same instruction across calls. Examples:</p>
+<ul>
+ <li>Extracting structured information from invoices as part of an accounting pipeline.</li>
+ <li>Translating documentation pages into other languages as part of a release process.</li>
+</ul>
+<p>Industrial prompting typically processes some Input data with an Instruction to produce some Output. Whenever the Input gets updated, industrial prompting naively re-runs the Instruction on the UpdatedInput to produce the UpdatedOutput. This approach has two downsides:</p>
+<h3>Lack of consistency</h3>
+<p>LLMs are non-deterministic, so the UpdatedOutput differs from the original Output beyond what the UpdatedInput necessitates.</p>
+<h3>Full processing time and token costs</h3>
+<p>Although only parts of the input have changed, we produce the UpdatedOutput in full. This is as expensive as the production of the original Output.</p>
+<p><em>Revision prompting</em> resolves both downsides of naive re-runs by operating on the input and output <strong>revisions</strong> instead of the full input and output.</p>
+<h2>How Revision Prompting works</h2>
+<p>Assume you have processed some Input with an Instruction to produce some Output by prompting an LLM with Instruction: Input.</p>
+<p>Now, Input has been updated, and you also want to process the UpdatedInput. Revision Prompting processes the UpdatedInput by constructing the RevisionPrompt as:</p>
+<p>Instruction: Input produced Output. The input got updated as follows: <code>diff(Input, UpdatedInput)</code>. Please produce a patch to update the output.</p>
+<p>The LLM responds to the RevisionPrompt with the OutputPatch that we apply to the Output to obtain the UpdatedOutput.</p>
+<h3>Example</h3>
+<p>You translate the product page of an e-bike to German with the prompt:</p>
+<p><strong>Instruction:</strong> Translate to German: Input <code>The Vela 3 e-bike has a range of 80 km. Its battery recharges in three hours. The frame is made from recycled aluminium. Every Vela 3 includes a two-year warranty.</code></p>
+<p>and the LLM produces:</p>
+<p><strong>Output:</strong> <code>Das E-Bike Vela 3 hat eine Reichweite von 80 km. Sein Akku lädt in drei Stunden auf. Der Rahmen besteht aus recyceltem Aluminium. Jedes Vela 3 hat zwei Jahre Garantie.</code></p>
+<p>Later, a battery upgrade increases the range from 80 km to 100 km. Instead of re-translating the whole page, you prompt:</p>
+<p><strong>Instruction:</strong> Translate to German: Input <code>The Vela 3 e-bike has a range of 80 km. Its battery recharges in three hours. The frame is made from recycled aluminium. Every Vela 3 includes a two-year warranty.</code> produced <strong>Output:</strong> <code>Das E-Bike Vela 3 hat eine Reichweite von 80 km. Sein Akku lädt in drei Stunden auf. Der Rahmen besteht aus recyceltem Aluminium. Jedes Vela 3 hat zwei Jahre Garantie.</code> The input got updated as follows: <code>diff(Input, UpdatedInput)</code> - The Vela 3 e-bike has a range of 80 km. + The Vela 3 e-bike has a range of 100 km. Please produce a patch to update the output.</p>
+<p>The LLM responds with:</p>
+<p><strong>OutputPatch:</strong> - Das E-Bike Vela 3 hat eine Reichweite von 80 km. + Das E-Bike Vela 3 hat eine Reichweite von 100 km.</p>
+<p>Applying the OutputPatch to the original Output produces the updated translation. The OutputPatch contains only two lines of text instead of a full re-translation. Unchanged content stays consistent with the original translation.</p>
+<h2>Why Revision Prompting works</h2>
+<h3>Consistency</h3>
+<p>By supplying the LLM with the input revision <code>diff(Input, UpdatedInput)</code>, we ensure that the OutputPatch is limited to what the input changes necessitate. Everything not touched by the OutputPatch remains identical to the original Output. Therefore, the UpdatedOutput is <strong>consistent</strong> with the original Output.</p>
+<h3>Time &amp; cost savings</h3>
+<p>Revision Prompting feeds the original Output back in as part of the prompt, so the LLM only generates the short OutputPatch. Most tokens thereby move from the output to the input. Since processing time scales roughly with the length of the output, this eliminates most of the processing time. It also converts most of the output token cost into much cheaper input token cost. If the re-run happens within a couple of minutes of the original run, prompt caching reduces part of the input token cost as well.</p>
+<h2>Revision Prompting in practice</h2>
+<h3>Revision Formats</h3>
+<p>The ideal formats for encoding <code>diff(Input, UpdatedInput)</code> and the OutputPatch depend on the Instruction. The POSIX <code>diff</code> utility is a useful generic format. For JSON outputs, the JSON Patch format works well.</p>
+<h3>Expected Savings</h3>
+<p>The time &amp; cost reduction scales with the size of the input changes and the sensitivity of the output to changes in the input. In our own industrial prompts, Revision Prompting reduces time by ~80%, and costs by ~65%.</p>

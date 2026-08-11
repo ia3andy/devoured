@@ -1,0 +1,88 @@
+<h1>Why you might want to build your WebApp in Canvas instead of HTML</h1>
+<p>I’m always curious how Google, Microsoft and Co. build their web apps - given that they need to work well on any computer, from a top-shelf speed machine to a potato with wires.</p>
+<p>Of course, there are many answers to this question - but one that I find particularly interesting is their use of the Canvas element for functionality that’s usually implemented in HTML.</p>
+<p>The document in Google Docs is a Canvas. So is the sheet in Google Sheets or in the web version of Excel. Unsurprisingly, Canva is a Canvas - but so is the board in Miro. Our own scheduling interface in Hivekit is also a Canvas. Hivekit's scheduler can be zoomed (changes displayed timespan), panned in x and y direction and has lots of interactive aspects that needed managing.</p>
+<p>I helped build it, and in this post, I want to explain why we chose Canvas over DOM elements, what we learned along the way, when I think that Canvas is or isn’t a good choice for web apps, and why I think Canvas is used by all these big companies for performance-critical apps.</p>
+<h2>What was Canvas again?</h2>
+<p>Canvas has been around for more than 20 years now. It provides a blank space within an HTML document that can be drawn on. To do that, you use a JavaScript API with higher-level methods like <code>fillRect()</code> to fill a rectangle and lower-level methods like <code>getImageData()</code> to access the raw RGBA values of your pixels.</p>
+<p>Whatever approach you take, you end up with what’s basically a static image. For Web Developers, that feels a bit odd. After all, they’re used to a complex Document Object Model, HTML parsed into element trees, click handlers and event bubbling, dynamic rendering and reflows - all managed for you and perfectly tuned for the user’s device.</p>
+<p>With Canvas, all of this is gone now.</p>
+<h2>So - why on earth would you use Canvas?</h2>
+<p>There are some things only Canvas can do. Pixel image manipulation is the obvious one. But why would you choose Canvas to build a web app that could also be built in HTML?</p>
+<p>A few reasons:</p>
+<ul>
+ <li><strong>Speed:</strong> Parsing HTML, creating a DOM, applying CSS styles, and handling the myriad of features related to user interaction all take time. If your web app becomes complex, the browser can end up doing some seriously heavy lifting. A “dumb” drawing API means less work. Less work means more speed.</li>
+ <li><strong>Control:</strong> If you’re building a whiteboarding app with an infinite workspace, a grid with countless rows, or a planning tool with a zoomable workspace, you need to take control of rendering anyway. You can (kind of) do that in HTML - for example, through “virtual scrolling,” where you swap the content of grid rows instead of using the browser’s native scrolling, or by cleverly adding and removing elements from the DOM as the user zooms and pans. But at that point, you might be better off owning the rendering altogether.</li>
+ <li><strong>Consistency:</strong> With canvas, you output exactly what you specify across devices. This used to be more of an issue when browser implementations differed, but even now, responsive designs, CSS gradients, and transition effects can look quite different across operating systems and screens. With canvas, you get the same result - for better or worse.</li>
+ <li><strong>Portability:</strong> Canvas is used to render output from other visual frameworks. Flutter Web and certain WebAssembly implementations output their screen buffers to canvas. But this also works the other way around: tools such as Ejecta and NativeScript wrap C++ drawing APIs in Canvas calls that let you output your graphics on other systems.</li>
+</ul>
+<h2>And why wouldn’t you use Canvas?</h2>
+<p>There are far more reasons not to use Canvas than to use it. And for most web apps, you’re much better off with good old DOM elements. Take the humble <code>&lt;input type="text"&gt;</code> element, for example. With it, you get crispy rendering at any resolution, support for tab, focus, selection, mouse interactions and arrow key navigation, internationalization for right-to-left text and Asian compound characters, accessibility for screen readers… the list goes on.</p>
+<p>Browsers give you a lot of functionality out of the box and there are plenty of great frameworks that make it easy to use, scale and work on in an organized and standardized way across teams.</p>
+<h2>When is Canvas the better choice?</h2>
+<p>There’s a certain set of use cases where Canvas can be the better choice.</p>
+<ul>
+ <li><strong>When you have a lot of absolutely positioned elements, irregular shapes or complex render order/z-index requirements.</strong> Whether you’re building a vision board app or a 2D platformer, if your app is outside the usual HTML layout flow, Canvas might make your life easier.</li>
+ <li><strong>When you only need to render specific things.</strong> If your app can be zoomed, panned, uses camera transforms, clipping, tiling, level-of-detail rendering, or virtualisation, Canvas makes it easy to make sure you only render what you need to.</li>
+ <li><strong>If your application already has a strong internal model.</strong> If your app already has a strong concept of state, geometry, focus and interaction and all you need is a way to visualize it, Canvas makes it easier than HTML.</li>
+</ul>
+<p>But if you do decide on a Canvas implementation, here are some of the key things you want to look out for:</p>
+<ul>
+ <li><strong>Manage when to Render:</strong> The pattern that worked best for us is to have one central renderer that calls other classes that render specific aspects, such as <code>backgroundRenderer</code>, <code>rowRenderer</code>, <code>taskRenderer</code>. Each of the other classes can call <code>scheduleRender</code> on the renderer. This schedules a single render pass for the next animation frame. Note that we clear the entire Canvas for every frame and render everything from scratch. This is wasteful and more sophisticated implementations might only clear and rerender specific regions. But - doing that also adds complexity - and rerendering the entire Canvas for every frame really never caused issues for us.</li>
+</ul>
+<pre><code>class Renderer\{
+    constructor(canvas)\{
+        this.renderScheduled = false;
+        this.canvas = canvas;
+        this.context = canvas.getContext('2d');
+        this.backgroundRenderer = new BackgroundRenderer(this);
+        this.rowRenderer = new RowRenderer(this);
+    }
+
+    scheduleRender()\{
+        if(this.renderScheduled) return;
+        this.renderScheduled = true;
+        requestAnimationFrame(this.render.bind(this));
+    }
+
+    render() \{
+        this.renderScheduled = false;
+        this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
+
+        // Render the individual layers in order
+        this.backgroundRenderer.render(this.context);
+        this.rowRenderer.render(this.context);
+    }
+}</code></pre>
+<ul>
+ <li><strong>Layer Multiple Canvas Elements:</strong> For our planning interface, the fundamental plan stays fairly static while the user interacts with the mouse. But there are a lot of highlight and hover effects. For these, we utilize a second Canvas element with the same dimensions as the original Canvas. This <code>InteractionRenderer</code> refreshes much more frequently than the actual Canvas, but only renders a few bounding frames, which is much more lightweight.</li>
+ <li><strong>Keep styles separate.</strong> Keeping CSS separate from HTML makes your life easier - so why not do this with Canvas? Keep a separate file for styles, e.g.</li>
+</ul>
+<pre><code>gapDiagonalLineSpacing: 10,
+textColor: '#ecf0f5', 
+textColorSecondary: '#4d6585',
+fontStyle: "13px 'Lato', sans-serif",
+fontStyleBold: "bold 13px 'Lato', sans-serif"
+...</code></pre>
+<ul>
+ <li><strong>Manage device resolution and pixel density</strong> To get crisp render results, make sure your Canvas element is scaled to the device’s pixel ratio. Then, counterintuitively, set the context’s scale to offset the element’s scale. This way, you get crisp render output without your code having to be conscious of scale and pixel density all the time.</li>
+</ul>
+<pre><code>getPixelScale() \{
+    return Math.max(window.devicePixelRatio, 1);
+}
+scaleCanvas(canvas, ctx) \{
+    const pixelScale = this.getPixelScale();
+    canvas.width = canvas.offsetWidth * pixelScale;
+    canvas.height = canvas.offsetHeight * pixelScale;
+    ctx.scale(pixelScale, pixelScale);
+}</code></pre>
+<ul>
+ <li><strong>Have central functions that translate domain coordinates to pixels:</strong> If you are building an infinite-workspace-type app, elements on this workspace likely have X and Y coordinates. If you are building a spreadsheet, you’ll have row and column indices. These will be different from the actual pixel coordinates, based on the user’s resolution, zoom and pan position, and a host of other factors. You’ll make your life a lot easier by having simple functions like <code>getXForColumn(colIndex)</code> or <code>getPositionForDomainCoordinates(x,y)</code>.</li>
+ <li><strong>Maintain a simple box model:</strong> As the user hovers over or clicks elements, you’ll want to know what they interacted with. To do this fast, build up an index of bounding boxes in screen space beforehand. For each, store its x1, x2, y1, and y2 coordinates, along with its z-index and some identifier that tells your implementation what element it belongs to. If you manage a lot of bounding boxes, you might also want to create simple indices based on x and y coordinates for faster lookups or even consider an R-Tree for spatial indexing.</li>
+ <li><strong>Manage Event Handler Life Cycles</strong> Have a global listener for mouse and keyboard events and a simple way to register and deregister callbacks for specific events and elements.</li>
+</ul>
+<h2>So, should you use Canvas?</h2>
+<p>Canvas isn’t a faster replacement for HTML. It’s a lower-level rendering tool that gives you more control—and makes you responsible for much more of the browser’s work.</p>
+<p>For most web apps, the DOM remains the better choice. It gives you accessibility, responsive layouts, text selection, input handling, and countless other features for free. But if the heart of your application is a large, spatial workspace with complex positioning, zooming, panning, or thousands of visual elements, Canvas may be a better fit.</p>
+<p>That was the case for us. Owning the rendering pipeline made the planning interface easier to reason about and gave us predictable performance across a wide range of devices. It also meant building our own systems for interaction, hit testing, scaling, and rendering—work that shouldn’t be underestimated.</p>
+<p>So don’t choose Canvas simply because it sounds fast. Choose it when your interface no longer behaves like a document and starts behaving more like a scene.</p>

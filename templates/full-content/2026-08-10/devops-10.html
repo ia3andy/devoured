@@ -1,0 +1,106 @@
+<p>Projects that want to share a GPU on Kubernetes have to work around an API instead of with it. The device plugin interface could count devices, and that was the whole vocabulary: <code>nvidia.com/gpu: 1</code>. It meant one whole card, take it or leave it. <a href="https://github.com/Project-HAMi/HAMi">HAMi</a>, which the CNCF Technical Oversight Committee (TOC) <a href="https://www.cncf.io/blog/2026/07/15/hami-becomes-a-cncf-incubating-project/">accepted as an incubating project on July 15, 2026</a>, built its entire pipeline (mutating webhook, scheduler extender, annotations, in-container enforcement) to express what that vocabulary couldn’t: “give this pod 8,000 MiB and 10% of a GPU, and make the limit stick.”</p>
+<p>Then, the vocabulary changed. <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/">Dynamic Resource Allocation (DRA)</a> reached general availability in Kubernetes v1.34 and is enabled by default since v1.35. With the <a href="https://kubernetes.io/blog/2025/09/18/kubernetes-v1-34-dra-consumable-capacity/">consumable capacity feature</a>, a pod can now ask the scheduler itself for a slice of a device’s memory, natively, with no annotations involved.</p>
+<p>So the question I keep seeing in the HAMi communication channels is: does DRA make HAMi obsolete? The short answer is no, but the complete answer depends on which of HAMi’s jobs you’re talking about. One of them, encoding fractional requests where the scheduler can see them, is exactly what DRA absorbs. The other, enforcing those fractions inside the container at CUDA-call granularity, is a job DRA was never designed to do. HAMi’s response has been to split accordingly: keep the enforcement, and rebuild the encoding on top of DRA across 3 repositories. Let’s walk through both halves, then look at what running the DRA stack takes today.</p>
+<h2>How GPU sharing worked when the API couldn’t help</h2>
+<p>To see what DRA changes, it helps be precise about the machinery it replaces: which parts of HAMi’s pipeline exist only because the device plugin API was too narrow.</p>
+<p>A HAMi user writes 3 extended resources:</p>
+<pre><code>resources:
+  limits:
+    nvidia.com/gpu: 1        # device IDs from 1 physical card
+    nvidia.com/gpumem: 8000  # MiB of that card's VRAM
+    nvidia.com/gpucores: 10  # 10% of compute, in 1% steps</code></pre>
+<p>None of these mean anything to the default scheduler. Extended resources are opaque integers to Kubernetes: it can subtract them from a node total, and that’s all. It doesn’t know that <code>gpumem</code> and <code>gpucores</code> must land on the same physical card, or that 2 pods with 8,000 MiB each fit on a 24 GiB card while a third asking for 12,000 MiB doesn’t (HAMi’s scheduler rejects that third pod at filter time with a <code>CardInsufficientMemory</code> event). So HAMi routes the pod through a <a href="https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/">mutating webhook</a> to its own scheduler extender, which filters nodes, scores cards, picks a specific device UUID, and records the decision where the API has room for it: an annotation.</p>
+<pre><code>hami.io/vgpu-devices-allocated: GPU-&lt;device-uuid&gt;,NVIDIA,8000,10:</code></pre>
+<p>The device plugin on the node later reads that annotation inside <code>Allocate()</code>, injects <code>CUDA_DEVICE_MEMORY_LIMIT_0=8000m</code> and <code>CUDA_DEVICE_SM_LIMIT=10</code> into the container, and preloads <code>libvgpu.so</code> so the limits get enforced. It works, and it’s been proven at scale (<a href="https://www.cncf.io/case-studies/daocloud/">DaoCloud runs 10,000+ GPUs across 10+ data centers on it</a>). Notice how much of the design is a workaround: the webhook exists because the scheduler can’t parse the request, the annotation exists because the API has no field for “which card and how much,” and the whole agreement between scheduler and kubelet rides on a string format that only HAMi’s components understand.</p>
+<p>Every fractional-GPU project of that era made the same trade, each with its own private annotation dialect. That’s the situation DRA was built to end.</p>
+<h2>What DRA changes underneath</h2>
+<p>DRA replaces integer counting with a claims model, deliberately shaped like PersistentVolumeClaims (PVC). Four objects in the <code>resource.k8s.io/v1</code> API group carry the flow, and each one has a different owner:</p>
+<ul>
+ <li><strong>ResourceSlice.</strong> Published by the device driver. Describes actual hardware per node with structured attributes (model, memory, architecture), so the scheduler sees devices instead of a bare count.</li>
+ <li><strong>DeviceClass.</strong> Written by the cluster admin. Defines categories of devices, filtered with <a href="https://cel.dev/">Common Expression Language (CEL)</a> expressions over those attributes.</li>
+ <li><strong>ResourceClaim and ResourceClaimTemplate.</strong> Written by the workload owner. A claim requests devices by class, selector, and constraint; a template stamps out one claim per pod so each replica gets its own allocation.</li>
+</ul>
+<p>The scheduler allocates a concrete device to a claim before binding the pod, and the result lives in the claim’s status as a typed API object. Compare that to the annotation string above: the “which card and how much” decision now has a first-class home that <code>kubectl</code> can read, RBAC can guard, and other controllers can build on.</p>
+<p>The timeline matters for planning. Core DRA went <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/">GA in Kubernetes v1.34 and is locked on since v1.35</a>. Extensions are still graduating at their own pace: prioritized device lists (ask for a large card, fall back to 2 small ones) went stable in v1.36, while partitionable devices and consumable capacity are <a href="https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/">beta as of v1.36</a> and aren’t stable yet as of this writing (July 2026).</p>
+<h2>Consumable capacity is the piece that matters here</h2>
+<p>Core DRA alone doesn’t give you HAMi-style sharing. Its baseline sharing model is multiple pods referencing one <code>ResourceClaim</code>, which means they share the same allocation rather than each getting an accounted slice. The piece that maps onto HAMi’s model is <a href="https://kubernetes.io/blog/2025/09/18/kubernetes-v1-34-dra-consumable-capacity/">consumable capacity</a>, introduced as alpha in v1.34 behind the <code>DRAConsumableCapacity</code> feature gate, <a href="https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/">beta and on by default since v1.36</a>.</p>
+<p>It adds 2 things. A driver can mark a device with <code>allowMultipleAllocations</code>, declaring that independent claims, even from different namespaces, may land on it simultaneously. And a claim can carry a capacity request, asking for a specific quantity of a named resource on the device instead of claiming the device in full. The scheduler then does for GPU memory what it has always done for node memory: bookkeeping, guaranteeing that the sum of granted capacity never exceeds what the device advertised.</p>
+<p>Line those up against HAMi’s extended resources and the mapping is almost mechanical. <code>nvidia.com/gpumem: 8000</code> becomes a capacity request for memory; <code>nvidia.com/gpucores: 10</code> becomes a capacity request for compute; HAMi’s scheduler-extender filter step (“does this card still have 8,000 MiB unpromised?”) becomes the upstream scheduler’s own math. The rejection HAMi users know as <code>CardInsufficientMemory</code> turns into a standard unschedulable claim. This is why HAMi’s maintainers treat DRA as convergence rather than competition: upstream Kubernetes adopted the same model the workaround had been implementing all along, and the project’s 2026 roadmap names complete DRA standard adaptation as a goal.</p>
+<h2>Scheduling is still only half the problem</h2>
+<p>Here’s the boundary that decides whether you still need HAMi at all. DRA, consumable capacity included, is a promise tracker. It guarantees the scheduler never promises more than a device has. It does nothing about a container that breaks the promise at runtime, and with GPUs that’s the failure mode that actually hurts: CUDA doesn’t care what a <code>ResourceClaim</code> says, and one greedy <code>cudaMalloc()</code> loop will happily take VRAM a neighbor was counting on.</p>
+<p>Enforcement is HAMi’s second job, and it lives in <a href="https://github.com/Project-HAMi/HAMi-core">HAMi-core</a>, a C library (<code>libvgpu.so</code>) preloaded into the container that intercepts CUDA and NVIDIA Management Library (NVML) calls and applies the granted limits from user space. The behavior is easy to verify on any shared card: give 2 pods 8,000 MiB grants each, then have one deliberately allocate past its limit. The offender gets a CUDA out-of-memory at exactly its 8,000 MiB boundary while the neighbor keeps running untouched, even if the physical card still has free VRAM. The quota is the limiter, per container, which is precisely what a shared multi-team cluster needs.</p>
+<p>I’ll be equally honest about the ceiling: this is software enforcement via library interposition. A workload that bypasses the preload (static linking against the driver, <code>CUDA_DISABLE_CONTROL</code>, containers-in-containers) escapes it. For adversarial multi-tenancy you want hardware partitioning (NVIDIA Multi-Instance GPU (MIG), which HAMi can also schedule dynamically); for cooperative teams sharing expensive cards, interception is the granularity winner: 1 MiB memory steps and 1% compute steps against MIG’s fixed profiles.</p>
+<p>Nothing in DRA replaces this layer. The DRA driver’s job ends at the <a href="https://docs.docker.com/build/building/cdi/">Container Device Interface</a> (CDI): telling the runtime which device nodes to mount and which environment to set. What happens after the process starts calling CUDA is out of scope by design. So the realistic architecture pairs the two: DRA as the request-and-scheduling language, HAMi-core as the runtime muscle, and a driver in between translating one into the other.</p>
+<h2>The DRA stack HAMi ships today</h2>
+<p>That driver exists, and the work is spread across 3 repositories worth knowing individually, because they solve different operational problems.</p>
+<p><a href="https://github.com/Project-HAMi/k8s-dra-driver">k8s-dra-driver</a> is the foundation: a DRA driver that publishes each GPU’s memory and compute as consumable capacity in <code>ResourceSlices</code>, runs the kubelet plugin that resolves allocations on the node, and wires containers up through CDI with HAMi-core enforcement attached. The project describes it as the first open source DRA driver for NVIDIA GPUs with consumable capacity enabled.</p>
+<p><a href="https://github.com/Project-HAMi/HAMi-DRA">HAMi-DRA</a> answers the question every platform team asks next: what about the hundreds of manifests already written against <code>nvidia.com/gpu</code> and <code>nvidia.com/gpumem</code>? It’s a mutating admission webhook that strips the classic extended resources out of incoming pods and generates the equivalent <code>ResourceClaims</code> on the fly, preserving the familiar UUID and device-type annotations for targeting. The resource names it translates are configurable (<code>resourceName</code>, <code>resourceMem</code>, <code>resourceCores</code> in the chart values), so renamed or vendor-specific resources keep working. If the pattern sounds familiar, it should: HAMi’s traditional pipeline also begins with a mutating webhook. There’s a deeper payoff than backward compatibility. Because the webhook emits a standard <code>ResourceClaim</code> and leaves scheduling to whoever owns it, HAMi-DRA drops into clusters running <a href="https://github.com/volcano-sh/volcano">Volcano</a>, KAI Scheduler, or any other scheduler without patching them. The traditional pipeline had to inject its own extender into the scheduling path, which meant every third-party scheduler needed HAMi-specific integration. DRA removes that coupling: the request is an object any DRA-aware scheduler already understands, so HAMi no longer has to modify upstream at all. The interception point survived the migration; only what gets written into the pod changed. With HAMi v2.9, <a href="https://dynamia.ai/de/blog/hami-v29-deep-dive">HAMi-DRA v0.2.0 was declared production-ready</a>, and the release line has <a href="https://github.com/Project-HAMi/HAMi-DRA/tags">since moved to v0.2.1</a>. Its platform list grew past NVIDIA to Ascend and Enflame, with <a href="https://github.com/Project-HAMi/HAMi-DRA">Hygon DCU documented</a> through Hygon’s own <code>k8s-dcu-dra-driver</code>.</p>
+<p><a href="https://project-hami.io/docs/installation/how-to-use-hami-dra">HAMi</a> itself documents DRA mode as an installation option since v2.8, and the observability story carries over: the DRA monitor component is enabled by default and exposes per-container device metrics over Prometheus (port 31995), so dashboards built against HAMi’s exporters survive the switch. The <a href="https://www.cncf.io/blog/2026/07/15/hami-becomes-a-cncf-incubating-project/">incubation announcement commits the team to monitoring DRA consumption</a> as a first-class concern.</p>
+<p>Leaving scheduling to the cluster’s own scheduler has a cost worth naming. HAMi-DRA ships no scheduler of its own, so it can’t make topology-aware placement decisions. If two GPUs on a node are linked by NVLink (say GPU0 reaches GPU1 and GPU2 at high bandwidth, but not GPU3), a claim for two GPUs should prefer an NVLink-connected pair and avoid splitting across the slow path. The webhook can’t express that. It hands the scheduler a count and a capacity, not a topology constraint. For workloads where inter-GPU bandwidth matters, you either stay on a scheduler that models topology or accept that placement is bandwidth-blind.</p>
+<p>Installing the webhook and driver is 1 Helm release, with <a href="https://cert-manager.io/docs/installation/">cert-manager</a> in place first for the webhook’s serving certificate (or bring your own via <code>certs.custom.crt</code> and <code>certs.custom.key</code>):</p>
+<pre><code>helm repo add hami-dra https://project-hami.github.io/HAMi-DRA
+helm repo update
+helm install hami-dra hami-dra/hami-dra</code></pre>
+<p>If the GPU Operator manages your drivers, install it with <code>devicePlugin.enabled=false</code> first, because the DRA stack replaces the device plugin’s job. After the release settles you should see 3 pods: the kubelet plugin, the webhook, and the monitor. <code>kubectl get resourceslice</code> confirms the driver is publishing GPU capacity, and once a workload lands, <code>kubectl get resourceclaim</code> shows the allocation the scheduler made, in the API instead of an annotation.</p>
+<p>The prerequisites are stricter than traditional mode, and each one is a real gate:</p>
+<ol>
+ <li><strong>Kubernetes v1.34 or newer, with DRAConsumableCapacity enabled.</strong> On v1.34 and v1.35 the gate is alpha and off by default, so it needs to be set on the control plane, which rules out managed clusters that don’t expose API server flags. The gate <a href="https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/">graduated to beta and turned on by default in v1.36</a>, which quietly removes the biggest adoption blocker.</li>
+ <li><strong>A CDI-capable runtime.</strong> containerd or CRI-O with CDI enabled, plus NVIDIA driver 440 or newer.</li>
+ <li><strong>A DRA driver for your silicon.</strong> NVIDIA is the mature path; Ascend, Enflame, and Hygon DCU are arriving. HAMi’s traditional mode covers a much longer list (12+ device families as of v2.9) through per-vendor device plugins. Until the driver list catches up, heterogeneous clusters stay on the device plugin path.</li>
+</ol>
+<p><strong>Important Note:</strong> DRA mode and traditional device-plugin mode must not run in the same cluster simultaneously.</p>
+<p>The <a href="https://project-hami.io/docs/installation/how-to-use-hami-dra">documentation states it flatly</a>, and the reason follows from everything above: two bookkeepers, the scheduler extender and the DRA scheduler, would each believe they own the same VRAM, and neither sees the other’s promises. Pick one mode per cluster.</p>
+<h2>The same GPU slice, old way and new</h2>
+<p>The convergence is easiest to see in YAML, with both examples taken from the current HAMi DRA documentation.</p>
+<p>Start with what HAMi users have written for years. Ask for one card, 10 GiB of its memory, and half its compute:</p>
+<pre><code>resources:
+  limits:
+    nvidia.com/gpu: 1
+    nvidia.com/gpumem: 10240
+    nvidia.com/gpucores: 50</code></pre>
+<p>This still works unchanged in DRA mode. The webhook rewrites it at admission into the native form below, so no manifest has to change.</p>
+<p>Here is that same request written natively, as a <code>ResourceClaim</code> against HAMi’s <code>DeviceClass</code>:</p>
+<pre><code>apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: gpu-half-claim
+spec:
+  devices:
+    requests:
+      - name: gpu
+        exactly:
+          deviceClassName: hami-core-gpu.project-hami.io
+          allocationMode: ExactCount
+          count: 1
+          capacity:
+            requests:
+              cores: 50
+              memory: "10Gi"</code></pre>
+<p>The pod references the claim instead of listing resource limits:</p>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-test-dra-native
+spec:
+  containers:
+    - name: cuda
+      image: nvidia/cuda:13.0.1-base-ubi9
+      command: ["sleep", "3600"]
+      resources:
+        claims:
+          - name: gpu
+  resourceClaims:
+    - name: gpu
+      resourceClaimName: gpu-half-claim
+  restartPolicy: Never</code></pre>
+<p>The mapping is direct: <code>nvidia.com/gpu</code> becomes the device count, <code>gpumem</code> becomes the memory capacity request, <code>gpucores</code> becomes cores. The native form is longer, but that verbosity is the point. The old three-line block was opaque to the scheduler, which is why HAMi needed a webhook, an extender, and an annotation to act on it. The <code>ResourceClaim</code> says the same thing in a shape the upstream scheduler reads, RBAC guards, and <code>kubectl</code> shows, no private annotation dialect required.</p>
+<p>Either way, <code>nvidia-smi</code> inside the running container reports 10,240 MiB, the granted slice rather than the physical card, because HAMi-core is doing the same interception it always did. The request language changed; the runtime contract didn’t.</p>
+<h2>How to choose, mid-2026</h2>
+<p>My read, as someone who runs the traditional pipeline and has been tracking the DRA work:</p>
+<ul>
+ <li><strong>Managed Kubernetes without feature-gate access on v1.34 or v1.35, or anything older</strong>: traditional mode, no hesitation. It’s the path with years of production mileage, <a href="https://www.cncf.io/blog/2026/07/15/hami-becomes-a-cncf-incubating-project/">16 releases</a>, and independent case studies reporting 3x utilization gains behind it.</li>
+ <li><strong>Mixed-vendor accelerator fleets</strong>: traditional mode, until DRA drivers exist for your silicon. This is HAMi’s widest moat and the part DRA touches last.</li>
+ <li><strong>NVIDIA clusters on v1.34+ where you control the control plane, and anyone on v1.36</strong>: stand up DRA mode in staging now. Start with the HAMi-DRA webhook so no manifests change, watch <code>kubectl get resourceclaim</code> against your real workload mix, and let the results decide your production timeline. You end up on an API the upstream scheduler understands natively, which compounds as extensions like prioritized lists stabilize.</li>
+</ul>
+<p>Three honest caveats remain: consumable capacity hasn’t reached stable upstream, the k8s-dra-driver’s own Helm chart is still marked work in progress, and DRA-side vendor coverage is a fraction of traditional mode’s. None of that is hidden; all of it is fixable with time, and the direction of travel is set on both sides, with the HAMi 2026 roadmap naming complete DRA standard adaptation as a goal.</p>
+<p>GPU sharing on Kubernetes was built in the gaps of an API that could only count. DRA closed the gap, HAMi kept the muscle, and for the first time the request, the schedule, and the enforcement all speak the same language.</p>

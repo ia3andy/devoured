@@ -1,0 +1,120 @@
+<p>Everyone is creating a new programming language these days, often one that's "like Go but with more features" or "like Rust but simpler".</p>
+<p><a href="https://solod.dev">Solod</a>, a systems language for C and Go developers, might look like one of those languages, but it takes a different approach.</p>
+<h2>Go's tooling</h2>
+<p>Solod is not "Go-like" in the usual sense, nor is it an attempt to "fix Go's mistakes". At the language level, Solod is literally a <em>subset</em> of Go. Solod reuses much of Go's existing tooling, including syntax highlighting, LSP, linters, and the package management system.</p>
+<p>Take this quick-start guide, for example:</p>
+<p><strong>Quick start</strong></p>
+<p>Install the So command line tool:</p>
+<pre><code>go install solod.dev/cmd/so@latest
+</code></pre>
+<p>Create a new Go project and add the Solod dependency to use the So standard library:</p>
+<pre><code>go mod init example
+go get solod.dev@latest
+</code></pre>
+<p>Write regular Go code, but use Solod packages instead of the standard Go packages:</p>
+<pre><code>package main
+
+import "solod.dev/so/math"
+
+func main() \{
+    ans := math.Sqrt(1764)
+    println("Hello, world! The answer is", int(ans))
+}
+</code></pre>
+<p>Run without saving the binary:</p>
+<pre><code>so run .
+</code></pre>
+<p>That's it!</p>
+<p>There's nothing new here. It's mostly standard Go workflow, except for <code>so run</code>, which is a Go program that mimics <code>go run</code>.</p>
+<h2>Go's standard library</h2>
+<p>Solod also reuses a lot of Go's standard library code and tests. Some of it is taken verbatim from Go's source code, like these two string functions:</p>
+<pre><code>// CutPrefix returns s without the provided leading prefix string
+// and reports whether it found the prefix.
+func CutPrefix(s, prefix string) (string, bool) \{
+    if !HasPrefix(s, prefix) \{
+        return s, false
+    }
+    return s[len(prefix):], true
+}
+
+// HasPrefix reports whether the string s begins with prefix.
+func HasPrefix(s, prefix string) bool \{
+    return len(s) &gt;= len(prefix) &amp;&amp; s[:len(prefix)] == prefix
+}
+</code></pre>
+<blockquote>
+ <p>Of course, Solod retains the Go authors' copyright.</p>
+</blockquote>
+<p>Some code requires changes to support the manual memory management with explicit allocators used by Solod:</p>
+<pre><code>// Go version.
+func Clone(s string) string \{
+    if len(s) == 0 \{
+        return ""
+    }
+    b := make([]byte, len(s))
+    copy(b, s)
+    return unsafe.String(&amp;b[0], len(b))
+}
+</code></pre>
+<pre><code>// Solod version.
+func Clone(a mem.Allocator, s string) string \{
+    if len(s) == 0 \{
+        return ""
+    }
+    b := mem.AllocSlice[byte](a, len(s), len(s))
+    copy(b, s)
+    return string(b)
+}
+</code></pre>
+<p>You can probably see the resemblance.</p>
+<h2>A grain of salt</h2>
+<p>Go tools don't know that Solod is a subset of the full Go language, so they won't flag features Solod doesn't support, like function literals or iterators. These diagnostics come from the custom <code>so</code> tooling:</p>
+<pre><code>package main
+
+func main() \{
+    f := func(n int) \{
+        println(n)
+    }
+    f(42)
+}
+</code></pre>
+<pre><code>main.go:4:7: function literals are not supported
+    f := func(n int) \{
+         ^here
+</code></pre>
+<p>Also, although a substantial part of Go's standard library is ported verbatim or with minimal changes from the original source, that doesn't mean the code is automatically correct. Solod still needs its own tests, including ones that run under sanitizers and static analyzers.</p>
+<h2>It's all C in the end</h2>
+<p>All Solod code is translated to regular C11 and then compiled with GCC or Clang. Solod therefore relies on C tooling and decades of optimization work just as much as on Go's.</p>
+<p>Solod code:</p>
+<pre><code>package main
+
+import "solod.dev/so/math"
+
+func main() \{
+    // What might it be?
+    ans := math.Sqrt(1764)
+    println("Hello, world! The answer is", int(ans))
+}
+</code></pre>
+<p>Translated C code:</p>
+<pre><code>// -- main.h --
+#pragma once
+#include "so/builtin/builtin.h"
+#include "so/math/math.h"
+
+// -- main.c --
+#include "main.h"
+
+int main(void) \{
+    // What might it be?
+    double ans = math_Sqrt(1764.0);
+    so_println("%s %" PRIdINT, "Hello, world! The answer is", (so_int)(ans));
+    return 0;
+}
+</code></pre>
+<p>The C version is noisier, of course, especially for more complex programs than this one. But it remains readable.</p>
+<p>And since there's no runtime, interoperability between Solod and C costs nothing.</p>
+<h2>Final thoughts</h2>
+<p>A new language doesn't necessarily need a new ecosystem.</p>
+<p>Solod relies heavily on Go, and I see that as a strength, not a weakness. Reusing Go's proven tools and standard library makes Solod more reliable and easier to work with.</p>
+<p>If you're interested, take a look at Solod's <a href="https://github.com/solod-dev/solod#readme">readme</a> — it has everything you need to get started. Or <a href="https://solod.dev/#try">try it online</a> without installing anything.</p>

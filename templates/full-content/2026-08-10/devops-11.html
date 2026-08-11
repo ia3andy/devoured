@@ -1,0 +1,82 @@
+<h1>Runtime instances: persistent compute for production AI agents on Amazon Bedrock AgentCore</h1>
+<p>When you move AI agents from prototype to production, the infrastructure challenges multiply. Your agents need to persist state across multi-step workflows that run for hours or days. They need to coordinate with other agents, share context, and sometimes access GPUs for specialized tasks. Amazon Bedrock AgentCore runtime microVMs provide a fully managed environment for invocations that can run for up to 8 hours and support stateful workflows through managed session storage. Some workloads also benefit from dedicated, larger-capacity environments — for example, when agents need to run continuously for multiple days, access GPUs or the underlying OS, or run multiple collaborating agents on the same host.</p>
+<p>Today, I’m happy to announce runtime instances, a new complementary compute option in Amazon Bedrock AgentCore Runtime that gives your agents persistent, managed infrastructure purpose-built for complex agent workloads.</p>
+<p><strong>What you get</strong></p>
+<p>Runtime instances provides AWS-managed EC2 infrastructure where you deploy multiple agents in a single runtime, each with their own dependencies and artifact types. Your agents can collaborate on the same host within shared sessions that persist for up to 14 days. The service supports GPU acceleration for compute-intensive tasks, session stop/restart to save costs during idle periods, and containerized deployments for teams that want to ship independently. For knowledge that needs to survive beyond a session, runtime instances pairs naturally with Amazon Elastic Block Store (Amazon EBS) and AgentCore Memory, which gives your agents long-term recall across sessions and environments.</p>
+<p>Before today, if you wanted to keep your agents running for days or they needed GPU access, or multi-agent coordination, you had to build and manage that infrastructure yourself. You provisioned EC2 instances, configured networking, set up session management, handled scaling, and stitched together monitoring. Runtime instances handles all of that for you while integrating with the same AgentCore APIs, identity controls, and observability you already use with AgentCore Runtime microVMs.</p>
+<p>A few things that should make agent developers smile: your agents can call each other as tools within a shared session, iterating autonomously until the job is done. You bring any framework (CrewAI, LangGraph, LlamaIndex, Strands) and any model. Packaging is minimal, a <code>@app.entrypoint</code> decorator and a zip file or container image. And if your workflow spans days, hibernate Monday night and resume Wednesday morning with everything intact.</p>
+<p>Runtime microVMs and runtime instances are complementary compute options that you can use independently or together through the same AgentCore runtime APIs. A lightweight orchestrator agent on runtime microVM can coordinate and dispatch work to specialized worker agents running on instances. The orchestrator handles API calls, task routing, and result aggregation using runtime microVM’s fast scaling, while workers on Instances perform compute-intensive tasks like code compilation, security scanning, or GUI automation that require persistent state and direct OS access.</p>
+<p><strong>Let me show you how it works</strong></p>
+<p>I built two agents for this demo: a code writer agent that generates Python code from natural language descriptions, and a code reviewer agent that analyzes the generated code for bugs, security issues, and style improvements. Both agents share the same file system, so the reviewer can read whatever the writer produces without any data transfer or API calls between them.</p>
+<p>Here is the code writer (simplified, no error handling):</p>
+<pre><code>writer = Agent(
+    model="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    system_prompt=(
+        "You are a senior Python engineer. "
+        "Given a task, return ONLY a single Python code block — no prose."
+    ),
+)
+
+@app.entrypoint
+def handler(event, context):
+    task = event.get("task") or event.get("prompt")
+    session_id = getattr(context, "session_id", None) or event.get("session_id")
+    session_dir = SHARED_DIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    code = str(writer(task))
+    (session_dir / "code.py").write_text(code)
+
+    return \{"agent": "writer", "wrote": str(session_dir / "code.py"), "code": code}</code></pre>
+<p>Here is the code reviewer agent (simplified, no error handling):</p>
+<pre><code>reviewer = Agent(
+    model="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    system_prompt=(
+        "You are a strict Python code reviewer. "
+        "Given code, return 3 bullet points: bugs, style, suggestions."
+    ),
+)
+
+@app.entrypoint
+def handler(event, context):
+    session_id = getattr(context, "session_id", None) or event.get("session_id")
+    code_path = SHARED_DIR / session_id / "code.py"
+    code = code_path.read_text()
+    review = str(reviewer(f"Review this code:\n\n\{code}"))
+
+    return \{"agent": "reviewer", "read": str(code_path), "review": review}</code></pre>
+<p>Each agent is a Python application using Strands Agents with an <code>@app.entrypoint</code> decorator and a model of its choice. I package each one as a zip file. For this demo, I use the AWS Management Console. You can also use the AgentCore CLI, the AWS Command Line Interface (AWS CLI) or infrastructure as code.</p>
+<p><strong>Step 1: Create a capacity provider.</strong></p>
+<p>A capacity provider defines the EC2 infrastructure your agents run on. In the AgentCore console, I select <strong>Runtime</strong> in the left navigation, then select the <strong>Capacity providers</strong> tab and <strong>Create capacity provider</strong>.</p>
+<p>I give it a <strong>Name</strong>, select Linux (64-bit ARM) as the <strong>Operating system</strong>, and choose <code>c7g.2xlarge</code> as the <strong>Allowed instance types</strong>. This gives me 8 vCPUs and 16 GiB of memory, enough for both agents to run comfortably side by side.</p>
+<p>Further down, I configure the <strong>VPC</strong>, <strong>subnets</strong>, and <strong>security groups</strong> for network access. Under <strong>Storage configuration</strong>, I keep the default gp3 volume. Under <strong>Service access</strong>, I select <strong>Create a new service role</strong> and let the console create the infrastructure role that manages EC2 instances on my behalf.</p>
+<p>I select <strong>Create capacity</strong> provider and wait a few seconds. The status moves to <strong>Active</strong>.</p>
+<p>Note the capacity provider configuration summary: operating system, instance type, subnets, security group, instance profile, and infrastructure role. Once created, only the description can be edited, so verify your settings before you proceed.</p>
+<p><strong>Step 2: Create a runtime and deploy the first agent.</strong></p>
+<p>Back on the <strong>Runtime</strong> page, I select <strong>Create runtime</strong>. I give it a <strong>Name</strong>, select Instances as the <strong>Compute type</strong>, and choose the <strong>Capacity provider</strong> I created in the previous step.</p>
+<p>Under <strong>Agent source</strong>, I select <strong>S3 Source</strong>, then <strong>Upload to S3</strong>. I choose my agent zip file (<code>ACIDemoWriter.zip</code>), set the <strong>Language runtime</strong> to <code>Python 3.13,</code> and specify <code>agent.py</code> as the <strong>Agent entry point</strong>. This is the file that contains my <code>@app.entrypoint</code> decorated function. Under <strong>Permissions</strong>, I select <strong>Create default role</strong> to let the console provision the IAM role my agent needs.</p>
+<p>I select <strong>Create runtime</strong> and wait for the status to become <strong>Ready</strong>.</p>
+<p>I repeat the same process for my code reviewer agent. I create a second runtime, select the same capacity provider, upload my reviewer agent zip file, and wait for it to become <strong>Ready</strong>. Both agents now share the same underlying EC2 infrastructure.</p>
+<p>The console shows me a <strong>View invocation code</strong> section with ready-to-use Python, TypeScript, and JavaScript snippets to invoke my agent programmatically. But for this demo, I use the built-in test feature. I select <strong>Test</strong> on the writer agent’s page.</p>
+<p><strong>Step 3: Invoke agents and observe collaboration.</strong></p>
+<p>The <strong>Runtime playground</strong> opens. At the top, I see three fields: <strong>Runtime agent</strong>, <strong>Endpoint</strong>, and <strong>Session ID</strong>. The console generates a session ID automatically. I take note of it because I will reuse it with the reviewer agent.</p>
+<p>In the <strong>Input</strong> field, I type a JSON payload asking the writer agent to generate code:</p>
+<pre><code>\{"prompt": "write a fibonacci suite"}</code></pre>
+<p>I select <strong>Run</strong>. After a few seconds, the <strong>Output</strong> panel shows the agent’s response. The writer agent generated a Python module with two implementations of a Fibonacci sequence (a list-based function and a generator) and wrote it to <code>/tmp/agentcore-session/ca5ec24d-07f5-4eeb-add1-5ba416bf9eb2/code.py</code>. Notice the session ID in the file path. That directory is the shared file system for this session.</p>
+<p><strong>Step 4: Invoke the reviewer agent in the same session.</strong></p>
+<p>Now I switch the <strong>Runtime agent</strong> dropdown to <strong>ACIDemoReviewer</strong>. The important part: I paste the same session ID (<code>ca5ec24d-07f5-4eeb-add1-5ba416bf9eb2)</code> in the <strong>Session ID</strong> field. This is what connects the two agents.</p>
+<p>I type a simple prompt:</p>
+<pre><code>\{"prompt": "review the code"}</code></pre>
+<p>I select <strong>Run</strong>. The reviewer agent reads the file the writer produced from the shared session directory and returns a detailed code review. It finds no critical bugs but suggests adding type hints, input validation, and simplifying the edge case handling.</p>
+<p>The two agents never exchanged messages or called each other’s APIs. They collaborated through the shared file system that runtime instances provide within a session. You can extend this pattern to any number of agents: a test agent that runs the code, a documentation agent that generates README files, a security agent that scans for vulnerabilities, all sharing the same working directory.</p>
+<p><strong>Key details</strong></p>
+<ul>
+ <li><strong>Supported OS</strong>: Linux (ARM64 and x86_64) at launch.</li>
+ <li><strong>Session persistence</strong>: Sessions persist for up to 14 days.</li>
+ <li><strong>Runtimes</strong>: Python 3.11-14 with native code support. Container images also supported.</li>
+ <li><strong>GPU</strong>: Support for GPU-accelerated instance types.</li>
+ <li><strong>Integration</strong>: Uses the same AgentCore APIs, identity, observability, and policy controls as AgentCore Runtime.</li>
+ <li><strong>Pricing</strong>: Standard EC2 pricing plus a management fee for AgentCore orchestration.</li>
+ <li><strong>Regions</strong>: US East (Ohio, N. Virginia), US West (Oregon), Asia Pacific (Mumbai, Singapore, Sydney, Tokyo), and Europe (Frankfurt, Ireland)</li>
+</ul>
+<p>To get started, visit the runtime instance in Amazon Bedrock AgentCore documentation and create your first capacity provider.</p>

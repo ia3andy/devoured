@@ -1,0 +1,55 @@
+<p>On July 22, we launched Cursor Router with two new configurations, Auto Intelligence and Auto Balance. Since then, we have continued improving both modes as new models have arrived and our routing system has learned from more production traffic.</p>
+<p>Today, Auto Intelligence delivers above Fable-level user satisfaction at 68% lower cost, a further 18% reduction since its launch. Auto Balance outperforms Opus 4.8 at 41% lower cost, a further 8% reduction over the same period, while further increasing user satisfaction by 3%.</p>
+<p>We're working towards a Cursor Router that improves alongside the model frontier. This post explains how the current system works.</p>
+<h2>A data-driven approach to routing</h2>
+<p>Cursor Router is built around the idea that model selection should be learned from how models perform on real developer work, rather than inferred from benchmark scores.</p>
+<p>The router makes each decision using signals from the current turn and recent conversation state. These include structured features such as the task category, along with recent tool calls and the broader context of the work.</p>
+<p>From there, routing happens in two parts.</p>
+<p>First, we need to decide whether a turn is simple enough for a price-efficient model. Compass, our complexity predictor, makes this decision.</p>
+<p>Second, if the turn is more demanding, we need to decide which frontier model is most likely to perform well on that kind of work. To make that decision, we classify the turn using a taxonomy of tasks, domains, and modifiers learned from real developer traffic.</p>
+<h2>Building a dataset</h2>
+<p>To develop the routing system, we first needed a dataset that reflected the conditions it would encounter in production. We built it from live Cursor traffic so it would preserve the actual mix of developer tasks, the context surrounding each turn, and the effects of switching between models.</p>
+<p>As always, we respected users' privacy mode and data retention settings throughout this process.</p>
+<p>The dataset contains hundreds of thousands of turns sampled across a range of models. Each datapoint includes the conversation signals available to the router, along with two outcomes we use to compare routing choices.</p>
+<ol>
+ <li><strong>Performance.</strong> We infer performance from what the user does next. Moving on to the next task is a strong positive signal, while correcting the agent is a strong negative one.</li>
+ <li><strong>Cost.</strong> We calculate cost from API pricing and token usage for that turn. Because the data comes from live traffic, it also captures costs that benchmarks often miss, including cache misses caused by switching models.</li>
+</ol>
+<h2>Predicting complexity with Compass</h2>
+<p>Compass estimates the complexity of each turn by predicting whether the user will be satisfied with Cursor's response. We train it on the performance signal mentioned above.</p>
+<p>We use the resulting prediction as a proxy for complexity. This works because users rarely ask for corrections after simple tasks, like making a commit, while they're more likely to make follow-up requests when the work is more complex.</p>
+<p>We evaluated Compass online and confirmed that its scores are strong predictors of user satisfaction. Turns that Compass rated as most likely to succeed received a positive performance signal 96% of the time, while turns it rated as least likely to succeed received one 71% of the time.</p>
+<p>In practice, Compass assigns each turn a continuous complexity score between 0 and 1. We set a threshold within that range to determine which turns stay on a price-efficient model and which are upgraded to a frontier model. Lower thresholds keep more traffic on the price-efficient model, while higher thresholds upgrade more often.</p>
+<h2>Learning model strengths</h2>
+<p>After Compass tells us when a turn is complex enough to justify using a frontier model, the next question is which frontier model to use.</p>
+<p>To answer it, we built a taxonomy from real developer traffic that describes each turn across three dimensions:</p>
+<ul>
+ <li><strong>Domains</strong> identify where the work happens: backend, database schemas, frontend</li>
+ <li><strong>Tasks</strong> identify what the developer wants done: fixing bugs, running commands, writing tests</li>
+ <li><strong>Modifiers</strong> capture characteristics that cut across domains and tasks, but may change which model performs best: bounded edits, product questions, visual-heavy changes</li>
+</ul>
+<p>We then compare how different models perform across those categories. We found that no model dominates every kind of work, and each has categories where it outperforms:</p>
+<ul>
+ <li><strong>Grok offers strong value across broad, routine work.</strong> Its low inference cost made it especially effective for categories such as Git commands and general database operations.</li>
+ <li><strong>Sol performs especially well on planning and codebase comprehension.</strong> It also delivered strong results across several implementation tasks at a lower cost than other frontier models.</li>
+ <li><strong>Opus performs well on execution-heavy work.</strong> It showed particular strengths in devops, database queries, and performance optimization.</li>
+ <li><strong>Fable excels at debugging and visual implementation.</strong> Its quality gains were most valuable on complex tasks where they justified its higher cost.</li>
+</ul>
+<p>Cursor Router uses those differences to match each turn to the model best suited to it.</p>
+<h2>Combining into an algorithm</h2>
+<p>Compass and the taxonomy play complementary roles. Compass estimates the model-agnostic complexity of the turn and compares that score with a routing threshold. Depending on where the score falls, we either send the turn to Grok, given its low inference cost, or use the taxonomy to identify the frontier model with the strongest observed performance on that kind of work.</p>
+<p>When Compass does send a turn to the taxonomy router, model selection follows two rules:</p>
+<ol>
+ <li><strong>Only route when performance is clearly better.</strong> A candidate model becomes eligible only when its observed performance on that task label clears a one-sided 75% uplift threshold against the price-efficient model. Roughly, this means we need 75% confidence that the improvement is real.</li>
+ <li><strong>Choose the best mix within the budget.</strong> From the eligible candidates, the optimizer chooses the traffic-weighted combination expected to deliver the largest performance gain while keeping the average cost per turn within the mode's budget.</li>
+</ol>
+<p>Together, the Compass threshold and the task router's cost budget define each mode's position on the cost-performance curve. Auto Balance keeps more traffic on the price-efficient path and gives the task router a smaller budget. Auto Intelligence gives the task router more room to select frontier models when the expected performance gain justifies the cost.</p>
+<h2>Evaluating performance in production</h2>
+<p>We evaluated our routing policies in two stages. First, we used cross-validation to tune the Compass thresholds and optimization budgets without overfitting to a particular split. We then evaluated the selected policies on a held-out test set that had not been used during training.</p>
+<p>This gives us a more reliable estimate of how each policy should perform on new traffic. It helps us eliminate weak candidates and compare expected cost and performance before deployment. But offline analysis still cannot fully capture how a policy will behave in production, and benchmarks are limited for the same reason. Live developer traffic remains the most representative test.</p>
+<p>We then tested the policies on live traffic, where we could measure user satisfaction and the actual cost of each turn under production conditions. This captures effects that are difficult to model offline, including token usage, caching, and the cost of switching between models.</p>
+<p>Before launch, we tested both modes on live traffic and found that each improved the cost-performance tradeoff relative to individual frontier models. Auto Balance delivered higher satisfaction than Opus 4.8 at lower cost, while Auto Intelligence approached Fable-level satisfaction at a much lower cost.</p>
+<p>We have since repeated this process as the routing system and available models have improved, moving both modes further beyond the cost-performance frontier.</p>
+<h2>Keeping pace with the model frontier</h2>
+<p>Since launching Cursor Router, we've added Opus 5 to the routing mix and improved Compass's predictions. That gives the router both a stronger set of models to choose from and a better signal for deciding when each one is worth using.</p>
+<p>Over time, we want the router to become more adaptive by predicting each model's expected quality and cost, learning from production outcomes, and updating continuously. As the system improves, Cursor users will be able to benefit from frontier models where they're needed most, without paying frontier-model prices on every turn.</p>

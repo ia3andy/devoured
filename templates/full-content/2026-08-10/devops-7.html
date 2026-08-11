@@ -1,0 +1,76 @@
+<p>Julio Merino recently published <em>A markdown-based test suite</em>, about using Markdown itself as a lightweight test format.</p>
+<p>That reminded me of a related workflow I’ve been using for a while with <code>scrut</code>: I put executable test plans directly in commit messages.</p>
+<h2>Why</h2>
+<ul>
+ <li>Makes the commit message’s test plan executable instead of purely descriptive. 
+  <ul>
+   <li>Great for test-driven development, to ensure that my validation plan actually detects the underlying issue.</li>
+   <li>Great for knowledge sharing and onboarding teammates.</li>
+  </ul></li>
+ <li>Supports re-validating entire commit stacks via <code>git test</code>. 
+  <ul>
+   <li>Often useful when rebasing on top of upstream changes.</li>
+   <li>On failure, it makes it quick and easy to bisect the first broken commit.</li>
+  </ul></li>
+ <li>Supports ad-hoc and differential testing, where there is no tested correct output, and we just want to document changes.</li>
+</ul>
+<h2>How</h2>
+<p>Inside my commit messages, I add <code>scrut</code> code blocks with test commands to run. Example:</p>
+<pre><code>fix(tests): fix tests on macOS with Git v2.37
+
+...
+
+Test Plan
+---------
+
+```scrut
+$ cargo nextest run --workspace --no-fail-fast -- 'submodule'
+```
+</code></pre>
+<p>I use a small script called <code>git-test-message</code> to read the commit message and run the <code>scrut</code> tests in the repository working tree:</p>
+<p>For individual runs, I invoke it like this:</p>
+<pre><code>$ git test-message
+🔎 Found 1 test document(s)
+
+Result: 1 document(s) with 1 testcase(s): 1 succeeded, 0 failed and 0 skipped
+</code></pre>
+<p>With <code>git test</code>, I’ve configured it as my default test command, which runs it on the entire stack:</p>
+<pre><code>$ git config 'branchless.test.alias.default'
+git test-message @
+
+$ git test run
+✓ Passed (cached): 624edd2 fix(tests): fix tests on macOS with Git v2.37
+Ran command on 1 commit: git test-message @
+1 passed, 0 failed, 0 skipped
+</code></pre>
+<h3>Patterns</h3>
+<p>By default, <code>scrut</code> asserts that the command exits successfully and that <code>stdout</code> matches. For some tools, especially <code>bazel</code>, <code>stdout</code> is not interesting or is non-deterministic, so I often redirect it to <code>stderr</code> so that it’s not asserted, but is still logged on failure:</p>
+<pre><code>$ bazel test //foo &gt;&amp;2
+</code></pre>
+<p>For ad-hoc validation, when there’s no test case to cover a specific situation, I often pipe to <code>grep</code> or use <code>scrut</code>’s output expectations:</p>
+<pre><code>$ bazel run //foo | grep bar
+some line with bar
+</code></pre>
+<p>For differential testing, I might record the new behavior, check out the previous commit, record the old behavior, and diff the two:</p>
+<pre><code>$ bazel run //foo &gt;after &amp;&amp; git checkout HEAD~ &amp;&amp; bazel run //bar &gt;before &amp;&amp; diff before after
+...diff output here...
+[1]
+</code></pre>
+<p>The <code>[1]</code> means that exit code <code>1</code> is expected from <code>diff</code>.</p>
+<h3>Script</h3>
+<p>Here’s my <code>git-test-message</code> script:</p>
+<pre><code>#!/bin/bash
+set -euo pipefail
+
+mise exec 'cargo:scrut' -- scrut test \
+  --work-directory="$\{PWD}" \
+  --match-markdown='*' \
+  &lt;(git show --no-patch --format='%B' "$\{1:-HEAD}")
+</code></pre>
+<p>Notes:</p>
+<ul>
+ <li>My script uses <code>mise</code> to just-in-time provision the <code>scrut</code> binary.</li>
+ <li>By default, <code>scrut</code> works in a temporary directory. I oftentimes run commands that need th repo state, so I added <code>--work-directory=$\{PWD}</code>.</li>
+ <li>By default, <code>scrut</code> only runs on Markdown input files. I specified <code>--match-markdown='*'</code> to match the process substitution filename (which usually ends up being a path like <code>/dev/fd/63</code>).</li>
+ <li><code>scrut</code> has features to auto-update the snapshot tests, but I haven’t integrated that (since they’d have to be written back to the Git commit message).</li>
+</ul>
