@@ -1,0 +1,47 @@
+<h1>Exploring Claude/GPT Knowledge Cutoffs &amp; Pre-training Timelines</h1>
+<h3>An analysis of what models know and what it tells us about how they were trained.</h3>
+<p>We can learn hidden facts about how frontier models were trained by “probing” them with carefully curated requests.</p>
+<ul>
+ <li>By scoring them on niche facts we can approximate how many parameters models like GPT-5 and Opus have, using “Incompressible Knowledge Probes”</li>
+ <li>By measuring how the models break down tokens we can reveal facts about the datasets mixtures they used to train the model (or at least the tokenizer) using “Data Mixture Inference”</li>
+ <li>By scoring them on date or self-identification related questions you can also estimate training timelines (<em>this post</em>)</li>
+</ul>
+<p>Everything here is an estimate. It’s possible that some speculation in this post is totally incorrect given there’s not a ton of publicly available ground truth to verify against.</p>
+<h2>How frontier models are trained</h2>
+<p>As a brief primer, how we train massive large language models has converged into 3 stages:</p>
+<ol>
+ <li>Take a massive amount of general purpose data (aka scrape the internet) and “pre-train” a massive auto-complete model on that data.</li>
+ <li>Use domain-specific “textbook quality” data to improve the base models and extend certain base capabilities like long-text understanding</li>
+ <li>Turn the base model into the “assistant” persona, honing in on its personality, reasoning ability, and tool-calling.</li>
+</ol>
+<p>While increasingly more compute is spent on post-training for boosting a model’s reasoning and problem solving, one of the most expensive and data-intensive steps is generating that pre-training checkpoint.</p>
+<p>While all labs operate slightly differently, what you might see is:</p>
+<ul>
+ <li>The “pre-training” team kicks off and babysits a multi-month run to get a base checkpoint. These pre-training models often, but not always, imply major versions of released models (GPT-4 → GPT-5).</li>
+ <li>While that’s happening, the “capability” and “post-training” teams will run experiments for how to improve on the most recent base model. Advancements in post-training and capabilities often manifest as minor versions of released models. These teams often also “distill” a single post-trained model into smaller variants that become model families. Labs may also release post-trained models from half-baked pre-training checkpoints as soon as x% of the version N+1 checkpoint is better than the 100% baked version N checkpoint.</li>
+ <li>The model released to the public is the culmination of the most recent checkpoint with the best set of capabilities and post-training techniques applied to it.</li>
+</ul>
+<p>With this in mind, I was curious how much of this process you can “see” just by probing the model over the official APIs.</p>
+<h2>Model Knowledge Timelines</h2>
+<h4>Historical Quizzes</h4>
+<p>To estimate the pre-training checkpoint dates, I constructed a dataset of daily-facts from Wikipedia and gave every model an 8-way multiple choice quiz on what happened on a given day. Then, by analyzing the error rate timeline, you can see roughly when it loses signal from its training dataset.</p>
+<p>After staring at these charts for a bit, here’s what I’m speculating:</p>
+<ul>
+ <li><strong>Anthropic models Opus 4.7 onwards are all from the same training run that cuts off just around late December 2025.</strong> This is derived from how they all share a very similar effective knowledge cutoff (green). A core assumption I’m making here is that the pre-training base model completion date is highly correlated with the dataset timespan used, if that’s wrong these results could be off by some offset (e.g. it’s actually Jan 2026). It’s also interesting that Opus 4.7+ models all have a published reliable and overall knowledge cutoff that’s identical — maybe that’s due to a new post-training technique being used?</li>
+ <li><strong>OpenAI’s GPT-5.6 family comes from their own checkpoint, separate from GPT-5.5, that finished around late February 2026.</strong> This is derived from how they have a distinct effective knowledge cutoff from previous models. You’ll notice Luna looks like it can predict the future — that’s more of an artifact of it having a high error rate all around at a “low” reasoning effort.</li>
+ <li><strong>Opus 5 is a bit unusual.</strong> The published reliable and overall knowledge cutoffs are May 2026 and yet it seems to know nothing more than previous Jan 2026 cutoff models. I did several ablations to test whether it was an artifact of the types of probing questions I used, but not really — the cutoff applies to recall on coding package versions as well.</li>
+</ul>
+<h4>Self-reported Dates</h4>
+<p>What if you just ask the model what today is? It ends up being fairly correlated with fact-based estimates. If you look closely you can see some vertical lines within a few of the families of models.</p>
+<ul>
+ <li>GPT-4.1 nano → GPT-4.1 mini → GPT-4.1</li>
+ <li>Opus 4.7 → Sonnet 5 → Fable/Opus 5</li>
+</ul>
+<p>Interpreting this graph as X = “pre-training corpus” and Y = “post-trained behavior”, these vertical strips (X constant, Y increasing) visualize active post-training on recency-biased datasets. Potentially distillation from old copies of teacher models is what causes smaller models to self-report older dates.</p>
+<h4>Self-reported Identity</h4>
+<p>You can also make predictions on training timelines and datasets indirectly by looking at who the models think they are. The more a model sees “I am X” in its pre-training dataset, the more likely it is to repeat that when pushed and given no other grounding context.</p>
+<p>After staring at these charts for a bit:</p>
+<ul>
+ <li><strong>Vertical bands show clear patterns of labs training on past-model outputs (from users).</strong> For OpenAI it’s GPT-4, GPT-4o, GPT-4.1 for a bit, GPT-5 and “ChatGPT” most recently. For Anthropic it’s 3.5 Sonnet then more recent models swap to Sonnet 4.5. This seems to align pretty well with training on chats from ChatGPT.com and Claude.ai respectively, where users chatted with the latest model and whose sessions became training material (directly or via web contamination). It seems unlikely to me these are coming from internal synthetic datasets given those would be much easier to suppress model identity.</li>
+ <li><strong>It’s a bit spicy that OpenAI models never identify as another lab’s model (besides briefly a Tesla Model S) yet Anthropic’s Sonnet 5 will regularly self-identify as GPT-4.</strong> It feels very unlikely that they are intentionally distilling GPT-4 but it’s possible a bunch of older ChatGPT chats are still making their way into the Claude training mixtures. It could also be carried through the generations via Sonnet 3.5 lineage. On top of this, in a follow-up experiment, when asked to answer identity questions “as model X would,” Claudes reproduce OpenAI models’ measured quirks at 68%; OpenAI models manage 8% on Claudes.</li>
+</ul>

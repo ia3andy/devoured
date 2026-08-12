@@ -1,0 +1,144 @@
+<p>We shipped Device Bound Session Credentials at Report URI, open-sourced the server-side implementation, and then discovered a long list of things the specification doesn't prepare you for.</p>
+<p>Some caused random logouts. One could deadlock a browser tab indefinitely. Two silently turned a device-bound session back into an ordinary bearer-token session while everything appeared to be working.</p>
+<p>This post is the collection of those production lessons: the bugs, browser behaviours, race conditions and implementation traps I wish we'd known before we started.</p>
+<h2>What DBSC actually does</h2>
+<p>Briefly, because I have a full explainer blog post on DBSC that you should read:</p>
+<p>Session cookies have one enormous weakness: they're bearer tokens. If malware on a user's machine reads the cookie out of the browser's storage and sends it to an attacker, the attacker is now that user. Every MFA prompt, every device check, every clever thing you did at login has already happened, and the cookie doesn't care. Infostealer malware has industrialised exactly this problem.</p>
+<p>DBSC fixes it by binding the session to a private key the browser generates in hardware — a TPM, a secure enclave — and cannot export. Alongside your normal session cookie there's a second, short-lived cookie. When that cookie expires, the browser <em>defers</em> whatever request needed it, calls a refresh endpoint on your server, proves possession of the device key by signing a challenge, and gets a fresh cookie back. Then, the deferred request resumes.</p>
+<h2>The spec reads backwards</h2>
+<p>Reading the specification, the shape I came away with was: registration is a two-step negotiation, and refresh is a single request. Both our tracking issue and my implementation plan were based on that. Turns out, it's the other way round.</p>
+<p><strong>Registration is single-phase.</strong> You attach a <code>Secure-Session-Registration</code> header to an authenticated response. Chrome generates a key, signs a JWT, and POSTs it to your registration endpoint. You verify it, create the binding, and reply <code>200</code> with the bound cookie. Done. One round trip.</p>
+<p><strong>Refresh is two-phase.</strong> The browser POSTs to your refresh endpoint with no challenge, because it doesn't have one yet. You answer <code>403</code> with a <code>Secure-Session-Challenge</code> header. The browser signs <em>that</em> and POSTs again. Now you answer <code>200</code> with a fresh cookie. Two round trips, and the <code>403</code> is the normal, healthy, everyday path, not an error.</p>
+<p>I know I'm not alone here, because months later the author of a Node DBSC implementation opened an issue on our repo and said, unprompted:</p>
+<blockquote>
+ the 403-then-200 refresh took me an embarrassing amount of time to figure out
+</blockquote>
+<p>If you take one thing from this post, take the fact that a <code>403</code> on your refresh endpoint is what progress looks like on the way to success.</p>
+<h2>Don't put the state in your session store</h2>
+<p>This one is worse, because it fails silently and it fails <em>closed-looking</em>.</p>
+<p>When we first shipped, DBSC state lived where all our other session state lives: in the session, keyed off the session ID. Obvious choice, right? Every request already loads it, it expires when the session expires, the plumbing is free. Easy.</p>
+<p>PHP sessions, and plenty of other session implementations, serialise the entire session as one blob and write the whole thing back. Last writer wins.</p>
+<p>Now look at what the browser does immediately after login:</p>
+<pre><code>POST /login          → 200, response carries Secure-Session-Registration
+  ├── GET  /account/       (the navigation the user is actually doing)
+  └── POST /dbsc/register  (Chrome, off the back of that header)</code></pre>
+<p>Those two run concurrently on the same session. <code>/account/</code> loads the session <em>before</em> registration completes, does its normal work, and writes its pre-registration snapshot back last. The binding we just carefully created got nuked in the process.</p>
+<p>This isn't just a bug, either, it's a security bug. The enforcement gate, finding no binding, concludes there is no DBSC session here and falls back to plain cookie authentication. Which is exactly correct behaviour for a browser that doesn't support DBSC, but exactly wrong here. The user's session is now a bearer token again. No error was logged. Nothing looked broken. Our audit trail showed registrations succeeding, because they had.</p>
+<p>The fix is to give DBSC its own storage, keyed by the session ID but written independently, so a concurrent session write can't clobber it. It's in the library's README as a warning now, phrased about as bluntly as I could manage:</p>
+<blockquote>
+ Report URI shipped DBSC with state in the PHP session blob; the post-login navigation races the <code>/dbsc/register</code> POST, both rewrite the whole blob last-writer-wins, the binding is clobbered, and enforcement silently no-ops — leaving exactly the stolen-cookie hole DBSC exists to close.
+</blockquote>
+<p>If you're implementing this: your DBSC binding needs its own key. Not a field in an existing blob you rewrite wholesale.</p>
+<h2>Everything rotates, or the browser terminates you</h2>
+<p>Three related rules, all learned the same way, all now baked into the library.</p>
+<p><strong>Rotate the cookie value on every refresh.</strong> If you verify the refresh JWT and reply <code>200</code> with the same cookie value the browser already has, because nothing has changed, so why not, Chrome reads that as "no refresh happened" and terminates the session. It wants to see rotation as proof the server actually did something I guess.</p>
+<p><strong>Rotate the challenge on every refresh too.</strong> Same reasoning. A refresh that doesn't advance the challenge hasn't advanced anything.</p>
+<p><strong>Do not put a challenge on the registration response.</strong> This one is properly counter-intuitive: it looks like an easy optimisation to hand the browser its first challenge on the same response that creates the session, saving that first <code>403</code>. Chrome reports a Challenge Error and the session never gets going.</p>
+<p>The reason is buried in two separate sections of the spec, and I only really understood it a month later when I was arguing about test vectors with that Node implementer. A <code>Secure-Session-Challenge</code> carries an <code>id</code> parameter naming which session it belongs to, and a challenge whose session can't be identified is silently dropped. But the registration response is the response that <em>creates</em> the session. At the moment it's parsed, there's nothing for the <code>id</code> to name. So the challenge resolves to nothing and Chrome, I guess quite reasonably, complains.</p>
+<p>I tried it, it didn't work, I reverted it, and there is now a test in the library whose name is literally <code>register response has NO Secure-Session-Challenge (Chrome rejects it there)</code>, because I did not want anyone (including future Scott with terrible memory) to "optimise" it back in.</p>
+<p>There's a fourth rule in the same family that's less about Chrome and more about arithmetic: <strong>your challenge TTL must be longer than your cookie lifetime.</strong> The browser caches a challenge. If it caches one just before the cookie expires, and the challenge TTL is shorter, the challenge is dead by the time there's a reason to use it. Our library's config constructor now refuses to build with the values the wrong way round.</p>
+<h2>The bug you cannot see on localhost</h2>
+<p>This is my favourite one, and it's the most transferable lesson here even if you never touch DBSC.</p>
+<p>The bound cookie rotates on every refresh. Fine. But rotation is not instantaneous <em>from the browser's point of view</em>. The refresh is a round trip, and during that round trip the browser is still doing other things.</p>
+<pre><code>t+0ms     browser starts POST /dbsc/refresh
+t+205ms   browser dispatches GET /ajax/some-widget  ← carries the OLD cookie. Correctly.
+t+1235ms  refresh response lands, browser stores the NEW cookie</code></pre>
+<p>That widget request left the browser 205ms into a 1,235ms refresh. It carried the pre-rotation cookie value because that was, at that instant, the only value the browser had. It is a completely legitimate request from a completely legitimate session.</p>
+<p>Our enforcement gate compared the presented cookie against the stored one, found a mismatch, and concluded: stolen cookie. Terminate the session, revoke the binding, log the user out.</p>
+<p>We shipped that and then beta users started getting randomly logged out.</p>
+<p>The signature in our audit trail was a successful refresh followed about a second later by an enforcement termination, with <em>no</em> refresh failure between them, which is what told us the fault was in the gate, not the refresh path. We caught it properly with a request trace showing exactly the sequence above.</p>
+<p>Here's the part that makes it dangerous: <strong>the failure rate is proportional to latency.</strong> The window is exactly the refresh round-trip time. On a developer's loopback interface that's a couple of milliseconds and you will basically never see it. We left it running on dev for two hours before it fired even once. Behind a CDN, over a real network, it's a second or more, and it fires on almost every refresh that races an ordinary request. Which is most of them, on a busy page.</p>
+<p>It passed every test we have, but it broke in production because production has physics.</p>
+<p>The fix is a single-depth history: accept the immediately-previous cookie value, but only until the instant that value would itself have expired in the browser anyway. I want to draw attention to that second clause, because it's a small design point I'm quite pleased with. There is no grace constant. No "give it five seconds and see". The acceptance window is exactly the lifetime the browser itself would still send that value for. It's a real quantity, derived from the system and it expires on its own without anyone having to tune it.</p>
+<p>And the security exposure is genuinely bounded too. One generation deep, expiring naturally, and a genuinely stolen cookie still can't complete a refresh without the device key, so it still hard-fails within minutes.</p>
+<h2>Never redirect a DBSC endpoint</h2>
+<p>Now, the big one. Our DBSC endpoints inherited the standard authentication gate that sits in front of every authenticated route on our application. Sensible reuse. That gate does what every such gate does: if you're not authenticated, you get a redirect to the login page.</p>
+<p>Consider what happens when a session finally expires while a tab sits idle:</p>
+<ol>
+ <li>The tab wakes up and requests a page.</li>
+ <li>The bound cookie has expired, so Chrome <strong>defers</strong> that navigation and calls <code>/dbsc/refresh</code> first.</li>
+ <li>Our auth gate sees an expired session and answers the refresh with <code>302 → /login</code>.</li>
+ <li>Chrome... stops.</li>
+</ol>
+<p>Not "gives up". Not "terminates the session and continues". It deadlocks. The deferred navigation is never released, never times out, and never fails. Blank tab, preliminary headers, forever.</p>
+<p>We proved it with a two-state matrix, forcing each state deliberately rather than waiting for a weekend to elapse:</p>
+<table>
+ <thead>
+  <tr>
+   <th>App session</th>
+   <th>DBSC binding</th>
+   <th><code>/dbsc/refresh</code> answers</th>
+   <th>Chrome</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>expired</td>
+   <td>present</td>
+   <td><strong>302 → /login</strong></td>
+   <td><strong>deadlocks</strong> — deferred navigation never resumes</td>
+  </tr>
+  <tr>
+   <td>alive</td>
+   <td>deleted</td>
+   <td><strong>401</strong></td>
+   <td><strong>recovers</strong> — terminates the DBSC session, navigation continues to /login</td>
+  </tr>
+ </tbody>
+</table>
+<p>Same broken-session situation, same user experience intent, completely different outcome based purely on the status code. A <code>401</code> tells Chrome the session is over, it tears the DBSC session down, and the deferred navigation is released to do what it was always going to do and land on the login page. A <code>302</code> tells Chrome nothing it can act on, and it waits.</p>
+<p>I feel like this is a bug so we raised it in Chromium.</p>
+<p>Our fix is the bit I'd encourage you to copy. The obvious patch is to add a guard: <em>if this is a DBSC endpoint and the auth gate is about to redirect, send a 401 instead.</em></p>
+<p>The DBSC endpoints now override the redirect mechanism itself to answer <code>401</code>. Not "this gate doesn't redirect DBSC requests" but "<strong>this endpoint cannot emit a redirect at all</strong>". Every existing gate is covered, and, more importantly, so is every gate anyone adds in the next five years without knowing any of this.</p>
+<h2>A challenge mismatch is not an attack</h2>
+<p>The most important fix in the library didn't come from us. It came from a contributor in the Netherlands with production logs from his own Chrome 150 install, showing real users being logged out.</p>
+<p>His trace, near enough:</p>
+<pre><code>20:29:33  refresh succeeded, new challenge issued
+          ── 16 minutes idle ──
+20:45:40  refresh: challenge expired      → session revoked path
+20:45:41  refresh: challenge mismatch     → session revoked path
+20:45:41  enforcement terminated, user logged out mid-flow</code></pre>
+<p>His challenge TTL was 900 seconds. The challenge presented at 20:45:40 had been issued 967 seconds earlier. So the first refresh legitimately failed as expired, which is a benign, retriable outcome, and we handled it correctly by minting a fresh challenge and answering <code>403</code>.</p>
+<p>One second later the browser came back. And it presented a challenge the server had <em>already rotated past</em>. That's a mismatch, and we treated a mismatch the way you'd expect: as a failed cryptographic proof. Stolen cookie. Revoke everything. Nuke it from orbit. Turns out though, that's wrong.</p>
+<p>The signature is verified before the challenge is compared. The refresh handler verifies the JWT against the device-bound public key first. Only if that passes does it look at which challenge was signed. So <em>anything that reaches the mismatch branch has already proved possession of the device's private key.</em> It cannot be forgery as a forgery dies earlier, at the signature check, and still terminates the session exactly as it should.</p>
+<p>This means a mismatch can only ever be one of a small set of benign situations:</p>
+<ol>
+ <li><strong>Concurrent refreshes.</strong> Two requests fire on return from idle, a service worker fetch racing a main navigation perhaps, and both holding the same cached challenge. The first succeeds and rotates. The second is correctly signed and now stale.</li>
+ <li><strong>A lost response and a retry.</strong> The browser signed a challenge, the response never arrived, so it tries again. There is no client-side fix for this, it's just a reality of the network being unreliable.</li>
+ <li><strong>A challenge-delivery race of your own making</strong>, if like us you have more than one path that can hand the browser a challenge.</li>
+</ol>
+<p>So mismatch, along with missing and expired, is now a benign, retriable outcome. Mint a fresh challenge, answer <code>403</code>, let the browser try again. Bad signatures remain terminal and unchanged.</p>
+<p>Another thing I liked was how this converges under concurrency, which the previous single-generation overlap window could not do. Three concurrent refreshes, all holding challenge <code>C</code>:</p>
+<pre><code>A(C)   → 200, cookie rotates, challenge now C2
+B(C)   → benign 403, mint C3           browser now signs C3
+D(C)   → benign 403, mint C4           browser now signs C4
+B′(C3) → matches the previous value → 200, cookie rotates again
+D′(C4) → C4 is now two generations back, overlap consumed → benign 403, mint C6
+D″(C6) → 200. Converged.</code></pre>
+<p>Everybody gets there and nobody gets logged out. The cost is one extra round trip per concurrency event (which is a bargain compared to the cost of a support ticket). And note that this handles <em>unbounded</em> concurrency, whereas the overlap window alone only ever covered two-deep. Three simultaneous requests were enough to trip a spurious logout under the old behaviour.</p>
+<p>The general point that I keep coming back to is: A single-use nonce sent over a lossy, concurrent transport will sometimes be presented stale. That is intrinsic to the design and not a defect in it. The bug was never that mismatches happened. The bug was terminating on an outcome that is inherent, benign, and tells you nothing about attackers.</p>
+<h2>Your SSO logins probably aren't binding at all</h2>
+<p>Chrome issues the registration POST in the SameSite context of the navigation that carried the registration header. That's fine for a normal login on your site, the user POSTed a form to you, the response is same-site, the POST carries your session cookie. All good.</p>
+<p>A SAML login doesn't work like that. The user lands on your callback via a chain the IdP initiated, so the registration POST that Chrome makes off that response counts as cross-site, and a <code>Lax</code> session cookie is withheld from it. The request arrives unauthenticated and gets a <code>401</code>.</p>
+<pre><code>22:47:20  GET  /account/        200   ← Lax rides a top-level navigation
+22:47:20  POST /dbsc/register   401   ← Lax does not ride this POST</code></pre>
+<p>And it's not merely a failure, it's a <em>spent</em> failure. Chrome marks the session as having a persistent HTTP error and won't retry. Offering the header on the SSO response doesn't just fail to bind that login; it burns the only attempt you get.</p>
+<p>The fix is to record the intent rather than act on it: mark that this login should be bound, then make the actual offer on the first document request that isn't cross-site, which is typically the very next page the user loads. We detect that with <code>Sec-Fetch-Site</code>, and treat a missing header as "don't bother", on the grounds that a client not sending <code>Sec-Fetch-Site</code> isn't going to register anyway.</p>
+<h2>Fail open at the edges, fail closed at the gate</h2>
+<p>DBSC has a lovely property, which is that adopting it cannot lock anyone out. A browser that doesn't support it ignores the registration header, never registers, and your gate, finding no binding, degrades to ordinary cookie authentication. Locking a current Firefox user out is <em>structurally impossible</em>. You don't need a compatibility check or a user-agent sniff; the protocol does it for you.</p>
+<p>That's the correct behaviour, and the library goes out of its way not to break it. But it has an ugly failure mode when it meets bad data.</p>
+<p>We had a routine that parsed a stored binding and returned <code>null</code> if it couldn't. Perfectly ordinary defensive code. Except the gate reads <code>null</code> as "there's no binding here", which, per the paragraph above, means "degrade gracefully to cookie auth".</p>
+<p>So a <em>corrupt</em> binding didn't fail closed. It quietly downgraded a hardware-bound session to a bearer token, which is the entire thing we implemented DBSC to prevent!</p>
+<p>It's not client-triggerable, to be clear, the realistic causes are internal: a serialiser mismatch, a truncated value, a schema skew across a deploy. But "only happens during a deploy" is not much comfort when the failure mode is silently disabling your session protection, and deploys are exactly when things are weird.</p>
+<p>Now it throws, <code>null</code> means "no record", and only that. Present-but-unparseable is a distinct, loud, fail-closed condition. The distinction is documented in the storage interface, so anyone implementing their own backend knows which is which.</p>
+<p>There's exactly one place we deliberately do the opposite, and I think the reasoning holds. Our "manage your sessions" screen shows a badge for whether each session is device-bound. If one row's binding can't be read, failing the whole page closed would mean a 500 for a page that is a <em>viewer</em>, not an enforcement point. So that badge is tri-state — bound, not bound, and unknown — and a bad read degrades to "unknown", surfaced as a visible alert rather than a silent "no".</p>
+<h2>Some decisions I'd defend</h2>
+<p>A few smaller calls that I think generalise.</p>
+<p><strong>Two overlap windows, deliberately asymmetric.</strong> We keep a one-generation history for the cookie <em>across</em> a successful refresh, but we explicitly discard the previous challenge on a successful refresh. That looks inconsistent, and it isn't: the refresh <code>200</code> delivers the new challenge synchronously with the new cookie, so there's no propagation window to bridge on that path — and <em>not</em> keeping it stops a spent challenge from being replayable. There's a comment in the source that says, more or less, "this asymmetry is intentional, do not consistency-refactor these into one," because I could see exactly how that tidy-up would go.</p>
+<p><strong>No Web Crypto fallback.</strong> We were asked about supporting non-Chromium browsers with a software key, and I chose not to. The entire value of DBSC for me is the hardware-binding guarantee, and a software-bound key trades that away. A browser without DBSC degrading cleanly to plain cookie auth is expected. A browser holding a software key that your code treats as hardware-bound is not.</p>
+<p><strong>Don't validate optional JWT claims speculatively.</strong> We verify the signature and the challenge. We deliberately do not check <code>iat</code>, <code>exp</code>, <code>typ</code>, <code>iss</code> or <code>aud</code>. The draft lists them as optional, browser emission isn't stable across versions, and our challenge TTL is already stricter than any <code>exp</code> a browser would plausibly emit. Adding checks the spec doesn't require buys you nothing, and we can tighten later if a revision mandates it.</p>
+<p><strong>Set a content type even on empty responses.</strong> Small one. Our <code>403</code> challenge response has no body, but it declares <code>application/json</code> anyway — because in development a framework debug bar will cheerfully inject HTML into a response the browser is parsing strictly, and you will spend an hour on that. Ask me how I know.</p>
+<h2>Where it stands</h2>
+<p>DBSC is now in open-beta at Report URI, it is being applied to a random downsample of our users that is increasing over time. The library is report-uri/dbsc-php if you want it, or just want to read the comments, and most of what's above is in there, next to the code it explains.</p>
+<p>DBSC is genuinely good. It closes a real hole that MFA doesn't touch, and it does it without any risk of locking users out. I'd encourage anyone running sessions at scale to look at it.</p>
+<p>Just don't redirect the refresh endpoint 😅</p>
