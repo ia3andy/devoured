@@ -1,0 +1,158 @@
+<p>I previously wrote about building an AI-assisted dependency vulnerability fixer. It used the GitHub Copilot SDK to start a repository-scoped coding agent for the fixes that could not be handled reliably by a deterministic packaging change. Each agent took a known finding, made the smallest safe change it could, validated the result, and opened a pull request for the repository owner.</p>
+<p>The .NET and Python tutorials isolate the permission boundary behind this kind of work: one agent, one repository, and explicit approval for side effects. This article looks at the next operational problem from the production fixer - what changes when many such workloads run concurrently.</p>
+<p>The first version processed one repository at a time. A representative batch of 30 repositories took roughly 46 minutes. With a worker pool of five, it took about 12.</p>
+<p>Replacing the sequential loop was the easy part. Before those five agents could run safely, each needed an isolated workspace, reliable cleanup, resource limits, rate limiting, and enough telemetry to show whether more concurrency helped. Multiple service replicas also needed durable job ownership and safe retries.</p>
+<p>That work changed my mental model:</p>
+<h2>An agent session is a workload, not a request</h2>
+<p>When I say “agent” in this article, I mean one live Copilot SDK client and session operating against one repository. In this setup, the client started the Copilot runtime and the session drove its model and repository tools. It was not a name for one model API request.</p>
+<p>An HTTP request usually borrows a connection, does bounded work, and returns. A Copilot session can live for minutes and contain many model and tool turns. It keeps a transcript in memory, drives a shell, mutates a checkout, creates subprocesses, uses upstream capacity, and may hold credentials that can create branches and pull requests.</p>
+<p>This introduces familiar distributed-systems questions. What isolates jobs? Who owns each resource? What happens when a worker disappears? Can a job run twice? Which resource sets the safe concurrency limit? Did a timed-out operation fail before or after changing an external system?</p>
+<p>The novelty is in who chooses the commands. The operational concerns are not new.</p>
+<p>Three decisions need to remain separate:</p>
+<ul>
+ <li><strong>Isolation:</strong> Each repository gets its own session and workspace, ideally inside a disposable sandbox.</li>
+ <li><strong>Concurrency:</strong> The worker count is bounded by the first resource likely to run out, not simply CPU.</li>
+ <li><strong>Persistence:</strong> Agent sessions can be ephemeral while job identities, attempts, and external effects remain durable.</li>
+</ul>
+<h2>Sequential execution had been protecting shared state</h2>
+<p>The first implementation was intentionally boring:</p>
+<pre><code>for (const repository of repositories) \{
+  await fixRepository(repository);
+}</code></pre>
+<p>It helped validate prompts, permissions, branch strategy, and review before concurrency obscured product mistakes. It also hid unsafe assumptions.</p>
+<p>The prompt cloned every repository into <code>/tmp/agent-workdir</code>. With two agents, one install could rewrite the lockfile another was preparing to commit. One cleanup could delete the other job’s files.</p>
+<p>The service now allocates the path and passes it to the agent as job data:</p>
+<pre><code>import \{ randomUUID } from "node:crypto";
+
+const safeName = `$\{repository}-$\{branch}`.replace(/[^a-zA-Z0-9_-]+/g, "-");
+const workdir = `/tmp/agent-$\{safeName}-$\{randomUUID()}`;</code></pre>
+<p>The same audit applies to ports, branches, cache keys, and temporary filenames. Any literal value becomes shared state when two jobs can use it.</p>
+<p>A unique directory prevents accidental overlap, but it is not a security boundary. Repository-controlled code still needs a disposable sandbox with bounded access to the host and network.</p>
+<p>The service did not call an LLM endpoint directly. For each job, it started a GitHub Copilot SDK client inside the unique working directory and created one agent session. Cleanup also needed to survive failure. The original code disconnected the session only after successful work, so an exception leaked both session and runtime resources.</p>
+<p>A simplified version of the corrected lifecycle looks like this:</p>
+<pre><code>import \{ CopilotClient, type CopilotSession } from "@github/copilot-sdk";
+
+async function runCopilotRemediation(job: Job, workdir: string) \{
+  const client = new CopilotClient(\{ workingDirectory: workdir });
+  let session: CopilotSession | undefined;
+
+  try \{
+    await client.start();
+    session = await client.createSession(\{
+      systemMessage: \{
+        mode: "append",
+        content: remediationInstructions(job),
+      },
+      onPermissionRequest: remediationPolicy,
+    });
+
+    return await session.sendAndWait(\{
+      prompt: buildRemediationTask(job),
+    });
+  } finally \{
+    await session?.disconnect();
+    await client.stop();
+    await removeWorkspace(workdir);
+  }
+}</code></pre>
+<p><code>client.start()</code> launches or connects to the Copilot runtime. <code>createSession()</code> gives the job its own transcript and agent loop. <code>sendAndWait()</code> lets that loop continue through repository reads, edits, shell commands, and validation until the session becomes idle. A worker pool of five can therefore mean five Copilot runtimes, five sessions, five mutable checkouts, and all of their subprocesses operating at once.</p>
+<p>The component that acquires a resource owns its lifecycle. Concurrency makes violations more frequent, not more complicated.</p>
+<h2>Bound concurrency with evidence</h2>
+<p>This is concise but unsafe:</p>
+<pre><code>await Promise.all(repositories.map(fixRepository));</code></pre>
+<p>It lets the input size set infrastructure policy. Thirty jobs may work; 300 may exhaust memory, fill disk, or trigger rate limits.</p>
+<p>I used a small worker pool instead:</p>
+<pre><code>async function runPool&lt;T&gt;(
+  items: T[],
+  limit: number,
+  run: (item: T) =&gt; Promise&lt;void&gt;,
+) \{
+  let next = 0;
+
+  async function worker() \{
+    while (next &lt; items.length) \{
+      const index = next++;
+
+      try \{
+        await run(items[index]);
+      } catch (error) \{
+        recordFailure(items[index], error);
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from(\{ length: Math.min(limit, items.length) }, worker),
+  );
+}</code></pre>
+<p>The cap is explicit, one repository failure does not cancel unrelated work, and the batch drains before completion is reported.</p>
+<p>I started with five workers. Five is not a generally safe number for coding agents. It was a conservative operating point for this workload.</p>
+<p>The real cap is the smallest limit implied by memory, ephemeral storage, subprocesses, file descriptors, provider requests and tokens, source-control operations, network bandwidth, spend, and acceptable blast radius. For memory, the rough calculation is:</p>
+<pre><code>memory_cap = floor(
+  (container_limit - service_baseline - safety_headroom)
+  / p95_incremental_memory_per_session
+)</code></pre>
+<p>A job-level cap does not replace API rate limiting. Five agents can still push branches or create pull requests simultaneously. The source-control client must independently honour rate-limit headers, <code>Retry-After</code>, and backoff.</p>
+<h2>Local limits stop being global limits</h2>
+<p>A process-local cap works only while there is one process. With a cap of five and four replicas, the service can create 20 live sessions:</p>
+<pre><code>effective_concurrency = replicas × per_replica_cap</code></pre>
+<p>An autoscaler can increase that number precisely when an upstream system is already under pressure.</p>
+<p>At this point, job ownership moves to a durable queue or database table. A worker atomically claims a job for a limited period, renews the lease while running, and records the outcome before acknowledging completion. If it disappears, the lease expires and another worker can retry. A global limiter protects shared provider and credential budgets.</p>
+<p>The agent session and workspace remain disposable. The durable state is the job identity, lease, attempt count, and record of external effects.</p>
+<p>Retries need reconciliation. Suppose the agent opens a pull request, but the response is lost before the job records success. A retry can create a duplicate.</p>
+<p>I gave each remediation a stable idempotency key derived from the repository and requested change. It enforces one active job, supports a stable branch name, and lets a retry find an existing branch or pull request. An atomic claim or uniqueness constraint closes the race that an existence check alone cannot.</p>
+<p>Stateless workers are useful. Statelessness means any worker can continue the protocol, not that the system remembers nothing.</p>
+<h2>Concurrency needs gauges and guardrails</h2>
+<p>Total batch duration is not enough to tune the pool. I needed queue wait and execution time separately, active sessions, peak memory, workspace size, subprocess count, cost per job, upstream throttling, retries, cleanup failures, and orphaned sessions.</p>
+<p>Three questions make those measurements useful:</p>
+<ol>
+ <li>Does active work regularly reach the cap?</li>
+ <li>Is queue time growing while constrained resources still have headroom?</li>
+ <li>Do failures, latency, throttling, or resource pressure rise with inflight work?</li>
+</ol>
+<p>If the pool never fills, a higher cap will not help. If queues grow while resources remain healthy, there may be room. If failures rise with inflight work, the system has found a boundary.</p>
+<p>Security belongs in the same discussion. The dependency fixer already treated repositories, install scripts, and tests as untrusted input. Concurrency multiplies that exposure. Each job needs bounded CPU, memory, processes, disk, time, network access, and short-lived repository-scoped credentials. It should have no ambient infrastructure credentials or permission to merge.</p>
+<p>Audit trails also need redaction. Terminal output, environment dumps, remote URLs, and package-manager logs can contain credentials.</p>
+<h2>Why five workers were not five times faster</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Phase</th>
+   <th>Sequential</th>
+   <th>Pool of five</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Clone and dependency setup</td>
+   <td>~10 minutes</td>
+   <td>~4 minutes</td>
+  </tr>
+  <tr>
+   <td>Agent inspection and editing</td>
+   <td>~22 minutes</td>
+   <td>~5 minutes</td>
+  </tr>
+  <tr>
+   <td>Push and pull-request creation</td>
+   <td>~12 minutes</td>
+   <td>~3 minutes</td>
+  </tr>
+  <tr>
+   <td>Artificial inter-job delay</td>
+   <td>~1.5 minutes</td>
+   <td>0</td>
+  </tr>
+  <tr>
+   <td><strong>Total</strong></td>
+   <td><strong>~46 minutes</strong></td>
+   <td><strong>~12 minutes</strong></td>
+  </tr>
+ </tbody>
+</table>
+<p>That is about a 3.8-times speedup. It is an operational measurement, not a benchmark. Removing an artificial delay contributed, and the rest was limited by uneven job duration, disk and network contention, provider latency, and source-control operations.</p>
+<p>The goal is not maximum concurrency. It is the best useful throughput inside the safety, cost, and reliability budgets.</p>
+<p>I would scale the next service in the same order: isolate each job, make cleanup unconditional, add a bounded local pool, measure it, then introduce durable claims and reconciliation before adding replicas.</p>
+<p>The worker pool reduced this batch from roughly 46 minutes to 12. Everything else was the cost of making that number safe.</p>
+<p>That is what concurrency actually costs.</p>
+<p>Thanks for reading ✌️</p>

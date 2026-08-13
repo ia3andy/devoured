@@ -1,0 +1,49 @@
+<h1>Reviewing code is a skill</h1>
+<p><strong>Intended audience:</strong> Software developers interested in getting better at developing software. Initially, I meant this post more for junior developers, but some parts are more applicable for tech leads etc. So if the post appears a bit muddled, please accept this apology from my inner Pascal, “Sorry, I did not have the time to break it up into two posts.”</p>
+<p>In developer communities, there has been a lot of discussion on code review, especially over the course of 2025-2026. For example, you may have seen claims like:</p>
+<ul>
+ <li>“Code review is the bottleneck”</li>
+ <li>“Mandatory pre-merge code review is for low-trust environments; you should push directly to main”</li>
+ <li>“Code review doesn’t find bugs”</li>
+ <li>“Code review is not for X, it’s for Y”</li>
+ <li>“LLMs are better than humans at reviewing code”</li>
+ <li>“LLM code reviews are much better than humans at finding edge cases/bugs”</li>
+ <li>“You should stop looking at the code; you should be doing XYZ instead”</li>
+</ul>
+<p>Out of this, zooming in on “Code review is not for X, it’s for Y” for a moment, the research has the following to say:</p>
+<blockquote>
+ <p>By coding our interview data, we identified four key themes for what Google developers expect from code reviews: education, maintaining norms, gatekeeping, and accident prevention. Education regards either teaching or learning from a code review and is in line with the initial reasons for introducing code review; norms refer to an organization preference for a discretionary choice (e.g., formatting or API usage patterns); gatekeeping concerns the establishment and maintenance of boundaries around source code, design choices or another artifact; and accidents refer to the introduction of bugs, defects or other quality related issues.</p>
+ <p>– <a href="https://dl.acm.org/doi/pdf/10.1145/3183519.3183525">Modern Code Review: A Case Study at Google</a> (2018)</p>
+</blockquote>
+<p>Similarly, <a href="https://d1wqtxts1xzle7.cloudfront.net/123087856/icse2013-libre.pdf?1748877378=&amp;response-content-disposition=inline%3B+filename%3DExpectations_outcomes_and_challenges_of.pdf&amp;Expires=1786290544&amp;Signature=R5O-pbRUD~ZBlCXj7MKPrQovHnP94AzTDdRaHH7OMLzSz-rElLhqbwYRJrN76q2ooGx6cRtl5laCF1fMf-rp3~CuR9vSOY2zWA20TuZCrQueownjjFMsMwMk16RgdsSgAPxtA~TXCOD06HqAo~wYeETeJW-l9gbRgbaFI2caM7pxbZM3eY2TvPQi54EAeymv3OyIylije4xUtlaoa9b7bwSfxSHwvxkaS2alYSqVu3HO1iZMTTQs9djOzEV3J8yGoJ26-PFhhwSUG1HIawGy6iGgOPur5Ue-EMWoLa85l5zGzh0jBdyJcf7VAaDIbU9wC4K~yXh9GzMocHpXV0YHDw__&amp;Key-Pair-Id=APKAJLOHF5GGSLRBV4ZA">Expectations, outcomes, and challenges of modern code review</a> (2013) points out:</p>
+<blockquote>
+ <p>Our study reveals that while finding defects remains the main motivation for review, reviews are less about defects than expected and instead provide additional benefits such as knowledge transfer, increased team awareness, and creation of alternative solutions to problems. Moreover, we find that code and change understanding is the key aspect of code reviewing and that developers employ a wide range of mechanisms to meet their understanding needs, most of which are not met by current tools</p>
+</blockquote>
+<p>So at least, hopefully we can agree that code review serves many purposes. I will get to the other points in a bit.</p>
+<p>But before that, I want to articulate a framing which I haven’t seen much elsewhere. Namely, that <em>reviewing code is a skill</em>. Specifically, I posit that:</p>
+<ul>
+ <li>It’s possible to get better at reviewing code. By “better”, I mean across all of the purposes above: catching bugs, catching design issues, increasing one’s awareness of what’s going on, and understanding the code.</li>
+ <li>It’s possible to teach someone to get better at reviewing code.</li>
+ <li>By virtue of it being a fairly modern skill, we don’t quite know where the human skill ceiling lies.</li>
+ <li>If you’re a software developer, and if you believe that people will continue to be involved in the development and maintenance of programs for the foreseeable future, then it’s <em>valuable</em> to get better at reviewing code.</li>
+</ul>
+<h2>A tale of three almost-introduced bugs</h2>
+<p>In two out of the three cases, the person who wrote the PR had experience with the surrounding code. The other thing to note is that LLM reviews with a mixture of high-end coding models were run for all of the PRs described below. They did not catch the issues that I caught.</p>
+<h3>Writing some git configuration</h3>
+<p>We use our own devboxes at <code>$WORK</code> which run on EC2 instances. The logic for starting things has two subprocesses: one background process to initialize state, and one foreground process that blocks the user until it's done. One of my colleagues created a PR to move some modifications to the global <code>~/.gitconfig</code> from the foreground process to the background process.</p>
+<p>When a <code>git config</code> command needs to modify <code>~/.gitconfig</code>, it first acquires an exclusive file lock on <code>~/.gitconfig.lock</code>. When I saw the PR, I remembered we’d hit non-determinism in the devbox setup, where git’s behavior of fast-failure on lock acquisition failure led to flakiness during startup. We converged on a solution which had a separate <code>flock</code> operation. This allowed for having retries with backoff, doing multiple modifications under the same <code>flock</code> without other intervening writes, and doing direct writes without worrying about concurrent writers.</p>
+<h3>To display progress or not to display progress</h3>
+<p>There’s a periodic CI job which does some processing and uploads a tarball to an AWS S3 bucket. The <code>aws</code> CLI displays progress by default. When a colleague changed the logic to upload to 4 buckets instead of 1 to speed up downloads, the CI job started failing, due to the log file exceeding the 10MB limit. The colleague submitted a PR to use <code>--no-progress</code>. I suggested <code>--progress-seconds</code> instead. We eventually realized that the existing CLI version in the CI job was too old to support that flag. The PR was later fixed by installing a sufficiently new <code>aws</code> CLI version.</p>
+<h3>The extra SHA that could’ve caused an outage</h3>
+<p>An engineer created a new CI job to upload tarballs with a checksum. I realized there was a bug: the CI job was uploading the tarball to a fixed object name, followed by the checksum. Because the job was uploading the tarball before the checksum, if the job was canceled or crashed, readers checking the integrity of the tarball against the old checksum would start failing, leading to an outage. I pointed out this failure mode to the person who created the PR.</p>
+<h2>The case for code review being a skill</h2>
+<p>I learnt how to review code along the way. I was not magically born with some innate ability to do code review, or to catch bugs in code review. Some things I can think of that help me: when I discover a bug that I introduced earlier, I tend to take it more personally; I tend to think of programs in terms of invariants and little proofs; I like reading tech blogs and watching tech talks. Out of these, I think the second point in particular is very learnable and teachable.</p>
+<h2>Putting on the mad scientist hat for a bit</h2>
+<h3>Randomized process-oriented Socratic dialogues</h3>
+<p>Say you have a junior engineer who is requesting a review from a senior engineer. A bot randomly decides to create a meeting. In the meeting, the senior person first asks the junior person for their perspective on why they did things a certain way, or what assumptions they were making. This shifts the focus to the <em>thought process</em>.</p>
+<h3>Lightweight near-miss post-mortems</h3>
+<p>Every time a bug is caught in code review during a sprint, the PR author could be asked to record a short clip explaining the context and what the caught issue was. During the team retro, the team could watch the clips together to increase shared knowledge.</p>
+<h3>Firewalled modeling</h3>
+<p>When working on a complex system, two people could play the roles of modeler and programmer. The modeler develops a model <em>without</em> looking at the code, while the programmer works on the code. They then meet to create test cases. The model serves as a reference to review the thoroughness of the code.</p>
+<h2>On the zeitgeist surrounding code review</h2>
+<p>If you’re going to be responsible for the code you ship, and the code you ship has real consequences for real people, it’s worth asking how you can get better at what you do. To that end, I believe that investing in getting better at reviewing code is one of the best things you can do as a software developer.</p>

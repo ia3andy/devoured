@@ -1,0 +1,73 @@
+<h1>rd-signal-2: Frontier Classification at Production Scale</h1>
+<p>Today we're launching Signals 2.0, powered by rd-signal-2, our new model pipeline for building task-specific binary classifiers from production traces.</p>
+<p>rd-signal-2 approaches <strong>GPT-5.6 Sol xhigh accuracy</strong> while costing <strong>1600x less, and 260x less than GPT-5.6 Luna xhigh</strong>.</p>
+<p>This model is available to all Raindrop customers today (at no additional cost).</p>
+<p>We are also releasing Signal Builder: a platform for training and hosting custom classifiers with Zero Data Retention. Signal Builder brings the power of Signals to the strictest of enviroments (including healthcare).</p>
+<h2>Everything is a binary classification problem</h2>
+<p>Last year, OpenAI published a paper called "Why Language Models Hallucinate". Hallucination, they said, is simply a binary classification problem: any statement is either true or not.</p>
+<p>The LinkedIn headlines were immediately victorious: "OpenAI solved hallucination."</p>
+<p>And, if being binary made classification easy, they would have. But, as it would turn out, everything in life is just binary classification too. You either should or should not get married; the UI is either good or not.</p>
+<p>...and a given agent behavior is either good or bad.</p>
+<p>Binary classification is a hard alignment problem. You need to align the humans within a company on the definition of good/bad, and then explore all of the edge cases, and then - and only then - you must align a model or pipeline to that definition.</p>
+<p>Raindrop covers the entire journey of training accurate classifiers for agent behavior.</p>
+<h2>Classifiers for Agents</h2>
+<p>In June 2025, we launched the first version of Signals: an automated pipeline for training tiny classification models.</p>
+<p>At the time, our classifiers evaluated a single input-and-output pair for a given behavior. That worked for the chatbot era, when the relevant evidence was contained within a single turn. Our competitors still have that limitation.</p>
+<p>But agent failures now unfold across multiple turns, tool calls, and subagents, sometimes spanning hundreds of thousands of tokens. These failures are often nuanced and sparse. Finding them requires both deterministic filtering to assemble the relevant evidence and semantic judgment to interpret it.</p>
+<p>Running a frontier model over every trace is the obvious solution, but, among other problems, it becomes prohibitively expensive and slow at production scale.</p>
+<p>Smaller models are affordable, but they struggle with complex behaviors and are often limited by how much context they can consume.</p>
+<p><em>rd-signal-2</em> solves this through an automated research loop. For each behavior, it studies production traces, writes code to assemble the context that matters, and uses that context to train a task-specific model.</p>
+<h2>How rd-signal-2 builds Signals</h2>
+<p>When an agent produces this trace, the failure is not contained in any single step. It is the relationship between the repeated tool failures and the assistant's final response. <em>rd-signal-2</em> can express that relationship:</p>
+<pre><code>export function run(event) \{
+  const attempts = findToolCalls(event.trace, "update_record");
+
+  const repeatedWithoutChange =
+    attempts.length &gt;= 3 &amp;&amp;
+    haveIdenticalInputs(attempts) &amp;&amp;
+    attempts.every(call =&gt; call.failed);
+
+  if (!repeatedWithoutChange) \{
+    return \{ matched: false };
+  }
+
+  return classify(
+    formatForReview(attempts, event.finalResponse),
+    "The assistant claims the operation succeeded",
+    \{ spanIds: attempts.flatMap(call =&gt; call.spanIds) }
+  );
+}</code></pre>
+<p>The code finds the relevant tool calls, compares their inputs, and checks whether they failed. If those conditions are not met, the Signal returns a non-match without calling a model.</p>
+<p>If they are met, the Signal extracts the failed attempts and the assistant's final response from the trace. The remaining semantic judgment goes to a combination of a "task-specific classification head" and our in-house semantic reasoning model, optimized for binary classification.</p>
+<p>This was an easy example, constrained to a single turn. Signals are built to efficiently and dynamically collect context from sessions that span days and weeks.</p>
+<h2>Reasoning at build time</h2>
+<p><em>rd-signal-2</em> separates the reasoning required to <strong>construct</strong> a classifier from the computation required to <strong>execute</strong> it.</p>
+<p>Traditional LLM Judges waste reasoning tokens rediscovering the same evidence and making slightly different judgments each time.</p>
+<pre><code>Prompt classifier cost = traffic × full-trace reasoning</code></pre>
+<p><em>rd-signal-2</em> pays a one-time cost that can be spread across every future trace:</p>
+<pre><code>rd-signal-2 cost = build once + deterministic execution
+                    + ambiguous candidates × compact context</code></pre>
+<p>By iterating and enforcing strict self-verification, the system can try several approaches before finding one that matches the customer's intent.</p>
+<p><strong>Model calls should scale with uncertainty, not traffic.</strong></p>
+<p>As a result, Signals are inexpensive enough to include with the Raindrop platform and run across billions of traces per month. This stands in stark contrast to platforms like Braintrust and Langchain that require customers to pay out-of-pocket for inference.</p>
+<h2>Binary classification is an alignment problem</h2>
+<p>The hardest part of building an effective classifier is often discovering what the user actually means. We quickly realized that this is as much a product problem as it is a machine-learning problem.</p>
+<p>To illustrate how challenging finding this line can be, we wrote four variations of the same one-sentence behavior and ran all four over the same 2,000 production traces. Match rates ranged from 0.9% to 4.6%, and 67% of matched traces were contested by at least one variation. Human-model alignment will remain an active area of research at Raindrop.</p>
+<h2>A Signal is never truly finished</h2>
+<p>Building an accurate classifier is just the first step. Raindrop helps keep it accurate.</p>
+<p>As models and harnesses change, the shape of traces changes too. Customers also discover specification errors as they see their Signal operate on more data. A Signal can become less accurate even when its code has not changed.</p>
+<p>After deployment, we continue watching. Each day we randomly sample production Signals using frontier models. When these evaluations uncover drift or a regression, we rerun prompt optimization and retune.</p>
+<p>This creates a continuous loop of deploying, sampling, evaluating, finding regressions, and retuning.</p>
+<h2>Running Signals safely at scale</h2>
+<p>Evaluating 10,000 traces is easy. Running more than two million a day requires careful model serving, queueing, retries, and isolation.</p>
+<p>Every generated Signal is treated as untrusted by default. Each customer's Signals run in an isolated environment with no credentials or internet egress. An organization's runtime can access only that organization's data.</p>
+<p>Trace context is fetched once and cached close to the evaluation workers, so multiple Signals can reuse it instead of repeating expensive queries. This keeps the hot path focused on deterministic execution and the small set of cases that need model judgment.</p>
+<p>At production scale, the median trace is classified in 100 ms. This infrastructure currently evaluates over 20 billion traces per month.</p>
+<h2>How rd-signal-2 builds a better Raindrop</h2>
+<p><em>rd-signal-2</em> already powers more than user-created classifiers inside Raindrop.</p>
+<p>Our Issue Detection system shares the same architecture to identify, track, and monitor emerging failure modes in our customers' data distributions. This allows our customers to insantly turn any issue detected into a long-standing Signal. From there, they can refine the policy, use Experiments to A/B test, and more.</p>
+<h2>Signals 2.0 API</h2>
+<p>Signals aren’t limited to just the Raindrop platform. Developers can now call the Signals API directly to build domain-specific detection into their own systems.</p>
+<p>For teams with stricter data requirements, ZDR Signals supports training and running task-specific classifiers without retaining production data.</p>
+<h2>Try Signals 2.0</h2>
+<p>Signals 2.0 is available today in Raindrop. Create your first Signal in Raindrop to get started.</p>

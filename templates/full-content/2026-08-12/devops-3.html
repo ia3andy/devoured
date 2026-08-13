@@ -1,0 +1,64 @@
+<p>Startup time affects everyone—users waiting for responses, developers testing features, and teams watching cloud costs. Datadog Application Performance Monitoring (APM) helps engineers understand performance throughout an application, including during startup. For Java, using APM involves attaching an agent to the JVM that automatically transforms classes to add observability, an approach known as instrumentation. Instrument too few places and you miss key details. Instrument too many and startup suffers. APM has to balance that trade-off, and the first step is deciding which classes to instrument—a problem called class matching.</p>
+<p>Over the past 4 years, the Datadog APM team has reduced class-matching overhead by 30%. Optimizing class matching during startup is particularly challenging because the just-in-time (JIT) compiler has not yet optimized the matcher code, and profilers have not captured enough samples to identify hot spots. Instead, we relied on our knowledge of JVM internals to identify promising ideas and ran multiple experiments to validate our intuition.</p>
+<p>One speculative optimization that paid off was encoding multiple class-name prefix matches ahead of time as a single JVM constant, loaded with a single bytecode instruction. In this post, we’ll explain how we developed that encoding and used it to replace a hand-rolled matcher of “uninteresting” classes.</p>
+<h2>Observing Java applications by instrumentation</h2>
+<p>Java provides several APIs for observing application behavior. Java Management Extensions (JMX) expose metrics such as memory levels and CPU load. But often you need a different perspective, such as measuring the time spent in a particular library or method call. The JVM Tool Interface (JVMTI) provides this level of detail, but it requires writing native code and a separate binary for each platform you want to support.</p>
+<p>The Java Instrumentation API provides an alternative to JVMTI that can be implemented entirely in Java. It lets you intercept class definitions and transform them before the JVM finishes loading the class. APM Java uses this mechanism to add method advice that records when a method starts and ends, as well as propagating context from one method to another.</p>
+<p>While a single piece of method advice only adds a small amount of overhead, instrumenting every method of every class would quickly become expensive. Instead, we need to identify the classes that provide the most observability value and focus our instrumentation there.</p>
+<p>A typical Java application defines tens of thousands of classes, and a large enterprise application may load more than 100,000. This creates a large search space that we must narrow down to find the relatively small number of classes that require instrumentation. Class names provide a cheap way to prune classes and packages compared to structural and class hierarchy matches, which need to parse the class file and may require parsing of additional class files to inspect related types.</p>
+<p>That’s why our first step is always to compare the class name against a curated ignore list of class and package prefixes. This significantly reduces the search space before we perform more detailed structural and hierarchy-based checks. Even then, the sheer number of classes involved means that small improvements to the prefix-matching algorithm can have a measurable impact on startup performance.</p>
+<h2>Optimizing prefix matching during JVM startup</h2>
+<p>Prefix matching is largely considered a solved problem. But prefix matching during JVM startup introduces unexpected constraints.</p>
+<p>Some instrumentation, such as adding context fields, must happen before a class is first loaded. To do this for Java Development Kit (JDK) classes, we need to register our class transformer during a little-known JVM phase called <code>premain</code>. When you attach an agent on the command line, the JVM calls the agent’s <code>premain</code> method before it calls the application’s <code>main</code> method.</p>
+<p>At this point, hardly any classes have been loaded and the JIT compiler is cold. We have to be careful what we load and call because some JDK methods have unexpected side effects that can affect the application. For example, anything that uses <code>java.util.logging</code> (JUL) will initialize the <code>LogManager</code> singleton, and that initialization is irreversible. If an application needs a custom <code>LogManager</code> and sets the <code>java.util.logging.manager</code> system property in <code>main</code>, triggering JUL initialization in <code>premain</code> will break the application.</p>
+<p>Java 8 adds a further constraint: It does not start the JIT compiler until after <code>premain</code>, so code there is interpreted and unoptimized.</p>
+<p>Back in 2020, APM Java used code to define a complex nested structure of prefix matches. This was flexible but hard to maintain. We also needed several optimizations to make it perform well on Java 8, where it could not benefit from JIT compilation during <code>premain</code>.</p>
+<p>After analyzing the existing prefix matches, the most obvious replacement was a <strong>trie</strong>. Tries are tree-based data structures that distribute elements of the key across several nodes.</p>
+<p>But how should we store the trie data? One benefit of the code-based approach was that the JVM handled finding and loading the classes from the agent. With a conventional trie, we would need to look up a resource, read the file, parse the content, and construct the trie nodes. And we would need to do all of that in the constrained environment of <code>premain</code>, where the JIT is cold or absent, we cannot touch certain classes, and we cannot load external dependencies that might later conflict with the application.</p>
+<p>We needed the lookup performance of a trie without the startup cost of building one.</p>
+<h2>Encoding a trie as a single string constant</h2>
+<p>The result was ClassNameTrie, a prefix trie encoded as a JVM constant.</p>
+<p>Storing trie data as a JVM constant has a number of benefits. The JVM loads the string constant as part of class loading, making the encoded trie accessible through a single bytecode instruction (<code>ldc</code>). There is no need to look up resources or perform I/O. Because the string constant is embedded directly in the class that uses it, it survives repackaging. The compact encoding also improves cache locality.</p>
+<p>So how does it work?</p>
+<p>Java string constants are defined as a sequence of chars. Each char can hold 2 bytes, giving us 65,536 unique values. How those values are interpreted is entirely up to us, which means we can store both control information and content in the same string.</p>
+<p>Values have three possible meanings, identified by the top bits of the value:</p>
+<ul>
+ <li>A leaf, which provides a definitive result and stops the search</li>
+ <li>A bud, which provides a potential result but allows the search to continue</li>
+ <li>The length of the inline segment string for that branch</li>
+</ul>
+<p>Buds and leaves may also have the glob bit set. Normally a value only applies if the key ends exactly at the bud or leaf node. If the glob bit is set, the value applies even when there are more characters left in the key. This leaves 8,191 as the maximum value that can be stored in a ClassNameTrie branch, which is more than enough for our needs.</p>
+<p>At the end of the node are the jump offsets for each branch, each stored in a single character. These give the offset to the inline segment string for each branch, or its child node if the branch has no segment, relative to the end of the current node. There is always one fewer jump than the number of branches because the offset for the first branch is guaranteed to be zero.</p>
+<p>Large tries may contain jump offsets that don’t fit into a character. Jump offsets larger than 61,439 (0xEFFF) are stored in a separate long-jump table. The index into that table is stored in the trie with the long-jump marker set, so the real offset can be retrieved from the table when required.</p>
+<p>In pseudocode, the matching process looks like:</p>
+<ol>
+ <li>Read the next key character.</li>
+ <li>Read the branch count for the current node.</li>
+ <li>Binary search the branch characters. 
+  <ul>
+   <li>If no branch matches, then stop.</li>
+  </ul></li>
+ <li>If the matched value is a leaf or bud: 
+  <ul>
+   <li>If there are no more key characters, or the value is a glob, update result.</li>
+   <li>If there are no more key characters, or the value is a leaf, stop.</li>
+  </ul></li>
+ <li>Treat the remaining value as a segment-length (0 for leaf or bud).</li>
+ <li>Apply the branch’s jump offset from the end of the node.</li>
+ <li>Match the <code>segment-length</code> key characters against the inline segment. 
+  <ul>
+   <li>If the segment does not match, stop.</li>
+   <li>Check whether a collapsed leaf follows the segment.</li>
+   <li>If there are no more key characters, or the collapsed leaf is a glob, update the result and stop.</li>
+  </ul></li>
+ <li>Repeat from step 1.</li>
+</ol>
+<p>This is implemented as a single static, thread-safe method.</p>
+<h2>Measuring cold-start performance</h2>
+<p>We want to measure cold-start performance because we’re most interested in how the trie behaves during <code>premain</code> and initial loading of the application. The results confirm that ClassNameTrie is much faster than the old code-based approach, especially on Java 8, where it is <strong>nearly 5x faster</strong>. It’s even faster than a classic radix trie during cold start, due to its compact representation and cache locality.</p>
+<p>In a real-world Spring Boot application, ignoring uninteresting classes by name reduced instrumented startup time by 20%. Switching from the code-based approach to ClassNameTrie saved a further 1% while making the ignore list much easier to maintain and grow.</p>
+<p>We then realized we had an efficient way to map class names to integers. That insight led us to another optimization: a known types index that maps class names directly to numbered instrumentations. This shortcut saved another 3%, bringing the total savings to more than 24% compared to not filtering by class name.</p>
+<h2>When data is cheaper than code</h2>
+<p>We’ve shown how it’s possible to encode a prefix trie as a string constant, and the advantages of storing data as constants in the JVM. This is especially important during early JVM startup, where code can be more expensive than data.</p>
+<p>Yet pruning by name is just one aspect of class matching. Structural matches rely on parsing the class files. To speed this up, we developed our own class-file parser that extracts only the elements needed for matching. More complex hierarchy matches require finding and loading class files outside of the current class. This can be costly and produce a lot of data, so we applied dynamic programming to combine matches and avoid repeated loops over the class hierarchy.</p>
+<p>All code discussed in this post is available from our open source instrumentation helper library.</p>
