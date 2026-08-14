@@ -1,0 +1,188 @@
+<h1>Filtered Vector Search: What ACORN Fixes, and What Fixes ACORN</h1>
+<p>Filtered vector search breaks when metadata filters turn a healthy nearest-neighbor graph into scattered islands. HNSW’s <code>m</code> parameter controls how many links each point gets. At Qdrant’s default <code>m=16</code>, the one-million-point collection benchmarked below averaged about 21 links per node on layer 0. Filter out 96% of the points and fewer than one link per node survives on average, so traversal can get stranded before it reaches the true nearest matches.</p>
+<p>Qdrant repairs that damage in two places. Filterable HNSW adds extra edges at index time; ACORN steps through neighbors of neighbors at search time. Both run on the same collection. ACORN earns its cost where the extra edges don’t reach: values too common to link, <code>AND</code> filters no single field’s edges cover, and payload fields the build skipped silently.</p>
+<p>This benchmark runs on a single Qdrant instance and compares four of Qdrant’s own search strategies over four builds.</p>
+<h2>The Two ACORNs</h2>
+<p>The <a href="https://arxiv.org/abs/2403.04871">ACORN paper</a> (Patel et al., SIGMOD 2024) describes two algorithms. Its headline claim of “2-1,000x higher throughput at a fixed recall” belongs to ACORN-gamma, which expands neighbor lists during index construction at 8.8x to 33.1x plain HNSW’s build time in the paper’s own table.</p>
+<p>ACORN-1 is lighter. It builds a standard HNSW graph, then checks neighbors of neighbors at search time where direct neighbors fail the filter. Qdrant implements ACORN-1 as a query parameter you opt into per request, with no index-time changes.</p>
+<h2>The Graph Qdrant Builds Instead</h2>
+<p><a href="https://qdrant.tech/articles/filterable-hnsw/">Filterable HNSW</a>, which our co-founder Andrey Vasnetsov described in 2019, builds the repair into the index. When a payload field, the metadata attached to each point, is <a href="https://qdrant.tech/documentation/manage-data/indexing/#payload-index">indexed</a>, Qdrant adds extra HNSW edges between points that share a value in that field, so a filtered query keeps a connected graph to traverse. Qdrant gives those edges to payload fields at index time, and not every field earns them.</p>
+<p>Those edges cost build time. On our one-million-point collection, the HNSW index built in 116 seconds without them and 507 to 652 seconds with them, 4.4x to 5.6x the cost. That range covers two builds at identical settings, so it is build-to-build variance. Both figures are index build time, with ingest excluded.</p>
+<p>Qdrant builds those edges per payload field, never per combination, so an <code>AND</code> filter lands on an intersection that no single field’s edges cover. ACORN-1 covers that gap and pays at query time instead of build time. Qdrant’s <a href="https://qdrant.tech/documentation/search/search/#query-planning">query planner</a> chooses automatically between ACORN, full scan, retrieval straight from the payload index, and filterable HNSW.</p>
+<h2>The Benchmark</h2>
+<p>The benchmark runs on one million <code>deep-image-96</code> vectors, 96-dimensional image embeddings from the <a href="https://github.com/erikbern/ann-benchmarks">ANN-benchmarks</a> suite. Keyword filters match from 20% of the points down to 0.012%. <code>Recall@10</code> is scored against exact brute force over 500 queries per filter, and latency is mean server-side query time.</p>
+<p>We tested four strategies:</p>
+<ol>
+ <li><strong>Plain graph</strong>: standard HNSW with no extra edges.</li>
+ <li><strong>Plain graph + ACORN</strong>: the same graph with ACORN forced on.</li>
+ <li><strong>Filterable HNSW</strong>: the default build with extra edges.</li>
+ <li><strong>Planner + ACORN</strong>: Qdrant’s default query planner, free to route each query to ACORN, full scan, or the payload index.</li>
+</ol>
+<p>Every filter matches one keyword value on a payload field. The collection carries seven such fields, holding 5, 10, or 100 distinct values each.</p>
+<h2>Single Filters: Extra Edges Win</h2>
+<p><code>hnsw_ef</code>, shortened to <code>ef</code> below, is the number of candidates the search evaluates, so raising it improves recall and slows the query. Selectivity is the fraction of points that pass the filter.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Filter (selectivity)</th>
+   <th>Plain graph</th>
+   <th>Plain graph + ACORN</th>
+   <th>Filterable HNSW</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>One keyword (20%)</td>
+   <td>62.9% @ 1.6ms</td>
+   <td>98.9% @ 4.4ms</td>
+   <td>94.8% @ 1.2ms</td>
+  </tr>
+  <tr>
+   <td>One keyword (10%)</td>
+   <td>20.6% @ 1.7ms</td>
+   <td>98.1% @ 4.3ms</td>
+   <td>99.0% @ 1.1ms</td>
+  </tr>
+  <tr>
+   <td>One keyword (1%)</td>
+   <td>0.1% @ 1.6ms</td>
+   <td>67.7% @ 4.7ms</td>
+   <td>99.8% @ 1.0ms</td>
+  </tr>
+  <tr>
+   <td>Correlated (10%)</td>
+   <td>88.4% @ 1.7ms</td>
+   <td>98.6% @ 3.5ms</td>
+   <td>99.0% @ 1.2ms</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Why Some Payload Fields Get No Extra Edges</h2>
+<p>Qdrant builds extra edges by walking the values of each indexed payload field. For each value it finds the points that share it and links them, so a query filtered to that value still has a graph to traverse.</p>
+<p>A value shared by more points than a size cap gets no extra edges, because the main graph should already keep that many points connected. Qdrant derives that cap per segment, the slice of a collection that has its own index. The formula is point count divided by average links per node, times four.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Field</th>
+   <th>Distinct values</th>
+   <th>Points per value</th>
+   <th>Extra edges built</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>2 fields</td>
+   <td>5</td>
+   <td>~200,000</td>
+   <td>No, all 5 values over the cap</td>
+  </tr>
+  <tr>
+   <td>2 fields</td>
+   <td>10</td>
+   <td>~100,000</td>
+   <td>Yes, 10 of 10 values</td>
+  </tr>
+  <tr>
+   <td>Correlated field</td>
+   <td>10</td>
+   <td>~100,000</td>
+   <td>Yes, 10 of 10 values</td>
+  </tr>
+  <tr>
+   <td>2 fields</td>
+   <td>100</td>
+   <td>~10,000</td>
+   <td>Yes, 100 of 100 values</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Double Filters: The Intersection Gap</h2>
+<p>The same benchmark at <code>hnsw_ef=64</code>, now with an <code>AND</code> filter over two keyword fields.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Filter (selectivity)</th>
+   <th>Plain graph + ACORN</th>
+   <th>Filterable HNSW</th>
+   <th>Planner + ACORN</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Two keywords (4%)</td>
+   <td>95.2% @ 7.7ms</td>
+   <td>63.7% @ 1.2ms</td>
+   <td>99.9% @ 13.9ms</td>
+  </tr>
+  <tr>
+   <td>Two keywords (1%)</td>
+   <td>72.7% @ 6.8ms</td>
+   <td>70.8% @ 1.5ms</td>
+   <td>100% @ 3.7ms</td>
+  </tr>
+  <tr>
+   <td>Two keywords (0.012%)</td>
+   <td>0.6% @ 2.6ms</td>
+   <td>1.8% @ 2.6ms</td>
+   <td>100% @ 1.3ms</td>
+  </tr>
+ </tbody>
+</table>
+<h2>ACORN on a Normal Collection</h2>
+<p>This is the default configuration: extra edges, the default threshold, and the planner free to choose the graph or the payload index in both columns.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Filter (selectivity)</th>
+   <th>Planner, ACORN off</th>
+   <th>Planner + ACORN</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>One keyword (20%)</td>
+   <td>90.8% @ 1.1ms</td>
+   <td>100% @ 5.7ms</td>
+  </tr>
+  <tr>
+   <td>One keyword (10%)</td>
+   <td>98.6% @ 0.9ms</td>
+   <td>99.9% @ 4.4ms</td>
+  </tr>
+  <tr>
+   <td>One keyword (1%)</td>
+   <td>100% @ 1.7ms</td>
+   <td>100% @ 1.6ms</td>
+  </tr>
+  <tr>
+   <td>Correlated (10%)</td>
+   <td>98.6% @ 1.0ms</td>
+   <td>100% @ 4.2ms</td>
+  </tr>
+  <tr>
+   <td>Two keywords (4%)</td>
+   <td>39.7% @ 1.1ms</td>
+   <td>100% @ 7.3ms</td>
+  </tr>
+  <tr>
+   <td>Two keywords (1%)</td>
+   <td>97.2% @ 2.1ms</td>
+   <td>100% @ 2.5ms</td>
+  </tr>
+  <tr>
+   <td>Two keywords (0.012%)</td>
+   <td>100% @ 1.4ms</td>
+   <td>100% @ 1.2ms</td>
+  </tr>
+ </tbody>
+</table>
+<h2>What to Measure on Your Own Collection</h2>
+<p>Measure recall for each filter shape you serve. Start with the ones most likely to break: values covering roughly a fifth of the collection or more, and <code>AND</code> combinations of them. Create a payload index on every field you filter on, and leave ACORN off to start. Then sample a few hundred real queries per filter shape. Compare the recall gain with the latency cost. Turning it on never lowered recall in any of our runs, so if you are unsure, the cost of leaving it on is latency.</p>
+<h2>Further Reading</h2>
+<ul>
+ <li><a href="https://arxiv.org/abs/2403.04871">ACORN (Patel et al., SIGMOD 2024)</a></li>
+ <li><a href="https://arxiv.org/abs/2607.00768">RACORN-1</a></li>
+ <li><a href="https://arxiv.org/abs/2603.23710">PostgreSQL ACORN study</a></li>
+ <li><a href="https://qdrant.tech/articles/filterable-hnsw/">Filterable HNSW</a></li>
+ <li><a href="https://github.com/qdrant-labs/acorn-filterable-hnsw-benchmark">Reproduction kit</a></li>
+</ul>

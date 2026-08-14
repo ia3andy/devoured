@@ -1,0 +1,140 @@
+<h1>Atomic Batch Publishing in NATS 2.12: All-or-Nothing Message Guarantees</h1>
+<p>NATS 2.12 introduces a powerful new feature called <strong>atomic batch publishing</strong>. If you’re building event-sourced systems or need to fan out messages to multiple services with consistency guarantees, this one’s for you.</p>
+<h2>The Problem with Partial Writes</h2>
+<p>Without atomic batching, each publish operation is independent. Imagine you need to write five related messages and your connection drops after the third. You’re left with a partial write—your data is inconsistent, and your system is in an undefined state.</p>
+<p>Atomic batch publishing solves this by giving you all-or-nothing guarantees: either every message in your batch commits together, or none of them do.</p>
+<h2>What This Unlocks</h2>
+<p>Avoiding partial writes with atomic batching is the foundation for several important patterns:</p>
+<ul>
+ <li><strong>Consistent multi-consumer fan-out.</strong> When multiple services consume from the same stream, they all see the exact same set of messages in the same order. No service sees a partial batch while another sees the full batch.</li>
+ <li><strong>Idempotent full-state replacement.</strong> Instead of publishing deltas, you can publish complete state and let consumers replace what they have. When your full state spans multiple messages, atomic batching ensures consumers never see a half-written snapshot.</li>
+ <li><strong>Snapshot + delta bootstrapping.</strong> New consumers can load a point-in-time snapshot and then apply only the events that came after. Without atomic batching, a snapshot written as multiple messages could be incomplete when read.</li>
+ <li><strong>Multi-event commits.</strong> A single logical operation often produces multiple events. For example, an order might emit <code>OrderCreated</code>, <code>InventoryReserved</code>, and <code>PaymentInitiated</code>. Consumers should see all three or none—not a partially committed transaction.</li>
+</ul>
+<h2>How It Works</h2>
+<p>Atomic batch publishing is a stream configuration option that lets you atomically publish multiple messages into a JetStream stream.</p>
+<p>Here’s what happens under the hood:</p>
+<ol>
+ <li><strong>Staging</strong>: When you start a batch, messages are staged invisibly on the server. Consumers don’t see anything yet.</li>
+ <li><strong>Sequencing</strong>: Each message gets a batch sequence number, and your messages sit in a staging area waiting.</li>
+ <li><strong>Commit</strong>: On your last message, you include a commit header. The server then commits everything atomically—all messages appear at once.</li>
+</ol>
+<h2>The Batch Headers</h2>
+<p>The server tracks batches using three headers:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Header</th>
+   <th>Purpose</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>NATS-Batch-ID</code></td>
+   <td>A unique identifier for your batch (max 64 characters)</td>
+  </tr>
+  <tr>
+   <td><code>NATS-Batch-Sequence</code></td>
+   <td>An incrementing number for each message in the batch</td>
+  </tr>
+  <tr>
+   <td><code>NATS-Batch-Commit</code></td>
+   <td>Tells the server to commit all staged messages</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Validation Rules</h3>
+<p>Your batch will be rejected if:</p>
+<ul>
+ <li>The batch ID exceeds 64 characters</li>
+ <li>There are gaps in your sequence numbers</li>
+ <li>The stream uses async persist mode (which can’t guarantee atomicity)</li>
+ <li>Duplicate messages exist in the batch (as of 2.12.1)</li>
+</ul>
+<h2>Optimistic Locking with Expected Sequence Headers</h2>
+<p>For scenarios where you need to guard against concurrent writes, atomic batching supports optional consistency checks:</p>
+<ul>
+ <li><strong><code>NATS-Expected-Last-Sequence</code></strong>: Only commit this batch if the stream’s last sequence matches this number. If someone else published while you were building your batch, the sequence moved, your batch fails, and you retry with fresh data. This header is only allowed on the first message of a batch.</li>
+ <li><strong><code>NATS-Expected-Last-Subject-Sequence</code></strong>: Same concept, but scoped to a specific subject.</li>
+</ul>
+<h2>Limits</h2>
+<p>The defaults are sensible, but all are configurable in your server configuration:</p>
+<ul>
+ <li><strong>1,000 messages</strong> per batch</li>
+ <li><strong>50 batches</strong> in flight per stream</li>
+ <li><strong>1,000 batches</strong> total per server</li>
+ <li><strong>10 seconds</strong> of inactivity before a batch is abandoned</li>
+</ul>
+<p>One important constraint: batches must go into a single stream—they can’t cross streams.</p>
+<h2>Use Cases</h2>
+<ol>
+ <li><strong>Event Sourcing</strong>: When a single command produces multiple events that must be written together to maintain consistency. Your event history stays coherent.</li>
+ <li><strong>Batch Telemetry / Fan-out</strong>: When you need to send related messages to multiple services atomically. Either every service gets their message, or none of them do.</li>
+</ol>
+<h2>Getting Started</h2>
+<h3>Creating an Atomic-Enabled Stream</h3>
+<pre><code>nats stream add orders --subjects="orders.&gt;" --allow-batch</code></pre>
+<h3>CLI Example: Single Subject</h3>
+<pre><code># Terminal 1: Subscribe
+nats sub "orders.&gt;"
+# Terminal 2: Publish atomically
+nats pub orders.events --send-on-newline --atomic
+&gt; order_created
+&gt; payment_received
+&gt; order_shipped
+&gt; ^D  # Ctrl+D to commit</code></pre>
+<h3>CLI Example: Multiple Subjects</h3>
+<pre><code># Set a batch ID
+BATCH_ID=$(uuidgen)
+# Publish to different subjects with batch headers
+nats pub orders.warehouse "ship item" \
+  --header "NATS-Batch-ID:$BATCH_ID" \
+  --header "NATS-Batch-Sequence:1"
+nats pub orders.payment "charge card" \
+  --header "NATS-Batch-ID:$BATCH_ID" \
+  --header "NATS-Batch-Sequence:2"
+nats pub orders.notification "send email" \
+  --header "NATS-Batch-ID:$BATCH_ID" \
+  --header "NATS-Batch-Commit:true"</code></pre>
+<h3>Go Code Example</h3>
+<pre><code>func runBatch(js jetstream.JetStream) error \{
+    messages := []string\{"order_created", "payment_received", "order_shipped"}
+    batchID := uuid.New().String()
+
+    for i, msg := range messages \{
+        m := nats.NewMsg("orders.events")
+        m.Data = []byte(msg)
+
+        // Set batch headers
+        m.Header.Set("NATS-Batch-ID", batchID)
+        m.Header.Set("NATS-Batch-Sequence", strconv.Itoa(i+1))
+
+        // Set commit header on last message
+        if i == len(messages)-1 \{
+            m.Header.Set("NATS-Batch-Commit", "true")
+        }
+
+        if _, err := js.PublishMsg(context.Background(), m); err != nil \{
+            return err
+        }
+    }
+    return nil
+}</code></pre>
+<h2>A Cleaner Approach with Orbit</h2>
+<p><a href="https://github.com/synadia-io/orbit.go">Orbit</a> is Synadia’s higher-level client library that simplifies NATS development. Its JetStream extension package handles all the batch header management for you:</p>
+<pre><code>batch, err := jetstreamext.NewBatchPublisher(js)
+if err != nil \{
+    return err
+}
+
+batch.Add("orders.warehouse", []byte("ship item"))
+batch.Add("orders.payment", []byte("charge card"))
+
+ack, err := batch.Commit(ctx, "orders.notification", []byte("send email"))
+if err != nil \{
+    // None of the messages were published
+    return fmt.Errorf("batch publish failed: %w", err)
+}
+// All messages published successfully!</code></pre>
+<h2>Wrapping Up</h2>
+<p>Atomic batch publishing in NATS 2.12 eliminates the partial write problem that has plagued distributed systems. Whether you’re doing event sourcing or need coordinated message delivery across services, this feature gives you the consistency guarantees you need.</p>
