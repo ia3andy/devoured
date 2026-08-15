@@ -1,0 +1,121 @@
+<h2>How it works</h2>
+<p>The runtime map of Foreman, covering what runs where, how the filesystem defines the agent, and the three boundaries that shape the design.</p>
+<p>Foreman is one eve agent with five subagents, three inbound channels, and two durable stores. Everything it can do is declared as a file under <code>agent/</code>, and eve discovers the surface from the filesystem at build time.</p>
+<h2>What runs where</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Component</th>
+   <th>Lives in</th>
+   <th>Responsibility</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Orchestrator</td>
+   <td><code>agent/agent.ts</code>, <code>agent/instructions.ts</code></td>
+   <td>Routes work between stations, assembles the pull request, speaks to people</td>
+  </tr>
+  <tr>
+   <td>Stations</td>
+   <td><code>agent/subagents/\{classifier,analyst,implementer,reviewer}/</code></td>
+   <td>The four-stage pipeline every work item passes through</td>
+  </tr>
+  <tr>
+   <td>Researcher</td>
+   <td><code>agent/subagents/researcher/</code></td>
+   <td>Optional web research, run before the Analyst when an item turns on an external fact</td>
+  </tr>
+  <tr>
+   <td>Inbound surfaces</td>
+   <td><code>agent/channels/</code></td>
+   <td>Turn GitHub webhooks, Linear Agent Sessions, and local dev requests into sessions</td>
+  </tr>
+  <tr>
+   <td>GitHub tools</td>
+   <td><code>agent/extensions/github.ts</code></td>
+   <td>31 allowlisted <code>github__*</code> tools, 12 of them gated</td>
+  </tr>
+  <tr>
+   <td>Linear tools</td>
+   <td><code>agent/connections/linear.ts</code></td>
+   <td>Linear's hosted MCP server, writes denied on unattended runs</td>
+  </tr>
+  <tr>
+   <td>Root tools</td>
+   <td><code>agent/tools/</code></td>
+   <td>The five memory tools, one artifact reader, and one that disables a framework built-in</td>
+  </tr>
+  <tr>
+   <td>Shared logic</td>
+   <td><code>agent/lib/</code></td>
+   <td>Trust predicates, approval policies, git safety, model assignments, and the Blob layer holding every reserved prefix</td>
+  </tr>
+  <tr>
+   <td>Skills</td>
+   <td><code>agent/skills/</code></td>
+   <td>Load-on-demand instruction packages for the orchestrator</td>
+  </tr>
+ </tbody>
+</table>
+<h2>The agent directory</h2>
+<p>In eve, identity comes from the filesystem rather than a <code>name</code> field. The file <code>agent/tools/read_factory_brain.ts</code> is the tool <code>read_factory_brain</code>, and the directory <code>agent/subagents/classifier/</code> lowers into the tool <code>classifier</code>. Renaming something means moving the file.</p>
+<h2>Three boundaries</h2>
+<p>Most of Foreman's behavior falls out of three structural decisions. They hold because of how the agent is wired, not because a prompt asks nicely.</p>
+<h3>Stations inherit nothing</h3>
+<p>Every declared subagent runs in a fresh child session with none of the root's instructions, skills, connections, tools, or sandbox. That has two consequences worth internalizing.</p>
+<p>The orchestrator must pack everything a station needs into the delegation message: the work item verbatim, plus every prior stage's output. Stations never see the conversation history, and they cannot read the factory brain, so any repository fact that matters has to be woven into the message.</p>
+<p>Long documents are the one exception, and they travel by reference rather than inline. The station that produced one saves it as a handoff artifact and returns the id, the orchestrator relays that id, and the receiving station opens the document itself.</p>
+<p>The upside is that each station's blast radius is readable at a glance. Whatever sits in <code>agent/subagents/&lt;id&gt;/</code> is the complete list of what that station can do.</p>
+<h3>Trust is stamped at dispatch</h3>
+<p>Every channel decides who the caller is from the signed webhook, before the model reads anything, and writes that decision into session auth. Nothing downstream re-derives trust from model-readable content, because model-readable content is exactly what an attacker controls.</p>
+<p><code>agent/lib/trust.ts</code> is the single authority that reads those stamps. New capabilities gate on its predicates rather than inventing their own caller check. The trust model covers the caller classes and policies.</p>
+<h3>Each station works in its own sandbox</h3>
+<p>Every eve agent gets a sandbox whether or not it asks for one, so all five subagents run in one. What separates them is what is inside it.</p>
+<p>The Analyst, Implementer, and Reviewer each declare their own <code>sandbox.ts</code>, so each gets a separate Vercel Sandbox holding its own clone of <code>FACTORY_REPO</code>. The three declarations are functionally identical, and none is more isolated than the others. The Reviewer's copy just carries the most weight, because it fetches the pushed branch into a clean checkout and therefore reviews what was actually pushed rather than the Implementer's working tree.</p>
+<p>The Classifier and Researcher never set one up, so they get the default: a working environment with an empty <code>/workspace</code> and no repository in it.</p>
+<p>The three repository sandboxes share their bootstrap through <code>agent/lib/github/repo-sandbox.ts</code>. The clone and <code>FACTORY_SETUP_COMMAND</code> run once per template build, and each session pays only a fetch. Git always targets the literal <code>https://github.com/&lt;FACTORY_REPO&gt;.git</code> URL rather than <code>origin</code>, because remote config inside a sandbox is model-writable.</p>
+<h2>What persists and what does not</h2>
+<table>
+ <thead>
+  <tr>
+   <th>State</th>
+   <th>Durable</th>
+   <th>Notes</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Factory brain</td>
+   <td>Yes</td>
+   <td>One document per target repository, read by every run</td>
+  </tr>
+  <tr>
+   <td>User preferences</td>
+   <td>Yes</td>
+   <td>One document per person</td>
+  </tr>
+  <tr>
+   <td>Handoff artifacts</td>
+   <td>Yes</td>
+   <td>Written once, never overwritten or deleted, but only the run that minted an id knows it</td>
+  </tr>
+  <tr>
+   <td>Root thread checkout</td>
+   <td>No</td>
+   <td>Rebuilt per session by the GitHub channel</td>
+  </tr>
+  <tr>
+   <td>Analyst, Implementer, and Reviewer clones</td>
+   <td>No</td>
+   <td>Rebuilt per template build, refreshed per session</td>
+  </tr>
+  <tr>
+   <td>Conversation history</td>
+   <td>No</td>
+   <td>Each webhook dispatch is a fresh session</td>
+  </tr>
+ </tbody>
+</table>
+<p>The last row explains a design choice that looks odd otherwise. Because each dispatch starts clean, the red-CI fix loop counts its own earlier comments on the pull request thread to enforce its 2-attempt cap. The thread is the only durable record those runs share.</p>
+<p>Handoff artifacts are durable in storage without being durable in practice. Nothing lists or expires them, but an id only ever reaches the next station through a delegation message, so a later run has no way to find one. That makes them a handoff mechanism rather than memory.</p>

@@ -1,0 +1,67 @@
+<p>Progressive rollouts allow DevOps teams to deploy a release to a small subset of production users before rolling it out to the entire user base. This approach reduces risk by allowing teams to validate the release in production and catch any issues before they affect all users. Typically, the rollout automatically promotes a new version of an application to increasingly larger percentages of production users, like 10%, 50%, and finally 100%. If there is an error, the rollout is halted.</p>
+<p>The <a href="https://docs.aws.amazon.com/wellarchitected/latest/devops-guidance/dl.ads.3-use-staggered-deployment-and-release-strategies.html">AWS Well-Architected framework recommends staggered deployments</a>, noting that:</p>
+<blockquote>
+ <p>These techniques contribute to safer and more reliable software deployment and release processes.</p>
+</blockquote>
+<p>In the previous post, you created a project that used a Claude agent step to categorize commits.</p>
+<p>In this post, you will create a sample project that demonstrates a progressive rollout through multiple production environments.</p>
+<h2>Prerequisites</h2>
+<ul>
+ <li>An <a href="https://octopus.com/start">Octopus Cloud</a> account. If you don’t have one, you can sign up for a free trial.</li>
+ <li>The Octopus AI Assistant Chrome extension. You can install it from the <a href="https://chromewebstore.google.com/detail/octopus-ai-assistant/agfpjjibnieiihjoehophlbamcifdfha">Chrome Web Store</a>.</li>
+</ul>
+<p>The Octopus AI Assistant will work with an on-premises Octopus instance, but it requires more configuration. The cloud-hosted version of Octopus doesn’t need extra configuration. This means the cloud-hosted version is the easiest way to get started.</p>
+<h2>Creating the project</h2>
+<p>Paste the following prompt into the Octopus AI Assistant and run it to create a sample project with a progressive rollout:</p>
+<pre><code>Create a new progressive deployment project called "18. Progressive rollout".</code></pre>
+<p>The resulting project models a gradual production rollout by promoting the same release through progressively larger slices of production.</p>
+<p>The AI Assistant creates a lifecycle with the environments <code>Prod 10</code>, <code>Prod 50</code>, and <code>Prod 100</code>. The lifecycle captures the different stages of the rollout as a percentage of production traffic, enforces the deployment order, and has the project deploy a release to each environment in turn.</p>
+<h2>How the progressive rollout works</h2>
+<p>The project creates a custom lifecycle called <code>Progressive</code> with four phases:</p>
+<ul>
+ <li><code>Development</code></li>
+ <li><code>Prod 10</code></li>
+ <li><code>Prod 50</code></li>
+ <li><code>Prod 100</code></li>
+</ul>
+<p>Each lifecycle phase targets a single environment, and the project uses a runbook to explicitly trigger the next deployment after the current one succeeds.</p>
+<p>The deployment process starts with a <code>Deploy App</code> step that simulates deploying an application by printing <code>Deploying app</code> to the task log. It is followed by a <code>Simulate Failure</code> step that acts as a validation gate. This step checks the prompted variable <code>Project.SimulateFail</code>, and if it is set to <code>True</code>, the deployment exits with an error and the rollout stops.</p>
+<p>If the validation step succeeds, the process runs a community step template called <code>Run Octopus Deploy Runbook</code>. This step starts a runbook named <code>Deploy Release</code> to promote the current release to the next environment. This works around a limitation where Octopus prevents a deployment to the next environment until the current one is complete, so you cannot trigger a deployment to <code>Prod 50</code> while the <code>Prod 10</code> deployment is still running. By having a runbook trigger the deployment after a short delay, we can be sure the current deployment has completed before the next one starts.</p>
+<p>The <code>Run Octopus Deploy Runbook</code> step is configured to run in the <code>Prod 10</code> and <code>Prod 50</code> environments. It dynamically chooses the next environment with the following logic:</p>
+<ul>
+ <li>When the current environment is <code>Prod 10</code>, it triggers a deployment to <code>Prod 50</code></li>
+ <li>When the current environment is <code>Prod 50</code>, it triggers a deployment to <code>Prod 100</code></li>
+</ul>
+<p>The step also passes the current release ID into the runbook as the prompted variable <code>Project.Release.Id</code>, ensuring the same release is promoted through each stage of the rollout.</p>
+<p>The runbook itself contains a single <code>Sleep</code> step that waits for 60 seconds before using the Octopus API to create the next deployment. This pause allows the current deployment to complete before the next rollout stage begins.</p>
+<p>In practice, the rollout looks like this:</p>
+<ul>
+ <li>You create a release and deploy it to <code>Development</code></li>
+ <li>You promote the release to <code>Prod 10</code></li>
+ <li>The <code>Run Octopus Deploy Runbook</code> step automatically starts the <code>Deploy Release</code> runbook</li>
+ <li>The runbook waits 60 seconds and then creates a deployment of the same release to <code>Prod 50</code></li>
+ <li>When the <code>Prod 50</code> deployment succeeds, the same pattern is used to create the final deployment to <code>Prod 100</code></li>
+ <li>If there are any failures, the rollout stops</li>
+</ul>
+<h2>Customizing the rollout</h2>
+<p>The <code>Deploy Release</code> runbook initiates a deployment to the next production environment after a short delay. This may be customized to instead <a href="https://octopus.com/docs/projects/project-triggers/scheduled-deployment-trigger">schedule a deployment at a specific time</a>, which allows the rollout to be paused for a longer period of time before continuing. You could, for example, only roll out to 100% of production traffic during off-peak hours, or after the release has been validated in <code>Prod 50</code> for a full day.</p>
+<p>You may also consider <a href="https://octopus.com/docs/releases/prevent-release-progression">preventing release progression</a> if a deployment fails. This ensures that a failed release cannot be promoted to the next environment until the issue is resolved. A blocked release will also prevent any scheduled deployments from taking place.</p>
+<h2>Comparing tenants and environments</h2>
+<p>This example used environments to represent progressive rollouts. It is also possible to use tenants to represent progressive rollouts. However, there are benefits to using environments:</p>
+<ul>
+ <li>Environments are easier to visualize in the Octopus UI</li>
+ <li>Lifecycles enforce the progression of releases through environments, which in turn progressively advance the rollout</li>
+ <li>The ability to block release progression after a successful deployment is only available for environments, not tenants</li>
+</ul>
+<p>For these reasons, environments are the recommended approach for modeling progressive rollouts in Octopus.</p>
+<h2>What just happened?</h2>
+<p>You created a sample project with:</p>
+<ul>
+ <li>A custom <a href="https://octopus.com/docs/releases/lifecycles">lifecycle</a> called <code>Progressive</code> that promotes releases through <code>Development</code>, <code>Prod 10</code>, <code>Prod 50</code>, and <code>Prod 100</code></li>
+ <li>A scripted deployment process that simulates an application deployment and then validates the result before continuing</li>
+ <li>A prompted variable that can intentionally fail the validation step to stop the rollout</li>
+ <li>A community step template that runs a <code>Deploy Release</code> runbook to promote the same release to the next production environment</li>
+ <li>A runbook with a delayed API call that chains the rollout from <code>Prod 10</code> to <code>Prod 50</code>, and then from <code>Prod 50</code> to <code>Prod 100</code></li>
+</ul>
+<h2>What’s next?</h2>
+<p>The next step is an example of blue/green deployments.</p>

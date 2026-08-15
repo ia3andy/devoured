@@ -1,0 +1,94 @@
+<h1>Switchyard</h1>
+<p>Switchyard is a Rust proxy and library for LLM traffic. It routes requests across providers, translates between OpenAI and Anthropic APIs, records operational metrics, and provides typed, composable routing algorithms.</p>
+<p><strong>Why Switchyard?</strong> Point a coding agent such as Claude Code or Codex at an open-source model. Switchyard translates between the OpenAI Chat, Anthropic Messages, and OpenAI Responses formats, so the agent keeps speaking its native API while the request is served by vLLM, NVIDIA NIM, Ollama, or any OpenAI-compatible endpoint. The same proxy can spread traffic across several models for A/B benchmarking, apply signal-driven stage routing, or run a custom algorithm you write yourself.</p>
+<h2>Features</h2>
+<ul>
+ <li><strong>Protocol Translation</strong>: convert between OpenAI Chat, Anthropic Messages, and OpenAI Responses formats</li>
+ <li><strong>Multi-Backend Routing</strong>: random routing, LLM-as-classifier routing, signal-driven stage-router, or your own algorithm</li>
+ <li><strong>Operational Metrics</strong>: Prometheus metrics cover requests, errors, latency, tokens, and routing overhead</li>
+</ul>
+<h2>Maturity</h2>
+<p>Switchyard is pre-alpha software that is evolving rapidly. The API and algorithms are expected to change significantly before we reach v1.0.</p>
+<p><strong>Warning:</strong> Experimental software. Not for production use.</p>
+<h2>Quick Start</h2>
+<p>Choose the launcher path to run Claude Code, Codex CLI, or OpenClaw through Switchyard. Choose the server path to run Switchyard as a standalone proxy. Choose the library path to embed routing in your own Rust application.</p>
+<h3>Launcher Path</h3>
+<p>Install <code>uv</code> if it is not already available, then install the published Switchyard tool:</p>
+<pre><code>curl -LsSf https://astral.sh/uv/install.sh | sh
+source "$HOME/.local/bin/env"
+uv tool install --python 3.10 "nemo-switchyard[cli]"</code></pre>
+<p>The coding agent you launch must also be installed and on your <code>PATH</code>. This does not install the standalone <code>switchyard-server</code> binary; use the Server Path for that.</p>
+<p>Set an OpenRouter key and launch against the packaged deployment:</p>
+<pre><code>export OPENROUTER_API_KEY="your-openrouter-key"
+switchyard launch claude --model switchyard
+switchyard launch codex --model switchyard
+switchyard launch openclaw --model switchyard</code></pre>
+<p>To use your own native TOML deployment, pass its route ID and configuration:</p>
+<pre><code>switchyard launch claude --model my-route --config routes.toml</code></pre>
+<h3>Server Path</h3>
+<p>Use this path to install and run the standalone Rust proxy. Install Rust with Cargo, then install the published binary:</p>
+<pre><code>cargo install --locked switchyard-server
+switchyard-server --help</code></pre>
+<p>Cargo builds the release binary and installs it into <code>~/.cargo/bin</code> by default.</p>
+<p>Create <code>routes.toml</code>, then validate it and start the server:</p>
+<pre><code>export OPENROUTER_API_KEY="your-openrouter-key"
+switchyard-server --config routes.toml --dry-run
+switchyard-server --config routes.toml --host 127.0.0.1 --port 4000</code></pre>
+<p>Verify the proxy in another terminal:</p>
+<pre><code>curl http://localhost:4000/health</code></pre>
+<h3>Library Path</h3>
+<p><code>switchyard-libsy</code> embeds the routing algorithms in your own Rust application. It never calls a model itself: an algorithm decides which target to use and hands every model call back to you, so it drops into an existing proxy, gateway, or agent runtime without owning an HTTP stack. Pair it with <code>switchyard-llm-client</code> when you want the calls made for you.</p>
+<pre><code>[dependencies]
+switchyard-libsy = \{ git = "https://github.com/NVIDIA-NeMo/Switchyard.git" }
+switchyard-protocol = \{ git = "https://github.com/NVIDIA-NeMo/Switchyard.git" }</code></pre>
+<h2>Routing Strategies</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Strategy</th>
+   <th>Use it when</th>
+   <th>Route <code>type</code></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>LLM Classifier</td>
+   <td>Request content should decide whether a turn needs the weak or strong tier.</td>
+   <td><code>llm_classifier</code></td>
+  </tr>
+  <tr>
+   <td>Stage Router</td>
+   <td>Signals already in the conversation, such as tool results and errors, should route most turns without an extra model call.</td>
+   <td><code>stage_router</code></td>
+  </tr>
+  <tr>
+   <td>Escalation Router</td>
+   <td>Every turn runs on the weak tier first, and a judge reads that answer to decide whether to send the same request to the strong tier.</td>
+   <td><code>llm_classifier</code> with <code>mode = "escalation"</code></td>
+  </tr>
+  <tr>
+   <td>Random</td>
+   <td>You need a fixed traffic split for A/B tests, baselines, or cost experiments.</td>
+   <td><code>random</code></td>
+  </tr>
+ </tbody>
+</table>
+<p>A <code>passthrough</code> route registers one target under one model ID with no routing decision.</p>
+<h2>Architecture</h2>
+<p>Clients keep their native OpenAI or Anthropic API format. Switchyard picks a configured backend, forwards the request in that backend's own format, and translates the response back into the shape the client expects. The server accepts OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages. Each configured LLM client selects one upstream format.</p>
+<h2>Documentation</h2>
+<ul>
+ <li>Getting Started: complete launcher and standalone server walkthroughs</li>
+ <li>Core Concepts: LLM clients, targets, routes, model IDs, and routing algorithms</li>
+ <li>Routing Overview: choose and configure a routing algorithm</li>
+ <li><code>switchyard-server</code>: server configuration, routing algorithms, and metrics</li>
+ <li><code>switchyard-libsy</code>: embed routing algorithms in a Rust application</li>
+ <li><code>switchyard-protocol</code>: provider-neutral request, response, and streaming types</li>
+ <li><code>switchyard-translation</code>: request, response, and stream translation</li>
+</ul>
+<h2>Community</h2>
+<ul>
+ <li><strong>Issues</strong>: <a href="https://github.com/NVIDIA-NeMo/Switchyard/issues">GitHub Issues</a></li>
+</ul>
+<h2>License</h2>
+<p>Apache 2.0 License. Copyright NVIDIA Corporation.</p>

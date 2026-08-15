@@ -1,0 +1,57 @@
+<h1>Agent Plugins are the future of Agent Skills</h1>
+<p>Agent Plugins is an open, vendor-neutral standard for packaging Agent Skills and the MCP servers they depend on into one portable folder that any compatible client can load. Google is joining the Technical Steering Committee as a Core Maintainer. The launch post covers the announcement, and the specification carries the detail. This is what we learned putting real skills through it.</p>
+<p>Agent Skills gave agents on-demand expertise. A folder of instructions the model pulls in only when a task matches, so your context window isn't carrying a deployment runbook while you fix a CSS bug. We've leaned on that hard, in the google/skills repository and the seven skills that ship with Agents CLI.</p>
+<p>What Skills never solved is distribution.</p>
+<p>A skill that needs a tool is two artifacts. Instructions live in SKILL.md, the tool lives in an MCP server, and nothing ties them together. So the binding lived in a README: copy this here, add that JSON block there, a different snippet per client. Every client invented its own bundle format to fix it, so authors picked one and rewrote for the next.</p>
+<p>Agent Plugins standardizes the box. The components inside it were already portable.</p>
+<p>Here's what changes when your skill becomes a plugin, and why you've already built most of one:</p>
+<ul>
+ <li>The one file you're missing. Your folder is already the right shape.</li>
+ <li>Your tools travel with your expertise. mcp.json, and paths that survive the trip.</li>
+ <li>Components fail independently. A dead server doesn't take your skills down.</li>
+ <li>Client-specific behaviour without forking. The extension namespace.</li>
+ <li>One folder, every client. What we shipped, and where it actually runs.</li>
+</ul>
+<h3>The one file you're missing</h3>
+<p>If you've written an ADK skill, look at where it lives: skills/&lt;name&gt;/SKILL.md, with scripts/, references/ and assets/ underneath. Agent Plugins asks for skills/&lt;dir&gt;/SKILL.md and defers the inside of that folder to the Agent Skills specification. It's the same tree.</p>
+<p>Here's a skill we'd already written, unchanged by packaging: Note what line 1 of the Steps assumes: a running MCP server. That dependency is the thing packaging fixes.</p>
+<p>The migration is one file at the root: Both fields are required, and that's the whole minimum. Names run 1 to 64 characters of lowercase alphanumerics, hyphens and periods, must start and end alphanumeric, and can't contain -- or ... So acme.reports is fine, while My-Plugin, -start and has--double are not.</p>
+<p>When you're ready to publish rather than test, the manifest takes metadata too. The schema is closed: ten top-level fields are permitted and nothing else. That's nine of the ten. The last is extensions, for client-specific data, which comes later. author also takes an optional email.</p>
+<p>version should be SemVer and license should be SPDX, though a client won't reject you for malformed strings. Wrong JSON types are a different matter: a number where a string belongs is fatal even on an optional field. Exactly two schema violations are non-fatal, an unknown top-level field and an extensions value that isn't an object. Both get reported and ignored, and the plugin still loads. Everything else is fatal and the client refuses the whole package.</p>
+<p>One rule catches people migrating to a large skills library. Discovery goes exactly one level deep: clients read the immediate subdirectories of skills/ and don't recurse. If you've been grouping skills into category folders, those skills stop existing the moment you package them, with no error explaining why.</p>
+<h3>Your tools travel with your expertise</h3>
+<p>mcp.json sits beside your manifest and declares the servers your skill needs. It carries only two top-level keys, and every server declares its transport explicitly:</p>
+<p>command is one executable token, not a shell command. Either a bare name resolved by platform search rules, or a plugin-relative path starting with ./. Placeholder expansion deliberately does not apply to it, so a bundled binary is found by that ./ path and nothing else.</p>
+<p>The two placeholders are environment variables the client provides to stdio subprocesses, and the difference between them matters more than the names suggest: Write into PLUGIN_ROOT and your state disappears the next time someone updates the plugin. Both expand in args, env values and cwd only. Not in environment keys, not in command, not in remote URLs, and not in headers. Expansion is textual and single-pass, so nothing nests.</p>
+<p>Headers are literal package data that anyone who downloads your plugin can read, which is why the spec forbids putting credentials in them. Agent Plugins 1.0.0 defines no portable OAuth or credential-reference field at all. Authentication stays client-managed.</p>
+<h3>Components fail independently</h3>
+<p>If your MCP server can't start, your skills still load. The spec requires the client to keep loading everything else, and says it should report the failure rather than swallow it. For an entry that is invalid or declares a transport the client doesn't support, the spec goes further: the client must skip that entry and carry on.</p>
+<p>Failure is scoped at three levels, and knowing which one you've hit is most of the debugging:</p>
+<p>Absence is tolerated too. A plugin with no mcp.json isn't broken, because a missing component location is not an error. A location in the wrong form, like mcp.json as a directory, invalidates that component type while the rest keeps loading.</p>
+<p>This is the difference between a bundle and a package format. A bundle is all-or-nothing. A package format degrades in parts, which is the only reason it's safe to hand someone a folder containing both your instructions and a server that has to reach the network.</p>
+<h3>Client-specific behavior without forking</h3>
+<p>Hooks, commands, subagents and rules aren't in v1. They're too client-specific to standardise without freezing someone's roadmap. Rather than forcing a lowest common denominator, the spec hands each client a namespace it owns.</p>
+<p>A client namespace can appear as a reverse-domain directory at the root, as a key under extensions in the manifest, or both. Neither one requires the other.</p>
+<p>Clients ignore namespaces they don't recognise, so the portable core stays portable. The same mechanism could re-fragment plugins one directory down if every client leans on its own namespace instead of the core, which is the thing to watch as v2 gets debated.</p>
+<h3>One folder, every client</h3>
+<p>Two Google products ship as Agent Plugins today. Agents CLI packages our expert skills for agent building, evaluation, deployment, observability and publishing. The Data Agent Kit brings Spanner, Cloud SQL and AlloyDB plugins, plus a starter pack covering BigQuery, into whichever coding agent you already use.</p>
+<p>In Antigravity CLI that is one command. Every other client still has its own installer, which is the gap the spec is closing.</p>
+<p>The set of clients that read the portable format is growing, and it is published and kept current at agent-plugins.org/compatible-clients.</p>
+<p>One caution from doing this ourselves. Conformance permits partial implementations: a client must support at least one of stdio and streamable-http and should support both, while sse is optional. Build on either modern transport and you are safe across everything listed today, but test your plugin in a second client before you promise it works there.</p>
+<h3>Deciding what to package</h3>
+<p>Not everything needs a plugin. A single skill with no tools is fine as a skill. One server for one client is simpler as a plain MCP config. Reach for a plugin when instructions and tools have to arrive together, in more than one place.</p>
+<h3>When it doesn't load</h3>
+<p>Every failure we hit was silent in practice, though only the first is silent by design: a directory nested too deep is never discovered, so there's nothing for a client to report. For an invalid SKILL.md the spec says the client should report it, and the clients we tried didn't. Each has a distinct signature:</p>
+<p>There's no standard validator yet. The project's non-normative future-considerations doc floats a plugin linter, and conformance test suites aimed at client implementations, as things a future version may define. Nothing is committed. For now the check is loading the plugin in a real client and reading the diagnostics.</p>
+<h3>What doesn't travel yet</h3>
+<p>Credentials are the first gap. Plugins must not embed secrets, and there's no portable field to reference them either, so anything behind an authenticated gateway still needs per-client setup. The folder moves; the authentication stays behind.</p>
+<p>The second is naming collisions with formats that already exist. Claude Code uses .claude-plugin/plugin.json and .mcp.json. Antigravity uses mcp_config.json. These sit next to the portable layout rather than inside it. Expect a transition period where a repo carries both, and check which one a client is actually reading before you debug a plugin that was never loaded.</p>
+<p>Two status notes worth carrying: ADK's Skills support is still experimental (Python v1.25.0, TypeScript v0.6.1, Go v1.2.0), and Agent Plugins 1.0.0 is published as a Working Draft.</p>
+<h3>Get started today</h3>
+<p>Build a valid plugin in about a minute:</p>
+<ul>
+ <li>Convert something real. Point it at a skill you've already written. Check nothing sits deeper than one level under skills/.</li>
+ <li>Add its tools. Write mcp.json. Use a ./ path for a bundled binary, $\{PLUGIN_ROOT} for assets you ship, and $\{PLUGIN_DATA} for anything you write.</li>
+ <li>Open it in a second client and confirm what actually loaded, not what should have.</li>
+ <li>Add publishing metadata once it works: version, license, repository, keywords.</li>
+</ul>
