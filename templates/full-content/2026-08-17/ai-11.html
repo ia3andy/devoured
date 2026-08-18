@@ -1,0 +1,78 @@
+<h1>Introducing Custom Agents</h1>
+<p>Software engineering has shifted from writing lines of code to orchestrating agents. With this shift comes an opportunity for a real productivity unlock via division of labor, breaking complex projects down into specialized agents that can act, verify, and run tasks in parallel.</p>
+<p>This is why we are introducing <strong>Custom Agents</strong> with first-class support in Antigravity 2.0 and the Antigravity CLI, with the Antigravity IDE following shortly.</p>
+<p>This post details what custom agents are, how you can set one up in seconds, and some functionalities we have given to custom agents that are unique to Antigravity.</p>
+<h2>What Are Custom Agents and Why Do They Matter?</h2>
+<p>General-purpose coding assistants are great, but they suffer from two major limitations:</p>
+<ol>
+ <li><strong>Lack of Specialization</strong>: A general-purpose assistant doesn’t know your specific project’s testing conventions or dependency management rules unless you explain them every single time.</li>
+ <li><strong>Context Window Bloat</strong>: Loading a massive, monolithic prompt containing all your coding guidelines, linters, and testing rules into every single chat turns into a token budget disaster.</li>
+</ol>
+<p>Custom agents solve this. They are specialized, file-based configurations that define a particular role with its own scoped instructions, tools, and constraints. This keeps your active context clean, minimizes token overhead, and gives you a predictable partner for specific tasks.</p>
+<p>Now, you might have read this and thought: aren’t these issues addressed by skills and dynamic subagents? To a large degree, yes! Custom agents don’t replace skills and dynamic subagents, they just provide even more customizability for another level of optimization:</p>
+<ul>
+ <li>Skills obviously specialize a custom agent by giving additional context and instructions, and with their progressive discovery, helps to address context window bloat by not adding the full additional text in the full prompt by default, even if not needed. Instead, we let the agent determine whether the full skill should be read given the work at hand. But, if you think about the full set of skills you need across all tasks that you may do, that is still a very large list and the descriptions themselves will take a lot of context. Custom agents let you specify the subset of skills that are actually relevant for the specialization at hand. The same extends to MCP servers, hooks, and other existing customization points. And then on top of that, custom agents let you also customize the system instruction, default tools, and other more “core” parts of the agent loop.</li>
+ <li>We introduced dynamic subagents a couple of months ago, and they also help along these axes by letting the main agent delegate some work to a subagent to not pollute the main agents’ context. The “dynamic” part is that the main agent can specify the prompt that it sends to the subagent. With custom agents, we take this one step further by allowing the main agent to delegate to a custom agent, with its specific customizations as discussed earlier, but also potentially other details like model and permissions.</li>
+</ul>
+<h2>What’s Available Today in Antigravity 2.0 &amp; CLI</h2>
+<p>Custom agents are now fully integrated across both the visual <strong>Antigravity 2.0 Desktop App</strong> and the <strong>Antigravity CLI</strong>.</p>
+<p>Similar to Skills, we’ve adopted a Markdown file format containing a YAML frontmatter header, allowing for progressive discovery over custom agents as well. You save these files in your local workspace under <code>.agents/agents/</code> or user-globally under <code>~/.gemini/config/agents/</code>.</p>
+<p>By committing project-specific agents to <code>.agents/agents/</code>, they automatically become available to every teammate who checks out the repository—giving your entire team standardized, instant workflow assistants out of the box without requiring manual setup.</p>
+<p>Here is a basic <strong>101 Blueprint</strong> of a simple agent:</p>
+<pre><code>---
+name: dependency-modernizer
+description: Helps upgrade local packages and verify that project tests pass.
+model: flash
+tools:
+  - view_file
+  - replace_file_content
+  - manage_task
+  - run_command
+---
+
+# Core Instructions
+You are a dependency modernizer. Your job is to check configuration files,
+update target dependencies, run test suites, and verify the build passes.</code></pre>
+<p>Setting up specialized agents is just a single Markdown file. The frontmatter tells the product how to run the agent, and the markdown body compiles directly into its system prompt.</p>
+<h2>What Makes Antigravity Custom Agents Special?</h2>
+<p>If you’ve used other tools in this space, this Markdown + YAML frontmatter layout will look very familiar. We deliberately aligned our file conventions to make porting your existing custom agents as painless as possible.</p>
+<p>That being said, how these agents run under the hood in Antigravity is structurally different. Let’s take our basic <code>dependency-modernizer</code> example and build on it to highlight some of the unique possibilities with custom agents in Antigravity.</p>
+<h3>1. True Symmetry: Main Agent vs. Subagent</h3>
+<p>In other tools in this space, custom agents are restricted to being <strong>subagents only</strong>. As a user, you interact with the main, default agent, and it decides when to spawn your worker behind the scenes using the frontmatter descriptions. You cannot launch a primary session directly <em>as</em> your custom agent.</p>
+<p>Antigravity introduces <strong>execution symmetry</strong> via simple configuration flags:</p>
+<pre><code># Add these to the YAML frontmatter:
+mainAgent: true
+subagent: true</code></pre>
+<ul>
+ <li><strong>As a Main Agent</strong>: You can select <code>dependency-modernizer</code> directly from the dropdown in the Antigravity 2.0 GUI, or run it via the CLI (<code>agy --agent dependency-modernizer</code>). The specific core instructions are directly compiled into the system prompt and you adopt all of the agent execution parameters in the frontmatter, allowing you talk directly to your custom agent.</li>
+ <li><strong>As a Subagent</strong>: The same agent can be dynamically called as a tool by a coordinator agent, as is standard.</li>
+</ul>
+<h3>2. Scoped Safety Policies (<code>commandExecutionPolicy</code>)</h3>
+<p>Running an agent that executes command-line operations (like dependency installs or test suites) can be incredibly frustrating. If the safety policy is too loose, you risk running unverified code. If the policy is too strict, you get stuck in a loop of constant approval prompts.</p>
+<p>While both Antigravity and other tools support basic, all-or-nothing permission levels (like <code>acceptEdits</code> or <code>bypassPermissions</code>), we add a dedicated execution filter:</p>
+<pre><code># Add this to the YAML frontmatter:
+permissionMode: acceptEdits
+commandExecutionPolicy: auto</code></pre>
+<p>Setting <code>commandExecutionPolicy: auto</code> allows the agent to execute standard test and compilation commands autonomously in the background. High-risk commands (like deleting files) remain strictly gated behind manual approvals. This lets the modernizer perform rapid trial-and-error cycles in the background without constantly prompting you for approval.</p>
+<h3>3. Rich Lifecycle Hooks (Nested Interceptors)</h3>
+<p>Other tools in this space support basic lifecycle hooks scoped to the subagent. Antigravity takes this further by introducing a robust, nested lifecycle hooks schema directly in the agent’s definition.</p>
+<p>We can add setup and verification checks to our modernizer at precise execution boundaries:</p>
+<pre><code># Add these hooks to the YAML frontmatter:
+hooks:
+  PreInvocation:
+    - type: command
+      command: scripts/setup.sh
+  PreToolUse:
+    - matcher: run_command
+      hooks:
+        - type: command
+          command: scripts/verify-local-env.sh</code></pre>
+<p>In this example:</p>
+<ul>
+ <li><strong>PreInvocation</strong>: Runs a setup script to prepare the environment before the agent starts thinking.</li>
+ <li><strong>PreToolUse (with Matchers)</strong>: Intercepts specific tool calls. Here, every time the agent tries to run a terminal command, we run a verification script first to ensure your local environment is sound.</li>
+</ul>
+<h2>Looking Forward</h2>
+<p>Custom agents are just our next step towards a cohesive customization story across every part of the product stack, allowing Antigravity to assist on more complex tasks in more efficient ways.</p>
+<p>To get started, check out the Custom Agents Guide in the docs and try defining your first custom agent in your workspace today.</p>
+<p>Happy hacking! :)</p>

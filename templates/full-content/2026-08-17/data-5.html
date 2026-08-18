@@ -1,0 +1,102 @@
+<h1>On Benchmarking</h1>
+<h3>Why a throughput number is not an architecture decision.</h3>
+<p><em>A benchmark is useful only when you can explain what it measured, why it stopped scaling, and whether it resembles the workload you intend to run.</em></p>
+<p>Your team tests a new lakehouse feature and gets an impressive result: <strong>50,000 operations per second.</strong></p>
+<p>Do not choose an architecture yet. That number tells you only that this system completed 50,000 operations per second <strong>under some set of conditions</strong>. The decision depends on whether those conditions are the ones that matter.</p>
+<p>Was the data already warm in cache? Did the client generate requests at the intended rate when the system slowed down? Were retries, commit conflicts, and errors counted? Did the test exercise a real data layout—or a convenient synthetic one?</p>
+<p>A benchmark score is an observation, not a conclusion.</p>
+<p>In <strong><a href="https://www.brendangregg.com/activebenchmarking.html">his writing on active benchmarking</a></strong>, <strong><a href="https://www.linkedin.com/in/brendangregg/">Brendan Gregg</a></strong> describes the fire-and-forget approach as <strong>passive benchmarking</strong>: run a test, collect its final numbers, and stop there. The number may be accurate for the narrow thing measured while still being a poor basis for an architecture decision.</p>
+<p>The better approach is <strong>active benchmarking</strong>: use the workload to put the system under controlled pressure, then explain its behavior while the test is running. A score comes at the end of that investigation, not in place of it.</p>
+<h1>A benchmark needs a contract before it needs a cluster</h1>
+<p>Most misleading benchmarks are not fraudulent. They are underspecified.</p>
+<p>Before starting a run, write a short benchmark contract:</p>
+<ul>
+ <li><strong>The decision:</strong> What choice will this test inform—engine selection, table format, cluster size, or cost target?</li>
+ <li><strong>The workload:</strong> Read/write mix, request sizes, partition distribution, dataset size, and concurrency pattern.</li>
+ <li><strong>The system boundary:</strong> Which client, network, catalog, object store, metadata service, and compute layers are included?</li>
+ <li><strong>The arrival model:</strong> Are requests issued at a fixed schedule, or does each client wait for a response before sending the next one?</li>
+ <li><strong>The state:</strong> Is this a cold-cache run, a warm-cache run, a compaction-heavy period, or a steady-state stream?</li>
+ <li><strong>The outcome:</strong> Throughput, error rate, cost, and latency percentiles—not one of them in isolation.</li>
+</ul>
+<p>These conditions determine what the score means. Without them, a throughput chart is a screenshot, not a decision document.</p>
+<p>For example, a data lake read test with a hot operating-system cache may correctly report excellent read performance. But it has measured the cache path, not object-store retrieval. That can still be a useful result—provided the chart says so.</p>
+<h1>Do not let your load generator hide the worst minutes</h1>
+<p>The most dangerous latency results often look reassuring.</p>
+<p>Consider a closed-loop client: each worker sends a request, waits for a response, then sends the next request. When the service pauses for a lock, garbage collection, or an overloaded metadata service, the workers wait. During the pause, the client issues fewer requests, so it fails to record the queueing delay of work that would have arrived at the intended rate.</p>
+<p>This is a <strong><a href="https://hdrhistogram.github.io/HdrHistogram/JavaDoc/org/HdrHistogram/AbstractHistogram.html">coordinated omission</a></strong>. It can make a system appear more responsive precisely when it cannot keep up with the intended arrival rate.</p>
+<p>The fix is not merely “use a better tool.” Make the arrival behavior explicit. If the real workload should offer 10,000 requests per second regardless of individual response times, use a load generator that can schedule that offered load independently of completed responses, or use a measurement method designed to correct for coordinated omission. Report both <strong>offered load</strong> and <strong>completed throughput</strong>, plus the percentile distribution and error rate.</p>
+<p>Average latency still has value for capacity planning. It is not enough for a user-facing or pipeline SLO.</p>
+<p>The fan-out problem, explored in <em><strong><a href="https://barroso.org/publications/TheTailAtScale.pdf">The Tail at Scale</a></strong></em><strong>,</strong> is why. If a request depends on 100 independent backend operations and each has a 1% chance of being slow, the chance that at least one is slow is:</p>
+<p><strong>1 − 0.99¹⁰⁰ ≈ 63%</strong></p>
+<p>The assumption of independence matters, and real systems often have correlated failures that are worse. Either way, a smooth mean can hide an unacceptable tail. Report p50, p95, and p99; add p99.9 only when the run has enough samples to make it meaningful. Always show timeouts and retries beside latency.</p>
+<h1>Use simple models as guardrails, not verdicts.</h1>
+<p>Performance models expose assumptions. They do not prove a system is correct, and they do not replace measurement.</p>
+<h2>Little’s Law exposes missing in-flight work</h2>
+<p>For a stable system:</p>
+<p><strong>L = λ × W</strong></p>
+<p>Here, L is the average number of in-flight requests, λ is effective throughput, and W is average time in the system.</p>
+<p>If a service sustains 10,000 requests per second at 50 ms end-to-end latency, it needs roughly 500 requests in flight on average:</p>
+<p><strong>10,000 × 0.05 = 500</strong></p>
+<p>That means <strong>500 in-flight operations</strong>, not necessarily 500 operating-system threads. An asynchronous client may achieve this with fewer threads and many connections; a synchronous client may need far more workers. The useful check is consistency: do observed throughput, latency, and in-flight work agree?</p>
+<p>When they do not, investigate the arrival model, the measurement boundary, caching, batching, and client-side backpressure before trusting the result.</p>
+<h2>Amdahl’s Law makes serial work visible</h2>
+<p>For a fixed amount of work, Amdahl’s Law bounds the speedup available from parallelism:</p>
+<p><strong>S(N) = 1 ÷ [(1 − P) + (P ÷ N)]</strong></p>
+<p>If 5% of a workload is genuinely serial, the theoretical maximum speedup is 20x, even with unlimited parallel resources. In data systems, that serial portion may be catalog access, a commit path, a coordination barrier, or a single skewed partition.</p>
+<p>Use this as a hypothesis, not a diagnosis. A plateau below the predicted ceiling may point to network, storage, skew, or client limitations. A plateau near it tells you where to investigate next.</p>
+<h2>The Universal Scalability Law turns a curve into questions</h2>
+<p><strong><a href="https://arxiv.org/abs/0808.1431">Neil Gunther’s Universal Scalability Law</a></strong> models the fact that added workers can introduce both contention and coordination overhead:</p>
+<p><strong>C(N) = N ÷ [1 + α(N − 1) + βN(N − 1)]</strong></p>
+<p>Here, C(N) is normalized capacity at scale factor N; α represents contention and β represents coordination or coherency cost.</p>
+<p>The model is valuable because it asks the right question when a cluster stops scaling: <em>what shared resource or coordination path grows with the cluster?</em> Fit it to repeated measurements across enough scale points to see a trend. Do not expect three data points to predict an exact collapse point.</p>
+<h2>Test the states that production will actually visit</h2>
+<p>Uniform ramps to a clean peak are easy to graph. Production is rarely so polite.</p>
+<p>Data platforms change behavior as caches warm, checkpoints accumulate, compactions begin, partitions skew, or write conflicts rise. A benchmark that measures only a fresh cluster at steady load can miss the states that create operational pain.</p>
+<p>Add scenarios that deliberately exercise those transitions:</p>
+<ul>
+ <li>Compare cold-cache and warm-cache reads.</li>
+ <li>Run long enough to include compaction, checkpointing, or metadata maintenance.</li>
+ <li>Vary key and partition skew instead of using uniformly distributed data.</li>
+ <li>For optimistic concurrency control, generate both non-overlapping writes and writes that intentionally contend for the same conflict domain.</li>
+ <li>Step load up, hold it, then step it down. Measure whether latency and queues recover promptly.</li>
+ <li>Inject a realistic dependency slowdown or partial failure when the decision warrants it.</li>
+</ul>
+<p>These experiments make feedback loops visible: a transient slowdown triggers retries, queue growth, timeouts, and more load until the system remains unhealthy after the original trigger has passed. <strong><a href="https://sigops.org/s/conferences/hotos/2021/papers/hotos21-s11-bronson.pdf">Metastable failure modes</a></strong> are difficult to predict and easy to miss, which is why recovery behavior belongs in the test plan.</p>
+<h2>Treat the benchmark as an investigation</h2>
+<p>Active benchmarking means observing the full path while the workload is running. Start with a hypothesis—” the catalog is the limiter,” “small files are saturating metadata operations,” or “the client cannot maintain offered load”—then gather evidence from both the client and every layer in the system boundary.</p>
+<p>Watch for:</p>
+<ul>
+ <li>client request rate, concurrency, connection pools, retries, and queue depth;</li>
+ <li>CPU utilization, run queues, context switches, memory pressure, and garbage collection;</li>
+ <li>network throughput, retransmissions, and connection saturation;</li>
+ <li>storage, object-store, and metadata-service latency and throttling;</li>
+ <li>engine-level task skew, shuffle behavior, commit latency, and failed operations.</li>
+</ul>
+<p>Profilers and tracing tools, including eBPF-based tools where available, are useful because they turn a flat throughput line into an explanation. A flame graph may reveal CPU time in serialization; queue metrics may reveal a saturated metadata service; traces may show retries amplifying a minor slowdown.</p>
+<p>The benchmark should answer more than “how fast?” It should answer:</p>
+<blockquote>
+ <p><em>What limited this workload at this scale, under these conditions—and what would need to change for it to go faster?</em></p>
+</blockquote>
+<h1>The benchmark review that earns trust</h1>
+<p>Before presenting a result, confirm that readers can find the answer to these questions:</p>
+<ol>
+ <li>What workload was tested, and how closely does it match production?</li>
+ <li>How was load offered, and can the client sustain that offer under pressure?</li>
+ <li>What cache state, data layout, configuration, and software versions were used?</li>
+ <li>What happened to throughput, errors, retries, and tail latency as load increased?</li>
+ <li>Where did the system bottleneck, and what evidence supports that conclusion?</li>
+ <li>Did the system recover when the load or fault was removed?</li>
+</ol>
+<p>If those answers are absent, the throughput chart is not a decision document. It is a starting point for the next experiment.</p>
+<p>Data engineering teams build systems that businesses depend on when the workload becomes messy: end-of-month spikes, backfills, hot partitions, expensive retries, and a storage service having a bad day. Benchmark for that reality.</p>
+<p>Run the load. Watch the system. Explain the result. Then decide.</p>
+<h1>References and further reading</h1>
+<ul>
+ <li>Brendan Gregg, <strong><a href="https://www.brendangregg.com/activebenchmarking.html">Active Benchmarking</a></strong></li>
+ <li>Gil Tene, <strong><a href="https://hdrhistogram.github.io/HdrHistogram/JavaDoc/org/HdrHistogram/AbstractHistogram.html">HdrHistogram documentation on coordinated-omission correction</a></strong></li>
+ <li>Jeffrey Dean and Luiz André Barroso, <strong><a href="https://barroso.org/publications/TheTailAtScale.pdf">The Tail at Scale</a></strong></li>
+ <li>John D. C. Little, <strong><a href="https://pubsonline.informs.org/doi/10.1287/opre.9.3.383">A Proof for the Queuing Formula: L = λW</a></strong></li>
+ <li>Gene M. Amdahl, <strong><a href="https://doi.org/10.1145/1465482.1465560">Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities</a></strong></li>
+ <li>Neil J. Gunther, <strong><a href="https://arxiv.org/abs/0808.1431">A General Theory of Computational Scalability Based on Rational Functions</a></strong></li>
+ <li>Nathan Bronson, Abutalib Aghayev, Aleksey Charapko, and Timothy Zhu, <strong><a href="https://sigops.org/s/conferences/hotos/2021/papers/hotos21-s11-bronson.pdf">Metastable Failures in Distributed Systems</a></strong></li>
+</ul>

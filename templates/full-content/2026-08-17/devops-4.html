@@ -1,0 +1,85 @@
+<h1>How to Run Terraform in Bitbucket Pipelines</h1>
+<p>Automating your processes is a key best practice when working with Terraform, OpenTofu, and similar tools for infrastructure as code. This gives you a consistent workflow for all changes to the infrastructure you manage using these tools. Two common approaches are:</p>
+<ol>
+ <li>Use a dedicated infrastructure automation platform such as Spacelift or HCP Terraform</li>
+ <li>Use a generalized automation tool where you can build your own automation workflows.</li>
+</ol>
+<p>The second option often involves using features available on a version control and collaboration platform such as GitHub, GitLab, or Bitbucket. In this blog post, we will cover an option in the second category of automation tools: how to run Terraform in Bitbucket Pipelines.</p>
+<p>Note that this blog post covers how to run Terraform in Bitbucket Pipelines, but the steps are also applicable to OpenTofu with minor changes (e.g., use the OpenTofu binary instead of the Terraform binary).</p>
+<p>To run Terraform in Bitbucket Pipelines, you define your pipelines in a single <code>bitbucket-pipelines.yml</code> file at the root of your repository. Bitbucket Pipelines is Bitbucket Cloud’s built-in CI/CD service, and every step runs in a fresh Docker container, so you choose an image such as <code>hashicorp/terraform</code> and script the Terraform commands yourself.</p>
+<h2>What are Bitbucket Pipelines?</h2>
+<p>Bitbucket Cloud, or simply Bitbucket, is a software-as-a-service (SaaS) collaboration platform for source code. Bitbucket is part of the Atlassian suite of products and integrates well with Jira and Confluence, which many organizations use for project management and documentation.</p>
+<p>Bitbucket was previously available as a single-instance, self-hosted product called Bitbucket Server, but Atlassian discontinued support for it in February 2024. If you want to host Bitbucket yourself, an alternative product called Bitbucket Data Center continues to be supported. Bitbucket Data Center is designed for high availability and is intended for larger deployments.</p>
+<p>One of Bitbucket’s features is the built-in continuous integration and continuous delivery (CI/CD) service, <b>Bitbucket Pipelines</b>.</p>
+<p>With Bitbucket Pipelines, you can define pipelines that should run when you push code to branches, when you open or update a pull-request, on a schedule, manually, and more. Your pipelines can include arbitrary scripts that perform steps such as building an application, migrating a database, scaling up a virtual machine, provisioning infrastructure with Terraform, and much more.</p>
+<p>Pipelines are defined as code in a file named bitbucket-pipelines.yml, and each pipeline step is executed in a fresh Docker container. You can use an existing Docker image from a container registry or use your own custom images.</p>
+<p>Bitbucket Pipelines is a natural choice for automation if your source code is hosted on Bitbucket.</p>
+<h2>How to run Terraform in Bitbucket Pipelines</h2>
+<p>In this section, we will describe how to enable and run Terraform in Bitbucket Pipelines for an existing Bitbucket repository. The prerequisites for following this walkthrough are:</p>
+<ul>
+ <li>Access to a Bitbucket Cloud workspace</li>
+ <li>Access to at least one repository where you can configure a pipeline and run Terraform</li>
+ <li>Administrator access to an AWS account and an S3 bucket for state storage</li>
+</ul>
+<p>In the following sections, we will build a few basic pipelines for running Terraform, with the aim of achieving the following:</p>
+<ul>
+ <li>Provision infrastructure on AWS.</li>
+ <li>Use an AWS S3 state backend.</li>
+ <li>Use OIDC workload identity to authenticate to AWS for state management and provisioning.</li>
+ <li>Run init, fmt, validate, and plan commands for every push to a feature branch and every pull request targeting the main branch.</li>
+ <li>Run <code>init</code>, <code>plan</code> and <code>apply</code> for every commit to the main branch.</li>
+</ul>
+<h3>Enable Bitbucket Pipelines for a repository</h3>
+<p>First, we need to enable Bitbucket Pipelines. Bitbucket Pipelines are disabled by default. You enable pipelines by manually committing a file named <code>bitbucket-pipelines.yml</code> or using the wizard in the UI.</p>
+<p>Your first pipeline run must be triggered manually. After committing the bitbucket-pipelines.yml file to the repository, go to the “Pipelines” section of your repository and you will see the following view. Click on “Run initial pipeline” to get started. The following runs will be triggered automatically based on the trigger events you have defined in your pipelines.</p>
+<h3>Define your pipelines in bitbucket-pipelines.yml</h3>
+<p>You can configure one or more pipelines for your Bitbucket repository using YAML configuration in a file named <code>bitbucket-pipelines.yml</code>. The file must have this exact name, and it must be placed in the root of your repository. You can only have one pipeline file per repository.</p>
+<p>We begin by specifying which Docker image we want to use for the steps of our pipelines.</p>
+<pre><code>image: hashicorp/terraform:1.15.7</code></pre>
+<p>Next, we define reusable steps for <code>fmt</code>, <code>validate</code>, <code>plan</code> and <code>apply</code> that we can include in the pipelines we will define later. We add these steps under <code>definitions.steps</code> using YAML anchors.</p>
+<h3>Configuring the S3 Terraform backend</h3>
+<p>To configure the AWS S3 state backend, add the following code under the <code>definitions</code> section of your pipeline:</p>
+<pre><code>definitions:
+  scripts:
+    - &amp;tf-init &gt;
+      terraform init -input=false
+        -backend-config="bucket=$\{TF_STATE_BUCKET}"
+        -backend-config="key=$\{TF_STATE_KEY}"
+        -backend-config="region=$\{AWS_DEFAULT_REGION}"</code></pre>
+<p>Go to your repository settings and click on “Repository variables”, then configure <code>TF_STATE_BUCKET</code>, <code>TF_STATE_KEY</code>, and <code>AWS_DEFAULT_REGION</code> with values corresponding to your bucket.</p>
+<h3>Configuring AWS OIDC authentication</h3>
+<p>We want to use the OIDC workload identity federation feature to achieve this. The benefit of this authentication mechanism is that we do not have to deal with long-lived credentials.</p>
+<p>The first step is to go to your repository settings and click on “OpenID Connect”. Copy the values for the Identity provider URL, Audience, Workspace UUID, and Repository UUID.</p>
+<p>In the <code>bitbucket-pipelines.yml</code> file, add another reusable script definition for OIDC:</p>
+<pre><code>definitions:
+  scripts:
+    - &amp;oidc-setup &gt;
+      echo "$BITBUCKET_STEP_OIDC_TOKEN" &gt; /tmp/web-identity-token &amp;&amp;
+      export AWS_ROLE_ARN="$AWS_ROLE_ARN" &amp;&amp;
+      export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/web-identity-token</code></pre>
+<h2>Best practices for running Terraform in Bitbucket Pipelines</h2>
+<h3>1. Use OIDC authentication if your Terraform provider supports it</h3>
+<p>If your target platform supports authentication with OIDC workload identity federation, you should always use this method of authentication to avoid managing long-lived credentials.</p>
+<h3>2. Use the built-in secrets management feature</h3>
+<p>Manage secrets by marking a variable as sensitive in your repository variables. Sensitive variables will not be exposed in the pipeline logs.</p>
+<h3>3. Define reusable steps and scripts</h3>
+<p>YAML anchors allow you to easily build reusable steps and scripts for composing your pipelines, ensuring a consistent experience.</p>
+<h3>4. Add concurrency control</h3>
+<p>If you have one or more steps that should not run at the same time, you can add them to a concurrency-group to avoid locked Terraform state file issues.</p>
+<h3>5. Use pipeline deployments for multiple environments</h3>
+<p>You can configure each deployment with unique variable values, allowing you to use different Terraform state backend configurations and authentication details for each environment.</p>
+<h2>Frequently asked questions</h2>
+<ul>
+ <li>
+  <h3>Why use Bitbucket Pipelines for Terraform?</h3>
+  <p>Bitbucket Pipelines runs Terraform builds directly inside Bitbucket Cloud, so teams already using Jira and Confluence avoid adopting a separate CI/CD tool. It supports Docker-based runners, deployment environments for scoped secrets, and manual approval steps.</p></li>
+ <li>
+  <h3>How do I authenticate to AWS from Bitbucket Pipelines?</h3>
+  <p>Use OpenID Connect (OIDC): register Bitbucket as an identity provider in AWS IAM, create a role with a trust policy scoped to your workspace or repository, then set oidc: true on the step so STS exchanges BITBUCKET_STEP_OIDC_TOKEN for short-lived credentials.</p></li>
+ <li>
+  <h3>What's the difference between Bitbucket Pipelines and GitHub Actions for Terraform?</h3>
+  <p>Bitbucket Pipelines is Atlassian’s built-in CI/CD tied to Bitbucket Cloud, while GitHub Actions is a marketplace-driven workflow engine native to GitHub.</p></li>
+ <li>
+  <h3>Is Bitbucket Pipelines free for Terraform workflows?</h3>
+  <p>A free tier is available with 50 build minutes per workspace each month, enough for light experimentation.</p></li>
+</ul>

@@ -1,0 +1,69 @@
+<p>AI has enabled employees across every team to build applications faster than ever before.</p>
+<p>But that speed is also what's keeping every CISO up at night: any employee can build an application, deploy it to the public Internet, and accidentally expose internal work or company data.</p>
+<p>Today, we're launching new tools to make it easy to keep your applications hosted on Workers private. You can now apply Cloudflare Access directly to a Worker or to every Worker in your account, so that your applications are behind your company login by default, without relying on each developer to set that up themselves.</p>
+<p>You can now:</p>
+<ul>
+ <li><strong>Set a policy at the account level </strong>to ensure that all preview and production deployments are behind your company login by default.</li>
+ <li><strong>Set a policy on a single application</strong> to ensure authentication is enforced on every domain associated with it, no matter how it's deployed.</li>
+ <li><strong>See exactly who visits your application.</strong> Get every authenticated user’s email, name, and groups directly in your code — no JWT (JSON Web Token) validation required.</li>
+ <li><strong>Deploy an internal platform where every deployment is private by default. </strong>We've open-sourced an example: an internal static site platform where every Worker deployed is private.</li>
+</ul>
+<h2>Access on Workers: how it works</h2>
+<p>When you enable Access on a Worker, Cloudflare enforces authentication before any request reaches your application code. It doesn't matter how the request gets to your Worker, whether it's through a custom domain, a route, a workers.dev subdomain, or a preview URL. If Access is on, the user has to authenticate first.</p>
+<p>Previously, you had to configure this at the hostname level, which meant setting up Access policies on each domain your Worker was reachable on. If you wanted to add a new custom domain to your Worker, you needed to update the Access policy first or that hostname would be reachable without authentication. Now the policy is attached to the Worker itself, so any domain or URL associated with that Worker is automatically protected. You can choose what to protect: just preview URLs, or all hostnames.</p>
+<p>If you set it to previews only, every preview URL created for that application, whether it's a workers.dev preview URL or a custom domain you use for previews, will require authentication whenever you deploy a new version. If you set it to all hostnames, every domain associated with that Worker is protected — custom domains, routes, workers.dev subdomains, and preview URLs.</p>
+<p>Access gives you control over how users authenticate. You can connect your existing identity provider, so employees sign in with the credentials they already use, or restrict access to specific email addresses, email domains, or groups. For agents, you can grant access through service tokens.</p>
+<p>Read more in the <a href="http://developers.cloudflare.com/workers/configuration/cloudflare-access/">Cloudflare Access for Workers documentation</a> here.</p>
+<h2>Keep every Worker in your account private by default</h2>
+<p>If you have developers across your organization deploying Workers, you don't want to rely on each one to remember to enable Access. You want the default to be private.</p>
+<p>You can set an Access policy once at the account level, and every Worker in your account, current and future, is private from the moment it's created.</p>
+<p>You choose what the policy covers: only preview URL traffic, all production traffic, or both. Preview-only is useful if your production Workers are intentionally public, but you never want an in-progress deployment exposed.</p>
+<p>Need a Worker to be public? Bypass the account-wide policy on that one Worker.</p>
+<h3>Protect a specific Worker</h3>
+<p>If you don't need an account-wide default and just want to lock down one specific Worker, you can apply Access to that Worker directly.</p>
+<p>The new Access tab in the Worker view shows exactly which policies apply to that application. If you have multiple, the most specific one takes priority: hostname policies first, then Worker policies, then account policies.</p>
+<h2>See who is accessing your application</h2>
+<p>When Access is protecting your Worker, you can get information about who is making each request — their email, name, and groups — so you can personalize what they see, enforce permissions, or log activity per user.</p>
+<p>This works through your Worker's context object (ctx). Every request to your Worker carries a ctx with metadata about that request. When Access is enabled, we attach the authenticated user's identity to it as ctx.access. From there, call <code>ctx.access.getIdentity()</code> to get back the user's email, name, and more.</p>
+<p>Before, this meant validating a JWT yourself — parsing the token, verifying the signature, and extracting the claims. Now, when Access is enabled on your Worker, every authenticated request includes ctx.access.</p>
+<p>Here's all you need to get the user's identity:</p>
+<pre><code>export default \{
+  async fetch(request, env, ctx) \{
+    if (!ctx.access) \{
+      return new Response("Access required", \{ status: 403 });
+    }
+
+    const identity = await ctx.access.getIdentity();
+    const email = identity?.email ?? "unknown";
+
+    return new Response(`Hello, $\{email}`);
+  }
+};</code></pre>
+<h2>Test locally before you deploy</h2>
+<p>We showed how you can use <code>ctx.access.getIdentity()</code> to give your Worker information about who is making a request — their email, name, and groups.</p>
+<p>You can use this when developing locally with wrangler dev. Add an access block to your <code>wrangler.jsonc</code> to simulate an authenticated user:</p>
+<pre><code>\{
+  "access": \{
+    "dev": \{
+      "aud": "my-app",
+      "identity": \{ "email": "admin@company.com" }
+    }
+  }
+}</code></pre>
+<p>Your Worker picks it up through <code>ctx.access.getIdentity()</code> — returning an identity object shaped like what you'd get in production. Swap the email in your config to test as a different user.</p>
+<p>This means you can verify that the right content shows up for the right user without having to deploy and sign in through Access every time you make a change.</p>
+<h2>Deploy an internal platform where every application is private by default</h2>
+<p>If you manage an internal platform where employees can prototype and deploy applications, you need every application to be private without configuring access controls on each one.</p>
+<p>Workers for Platforms lets you deploy Workers at scale. Every Worker lives inside a namespace, and all traffic to that namespace goes through a single entry point: the dispatch Worker.</p>
+<p>Set an Access policy on your dispatch Worker, and every Worker deployed through it is private by default.</p>
+<p>We also have an open-source example where you can deploy your own internal drag-and-drop deployment platform — configure access on the dispatcher worker once and every site deployed through it is private by default.</p>
+<p>Click the button below to deploy it yourself!</p>
+<p>For the full architecture, see our <a href="https://developers.cloudflare.com/cloudflare-for-platforms/workers-for-platforms/">Workers for Platforms reference architecture.</a></p>
+<h2>Built on solid foundations</h2>
+<p>This feature was made possible by FL2, the new Rust-based modular proxy that powers Cloudflare's edge. Access is the front gate to your applications, and as such, it traditionally ran before all Workers logic in the request pipeline. But in order for Access applications to target individual Workers themselves instead of their hostnames, Access needs to know which Worker a given request is destined to reach. Therefore, we needed to split Workers <em>routing</em> from Workers <em>execution</em>, and move the routing logic, so it could run before Access.</p>
+<p>In our old FL1 system based on NGINX and modules written in Lua, this change would have been complex and risky. Interactions between products can be subtle, and moving logic to an earlier phase of the request pipeline can be unsafe if it depends on shared state that is modified by another product.</p>
+<p>FL2 made it easy. Its strict module system separates logic into well-defined, consistently ordered phases that statically declare their inputs and outputs. We were able to lean on the compiler to surface any broken interactions between phases, and gradually roll out this refactor with confidence.</p>
+<h2>Try it today</h2>
+<p>This is now available to everyone. Try it out in the <a href="https://dash.cloudflare.com/account/workers-and-pages">dashboard</a> or read the <a href="http://developers.cloudflare.com/workers/configuration/cloudflare-access/">Cloudflare Access for Workers documentation</a> to get started.</p>
+<h2>Acknowledgments</h2>
+<p>Thank you to Jesse Li, Brandon Strittmatter, Kyle Hiller, Kenny Johnson, Matt "TK" Taylor, Brendan Irvine-Broque, Yomna Shousha, and Mike Aizatsky for the engineering and design work that made this possible!</p>

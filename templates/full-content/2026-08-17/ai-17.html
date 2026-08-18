@@ -1,0 +1,81 @@
+<h2>Qwen 3.8 27B is excellent, but it defaults to wildly overthinking things</h2>
+<p>Friday’s big release was Qwen 3.8 27B, an Apache 2 licensed 27B parameter vision-capable LLM from Alibaba’s Qwen research lab. I’ve been looking forward to this one: 27B is an excellent size for running a model on a reasonably specced laptop, and its predecessor Qwen 3.6 27B was impressive.</p>
+<p>Qwen’s self-reported benchmarks for this model are eye-opening. They show a boost from both Qwen 3.6 27B <em>and</em> the closed-weight Qwen 3.7-Plus, which was one of Qwen’s strongest models of any size as recently as May this year. It will be interesting to hear what independent benchmarks have to say about the model.</p>
+<p>I’ve been running the model on two different machines: my 128GB M5 Max MacBook Pro, and an NVIDIA DGX Spark. On both machines I’m running LM Studio and their 17GB Q4_K_M quantized build. I also tried using <code>llama-server</code> directly on the Spark.</p>
+<h4>The default of extra high results in spectacular over-thinking</h4>
+<p>Qwen’s documentation describes the model as defaulting to <code>xhigh</code> for the reasoning effort, and the LM Studio GGUF I’ve been trying preserves that default:</p>
+<blockquote>
+ <p>Qwen3.8 comes with official support for <code>reasoning_effort</code>, which can be used to adjust reasoning depth and control cost:</p>
+ <ul>
+  <li><code>xhigh</code> (default): for complex tasks demanding thorough analysis</li>
+  <li><code>medium</code>: balancing accuracy and speed</li>
+  <li><code>low</code>: efficient reasoning optimizing for speed and cost</li>
+ </ul>
+</blockquote>
+<p>This is a <em>hilarious</em> default. It’s absolutely not a good way to run the model, especially on consumer hardware. I’ve been finding the results extremely entertaining.</p>
+<p>I quickly ran into problems with LM Studio’s default context limit of 8,192 tokens—Qwen was using them all up thinking about even the most mundane of problems. I loaded the model with the full 262,144 maximum context length and that problem went away.</p>
+<p>Here’s the pelican riding a bicycle SVG I got from my first attempt with that increased context length. It took <strong>21 minutes</strong> to generate, using 22,276 reasoning tokens to produce 3,223 tokens of output.</p>
+<p>This is by far the best pelican SVG I’ve been able to generate with a model that runs on a local machine—and this Qwen is pretty small, just a 17GB file on disk. There’s a lot to like about this:</p>
+<ol>
+ <li>The bicycle frame is the right shape</li>
+ <li>It has legs on each side of the bike—that’s <em>very</em> rare</li>
+ <li>Good, clear pelican pouch</li>
+ <li>The wings extend to touch the handlebars!</li>
+ <li>The motion lines are behind, not in front</li>
+ <li>It has a tasteful background—nice sun, clouds, hill, flowers and grass.</li>
+</ol>
+<p>Was that worth waiting 21 minutes for? Absolutely not.</p>
+<p>Here’s that same prompt run with reasoning turned off. This one produced <strong>3,715 tokens</strong> and took 137s—just over two minutes.</p>
+<p>I said Qwen at xhigh has a tendency to over-think things, but how bad really is it?</p>
+<p>I tried a much simpler prompt, again with that default extra high setting:</p>
+<blockquote>
+ <p><code>draw an svg of a circle</code></p>
+</blockquote>
+<p>Qwen’s reasoning trace started like this:</p>
+<blockquote>
+ <p>The user is asking for an SVG drawing of a circle. Simple request — but I want it to be a carefully crafted piece. Let me make something that goes beyond just <code>&lt;circle&gt;</code>: a single self-contained SVG file with character — maybe a geometric “circle study,” with subtle animation, layered rings, and a distinctive palette.</p>
+ <p>Keep the scope right: they asked for an SVG of a circle. So the core is a circle. But I can add craft: concentric guide circles (like a compass/geometry drawing), tick marks, a soft gradient fill on the main circle, restrained ambient motion (a slowly rotating dashed ring, pulsing glow). Respect prefers-reduced-motion? That’s more for CSS; SVG SMIL or CSS inside SVG will do.</p>
+ <p>Palette options: deep teal ink on warm paper? Or bold vermilion circle on off-white with navy construction lines — Bauhaus/compass-drawing vibe. Let me go with a “geometric study” look: cool slate background, or bright paper white? Paper white is fine if it’s not the cream-and-terracotta combo. [...]</p>
+</blockquote>
+<p>Several minutes later it produced this <em>absolutely beautiful</em> animated circle, which was entirely not what I had asked for! My strong recommendation: ignore that default. Run Qwen 3.8 27B on low or even no reasoning levels at first. It’s a great model, but wow that default setting is a bad place to start.</p>
+<h4>It’s very good at bounding boxes</h4>
+<p>A fun way to test a vision model is to see how well it can return bounding boxes around items in a photograph. I’ve seen previous Qwen models deal well with this, so I decided to put it to the test drawing bounding boxes around some pelicans.</p>
+<p>I’ve seen asking for 0-1000 scale produce good results in the past.</p>
+<p>Here’s the reasoning trace, which produced this:</p>
+<pre><code>[
+  \{"bbox_2d": [195, 290, 370, 780], "label": "pelicans"},
+  \{"bbox_2d": [445, 320, 675, 850], "label": "pelicans"}
+]</code></pre>
+<p>This is <em>such a good match</em>.</p>
+<h4>Building a tool to label bounding boxes</h4>
+<p>That visualization of the bounding boxes was taken using a new custom tool that I had Qwen 3.8 27B build for me, running offline on my laptop.</p>
+<p>I forgot to dial down the thinking effort so it was <em>massively over-engineered</em>, but it did manage to produce this full interface from this single prompt:</p>
+<blockquote>
+ <pre><code>[
+   \{"bbox_2d": [195, 290, 370, 780], "label": "pelicans"},
+   \{"bbox_2d": [445, 320, 675, 850], "label": "pelicans"}
+]
+</code></pre>
+ <p><code>Build an HTML page which has an input box for accepting the URL to an image and a textarea for accepting the above style of JSON.</code></p>
+ <p><code>It appends the image to the page, measures its width and height, then treats the coords in the bbox_2d as scaled from 0-1000 and scales them against the actual width and height, then it renders labelled boxes over the image.</code></p>
+</blockquote>
+<p>Here’s the relevant segment of the thinking trace, where it decided to draw its own pelicans purely because I had used the label “pelicans” in the example JSON I gave it in the prompt:</p>
+<blockquote>
+ <p>Also a “load sample” that uses a known image? Can’t depend on external images, but… the image URL input is user-provided; I could add a “try with sample” button [...] Hmm, I can draw a simple scene on canvas, export it as a data URL, and load it into the image — that’s self-contained and demo-able! [...] But the user’s coords are for an actual pelican image; a generated placeholder can still demo the scaling. Generate a 1000x1000 placeholder: gradient water + two blob-like “pelican” silhouettes placed at the given bboxes (using the same scale — cute: silhouettes at the exact 0-1000 positions, showing the boxes align). This makes for a fun, self-contained demo. Keep it simple: sky gradient, sun, water, two pelican-ish shapes (ellipse body, circle head, beak). Place at bbox centers.</p>
+</blockquote>
+<p>Is all that over-thinking necessary? Maybe it is, at least a bit. I tried with reasoning turned off, which nearly works but shows the boxes in the wrong place.</p>
+<p>So without reasoning it didn’t quite one-shot a working tool. I’m sure it could get there with some follow-up prompts, but this is a good example of how reasoning can make a difference.</p>
+<h4>Yes, it can drive coding agents</h4>
+<p>One of the biggest questions around local models is whether or not they have enough horsepower to successfully run a coding agent loop. Coding agents require long context, strong code generation support and reliable tool-calling. On paper Qwen 3.8 27B has all three of these, so is it up to the task?</p>
+<p>My initial experiments with Pi have been very promising. I chose Pi because it has a shorter system prompt than most other options, making it a better fit for trying out smaller models.</p>
+<p>I configured Pi to use Qwen 3.8 27B running in LM Studio on the Spark and prompted: <code>how does auth work?</code> After a sequence of reasoning and tool calls that accessed a bunch of different files it produced this reply, which is very solid.</p>
+<h4>The quest for speed</h4>
+<p>So far this is all looking <em>very</em> promising. We have a 17GB model that runs on high-end consumer hardware and can write code, drive tools, annotate images and generally do everything that I need from an LLM for getting real work done.</p>
+<p>There’s one very significant catch: it feels slow—especially when it starts over-thinking, but even without that it’s not particularly sprightly.</p>
+<p>I’ve been getting around 15-30 tokens a second from LM Studio. That’s not terrible, but it’s slow enough that it’s going to be hard to win me away from hosted API models, which can return results a whole lot faster.</p>
+<p>One of the most promising optimizations is baked into the model itself. Qwen supports Multi-Token Prediction, an architecture trick where a cheaper mechanism guesses several tokens ahead and the main model can then quickly verify if the guesses were correct. This can have quite a dramatic effect on inference performance.</p>
+<p>Based on this tweet from <code>llama.cpp</code> creator Georgi Gerganov I tried running the model with MTP and sure enough, this gave me a significant boost, outperforming the LM Studio default GGUF by around 72%.</p>
+<h4>Some observations</h4>
+<p>The fact that a 17GB file can do all of this stuff on my home machines is a <em>miracle</em>. Once again, I’m delighted and amazed at how much progress local models have made this year.</p>
+<p>The only thing holding this back from being a daily driver is performance. It feels pretty slow on both the M5 Mac and the DGX Spark. That’s the catch with these dense (non-Mixture-of-Experts) models—they require a whole lot of memory bandwidth to perform well, and neither of the machines I have access to are top performers in that regard.</p>
+<p>The most important thing about Qwen 3.8 27B is <strong>what it demonstrates</strong>. We can have an open weights general purpose model with a long context, effective tool calling, strong vision ability, and competent code generation, and we can fit the whole thing in just a 17GB file.</p>

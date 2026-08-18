@@ -1,0 +1,78 @@
+<h1>Needle 2</h1>
+<p>Needle 2 is an open 45M-parameter model for tool calling, device use and structured extraction. The whole model is a single 14MB binary that runs a full session in about 28MB of RAM. It is built on our Simple Attention Network findings, compressed to CQ2-bit with Cactus Quants, and baked into its own engine. On the benchmarks below, Needle 2 trades wins with other small models like FunctionGemma 270M, LFM2.5 230M and Apple FM, at 5x to 70x smaller, and 2 bits against their f16.</p>
+<p>This repository is the Python package: inference, LoRA fine-tuning, and export. <code>pip install cactus-needle</code>, describe your tools, and call them from Python. The inference engine is fetched once from Hugging Face and cached; there is nothing else to build, and offline setup for air gapped devices is covered in doc/apis.md.</p>
+<ul>
+ <li><strong>Self-contained</strong>: weights baked into a single 14MB engine; no separate model files to manage, and inference does no network.</li>
+ <li><strong>Simple contract</strong>: tool calls come back as structured data, text in, JSON out; a byte-level grammar compiled from your schemas constrains every token.</li>
+ <li><strong>Confidence-gated</strong>: every response carries a calibrated confidence score from a learned head; set a threshold, act above it, escalate below it.</li>
+ <li><strong>Tool retrieval</strong>: declare a large catalogue and a built-in retrieval head renders only the top five tools per turn, with the grammar constrained to that subset.</li>
+ <li><strong>Bounded memory</strong>: a 256-token sliding window with the tools pinned as KV sinks, so total memory stays near 28MB no matter how long the conversation runs.</li>
+</ul>
+<p>Weights: <a href="https://huggingface.co/Cactus-Compute/needle2">huggingface.co/Cactus-Compute/needle2</a> · source: <a href="https://github.com/cactus-compute/needle">github.com/cactus-compute/needle</a>.</p>
+<h2>Simple Attention Network</h2>
+<p>Needle 2 is a Simple Attention Network, our dense small-model recipe: a Hadamard MLP in place of the FFN, GQA attention, engram key-value memory, and multi-lane hyper-connections. See the paper for the design and ablations: <a href="https://arxiv.org/abs/2607.18363">arXiv:2607.18363</a>.</p>
+<p>Each block carries its update rule. Here x̂ is the RMS-normalised flattening of the four residual streams, H the orthonormal Walsh-Hadamard transform (a fixed matrix, applied in n log n time with no weights to read), (kₜ, vₜ) rows gathered from hashed n-gram tables, and P the doubly-stochastic normalisation of the routing logits A, computed by Sinkhorn iteration; a, b, g and all σ-gates are learned and input-dependent. Both attention and MLP residuals are sandwich-normed and gated, the engram sites fire at two layers, and decoding is constrained by a byte-level grammar compiled from the declared schemas.</p>
+<h2>Quickstart</h2>
+<pre><code>pip install cactus-needle</code></pre>
+<p>Needle reads your tool descriptions to decide what to call and how to fill arguments, so describing them well is the whole game.</p>
+<p><strong>Simple</strong>: decorate a function. The signature gives the argument types, the docstring is the tool description, and <code>run()</code> completes the loop: model picks the call, Needle executes your function, feeds the result back, and returns the final response with the executed tool results attached as <code>results</code>.</p>
+<pre><code>import needle
+
+@needle.tool
+def get_weather(city: str):
+    "Get the current weather for a city."
+    return \{"city": city, "temp_c": 27, "sky": "clear"}
+
+agent = needle.Needle(tools=[get_weather])
+print(agent.run("what's it like in Lagos right now?")["results"])
+# [\{'city': 'Lagos', 'temp_c': 27, 'sky': 'clear'}]</code></pre>
+<p><strong>Extraction</strong>: to pull structured data out of text, declare the shape and call <code>extract()</code>. Pass a Pydantic model and you get a typed object back.</p>
+<pre><code>from pydantic import BaseModel
+
+class Invoice(BaseModel):
+    vendor: str
+    total: float
+    due_date: str
+
+invoice = needle.extract("Invoice from Acme Corp, $1,200.00, due 2026-09-01", Invoice)
+print(invoice.vendor, invoice.total)   # -&gt; Acme Corp 1200.0</code></pre>
+<p>Per argument descriptions and choices, value constraints compiled into the decode grammar, raw JSON schemas, driving the loop with <code>complete()</code>, the response contract, system facts, tool retrieval, and confidence gating are all covered in doc/apis.md.</p>
+<h2>Playground</h2>
+<p>Try any model in the browser: pick a preset, edit the tools or prompt, and Run. Follow-up queries continue the same conversation.</p>
+<pre><code>needle playground                      # base model, http://127.0.0.1:7860
+needle playground --weights my.cact    # a tuned model</code></pre>
+<p>The server downloads and initializes the model before serving, so the first query is instant. The <strong>Finetune on these tools</strong> button runs the fine-tuning pipeline below from the UI and hands back a downloadable <code>.cact</code>.</p>
+<h2>Fine-tuning</h2>
+<p>Needle fine-tunes with LoRA on the frozen base and merges the adapter at export, so a run is cheap and the tuned model is still a single <code>.cact</code> that runs on the same engine. The workflow is: (optionally) synthesize data, LoRA fine-tune, then build a tuned <code>.cact</code>. See doc/finetuning.md for dataset sizing, reading the loss curve, and troubleshooting.</p>
+<p><strong>Data format.</strong> A JSONL file, one example per line. <code>reasoning</code> is optional; an off-topic example has <code>answers: []</code>.</p>
+<pre><code>\{"query": "dim the kitchen to 10", "tools": [\{"name": "set_lights", "parameters": \{"type": "object", "properties": \{"room": \{"type": "string"}, "brightness": \{"type": "integer"}}, "required": ["room"]}}], "answers": [\{"name": "set_lights", "arguments": \{"room": "kitchen", "brightness": 10}}], "reasoning": "'kitchen' -&gt; room; 'dim to 10' -&gt; brightness 10"}</code></pre>
+<p><strong>1. Synthesize data (optional).</strong> Needs <code>OPENROUTER_API_KEY</code>. Seed from a tool schema file, or expand an existing set:</p>
+<pre><code>export OPENROUTER_API_KEY=sk-or-...
+needle generate-data --tools my_tools.json --num-samples 500 --output data.jsonl
+needle generate-data --augment data.jsonl --num-samples 500      # expand an existing JSONL</code></pre>
+<p>Set <code>OPENROUTER_URL</code> to use an OpenAI-compatible gateway instead of the default OpenRouter endpoint.</p>
+<p><strong>2. LoRA fine-tune.</strong> The base checkpoint auto-downloads from Hugging Face if you do not pass <code>--checkpoint</code>. <code>--generate N</code> first synthesizes N more examples from the tools in your data (also needs <code>OPENROUTER_API_KEY</code>).</p>
+<pre><code>needle finetune data.jsonl --epochs 10
+needle finetune data.jsonl --epochs 10 --generate 300 --lora-rank 16 --lora-alpha 32</code></pre>
+<p>Key options: <code>--epochs</code> (default 3), <code>--lora-rank</code> (16), <code>--lora-alpha</code> (32), <code>--lr</code> (1e-4), <code>--batch-size</code> (16), <code>--max-len</code> (1024), <code>--val-split</code> (0.1), <code>--checkpoint &lt;base.pkl&gt;</code>, <code>--out &lt;adapter.pkl&gt;</code>. The adapter is written to <code>checkpoints/needle_lora.pkl</code>. A validation loss prints each epoch from the held out split.</p>
+<p>Training is plain JAX and runs on any accelerator jax supports. On an NVIDIA machine install the CUDA build and the same command trains on the GPU:</p>
+<pre><code>pip install "cactus-needle[gpu]"</code></pre>
+<p>On Apple Silicon the <code>metal</code> extra trains on the GPU:</p>
+<pre><code>pip install "cactus-needle[metal]"</code></pre>
+<p><strong>3. Build a tuned <code>.cact</code>.</strong> Merge the adapter into the base and quantize. The base auto-downloads if absent.</p>
+<pre><code>needle build checkpoints/needle2.pkl --lora checkpoints/needle_lora.pkl --out my_needle.cact</code></pre>
+<p>Add <code>--bits 2</code> for a smaller model (by default the export follows the checkpoint's declared per-layer bit map, falling back to 4 when the checkpoint declares none), or set <code>NEEDLE_HF_REPO=&lt;you&gt;/&lt;model&gt;</code> and pass <code>--upload</code> to publish the <code>.cact</code>. The counterpart <code>needle download &lt;you&gt;/&lt;model&gt;/my_needle.cact</code> pulls a published archive on any machine.</p>
+<p><strong>4. Run it.</strong> The engine is weights-agnostic, so a tuned <code>.cact</code> runs on it directly - no recompilation:</p>
+<pre><code>import needle
+agent = needle.Needle(weights="my_needle.cact", tools=[...])
+agent.run("...")</code></pre>
+<h2>Citation</h2>
+<p>Needle 2 is built by the Cactus Compute team. If you use it in your work, please cite:</p>
+<pre><code>@misc\{needle2_2026,
+  title        = \{Needle 2: A 45M-Parameter Foundation Tool-Calling Model for Tiny Devices},
+  author       = \{Ndubuaku, Henry and Mosoyan, Karen and Mroz, Jakub and Cylich, Noah and
+                  Kumar, Satyajit and Sandhu, Parkirat and Shemet, Roman and Lee, Justin H.},
+  year         = \{2026},
+  organization = \{Cactus Compute, Inc.},
+  howpublished = \{\url\{https://github.com/cactus-compute/needle}}
+}</code></pre>

@@ -1,0 +1,130 @@
+<p>I seem to have a knack for discovering corner cases – or in many situations <em>being</em> a corner case.</p>
+<p>One category of this is where I find myself using a data model which appears simple to start with – and then the real world interferes. I’ve always found this sort of thing interesting, and recently I’ve come across a pretty good example which I thought I’d share. This also gives an example of some of the thought processes I use when scoping how I model data.</p>
+<p>I’m trying to model the text of the Bible, for reasons I won’t go into. BibleGateway is my “source of truth” here, and all the screenshots in this post are from that site (with appropriate links).</p>
+<h2>Initial assumptions, scoping and simplifications</h2>
+<p>Note: this section is not all <em>true</em>. It’s how I approached the data model to start with. Later sections will show where it breaks down.</p>
+<p>There are multiple translations of the Bible. I’m scoping my model to only English translations. I’m not interested in “first edition” vs “second edition” etc, but I do want to be able to differentiate between “New International Version” and “New International Version – UK” etc.</p>
+<p>Each translation is made up of several books (Genesis to Revelation). While we could split this into “Old Testament” and “New Testament” (and some other categories, potentially) I don’t need that categorisation, so it won’t be part of the model. Different translations consist of different books, as some translations include the Apocrypha and others don’t.</p>
+<p>Different translations may refer to the same book with different titles. For exmaple, “Song of Songs” is also known as “Canticle of Canticles” or “the Song of Solomon”; likewise “the Book of Wisdom” is also known as “the Wisdom of Solomon” and “Sirach” is also known as “Ecclesiasticus” (and some other titles, apparently). I don’t particularly need to know which title is used in each translation, but I do need a canonical representation. (If a user says they want to see a passage in “Sirach” or “Ecclesiasticus” I want to give the same results in either case, regardless of what the translation calls it.)</p>
+<p>Each book is split into chapters, and each chapter is split into verses. Each book starts with chapter 1 and proceeds in the obvious way; each chapter starts with verse 1 and proceeds in the obvious way. Different translations may have number of verses for the same chapter, but have the same number of chapters for the same book (modulo books which are augmented by the Apocrypha). Some verses have optional splits (e.g. 25a, 25b, 25c) which may not be consistent between translations. For now, I’ll deem the splits to be out of scope for the data model (at least to start with).</p>
+<p>The text within each verse may have some formatting details such as indentation. Sometimes there are headings within chapters. Some translations may come with cross references and commentary notes. All of this is out of scope of at least this blog post.</p>
+<p>In other words, I might expect a simple C# representation to look something like this:</p>
+<pre><code>// Note: BookId is an enum or equivalent, so that "Genesis" uses the same BookId in all translations.
+
+public record Bible(string Id, string Description, ImmutableArray&lt;Book&gt; Books);
+// Chapters[0] = chapter 1 etc.
+public record Book(BookId Id, ImmutableArray&lt;Chapter&gt; Chapters);
+// Verses[0] = verse 1 etc.
+public record Chapter(ImmutableArray&lt;string&gt; Verses);
+</code></pre>
+<h2>The complex reality</h2>
+<p>Of course, this post wouldn’t exist if the data model were really that straightforward. The very top-level aspects – a Bible with an ID, a description, and a sequence of books – is fine. But when we get to the “a book is a sequence of chapters” and “a chapter is a sequence of verses” aspects, it turns out life is more complicated.</p>
+<p>It seems unlikely that I’ve discovered <em>all</em> the ways in which the simple data model is broken, but here are the ones I’ve encountered so far.</p>
+<h3>Verse ranges</h3>
+<p>Not all Bible translations attempt to translate each verse directly, in the original textual order. For example, The Message translates “chunks” of text at a time. Here’s the start of John’s Gospel in The Message:</p>
+<p>As you can see, each chunk of text is associated with a <em>range</em> of verses (1-2, 3-5, 6-8) rather than a single verse.</p>
+<p>That already completely messes up our data model. We can’t just use a sequence of verses in the chapter with each verse being represented by a single string. We need a more complex representation with a dedicated type for “part of a chapter”. It could look something like this:</p>
+<pre><code>public record Bible(string Id, string Description, ImmutableArray&lt;Book&gt; Books);
+public record Book(BookId Id, ImmutableArray&lt;Chapter&gt; Chapters);
+public record Chapter(ImmutableArray&lt;ChapterSection&gt; Sections);
+public record ChapterSection(string Text, int StartVerse, int EndVerse);
+</code></pre>
+<p>Note that at this point, if a user performs a search based on a book, chapter and range of verses, they might see text that doesn’t really belong in that range.</p>
+<p>For example, searching for “Genesis 1:2-7” in The Message <em>has</em> to either show verses 1 and 8, or miss out verses 2, 6 and 7, because we don’t have enough information about which part of each chunk comes from each verse.</p>
+<p>Still, at least we know the verses are in order, right?</p>
+<h3>Out-of-order verses</h3>
+<p>Sometimes, the order of verses differs between translations, <em>even if the verse numbering doesn’t</em>. Where two translations differ in this respect, naturally at least one of them has to have verses which don’t follow the natural order.</p>
+<p>This may happen all over the Bible, but at least one example is in Isaiah chapter 38. The New International Version (NIV) has all the verses in the natural order, with verses 21 and 22 coming after verse 20:</p>
+<p>… whereas the Good News translation has them inserted between verses 6 and 7:</p>
+<p>We can still keep the same data model as we have before, but we need to know that verses can be out of order when we perform a search. We also have decisions to make about what to return in the searches.</p>
+<p>Assuming that we’re searching in the Good News Bible, what should a search for “Isaiah 38:4-8” return? Should it include verses 21 and 22 because they occur <em>textually</em> between verses 4 and 8, or should it only return verses 4, 5, 6, 7 and 8?</p>
+<p>What should a search for “Isaiah 38:4-21” return? Looking at the textual order of the verses, it might make sense to only return verses 4, 5, 6 and 21 – but that would be odd in any other understanding of the range “4 to 21”.</p>
+<p>(The answer my own code has here is that “4-8” really means “only chunks of text which include anything in the range 4-8” so it will omit 21 and 22; if you search for the whole of Isaiah 38 though, it will show all the verses in the textual order.)</p>
+<h3>Subverse ordering</h3>
+<p>Okay, so we not every chunk of text is a single verse, and the verses might appear in a weird order, but at least any given verse number only appears once, right? Not so much.</p>
+<p>Earlier I deemed how verses were split (25a, 25b, 25c etc) to be out of scope. That’s fine <em>almost everywhere</em>, but Sirach chapter 28, at least in the New Revised Standard Version (Anglicised) (referred to from here on as NRSVA) ends with some <em>very</em> odd verse splits. The verse ordering is 23, 24a, 25b, 24b, 25a, 26.</p>
+<p>At that point we <em>either</em> have to change our data model to include the splits, <em>or</em> we have to accept that there’ll be duplicate verse numbers (23, 24, 25, 24, 25, 26). If we want splits, we could change the model to something like this:</p>
+<pre><code>public record Bible(string Id, string Description, ImmutableArray&lt;Book&gt; Books);
+public record Chapter(ImmutableArray&lt;ChapterSection&gt; Sections);
+public record ChapterSection(string Text, VerseNumber StartVerse, VerseNumber EndVerse);
+public record VerseNumber(int Number, char? Subverse);
+</code></pre>
+<p>(It probably makes sense for <code>VerseNumber</code> to be a <code>record struct</code> rather than the implicit <code>record class</code>, but that’s more of an implementation detail.)</p>
+<h3>Missing verses</h3>
+<p>Some translations miss out certain verses, or <em>parts</em> of verses. Just missing out some text that appears in some other manuscripts doesn’t affect our data model, but missing a verse entirely is at least somewhat surprising. For example, take the start of John 5 in the NRSVA:</p>
+<p>Verse 4 is missing, although there’s a footnote, which reads:</p>
+<blockquote>
+ <p>Other ancient authorities add, wholly or in part, <em>waiting for the stirring of the water; 4 for an angel of the Lord went down at certain seasons into the pool, and stirred up the water; whoever stepped in first after the stirring of the water was made well from whatever disease that person had.</em></p>
+</blockquote>
+<p>This doesn’t require any changes to the data model, but it’s important to be aware of when validating.</p>
+<h3>Alternative verse numberings</h3>
+<p>I don’t know whether there are multiple instances of this, but 2 Esdras chapter 7 has a verse range (36-105) which is included in some versions and omitted in others – and unlike the alternative <em>ordering</em> earlier on where the a verse number was at least consistent in what text was being translated, in this case the verse numbers change too. So “verse 36” could refer to text translated as “The pit of torment shall appear, and opposite it shall be the place of rest; and the furnace of hell shall be disclosed, and opposite it the paradise of delight” or “I answered and said, ‘How then do we find that first Abraham prayed for the people of Sodom, and Moses for our ancestors who sinned in the desert,”.</p>
+<p>Bible Gateway indicates the alternative verse numberings in italics:</p>
+<p>How do we represent this in the data model? What does a search for “2 Esdras 7:30-40” return? Most importantly, how much effort are we prepared to put into making our model high fidelity?</p>
+<p>Personally, I’ve taken the approach of “do the simplest thing that doesn’t crash” – which ends up meaning that all the “extra” verses are included, and the verse numbering is based on that. An alternative would be to exclude all the “extra” verses, and still have a single consistent verse numbering scheme. Coming up with a data model which actually represents both verse numbering schemes would lead to a lot of complexity, and I’d only do that if I really, really needed it.</p>
+<h3>Just one chapter</h3>
+<p>What should a search for “Obadiah 4” return? For most books of the Bible, it would return all of <em>chapter</em> 4, with multiple verses.</p>
+<p>However, there isn’t a chapter 4 of Obadiah – there’s only a single chapter. So “Obadiah 4” should, in a functionally-complete system, almost certainly return just <em>verse</em> 4 instead. Should “Obadiah 1:4” be acceptable as well? I guess that’s up to the product requirements.</p>
+<p>This isn’t really a data modelling question – but it does affect how the model is used, implicitly converting any query which looks like it’s “book and chapter” into “book, chapter 1, verse” when there’s only a single chapter.</p>
+<p>This affects nine books of the Bible, including apocrypha, as far as I can see. Most are straightforward, but the Letter of Jeremiah isn’t. It only has a single chapter – but that’s chapter 6. It’s not <em>quite</em> as odd as it sounds, because it’s effectively chapter 6 of the book of Baruch… but separated out as its own book. So in this case, “Letter of Jeremiah 5” is equivalent to “Letter of Jeremiah 6:5”. Hmm.</p>
+<h3>Psalm 151</h3>
+<p>The book of Psalms has 150 chapters. Unless your Bible contains the Apocrypha, in which case Psalm 151 exists as well. Should this be regarded as a separate book, or just an extra chapter in the existing book? It could be modelled either way, and is a little like the Letter of Jeremiah mentioned above. Either way, it’s something that has to be thought about both in terms of data modelling and how the data is then handled.</p>
+<h3>Mid-verse chapter beginnings</h3>
+<p>Most of the time, a chapter starts with a new sentence, and that’s the start of the first verse. There are some cases where it appears that’s not true, however. For example, 2 Samuel 12 in NRSVA starts “But the thing that David had done displeased the Lord, and the Lord sent Nathan to David” – but the way it’s presented suggests that chapter 12 and verse 1 only start at “and the Lord sent Nathan to David.” Which chapter does “But the thing that David had done displeased the Lord” belong to? Is it chapter 11 verse 27, or is it text that isn’t in a chapter or verse at all? How should that be represented in our data model?</p>
+<p>As for alternative verse numberings, my own answer is “just make it simple”. I’ve effectively moved the start of chapter 12 verse 1 to the start of the text (“But the thing”). I strongly suspect that if someone searches for “2 Samuel 12:1-4” they don’t <em>really</em> want it to start mid-sentence.</p>
+<h3>Alternative endings</h3>
+<p>The Gospel of Mark has two endings: the “short” ending and the “long” ending.</p>
+<p>The short ending version of chapter 16 has 8 verses, and the long ending version has 20 verses. It would be reasonably simple to have some sort of “optional” flag in the data model to represent that. However, in at least some translations, verse 8 in the short ending has additional text. Here’s how it looks for the NRSVA translation of Mark 16:</p>
+<p>(The long ending continues further.)</p>
+<p>The <em>simplest</em> representation is to include everything from both versions, with no differentiation – so you would see the longer version of verse 8 <em>and</em> verses 9-20. I believe that’s exactly what my current implementation does, because again, that’s good enough. It feels to me like any “high-fidelity” representation either has to get the user to indicate whether they want to see the short version or the long version, or display both versions as Bible Gateway does, with suitable annotations.</p>
+<p>I strongly suspect there are other books that have this sort of optionality, too – although whether they have the “the contents of verse X depends on whether you’re including chunk Y or not” is a different matter.</p>
+<h3>And then there’s Greek Esther…</h3>
+<p>Just when you think we’re at the end of oddities, Greek Esther comes along. While the Hebrew book of Esther appears in most translations, the book of Greek Esther is part of the Apocrypha. It’s the same book, but with some additional chapters. While Esther has 10 chapters, Greek Esther has 16 chapters.</p>
+<p>As far as I can tell, Greek Esther is <em>almost</em> entirely additive with respect to Esther – the differences are only in the additional text in chapters 11-16. The exceptions are chapter 5, where verses 1 and 2 from the Hebrew version are omitted; chapter 9, where verse 30 is omitted; chapter 10 which has more verses in Greek.</p>
+<p>But the extra chapters don’t come at the end. Instead, the chapters are interspersed through the “normal” chapters. They’re not just done as “chapters 1-5, then chapter 11” or similar though… some additional chapters are inserted <em>within</em> the original chapters, and sometimes even split up to be inserted in multiple places. Chapter 11 takes the biscuit for this: Greek Esther <em>starts</em> with chapter 11 verse 2, and the very final verse is chapter 11 verse 1.</p>
+<p>It looks like in some translations the chapters are given letters instead of numbers (and it’s not a 1:1 correspondence between them, either). I’m going to ignore that part, at least.</p>
+<p>Looking at the NRSVA translation, we have:</p>
+<ul>
+ <li>Chapter 11, verses 2-12 (end)</li>
+ <li>Chapter 12, verses 1-6 (end)</li>
+ <li>Chapter 1, verses 1-22 (end)</li>
+ <li>Chapter 2, verses 1-23 (end)</li>
+ <li>Chapter 3, verses 1-13</li>
+ <li>Chapter 13, verses 1-7</li>
+ <li>Chapter 3, verses 14-15 (end)</li>
+ <li>Chapter 4, verses 1-17 (end)</li>
+ <li>Chapter 13, verses 8-18 (end)</li>
+ <li>Chapter 14, verses 1-19 (end)</li>
+ <li>Chapter 15, verses 1-16 (end)</li>
+ <li>Chapter 5, verses 3-14 (end)</li>
+ <li>Chapter 6, verses 1-14 (end)</li>
+ <li>Chapter 7, verses 1-10 (end)</li>
+ <li>Chapter 8, verses 1-12</li>
+ <li>Chapter 16, verses 1-24</li>
+ <li>Chapter 8, verses 13-17 (end)</li>
+ <li>Chapter 9, verses 1-29, 31-32 (end)</li>
+ <li>Chapter 10, verses 1-13 (end) (verses 4-13 are only in Greek Esther)</li>
+ <li>Chapter 11, verse 1</li>
+</ul>
+<p>This quashes two assumptions:</p>
+<ul>
+ <li>Chapters are in order</li>
+ <li>Any given chapter only appears once</li>
+</ul>
+<p>We can represent this fairly easily in terms of having all of the right data, by giving out <code>Chapter</code> record a <code>Number</code> property. Combined with the other augmentations, we end up with:</p>
+<pre><code>public record Bible(string Id, string Description, ImmutableArray&lt;Book&gt; Books);
+public record Book(BookId Id, ImmutableArray&lt;Chapter&gt; Chapters);
+public record Chapter(int Number, ImmutableArray&lt;ChapterSection&gt; Sections);
+public record ChapterSection(string Text, VerseNumber StartVerse, VerseNumber EndVerse);
+public record VerseNumber(int Number, char? Subverse);
+</code></pre>
+<p>Then everything which <em>uses</em> the data needs to know that it can’t assume any correspondence between the index of a chapter within <code>Book.Chapters</code> and the chapter number.</p>
+<h2>Conclusion</h2>
+<p>All the details above are probably irrelevant to you, unless you happen to be creating a data model for the Bible yourself. But I thought it worth going into some of the concrete details to show the <em>type</em> of issues I run into in almost every situation where the real world meets a theoretical data model. (The election web site is another example of this. Date/time handling runs into it quite a bit too.)</p>
+<p>I wish I had really good suggestions for what to do when you run into this sort of issue, but the best I can suggest is to stop and ask yourself what you really need. I find the answer usually falls into one of three buckets:</p>
+<ul>
+ <li>I can live without high fidelity, so it’s not worth making the code more complex.</li>
+ <li>I need the details, so I have to suck it up and live with the complexity.</li>
+ <li>A half-way house: introduce a <em>bit</em> more complexity into the model to get to an acceptable state, which may still be a bit odd, but which I can live with – and doesn’t involve making the data model horrendous.</li>
+</ul>
+<p>If you have any favourite oddities along these lines, please leave a comment – it’s always good to collect weird and wonderful anecdotes.</p>

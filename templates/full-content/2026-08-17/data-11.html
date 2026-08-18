@@ -1,0 +1,75 @@
+<h1>Snowflake says this 149 GB query scanned -1.5 GB</h1>
+<p>You sum a week's worth of queries in your lake copy of <code>query_history</code> to see how much data your Snowflake users scanned:</p>
+<pre><code>SELECT SUM(bytes_scanned) AS bytes_scanned
+FROM query_history
+WHERE start_time &gt;= CURRENT_TIMESTAMP - INTERVAL '7 days';</code></pre>
+<p><code>bytes_scanned<br>
+   -24914258573</code></p>
+<p>The answer is... -25 GB. Wait, what?</p>
+<p>So you sort the queries:</p>
+<pre><code>SELECT bytes_scanned
+FROM query_history
+WHERE start_time &gt;= CURRENT_TIMESTAMP - INTERVAL '7 days'
+ORDER BY bytes_scanned;</code></pre>
+<p><code>bytes_scanned<br>
+   -1489232152</code></p>
+<h2>Negative numbers are the good case</h2>
+<p>Here are five queries, pulled three ways:</p>
+<pre><code>query_id     | worksheet, CSV | Parquet unload
+01c6044e... | 39,859,836,488 |  1,205,130,824
+01c63956... | 24,649,139,192 | -1,120,664,584
+01c5f5d4... | 23,955,113,888 | -1,814,689,888
+01c61d37... | 23,880,529,840 | -1,889,273,936
+01c5fb74... | 23,613,606,928 |  2,138,770,448</code></pre>
+<p>The negative numbers are obvious integer overflow. The positive ones are worse: you think you're looking at real data, but you're effectively seeing RANDINT(2**31). Not super helpful when you're trying to figure out which workloads are running up your bill.</p>
+<h2>Why does this happen?</h2>
+<p>The obvious guess is that the column is the wrong type, but it isn't:</p>
+<pre><code>SELECT column_name, data_type, numeric_precision
+FROM snowflake.information_schema.columns
+WHERE table_schema = 'ACCOUNT_USAGE' AND table_name = 'QUERY_HISTORY';</code></pre>
+<p><code>BYTES_SCANNED NUMBER 38<br>
+   BYTES_SENT_OVER_THE_NETWORK NUMBER 38<br>
+   QUERY_ACCELERATION_BYTES_SCANNED NUMBER 38</code></p>
+<p>All three are NUMBER(38,0), and in the same file from the same COPY INTO, only bytes_scanned comes out as INT32.</p>
+<p>What matters is whether the column passes straight through the query or gets computed along the way. A NUMBER(38,0) is what the catalog promises, not what Snowflake keeps on disk; internally it stores each value in the narrowest integer that has held it so far, and for bytes_scanned that is four bytes. If you select the column by name and change nothing about it, the unload hands the Parquet writer that physical representation, and the writer faithfully records what it was given: INT32.</p>
+<p>If you wrap the column in any expression at all, the result is a new value that Snowflake has to type from the declaration rather than from storage, so the writer sees NUMBER(38,0) and emits a DECIMAL wide enough to hold it. Success!</p>
+<p>We tested this by unloading seven versions of the same column in one statement:</p>
+<pre><code>projection                         | type    | wrong/50
+bytes_scanned                      | INT32   | 44
+CAST(bytes_scanned AS NUMBER(38,0)) | DECIMAL | 0
+CAST(bytes_scanned AS NUMBER(38,9)) | DECIMAL | 0
+CAST(bytes_scanned AS NUMBER(19,0)) | DECIMAL | 0
+bytes_scanned + 0                  | DECIMAL | 0
+CAST(bytes_scanned AS DOUBLE)       | DOUBLE  | 0
+TO_VARCHAR(bytes_scanned)          | UTF8    | 0</code></pre>
+<p>Even an identity cast fixes it. Everyone on our team has hit this at least once; worksheets and CSV both hand you the real number, so nothing looks broken until you go and check.</p>
+<h2>Here's the fix</h2>
+<pre><code>COPY INTO @~/query_history/
+FROM (
+ SELECT
+   * EXCLUDE (bytes_scanned, rows_produced, rows_updated, rows_deleted,
+     rows_unloaded, bytes_deleted, transaction_id, session_id, authn_event_id),
+   CAST("BYTES_SCANNED" AS NUMBER(38, 0)) AS bytes_scanned,
+   CAST("ROWS_PRODUCED" AS NUMBER(38, 0)) AS rows_produced,
+   CAST("ROWS_UPDATED" AS NUMBER(38, 0)) AS rows_updated,
+   CAST("ROWS_DELETED" AS NUMBER(38, 0)) AS rows_deleted,
+   CAST("ROWS_UNLOADED" AS NUMBER(38, 0)) AS rows_unloaded,
+   CAST("BYTES_DELETED" AS NUMBER(38, 0)) AS bytes_deleted,
+   CAST("TRANSACTION_ID" AS NUMBER(38, 0)) AS transaction_id,
+   CAST("SESSION_ID" AS NUMBER(38, 0)) AS session_id,
+   CAST("AUTHN_EVENT_ID" AS NUMBER(38, 0)) AS authn_event_id
+ FROM snowflake.account_usage.query_history
+)
+file_format = (type = PARQUET);</code></pre>
+<p>Those are the nine INT32 columns in query_history. Transaction_id deserves particular attention, because it's an identifier rather than a statistic: wrapping here can lead to bad joins and id collisions.</p>
+<h2>Ask your rep to fix it!</h2>
+<p>It would be great to fix this upstream. Call your rep and let them know and maybe it'll happen :)</p>
+<h2>Frequently Asked Questions</h2>
+<h3>Why does an Apache Parquet unload from Snowflake return different values than a worksheet?</h3>
+<p>Worksheets and CSV unloads hand you the real number, but the Apache Parquet writer records the physical representation Snowflake stores internally, which is the narrowest integer that has held the value so far. If a column passes straight through the query untouched, the writer faithfully emits INT32. Any expression on the column forces Snowflake to type the result from the declaration instead, producing a DECIMAL wide enough to be correct.</p>
+<h3>Why does Snowflake's bytes_scanned column show negative numbers?</h3>
+<p>Negative bytes_scanned values are integer overflow. When query_history is unloaded to Parquet, Snowflake can write the column as INT32 even though the catalog says NUMBER(38,0), so any value above 2,147,483,647 wraps. Negative numbers are the good case: they are obviously wrong. Wrapped positive values look like real data and quietly corrupt any analysis of which workloads drive your bill.</p>
+<h3>Which QUERY_HISTORY columns are affected by the INT32 Parquet bug?</h3>
+<p>Nine columns in Snowflake's QUERY_HISTORY view unload as INT32: bytes_scanned, rows_produced, rows_updated, rows_deleted, rows_unloaded, bytes_deleted, transaction_id, session_id, and authn_event_id. Transaction_id deserves particular attention because it is an identifier rather than a statistic: wrapping there can lead to bad joins and id collisions rather than just wrong sums.</p>
+<h3>How do I fix wrong values when using COPY INTO to unload query_history?</h3>
+<p>Wrap each affected column in an expression inside the COPY INTO statement. Even an identity cast works: CAST(bytes_scanned AS NUMBER(38,0)) forces the Parquet writer to emit a DECIMAL instead of INT32. Use SELECT * EXCLUDE the nine INT32 columns, then re-add each with a CAST, and every unloaded value matches what a worksheet shows.</p>
