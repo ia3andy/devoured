@@ -1,0 +1,89 @@
+<h1>Waymo vs Tesla: Two Ways to Build Self-Driving Cars</h1>
+<p>A vehicle travelling at 40 miles per hour covers about 60 feet every second. Within that second, software has to determine what is physically nearby, classify each object, estimate where those objects will move, select a path, and issue steering and braking commands.</p>
+<p>Doing all of this quickly is something that has been largely solved. However, doing this correctly in unpredictable and distinct traffic situations is still an open problem. This is because real-world traffic produces more distinct scenarios than any team can pre-determine. For example, Waymo describes one such case, where a vehicle is on fire on the road ahead while the drivable lanes remain physically clear. The geometry of such a scenario might permit driving straight through it. However, the real meaning of it calls for turning around or taking preventive action.</p>
+<p>Waymo and Tesla, two companies investing in self-driving cars, have tried to come up with different types of answers to these questions.</p>
+<p>For reference, Waymo reports 220.6 million rider-only miles through March 2026. These are miles covered with no human in the driver’s seat, across five metro areas. On the other hand, Tesla reports more than three million vehicles in the United States covering over 30 billion miles a year, with 1.28 million active Full Self-Driving subscriptions in the first quarter of 2026. Almost all of those Tesla miles involve a driver who remains responsible for the vehicle. Tesla’s driverless service is separate and much smaller, running without safety monitors in Austin, Dallas, and Houston, while the Bay Area service uses a safety driver.</p>
+<p>Both approaches depend heavily on machine learning. But they differ in how much gets fixed in advance. In this article, we will take a look at both approaches while trying to answer the following questions:</p>
+<ul>
+ <li>How does each system detect what is physically nearby?</li>
+ <li>What each builds from that data, and why one keeps the result readable?</li>
+ <li>How each estimates what other road users will do?</li>
+ <li>How a path gets selected, and what verifies it before the vehicle acts?</li>
+ <li>What safety evidence each publishes, and why the figures measure different things?</li>
+ <li>Where does the knowledge inside each system come from?</li>
+</ul>
+<h2>Sensing</h2>
+<p>A camera records light intensity across a grid of pixels. Distance appears nowhere in that grid, so depth has to be computed from the arrangement of pixels, but that computation can be wrong. A large object far away and a small object nearby can occupy the same region of an image.</p>
+<p>Lidar arrives at the same answer by a different route. The unit emits laser pulses, measures how long each pulse takes to return after reflecting off a surface, and converts that interval into a distance. We can think of the output of this as a point cloud, which is a three-dimensional set of measured points describing the surfaces around the vehicle. The distance is no longer an estimate but a measurement.</p>
+<p>Waymo’s sixth-generation system, which began fully autonomous operations in February 2026, carries 13 cameras, four lidar units, six radar units, and a set of external audio receivers used to detect sirens and railroad crossings. Coverage overlaps in every direction and extends to 500 metres. This overlap is for help situations when rain, road grime, or ice limits what a camera captures. Lidar and radar sustain the perception capabilities in such scenarios.</p>
+<p>Tesla’s vehicles mainly rely on cameras. Instead, Tesla relies entirely on a “pure vision” approach that uses exterior cameras and artificial intelligence to navigate. For example, Tesla’s documentation describes Model 3 and Model Y as running camera-based Tesla Vision, without radar, using cameras and neural network processing.</p>
+<p>Waymo’s fifth-generation Jaguar I-PACE vehicles carry 29 cameras. The sixth-generation system carries 13, which Waymo attributes to a 17-megapixel imager covering the same area with fewer than half the cameras. In other words, Waymo is also reducing overall sensor count while continuing to describe redundancy as essential.</p>
+<p>The tradeoff here is that a direct measurement costs money while adding a component that can fail noticeably. However, a derived value may not cost much, but it can be wrong as well.</p>
+<h2>Representation</h2>
+<p>Something has to convert millions of pixels and points into a description that the system can understand and operate on. The nature and form of that description is one of the most important architectural decisions for an autonomous driving setup.</p>
+<p>Waymo places the Waymo Foundation Model at the centre, built from two components:</p>
+<ul>
+ <li><strong>Sensor Fusion Encoder:</strong> It merges camera, lidar, and radar data over time and outputs objects, semantic attributes, and embeddings. These are compact numerical summaries that downstream components consume.</li>
+ <li><strong>A Driving VLM: </strong>Trained using Gemini and fine-tuned on Waymo driving data, they cover rare situations requiring background world knowledge, such as the burning vehicle example mentioned earlier.</li>
+</ul>
+<p>Both feed a World Decoder that forecasts the behaviour of other road users, produces high-definition maps, generates candidate trajectories, and emits signals used to verify them.</p>
+<p>The system maintains compact structured representations, meaning explicit lists of objects, their semantic attributes, and roadgraph elements describing lanes and connections. The Waymo engineering team provides three reasons for such a setup:</p>
+<ul>
+ <li>Correctness and safety validation can run at inference time, while the vehicle is moving</li>
+ <li>Simulation runs efficiently at large scale, because a compact world state is cheap to replay and modify</li>
+ <li>Training feedback becomes verifiable, since a component evaluating driving quality has something concrete to measure</li>
+</ul>
+<p>This design provides significant benefits over pure end-to-end or modular approaches.</p>
+<p>Tesla’s documentation talks about per-camera networks performing semantic segmentation, which assigns every pixel to a category, plus object detection and monocular depth estimation, meaning distance estimated from a single camera. Those feed birds-eye-view networks that output road layout, static infrastructure, and three-dimensional objects in a top-down view. A full build involves 48 networks taking nearly 70,000 GPU hours to train and producing 1,000 distinct tensors per time step.</p>
+<p>Prior mapping also occupies one end of this decision. For example, Waymo surveys a territory before operating there, recording lane markers, signs, curbs, and crosswalks. It then matches those maps against live sensor data to establish position, since GPS alone can lose signal. The map is basically knowledge acquired once and reused. It saves computation on every trip, but also creates an obligation to keep it current. In contrast, Tesla’s approach skips the survey and derives equivalent information during the drive.</p>
+<p>The trade-off is that a structured representation can be inspected, logged, replayed, and checked against explicit criteria. But it limits what the system can express. On the other hand, a learned representation carries nuance no schema can anticipate.</p>
+<h2>Prediction</h2>
+<p>Once the system holds a description of its surroundings, the next task is estimating what those objects will do. Several futures are valid at the same moment. For example, a cyclist approaching an intersection might continue straight, turn, or stop. A safe response should account for all possibilities.</p>
+<p>Waymo describes the system as producing many possible paths for each road user rather than one, drawing on accumulated driving data and accounting for the different ways a car, a cyclist, and a pedestrian move.</p>
+<p>In June 2025, Waymo published research on whether prediction quality scales predictably. Using an internal dataset spanning 500,000 hours of driving, the study found that motion forecasting quality follows a power law in training compute, matching a pattern observed in language models. A power law here means each doubling of compute yields a proportional, predictable improvement. Data scaling proved critical, and increasing compute at inference time improved performance on harder scenarios.</p>
+<p>Waymo reported the same trend in closed-loop performance, where results are measured in simulations in which the system’s own actions change what happens next. This trend suggested that real-world driving improves with more data and compute, rather than only benchmark scores.</p>
+<p>Tesla’s describes an upgraded reinforcement learning stage in version 14.3, intended to cover long-tail edge cases, meaning rare situations that appear infrequently even across very large mileage.</p>
+<p>A system that commits to one predicted future becomes fragile in situations where prediction matters most. However, carrying several weighted futures costs compute on every cycle, but can guard against the possibility of unusual situations.</p>
+<h2>Planning</h2>
+<p>With a description of the surroundings and a set of likely futures, the system selects a trajectory. You can think of it as a specific path with speeds attached to it. The question is what verifies the trajectory before the vehicle executes it.</p>
+<p>Waymo trains large Teacher models to generate safe, comfortable, and compliant action sequences. It then distils them into smaller Student models sized to run onboard in real time. Distillation transfers behaviour from a large model to a compact one. Output from that Student model then passes through a separate onboard validation layer, which verifies the trajectories the generative model produced. This means that two independent components have to agree before the vehicle moves.</p>
+<p>Tesla talks about building a planning and decision-making system that operates under uncertainty, with algorithms evaluated at the scale of the entire fleet, optimising for throughput, latency, correctness and determinism.</p>
+<p>For Tesla vehicles on the road today, verification comes from a person. Full Self-Driving (Supervised) requires an attentive driver and leaves the vehicle slightly short of autonomous. The system enforces this through a strikeout mechanism, where repeated inattention warnings disengage the feature for the remainder of a trip. Enough strikeouts suspend access for a week. In the driverless service, that role belongs to safety monitors or remote supervision.</p>
+<p>A validation layer catches a category of unacceptable outputs before they reach the actuators, and it can only evaluate against the defined criteria. Anything outside those criteria passes through unexamined. This is the same tradeoff as an assertion in production code, where the check is only as good as the condition behind it.</p>
+<h2>Validation</h2>
+<p>Waymo’s Safety Impact hub reports 220.6 million rider-only miles through March 2026, meaning no human occupied the driver’s seat for any of them. Measured against human crash rates in the same operating areas, adjusted for where within each city the service drives, the reported reductions are 94% for serious injury or worse crashes and 82% for injury-causing crashes. The methodology has been published in peer-reviewed journals, and the raw data is downloadable so third parties can reproduce the figures.</p>
+<p>Tesla’s Vehicle Safety Report takes a different form. It compares Teslas with Full Self-Driving (Supervised) engaged against Teslas driven manually, using the same telemetry pipeline for both, and reports 7 times fewer major and minor collisions and 5 times fewer off-highway collisions. A collision counts as occurring with the system engaged if it was active at any point within five seconds beforehand, a window chosen to capture cases where a driver took over shortly before impact. Tesla attributes no fault in the reported data, treating that determination as too subjective to include.</p>
+<p>As you can see, the two reports answer different questions, and we can’t simply do a side-by-side comparison. The difference comes down to what each population represents:</p>
+<ul>
+ <li>Waymo is measuring outcomes across miles where no person was available to intervene.</li>
+ <li>Tesla is measuring whether an assistance system reduces collisions while a driver remains responsible.</li>
+</ul>
+<p>Both companies also state their own limitations. Waymo states that no perfect comparison between autonomous and human data exists today, and that its operating cities see no appreciable snowfall. Tesla states that its estimate of a United States average involves unavoidable assumptions that may skew the figure in either direction.</p>
+<p>Waymo separates two things that are easy to conflate. Safety impact gets measured after deployment. Whether a release is acceptable to deploy at all gets determined beforehand through a Safety Framework and a Safety Case.</p>
+<h2>Training</h2>
+<p>Both systems improve between releases. However, the underlying mechanisms differ as much as the architectures.</p>
+<p>Waymo runs three components off the same foundation model:</p>
+<ul>
+ <li>The Driver produces action sequences.</li>
+ <li>The Simulator generates scenarios for training and testing.</li>
+ <li>The Critic evaluates driving quality and surfaces problems.</li>
+</ul>
+<p>Large versions of each get distilled into smaller ones that run at the required volume. Two loops connect them:</p>
+<ul>
+ <li>An inner loop applies reinforcement learning inside simulation, where scenarios can be generated and repeated cheaply.</li>
+ <li>An outer loop begins with the Critic flagging suboptimal behaviour from real driving, turns improved alternatives into training data, verifies the fixes in simulation, and deploys only once the safety framework confirms the absence of unreasonable risk.</li>
+</ul>
+<p>Waymo states that its fully autonomous mileage now far exceeds its manually driven data, and that no volume of simulation or test-driver operation reproduces the situations encountered when the system operates with no driver present.</p>
+<p>Tesla’s data comes from a consumer fleet. The Vehicle Safety Report describes two telemetry paths. On shifting to park, a vehicle transmits anonymised mileage broken down by control type and road classification. On detecting a major or minor collision, it transmits a separate packet tied to the vehicle. Tesla reports receiving 2.5 billion telemetry packages in the third quarter of 2025 alone. Tesla has also built an evaluation infrastructure from anonymised fleet clips assembled into test suites, alongside simulation producing sensor data for automated testing. Training runs on Cortex 1, listed at over 100,000 H100-equivalent GPUs in production, and Cortex 2 at over 130,000 in early ramp.</p>
+<h2>Conclusion</h2>
+<p>The same question recurs at every stage of an autonomous driving process. How much gets determined in advance and written into a form that can be examined, and how much gets computed during the drive by a model whose internal state stays out of reach?</p>
+<p>Each stage poses one version of it:</p>
+<ul>
+ <li>Sensing asks whether distance arrives as a measurement or as a derived value</li>
+ <li>Representation asks whether the description of the world stays inspectable</li>
+ <li>Prediction asks how many futures the system carries at once</li>
+ <li>Planning asks what verifies a trajectory before execution</li>
+ <li>Validation asks what kind of safety claim the resulting evidence can support</li>
+ <li>Training asks which miles improve the system</li>
+</ul>
+<p>Waymo sits further toward written-down knowledge at most stages. This involves per-city preparation and purpose-built hardware. Tesla sits further toward computed knowledge. Both positions have merit, and only the future will tell which approach becomes more dominant or do things fall somewhere in the middle.</p>
