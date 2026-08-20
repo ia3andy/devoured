@@ -1,0 +1,91 @@
+<p><strong>Linux kernel 7.2 has been released, adding cache-aware scheduling, ext4 filesystem performance boosts and a slew of new and improved hardware drivers for laptops and peripherals.</strong></p>
+<p>A merge widow record was also set during the 9-week development cycle, with more than 2,100 individual contributors involved. AI, obviously, has helped. Commit-crunching by LWN found roughly 5% of commits in 7.2 have an ‘assisted-by’ tag, indicating AI usage.</p>
+<p>Not that the latest kernel update was all additions.</p>
+<p>More than 13,000 lines of code for legacy i486 CPU emulation were removed from Linux 7.2, as was a 40-year-old Hercules graphics card driver, AppleTalk networking protocol and ISA and PCMCIA ARCnet drivers.</p>
+<p>None of that is stuff people will miss on the daily, and those who do can boot Linux 7.1 or lower.</p>
+<p>Finally, a key feature expected to arrive in Linux 7.2 – a fair(er) GPU scheduler – didn’t. A last-minute revert switched back to the first-in-first-out (FIFO) method due to reports of performance regressions on certain AMD graphics cards.</p>
+<p>For a closer look at more of what’s new in Linux 7.2, read on!</p>
+<h2>Linux 7.2: key changes</h2>
+<h3>Cache-aware scheduling</h3>
+<p>Linux 7.2 makes its task scheduler (which decides what tasks run and when) cache-aware. This means it can recognise when threads (parts of a task) belong to the same process and keep them on cores that share a cache.</p>
+<blockquote>
+ <p>Scheduler is now smarter, keeping process threads on a core with a shared cache</p>
+</blockquote>
+<p>Previously the scheduler balanced load across all your CPU’s cores without checking whether threads on separate cores shared memory.</p>
+<p>Threads on different cores would need to re-fetch or sync the same data, an occurrence known as ‘cache bouncing’ – which this now limits.</p>
+<p>Guardrails are in place to prevent a process from overloading a cache ‘domain’ (so one app’s tasks can’t choke the system). The scheduler also won’t move more threads if a process is already using &gt;25% CPU time, or &gt;33% of the load in a domain.</p>
+<p>AMD and Intel CPUs with ‘multiple cache domains’ benefit the most from this, though by how much will depend on the processor and the workload involved.</p>
+<h3>Pipes get a locking fix</h3>
+<p>A locking fix for pipes (yes, pipes as in <code>|</code>, oft-used in shell commands and behind-the-scenes tasks) reduces how long they can hold a lock – preventing simultaneous access – during a write.</p>
+<p>Now, this might sound a tad <em>“and?”</em>, but the improvements it results in are rather <em>“Ooh”</em>. Per the commits cover, this nets performance jumps of up 6-28% and reduces write latency 5-22% (rising under memory pressure) in specific situations.</p>
+<p>As with most optimisations in most Linux kernel updates, the benefits of this aren’t blanket, so a regular day-to-date workflow won’t notice or benefit from this in any obvious sense. But whenever a pipe mechanism is in play, this will be there, keeping it efficient.</p>
+<h3>Memory reclaim made tighter</h3>
+<p>Linux 7.2 fines the Multi-Generational LRU (MGLRU), an algorithm used by the kernel to decide what gets removed from memory, when memory runs low, and how it’s reclaimed.</p>
+<p>By clearing and tightening the ‘reclaim’ loop, as well as how ‘dirty pages’ are written back during the process, which benefits specific kinds of workloads. The cover commit touts an <em>“up to ~30% increase</em>” in MongoDB with YCSB, and reduces unexpected out-of-memory (OOM) kills.</p>
+<h3>Ext4 filesystem changes</h3>
+<p>Ext4, Ubuntu’s default filesystem, gets some minor speed-focused improvements in Linux 7.2.</p>
+<blockquote>
+ <p>ext4 nixes lock contention and deadlocks under heavy usage</p>
+</blockquote>
+<p>A change to the ext4 filesystem’s fast commit feature, which, as its name suggests, writes journal entries quicker than it would with a full commit, removes lock contention and deadlocks under heavy usage.</p>
+<p>Stats for that are also now viewable at <code>/proc/fs/ext4/*/fc_info</code> (we’ll be coming back to proc elsewhere in this roundup).</p>
+<p>Another fix, one shared with XFS as well, nixes a memory-cleaning step from the kernel’s IOMAP layer, netting a 5% boost in small, random 4K reads from NVMe drives with <code>io_uring</code>‘s polling mode.</p>
+<p>Finally, a directory lookup change now handles data in 4-byte chunks, which is said to make finding files in dense folders faster.</p>
+<h3>Other filesystem improvements</h3>
+<p>NTFS handling in Linux 7.2 is bolstered with Windows symbolic link support – the proper kind, not just WSL-esque ones. A bug with these links appearing as zero-byte files was also fixed. Separately, NTFS was ‘hardened’ against on-disk metadata corruption.</p>
+<p>exFAT, the format you probably use on SD cards and USB drives, sees improved read and write speeds by adopting the kernel’s <code>iomap</code>. Benchmarks in the commit report write speeds increased by as much as 87% under heavy load following this change.</p>
+<p>Elsewhere, and avid kernel watchers, Btrfs is where the headline changes often sit.</p>
+<p>The filesystem sees further speedups in Linux 7.2, now that large folios are enabled by default – a feature that’s been experimental since Linux 6.17. The filesystem can now handle memory in bigger chunks, cutting overhead and thus improving seed.</p>
+<p>Also aiding performance: direct I/O is no longer made to run ‘serially’ (in turn), which reportedly boosts write performance by up to 59%. Sequential writes also jump by 15% due to new limits on how large a single writeback request can get.</p>
+<h3>USB4 cable direct data transfers</h3>
+<p>Linux 7.2 supports USB4STREAM, a new protocol for sending data between two devices using a USB4 or Thunderbolt cable (and it can be used alongside existing Thunderbolt networking).</p>
+<p>A new driver creates device files named <code>/dev/tbstreamX</code> on each computer. Data can be sent along a compatible cable to a compatible port via tools like <code>cat</code>, <code>echo</code> and <code>dd</code>, without a network connection.</p>
+<h3>Faster proc file reading</h3>
+<p><code>/proc</code>, the virtual filesystem the kernel uses to share system state as files, saw two of the said files become more efficient: <code>/proc/filesystems</code> lists filesystem support; <code>/proc/interrupts</code> details hardware interrupts.</p>
+<p>The former rewrites how /proc/filesystems files are generated, opting to pre-build rather than construct on the fly, on each read. Testing shows up to 140% faster reads, and up to 444% if 20 processes read the file at the same time.</p>
+<p>Your day-to-day system usage won’t benefit, but any tools and scripts which probe system status (and often) will be appreciably nippier as a result.</p>
+<h3>Improved laptop drivers</h3>
+<p>Various laptops pick up improvements in their respective vendor drivers.</p>
+<p>The <em>Uniwill</em> laptop driver, used by TUXEDO Computers, adds support for battery charging modes; the <em>Microsoft Surface</em> platform driver gains Surface Pro 12-inch support, and more Lenovo Legion devices can use battery charging limits via the <code>wmi</code> driver.</p>
+<p>The AMD ISP4 webcam on the HP ZBook Ultra G1a is supported in Linux 7.2, as are a swathe of pen-enabled Wacom W9000-series touchscreens, typically found in 2-in-1 convertible devices that come bundled with stylus/digitisers.</p>
+<p>Audio-wise, the internal microphone array on the HyperX OMEN Gaming Laptop 16-ap1xxx (using AMD Ryzen 7 or 9 CPUs) now works too, while audio quirks on the Lenovo Yoga 7 (16IAP7) and the Legion 7i (16IAX7) have been resolved.</p>
+<p>Microsoft’s OG Surface RT tablet (model 1516) reports battery capacity and charging info when running the Linux 7.2 kernel. That might amuse any of you reading who has one of these early ARM-based devices from 2010 gathering dust in a drawer.</p>
+<p>Linux 7.2 can now boot Apple M3 MacBook Pros, Airs and iMacs – albeit only to a console. While far from ‘daily driver’ ready the way Apple M1 and M2 devices are, it’s encouraging to see new fruits from the Asahi Linux effort.</p>
+<h3>Expanded peripheral drivers</h3>
+<p>Linux gamers will find the side buttons on the <em>Rakk Dasig X</em> gaming mouse now function, having been ignored because of a faulty HID report descriptor, while PlayStation DualSense Edge controller’s rear buttons finally see support too.</p>
+<p><em>OneXPlayer</em> configuration driver was mainlined, courtesy of Valve, and the third-party HORI Wireless Switch Pad for the Nintendo Switch works out of the box.</p>
+<p>This kernel version supports the Realtek RTL8159 ASIC found in many 10 Gbps USB network adapters, as well as more USB wireless adapters, including Mercusys MA60XNB and NETGEAR NightHawk A8500 WiFi 7, which should work out of the box.</p>
+<p>New drivers for the Realtek 8922AU and 8922AE (including Bluetooth) are on board, and Linux 7.2 supports the Mediatek MT7927 (Filogic 380), often found in motherboards, for full WiFi 7 (2+ Gbps on 6 GHz) and Bluetooth 5.4 connectivity.</p>
+<p>And there’s more temperature and fan speed tracking on a range of ASUS and ASRock desktop motherboards, including the ASRock Z890 Pro-A, and there’s a new driver for the ARCTIC Fan Controller.</p>
+<h3>Other changes</h3>
+<p>Linux 7.2 continues to add support for Intel and AMD CPUs and GPUs that aren’t available to buy yet. I prefer to highlight changes affecting hardware people do own and use. Plus, kernel support for major CPUs usually lands before the hardware is available to the masses.</p>
+<p>As well as the highlights above, other notable changes in Linux 7.2 include:</p>
+<ul>
+ <li><strong>khugepaged can merge memory into multiple huge page sizes</strong></li>
+ <li><strong>Landlock can restrict UDP bind, connect and send</strong></li>
+ <li><strong>New openat2() flag lets programs refuse to open device files</strong></li>
+ <li><strong>NFS, ksmbd servers can report case-insensitive filesystems</strong></li>
+ <li><code>AF_ALG</code>, <strong>involved in recent security issues, is deprecated</strong></li>
+ <li><code>strncpy()</code> <strong>was removed from the kernel</strong></li>
+ <li><strong>Initial support for AMDGPU HDMI 2.1 FRL</strong></li>
+ <li><strong>PCIe 2.5 GT/s link-speed fix</strong></li>
+ <li><strong>AMD Zen 6 EPYC support</strong></li>
+ <li><strong>Intel TDX can update runtime module without a reboot</strong></li>
+ <li><strong>Continued work to support WiFi 8</strong></li>
+ <li><strong>Phase IV of swap table improvements</strong></li>
+ <li><strong>Preparatory support for sub-schedulers in </strong><code>sched_ext</code></li>
+ <li><strong>Improved write performance with</strong> <code>RWF_DONTCACHE</code></li>
+</ul>
+<p>For more detail on the release as whole, read through LWN’s merge report recaps (first half and second half) – keep in mind those were compiled prior to the stable release so will mention the fair(er) DRM scheduler, despite it being reverted last-minute.</p>
+<p>Dedicated kernel hounds can opt to sift through the entire Linux 7.2 commit history on GitHub.</p>
+<h2>Will Ubuntu 26.10 use Linux 7.2?</h2>
+<p>Canonical has said Linux 7.2 is the kernel version targeted for Ubuntu 26.10.</p>
+<p>But, under Ubuntu’s new kernel selection policy, in which it aims to ship the “absolute latest upstream version” in development by Ubuntu’s kernel freeze deadline, even if in RC status, Linux 7.3 could still be a viable candidate.</p>
+<p>Why?</p>
+<p>The working assumption was that Linux 7.2 would be released <em>after</em> the <code>stonking</code> kernel freeze deadline of 20 August, when it has arrived before it. That means the merge window for 7.3 has opened; thus it is now “the latest” version in development.</p>
+<p>Canonical’s kernel engineers will, no doubt, provide clarification on which kernel Ubuntu 26.10 will use, shortly.</p>
+<p>Of course, whether Linux 7.2 or 7.3 is selected for the next release, you can expect a kernel backport to Ubuntu 26.04 in early 2027 via the Hardware Enablement stack (HWE) update/26.04.2 LTS point release.</p>
+<h2>Download Linux 7.2</h2>
+<p>The Linux 7.2 kernel source code is available for download from kernel.org, if you want to compile it by hand (which, chances are, you don’t).</p>
+<p>For Ubuntu users, this kernel version will not come as an official software update (unless part of a future HWE). However, you can install a Canonical Mainline .deb or use a third-party PPA or repo to get it <em>unofficially</em>, sooner.</p>
+<p>Keep in mind that installing a Linux kernel on Ubuntu that comes from outside of the official repos is not recommended: no guarantees, no support, missing Ubuntu-specific patches or drivers, and hardware or security features that may not work.</p>

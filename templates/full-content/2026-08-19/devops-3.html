@@ -1,0 +1,103 @@
+<h1>A Preview of DuckDB v2.0</h1>
+<p><em>TL;DR: DuckDB v2.0 is coming this fall. In this post, we preview its headline features: DuckDB as a server, triggers, the VARIANT type, asynchronous I/O, a new SQL parser, a new storage format, and much more.</em></p>
+<p>DuckDB v2.0 will be named “Cyanoptera” after the cinnamon teal (<em>Anas cyanoptera</em>), a strikingly reddish-brown duck found in the western Americas.</p>
+<p>A major version bump is not something we do lightly, and it is not just ceremony: v2.0 ships a new SQL parser, a new default storage format, a reworked C API, and a small number of carefully chosen breaking changes. But above all, it is a feature release, built from over 10,000 commits since we released v1.5 in March. Where last year was the year of the lakehouse, this release kicks off the year of DuckDB as a server.</p>
+<p>DuckDB is moving rather quickly, and we can only cover a small fraction of the changes here. Condensing all new features down to a shortlist is always a fight over what gets in, and yes, we know that what follows is technically a listicle (<em>Ten Things Coming to DuckDB v2.0, Number Eight Will Shock You</em>). We are not proud of the format, but it works, so here it is, starting with the SQL-level features and working down into the engine.</p>
+<h2>1. DuckDB as a Server: Quack and <code>CONNECT</code></h2>
+<p>DuckDB has been an in-process database since day one. But people have asked us – very persistently – for a client/server mode, and we have finally caved. The <code>quack</code> extension implements DuckDB's native protocol for talking to other DuckDBs. It graduates to stable in v2.0, and it is a big part of where DuckDB is headed: any DuckDB process can serve its databases over the network, and any other DuckDB can attach to it and route queries there using the new <code>CONNECT</code> statement. For example:</p>
+<h4>DuckDB server</h4>
+<pre><code>CALL quack_serve(
+    token = 'my_token'
+);
+</code></pre>
+<h4>DuckDB client</h4>
+<pre><code>ATTACH 'quack:server.example.com'
+    AS qk (TOKEN 'my_token');
+
+CONNECT qk;
+SELECT count(*) FROM events;
+-- executes on the server,
+-- results stream back
+DISCONNECT;
+</code></pre>
+<p><code>CONNECT</code> is the successor to the <code>remote.query($$...$$)</code> workaround we showed when Quack was first revealed – we looked at that syntax and said: no, this cannot be it. And <code>CONNECT</code> is not limited to Quack: it points your session at any remote database that supports it, and the new remote pushdown optimizer ships SQL directly to PostgreSQL and MySQL instead of pulling tables over the wire:</p>
+<pre><code>CONNECT 'postgres://localhost/mydb';
+SELECT count(*) FROM orders; -- runs on the PostgreSQL server
+DISCONNECT;
+</code></pre>
+<p>If you have worked with analytical systems in the past, you may assume that DuckDB cannot handle transactional workloads. But DuckDB has been built as a transactional, multi-connection database with full MVCC and transaction isolation since day one. Most users just never needed that in a single-user scenario. It turns out DuckDB handles transactions well: it's fast enough to compete with general-purpose databases like PostgreSQL on quite a few workloads, and the client/server pattern finally lets that machinery shine in multi-tenant, long-running deployments.</p>
+<h2>2. <code>VARIANT</code> Becomes a First-Class Citizen</h2>
+<p>The <code>VARIANT</code> type shipped in DuckDB v1.5, and the way to think about it is JSON on steroids. Basically, imagine if JSON were fast. Like JSON, a <code>VARIANT</code> column can store differently-shaped data in every row. Unlike JSON, it is not a text format: DuckDB automatically detects the common structure hidden in your semi-structured data and “shreds” it, so it compresses well in storage and executes fast in queries, all without you ever declaring a schema. This makes <code>VARIANT</code> a natural fit for real-time log ingestion, where streams of JSON-ish records share structure but evolve over time.</p>
+<p>In v2.0, this pipeline works end to end: shredded execution straight from storage, extraction pushdown into scans, shredded <code>VARIANT</code> reading <em>and</em> writing for Parquet, and a family of <code>variant_*</code> functions:</p>
+<pre><code>CREATE TABLE events (payload VARIANT);
+INSERT INTO events
+VALUES ('\{"user": \{"id": 42, "tags": ["a", "b"]}}'::JSON::VARIANT);
+
+SELECT variant_type(payload), variant_keys(payload)
+FROM events;
+
+SELECT *
+FROM events
+WHERE variant_contains(payload, \{'user': \{'id': 42}}::VARIANT);
+</code></pre>
+<h2>3. Triggers</h2>
+<p>Triggers have been a long-standing feature request, and DuckDB v2.0 delivers them in full: <code>BEFORE</code> and <code>AFTER</code> triggers, <code>FOR EACH ROW</code> and <code>FOR EACH STATEMENT</code>, transition tables via <code>REFERENCING OLD/NEW TABLE</code>, multiple triggers per event, <code>RETURNING</code> on triggered tables, and <code>DROP TRIGGER</code>.</p>
+<p>The classic use case is audit tables: something happens in the system, and a trigger records what changed. For example:</p>
+<pre><code>CREATE TABLE target (id INTEGER, val INTEGER);
+CREATE TABLE audit (id INTEGER, old_val INTEGER, new_val INTEGER);
+
+CREATE TRIGGER trg_audit AFTER UPDATE ON target
+REFERENCING OLD TABLE AS o NEW TABLE AS n
+FOR EACH STATEMENT
+    INSERT INTO audit
+    SELECT n.id, o.val, n.val
+    FROM o
+    JOIN n ON o.id = n.id;
+
+INSERT INTO target VALUES (1, 10), (2, 20);
+UPDATE target SET val = val * 10 WHERE id &lt;= 2;
+SELECT * FROM audit;
+</code></pre>
+<h2>4. SQL Dialect Additions</h2>
+<p>As always, DuckDB's SQL dialect keeps growing. A few favorites from this release cycle:</p>
+<p>With <strong><code>NEAREST</code> joins</strong>, top-k similarity search becomes a join clause, handy for vector and embedding workloads:</p>
+<pre><code>SELECT q.user_id, t.product_id
+FROM users q
+    INNER JOIN products t APPROX NEAREST 2
+    BY SIMILARITY array_cosine_similarity(q.embedding, t.embedding);
+</code></pre>
+<p><strong>DML inside CTEs</strong> lets you use <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, and <code>COPY</code> as pipeline steps:</p>
+<pre><code>WITH moved AS MATERIALIZED (
+    DELETE FROM staging RETURNING *
+)
+INSERT INTO archive SELECT * FROM moved;
+</code></pre>
+<p><strong>Nested schemas</strong> allow schemas within schemas:</p>
+<pre><code>CREATE SCHEMA finance;
+CREATE SCHEMA finance.reports;
+CREATE TABLE finance.reports.q3 (revenue DECIMAL);
+</code></pre>
+<p>The new <strong>variable syntax</strong> lets you write <code>$x</code> anywhere an expression is allowed:</p>
+<pre><code>SET VARIABLE threshold = 100;
+SELECT * FROM orders WHERE amount &gt; $threshold;
+</code></pre>
+<p>The <strong>JSON mutation functions</strong> <code>json_set</code>, <code>json_insert</code>, <code>json_replace</code>, and <code>json_remove</code> finally let you modify JSON documents in place:</p>
+<pre><code>SELECT json_set('\{"a":1}', '$.b', '2');
+</code></pre>
+<p>And <strong>recursive CTEs with <code>USING KEY</code> aggregation</strong> enable iterative algorithms in pure SQL.</p>
+<h2>5. Asynchronous I/O</h2>
+<p>Interacting with object stores like S3 is central to the DuckDB experience. DuckDB v2.0 introduces asynchronous I/O throughout the engine. Thanks to asynchronous access, the I/O layer now scales independently from the query processing layer, which means far more parallelism for remote reads and dramatically faster queries on network storage.</p>
+<h2>6. Faster Queries Across the Board</h2>
+<p>As with every release, a lot of work went into making your existing queries faster without you doing anything. Recursive CTEs are significantly faster, aggregations now spill to disk when they outgrow memory, and row-group pruning has been massively expanded for complex types and filters. Query planning also becomes <strong>partition-aware</strong>, allowing better performance on lakehouse formats.</p>
+<h2>7. Storage Format v2.0</h2>
+<p>DuckDB v2.0 bumps the default storage format version to v2.0.0. Column metadata is now loaded lazily, so wide tables open faster. The <code>DICT_FSST</code> string compression method is enabled by default, deletes are stored compactly, and the storage layer performs much stronger corruption validation on read.</p>
+<h2>8. A Brand New SQL Parser</h2>
+<p>DuckDB v2.0 ships our own modern, extensible PEG-based parser. This change ties into the extension ecosystem: extensions can now hook into the grammar itself, so expect extensions that expose entirely new SQL syntax. It also brings better error messages with precise source locations, and dialect compatibility modes.</p>
+<h2>9. Timezones, Calendars, and Collations Without ICU</h2>
+<p>In v2.0, the ICU library is gone entirely: the <code>icu</code> extension now implements timezones, calendars, and collations itself, with the timezone data built directly from the IANA database. Everything keeps working as before, but the implementation is smaller, easier to keep up to date, and significantly faster.</p>
+<h2>10. Write Extensions Once, Host Them Yourself</h2>
+<p>DuckDB v2.0 will ship with a revamped C API. The API will have a versioned specification expressed in YAML, providing a stable ABI across DuckDB versions. You won't need to re-target or rebuild extensions every time a new DuckDB version comes out. Additionally, you will be able to register your own trusted repositories, so an organization can host and sign its own extensions and have them install and load just like the built-in ones.</p>
+<h2>Bonus: DuckDB Foundation – Advisory Board</h2>
+<p>Starting this fall, we will add a stakeholder advisory board to the DuckDB Foundation. The advisory board will provide input on the development roadmap of DuckDB, DuckLake, and Quack.</p>
+<h2>Final Thoughts</h2>
+<p>These are only a few highlights, and this post is only a preview. There have been more than 10,000 commits by many contributors since we released v1.5. We would like to thank our community for the detailed issue reports, feedback, and contributions that shaped this release.</p>

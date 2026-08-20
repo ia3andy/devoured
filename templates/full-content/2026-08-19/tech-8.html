@@ -1,0 +1,164 @@
+<h1>Code Mode</h1>
+<p>Code mode lets a model write JavaScript or TypeScript that calls your AI SDK tools. The generated code runs in an isolated QuickJS sandbox and returns a JSON-serializable result.</p>
+<p>Instead of calling tools one at a time, a model can use code mode to:</p>
+<ul>
+ <li>call independent tools concurrently</li>
+ <li>transform and combine tool results</li>
+ <li>filter large tool responses before returning them to the model</li>
+ <li>use JavaScript control flow for multi-step operations</li>
+</ul>
+<p>Code mode is provided by the <code>@ai-sdk/code-mode</code> package.</p>
+<p>Code mode is experimental and its APIs may change in future releases. It requires Node.js 22 or newer and is not available in browser or edge runtimes.</p>
+<h2>Installation</h2>
+<pre><code>pnpm add ai @ai-sdk/code-mode zod</code></pre>
+<h2>Using Code Mode with <code>generateText</code></h2>
+<p>Define your tools in one tool set and use <code>experimental_toolCallers</code> to select which tools code mode can call:</p>
+<pre><code>import \{
+  DIRECT_TOOL_CALL,
+  experimental_codeModeTool as codeModeTool,
+} from '@ai-sdk/code-mode';
+import \{ generateText, isStepCount, tool } from 'ai';
+import \{ z } from 'zod';
+
+const getInventory = tool(\{
+  description: 'Get available inventory for a product.',
+  inputSchema: z.object(\{
+    productId: z.string(),
+  }),
+  outputSchema: z.object(\{
+    productId: z.string(),
+    availableUnits: z.number(),
+  }),
+  execute: async (\{ productId }) =&gt; (\{
+    productId,
+    availableUnits: 42,
+  }),
+});
+
+const getDemand = tool(\{
+  description: 'Get requested units for a product.',
+  inputSchema: z.object(\{
+    productId: z.string(),
+  }),
+  outputSchema: z.object(\{
+    productId: z.string(),
+    requestedUnits: z.number(),
+  }),
+  execute: async (\{ productId }) =&gt; (\{
+    productId,
+    requestedUnits: 31,
+  }),
+});
+
+const tools = \{
+  code_mode: codeModeTool(\{
+    executionPolicy: \{
+      timeoutMs: 30_000,
+    },
+  }),
+  getInventory,
+  getDemand,
+} as const;
+
+const result = await generateText(\{
+  model: "xai/grok-4.6",
+  tools,
+  experimental_toolCallers: \{
+    getInventory: ['code_mode'],
+    getDemand: ['code_mode'],
+  },
+  stopWhen: isStepCount(10),
+  prompt: 'Compare inventory and demand for product sku_123.',
+});</code></pre>
+<p>The keys in <code>experimental_toolCallers</code> are the tools being governed. The values identify their allowed callers. In this example, <code>getInventory</code> and <code>getDemand</code> are available through <code>code_mode</code>, but they are not exposed to the model as directly callable tools. Include <code>DIRECT_TOOL_CALL</code> when a tool should also be callable directly:</p>
+<pre><code>experimental_toolCallers: \{
+  getInventory: ['code_mode', DIRECT_TOOL_CALL],
+};</code></pre>
+<p>Tools without an <code>experimental_toolCallers</code> entry keep their existing direct tool-calling behavior.</p>
+<p>The code mode tool description includes TypeScript signatures generated from the input and output schemas of its allowed tools. Descriptions, <code>inputExamples</code>, and precise schemas help the model write correct code.</p>
+<p>For the example above, the model can generate a program like:</p>
+<pre><code>const [inventory, demand] = await Promise.all([
+  tools.getInventory(\{ productId: 'sku_123' }),
+  tools.getDemand(\{ productId: 'sku_123' }),
+]);
+
+return \{
+  sufficient: inventory.availableUnits &gt;= demand.requestedUnits,
+  remaining: inventory.availableUnits - demand.requestedUnits,
+};</code></pre>
+<p>Each provided tool is available through the global <code>tools</code> object. Tool names that are not valid JavaScript identifiers use bracket notation:</p>
+<pre><code>const user = await tools['lookup-user'](\{ userId: 'user_123' });
+return \{ id: user.id, plan: user.plan };</code></pre>
+<h2>Writing Code Mode Programs</h2>
+<p>Generated programs support:</p>
+<ul>
+ <li>JavaScript and type-stripped TypeScript</li>
+ <li>top-level <code>await</code> and <code>return</code></li>
+ <li>standard JavaScript control flow and data transformations</li>
+ <li><code>Promise.all</code> for concurrent tool calls</li>
+ <li><code>JSON.parse</code> and <code>JSON.stringify</code></li>
+ <li><code>console.log</code>, <code>console.info</code>, <code>console.debug</code>, and <code>console.error</code></li>
+</ul>
+<p>Every tool call is asynchronous and must be awaited or otherwise observed. Returning while tool calls are still detached fails the invocation and aborts the outstanding work.</p>
+<p>Programs and tool inputs and outputs cross the sandbox boundary as JSON. Return only JSON-serializable values. TypeScript support is limited to removing type syntax; code mode does not perform type checking or provide a full TypeScript compiler.</p>
+<h2>Direct Execution</h2>
+<p>Use <code>experimental_runCodeMode</code> when you want to execute a program directly instead of exposing code mode to a model:</p>
+<pre><code>import \{ experimental_runCodeMode as runCodeMode } from '@ai-sdk/code-mode';
+
+const result = await runCodeMode(\{
+  js: `
+    const inventory = await tools.getInventory(\{
+      productId: 'sku_123',
+    });
+
+    return \{
+      productId: inventory.productId,
+      available: inventory.availableUnits &gt; 0,
+    };
+  `,
+  tools: \{ getInventory },
+});</code></pre>
+<p><code>runCodeMode</code> returns the value returned by the program. It uses the same sandbox and execution limits as the AI SDK tool.</p>
+<h2>Tool Approval</h2>
+<p>Code mode does not currently integrate with AI SDK tool approval flows. Tool calls made by generated code are nested inside the code mode invocation, so they cannot pause the generation and surface a tool approval request to your application.</p>
+<p>Do not expose tools that rely on user approval to code mode. Keep those tools directly callable by the model instead. If a nested tool requires approval, the call is rejected rather than executed.</p>
+<h2>Execution Limits</h2>
+<p>Every invocation has limits for runtime, memory, source size, results, tool payloads, console output, and tool calls. Override them with <code>executionPolicy</code>:</p>
+<pre><code>const codeMode = codeModeTool(\{
+  executionPolicy: \{
+    timeoutMs: 30_000,
+    memoryLimitBytes: 64 * 1024 * 1024,
+    maxResultBytes: 1024 * 1024,
+    maxBridgeRequests: 100,
+    maxInFlightBridgeRequests: 10,
+  },
+});</code></pre>
+<p>The available limits are:</p>
+<ul>
+ <li><code>timeoutMs</code>: total execution time</li>
+ <li><code>memoryLimitBytes</code>: QuickJS memory</li>
+ <li><code>maxStackSizeBytes</code>: QuickJS stack</li>
+ <li><code>maxSourceBytes</code>: generated source code</li>
+ <li><code>maxResultBytes</code>: returned result</li>
+ <li><code>maxConsoleOutputBytes</code>: combined console output</li>
+ <li><code>maxToolInputBytes</code>: input for each tool call</li>
+ <li><code>maxToolOutputBytes</code>: output from each tool call</li>
+ <li><code>maxBridgeRequests</code>: total tool calls</li>
+ <li><code>maxInFlightBridgeRequests</code>: concurrent tool calls</li>
+</ul>
+<p>Use <code>experimental_setMaxWorkers</code> to set a process-wide cap on concurrent code mode workers:</p>
+<pre><code>import \{ experimental_setMaxWorkers as setMaxWorkers } from '@ai-sdk/code-mode';
+
+setMaxWorkers(4);</code></pre>
+<p>Without an explicit cap, code mode chooses one based on available memory, up to 32 workers.</p>
+<h2>Isolation and Tool Access</h2>
+<p>Each invocation receives a fresh QuickJS context. Sandboxed code cannot access:</p>
+<ul>
+ <li>Node.js globals such as <code>process</code>, <code>require</code>, or <code>module</code></li>
+ <li>the host file system or module loader</li>
+ <li><code>fetch</code>, WebCrypto, or performance APIs</li>
+ <li><code>eval</code> or dynamic <code>Function</code> construction</li>
+</ul>
+<p>Network or system access must be implemented in a tool and explicitly provided to code mode.</p>
+<p>Treat the sandbox as defense in depth. Generated code and tool arguments are untrusted. Tools execute in your host application, outside the QuickJS sandbox, and every capability exposed by a provided tool is available to the generated program. Enforce authorization and validate inputs inside each tool.</p>
+<p>Tool input schemas are validated before their <code>execute</code> functions run. Abort signals and AI SDK tool execution context are forwarded to nested tool calls.</p>

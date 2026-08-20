@@ -1,0 +1,106 @@
+<p>There is a moment every release engineer knows well.</p>
+<p>The CI/CD pipeline turns green. The deployment job reports success. Everyone exhales for a second and thinks, “Okay, the release is done.” But in Kubernetes, that is not always true.</p>
+<p>A green pipeline usually means the deployment step completed. The job finished, Helm ran successfully, and the new version was handed over to Kubernetes. That is important, but it only answers one question: was the release sent?</p>
+<p>It does not fully answer the more important reliability question: is the application actually healthy now?</p>
+<p>On the team I work on, we manage Kubernetes workloads in a large payments environment. Like many SRE teams, we were dealing with the gap between “the deployment ran” and “the application is actually ready to serve traffic.” That gap created release anxiety, extra manual work, and inconsistent validation.</p>
+<p>This is the story of how we closed that gap by turning manual Kubernetes release checks into lightweight CI/CD automation — and reduced validation time from around 45 minutes to about 2 minutes.</p>
+<p>The time savings were nice. But the bigger win was consistency, confidence, and less operational toil.</p>
+<h2>Deployment Completion Is Not the Same as Application Health</h2>
+<p>Deployment completion and application health are two different signals.</p>
+<p>Deployment completion is a delivery signal. It tells us the release went out.</p>
+<p>Application health is a runtime signal. It tells us whether the service is working after the release.</p>
+<p>That difference matters a lot in Kubernetes.</p>
+<p>After a release, there are still important questions to answer. Did the workloads scale back up correctly? Did the pods start? Did they become Ready? Is anything stuck in <code>Pending</code>? Is anything failing with <code>CrashLoopBackOff</code>? Is there an image pull issue? Can the application actually serve users?</p>
+<p>A green deployment step does not always answer those questions.</p>
+<p>A deployment can complete while one pod fails its readiness probe. Another pod may start and then crash. Another may not pull the image because of a bad tag or registry issue. From the pipeline’s point of view, the deployment may look complete. From the user’s point of view, the service may still be degraded.</p>
+<p>That was the reliability gap we wanted to close.</p>
+<p>We did not want the release process to assume health. We wanted it to verify health before calling the release successful.</p>
+<h2>The Old Way: Release Validation by Hand</h2>
+<p>Before automation, the release validation process was manual.</p>
+<p>For each release, an engineer had to log in to Kubernetes clusters, go namespace by namespace, scale deployments down, check pod status, deploy the new version, scale deployments back up, check pod status again, and review logs when something looked wrong.</p>
+<p>None of those steps are difficult by themselves.</p>
+<p>Checking pod status is simple. Reading logs is simple. Scaling a deployment is simple.</p>
+<p>The problem was repetition.</p>
+<p>In our environment, a larger release could span multiple clusters, each with several namespaces and many deployments — which quickly adds up to hundreds of workload checks across the release.</p>
+<p>For a small release, the manual process was manageable. For a larger production release, validation could take around 45 minutes.</p>
+<p>From an SRE perspective, this is classic toil. It is manual, repetitive, necessary, and it does not scale well as the number of services grows.</p>
+<p>The slower process was only part of the problem. The bigger issue was inconsistency.</p>
+<p>When engineers repeat the same checks under release pressure, things can get missed. A namespace may be skipped. A pod may be Running but not Ready. A release window may be tight, and the checks may be rushed.</p>
+<p>That meant release confidence depended too much on the person doing the validation. We wanted release confidence to come from the process itself.</p>
+<p>So we asked a simple question:</p>
+<p>Could we take the same release checks engineers already trusted and let the pipeline run them automatically?</p>
+<h2>What We Built — and What We Deliberately Avoided</h2>
+<p>We did not build a heavy new platform.</p>
+<p>We did not build a Kubernetes Operator.</p>
+<p>We did not replace the deployment system.</p>
+<p>We already had a CI/CD pipeline and an internal deployment platform that could perform Helm operations and read pod status for the namespaces our team managed. So we reused what already existed.</p>
+<p>That was an important design choice.</p>
+<p>The goal was not to make the architecture more complex. The goal was to remove repetitive manual work and make validation consistent.</p>
+<p>The pipeline now performs the release flow automatically:</p>
+<ul>
+ <li>It scales down the target workloads.</li>
+ <li>It checks pod status to confirm the workloads are coming down.</li>
+ <li>It deploys the new version.</li>
+ <li>It scales the workloads back up.</li>
+ <li>It checks pod health across the required namespaces.</li>
+</ul>
+<p>If everything becomes healthy, the release passes.</p>
+<p>If something is not healthy, the pipeline reports the failing pod and the reason.</p>
+<p>If the release never reaches a healthy state, rollback can be triggered.</p>
+<p>At a high level, each validation stage calls an internal deployment API with the target cluster, namespace, release name, and operation. The internal platform performs the Kubernetes or Helm operation and returns the current status to the pipeline.</p>
+<p>The pipeline then uses that response to decide what to do next: continue, wait, pass, fail, or roll back.</p>
+<p>Conceptually, this is a small release control loop.</p>
+<ul>
+ <li>Observe the current state.</li>
+ <li>Evaluate health.</li>
+ <li>Continue if healthy.</li>
+ <li>Wait if still progressing.</li>
+ <li>Fail and roll back if unhealthy.</li>
+</ul>
+<p>The implementation was not the most complicated part. The real value came from automating the right checks at the right time in the release process.</p>
+<h2>Why Ready Matters More Than Running</h2>
+<p>One of the most important checks is pod readiness.</p>
+<p>In Kubernetes, <code>Running</code> and <code>Ready</code> are not the same thing.</p>
+<p><code>Running</code> means the container process has started.</p>
+<p><code>Ready</code> means Kubernetes considers the pod safe to receive traffic.</p>
+<p>That distinction matters during releases.</p>
+<p>Imagine a deployment with five replicas. After the release, all five pods may show as <code>Running</code>. If we stop there, we may assume the application is healthy.</p>
+<p>But maybe only three pods are actually <code>Ready</code>. The other two may still be starting, waiting for a dependency, loading configuration, or failing a readiness probe.</p>
+<p>In that situation, the application is not fully healthy yet.</p>
+<p>That is why the automation checks readiness, not just whether the pod is running.</p>
+<p>The failure reason also matters.</p>
+<p>If a pod is stuck in <code>Pending</code>, that may point to a scheduling or resource issue.</p>
+<p>If it is in <code>CrashLoopBackOff</code>, that usually points to an application startup problem, missing configuration, missing secrets, or a dependency issue.</p>
+<p>If it is in <code>ImagePullBackOff</code>, that points to an image tag, registry, or authentication problem.</p>
+<p>Each reason sends the engineer in a different troubleshooting direction.</p>
+<p>That is why the pipeline does not just say “unhealthy.” It reports which pod is failing and why. That saves time because engineers do not have to start from zero during a failed release.</p>
+<h2>The 60-Second Stability Window</h2>
+<p>One design choice that made a big difference was the 60-second stability window.</p>
+<p>At first, it may seem enough to mark the release successful as soon as all pods become Ready.</p>
+<p>But in real releases, that can create false confidence.</p>
+<p>A pod can become Ready for a few seconds and then fail again. Maybe the application starts successfully, passes the readiness check, and then crashes. Maybe a dependency issue appears only after the service begins handling traffic.</p>
+<p>If the pipeline passes the release at the first green moment, the release may look successful even though the application becomes unhealthy shortly after.</p>
+<p>That is why we added a stability window.</p>
+<p>Once all pods become Ready, the automation keeps watching for 60 more seconds. If all pods stay healthy for the full window, the release passes. If any pod becomes unhealthy during that time, the timer resets.</p>
+<p>This changes what <code>PASS</code> means.</p>
+<p>It no longer means, “The app looked healthy for one moment.” It means, “The app became healthy and stayed healthy long enough for us to trust the release.” That is a much stronger signal.</p>
+<h2>What Changed After Automation</h2>
+<p>The most obvious result was speed.</p>
+<p>For larger releases, validation went from around 45 minutes to about 2 minutes.</p>
+<p>But speed was not the only win.</p>
+<p>The bigger win was consistency.</p>
+<p>Every release now follows the same validation path. The pipeline does not forget a namespace. It does not skip a pod check. It does not rush because the release window is tight.</p>
+<p>Problems also surface earlier.</p>
+<p>Instead of waiting for an engineer to manually find an unhealthy pod, the pipeline reports the failing pod and reason directly. That makes investigation faster and handoffs easier.</p>
+<p>The team also gained more confidence in the release process.</p>
+<p>Before automation, a green pipeline still required manual confirmation. After automation, the pipeline itself became a stronger release gate because it checked runtime health, not just deployment completion.</p>
+<p>That is an important shift for SRE teams.</p>
+<p>The goal is not only to deploy faster. The goal is to know, with more confidence, that the application is healthy after the deployment.</p>
+<h2>Lessons Learned</h2>
+<p>The biggest lesson is simple:</p>
+<p>A release is not done when the pipeline turns green. A release is done when the application is healthy and stable.</p>
+<p>For us, the best solution was not a large platform or a complex Kubernetes Operator. It was lightweight automation inside the CI/CD pipeline.</p>
+<p>We started with the checks engineers were already doing manually. Then we automated them. We checked pod readiness, failure reasons, and stability over time. We kept the output clear enough that any engineer could understand what happened.</p>
+<p>That made the release process faster, but more importantly, it made it more reliable.</p>
+<p>For teams dealing with similar Kubernetes release pain, the starting point does not have to be complicated. Look at the manual checks your engineers already trust. Identify which ones are repeated across clusters, namespaces, and deployments. Turn those checks into pipeline stages. Require health to stay stable before calling the release successful.</p>
+<p>That is when “green pipeline” starts to mean what everyone hoped it meant in the first place: not just that the release was sent, but that the application is healthy enough to trust.</p>
