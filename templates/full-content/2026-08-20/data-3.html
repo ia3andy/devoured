@@ -1,0 +1,71 @@
+<h1>Simplifying Data and Product Integrations with a Data Abstraction Layer</h1>
+<h2>Introduction</h2>
+<p>If you work with data regularly, how often have you run into this?</p>
+<p><strong>The widget_metrics_v2 table is the source of truth for widget metrics. Prior to 2025, use the widget_metrics_v1 table instead. There are some differences between these tables—the count_widgits metric used to be called num_widgets in v1, and average_widgit_score is only available in v2.</strong></p>
+<p>Situations like this are very common, and tooling just can’t keep up with constantly evolving product needs and data models. Queries are tightly coupled with the structure and topology of the underlying datasets, so making changes is often long, slow, and difficult.</p>
+<p>What if we took a page out of the programming playbook and introduced an abstraction? In programming parlance, an <em>abstraction</em> hides complexity and implementation details behind a simple interface. Abstractions let consumers focus on <em>what</em> something does rather than <em>how</em> it is done, and can make it much easier to develop systems with low coupling. In this blog, we describe a data abstraction layer—or DAL—that we built at Uber to make it easier for consumers to access all kinds of data while empowering data producers to evolve models over time. Although designed to be flexible and domain agnostic, we focused initially on a critical driver of business value for Uber: ads.</p>
+<h3>Case Study: Advertiser Reporting</h3>
+<p>Advertiser reporting is a use case that significantly benefits from this concept of an abstraction. When advertisers run ad campaigns through Uber, we gather data on how their ads are performing. One critical use case for this data is reporting, where advertisers can explore their performance data, slice and dice, compare metrics, and so on. Data is collected in near-real-time, but advertisers can also query historical data for long-term comparisons and trend analysis.</p>
+<p>Data presentations vary from charts to tables and more. Most are configurable—advertisers can specify a time range, select campaigns, and choose the dimensions to break down on and the metrics to compute. Supporting this with traditional tools is a monumental task given the request flexibility and heterogeneity of data storage. Before onboarding to the DAL, it used to take anywhere from several weeks to a couple of months to build out a new report.</p>
+<h3>Enter the DAL</h3>
+<p>The DAL is an RPC service that sits between a <em>data consumer</em> (in this case, the advertiser-facing front ends) and a <em>data producer</em>. Its responsibilities include accepting requests, determining where to source data, orchestrating queries, and assembling a coherent response. It does this through a combination of configuration files that declaratively specify data locations and relationships, and a sophisticated table resolution process that creates an execution plan to satisfy the request.</p>
+<h3>Requesting Data</h3>
+<p>The DAL exposes a <em>FetchData</em> endpoint for data retrieval. The request specifies a table name, schema, time range, and filters of interest. For example, Figure 3 shows a request to get basic ad performance data for an account, broken down by campaign.</p>
+<p>Removing <em>ad_campaign_uuid</em> from the above request produces the same data at the account level.</p>
+<p>Notice how metrics are automatically rolled up to match the new schema—the client didn’t need to do anything other than omit the dimension. This reflects a fundamental design principle of the DAL: the request specifies <em>what</em> data the consumer wants to see. The service is responsible for <em>how</em> the data is retrieved and computed.</p>
+<h3>Behind the Scenes</h3>
+<p>A <em>FetchData</em> request is made against a logical table—an expression of a data interface that defines the shape of data without describing where or how to get it. Let’s take an example.</p>
+<p>The <em>ads.advertiser_metrics</em> logical table exposes the schema shown in Figure 6.</p>
+<p>The <em>dimensions</em> and <em>metrics</em> elements are sets of columns of a particular <em>grouping type</em>. Dimensions and metrics generally behave as expected—dimensions are classifications used to determine the grouping key for aggregations, and metrics are measurements that can (usually) be aggregated.</p>
+<p>If you look at the <em>metric</em> columns, you’ll notice that they have a <em>source</em> attribute. This contains a list of the physical tables candidates that provide the metric. This serves as the starting point for seeding the candidates in table resolution.</p>
+<h3>Table Resolution</h3>
+<p>Table resolution is the process by which a query plan is generated for a request based on the logical table being queried, the time range, and the requested schema. It occurs over several phases, where a set of rules is applied to physical dataset candidates based on the columns in the request to determine the right tables to query. The major phases are:</p>
+<ol>
+ <li><strong>Schema eligibility</strong>. Candidates that don’t contain <em>every </em>dimension or <em>any</em> metric in the request are discarded.</li>
+ <li><strong>Dataset availability.</strong> Tables define an availability window in terms of freshness and retention. Candidates whose availability window doesn’t intersect with the request interval are discarded.</li>
+ <li><strong>Column continuity</strong>. For each metric, construct a mapping from time range to candidate. When these intervals overlap, prefer candidates that are closer in cardinality to that of the request.</li>
+</ol>
+<p>From this result, we now have a set of physical tables, columns, and time ranges to query.</p>
+<p>Explaining every part of these configurations is beyond the scope of this blog, but a few things to call out:</p>
+<ul>
+ <li><strong>Tables describe their availability windows</strong>. The <em>realtime</em> tables have overlapping availability with the <em>daily</em> table 3-8 days ago.</li>
+ <li><strong>Each table has the same dimensions</strong>. This is important for result assembly, described later.</li>
+ <li><strong>Metrics describe how they can be rolled up</strong>. All these metrics use the SUM transform, but other aggregation functions are available.</li>
+</ul>
+<p>That is, this request will result in three queries being executed, one against each of the <em>realtime</em> tables to retrieve a subset of the metrics for the most recent 3 days, and another against the <em>daily</em> table for the remaining 4 days.</p>
+<p>The example here is somewhat simplified. Physical table dependency graphs can be multiple layers deep, and logical tables can reference physical tables across multiple database technologies.</p>
+<h3>Query Generation and Execution</h3>
+<p>After table resolution, the query engine is responsible for orchestrating data retrieval. Each table undergoes the following steps:</p>
+<ol>
+ <li>A query is generated to match the schema and request semantics, possibly doing aggregations, applying predicates, and running transformations.</li>
+ <li>The query is sent to a query runner that submits the query, waits for completion, and retrieves the response.</li>
+</ol>
+<p>Both operations are database-specific, with implementations for our internal OLAP database, Docstore, Apache Hive™, and more. Note that these queries can be mixed for a single consumer request. The DAL can retrieve data from both the OLAP database and Docstore simultaneously, for example.</p>
+<p>The engine executes queries in parallel to minimize latency. After a response has been received from each query, we move to the final stage: result assembly.</p>
+<h3>Result Assembly</h3>
+<p>In result assembly, the individual responses to each query are assembled into a final result. There are several kinds of operations in result assembly that are conditionally invoked depending on the outcome of table resolution:</p>
+<ul>
+ <li><strong>Concatenation. </strong>Assembly concatenates datasets that are temporally adjacent. For example, if table resolution indicates that data should be read from a daily table and an hourly table, the responses from each will be concatenated together.</li>
+ <li><strong>Joins. </strong>Complementary datasets—meaning datasets that individually cover a subset of the metric columns—are joined together using the dimensions of each row.</li>
+ <li><strong>Rollups.</strong> Although aggregations are usually performed during query execution, in some situations data must be rolled up during result assembly.</li>
+ <li><strong>Scalar transformations.</strong> We also support a variety of other types of transformations, including virtual columns, normalizations, and reference joins.</li>
+</ul>
+<p>Once assembled, the response is sent to the client.</p>
+<h3>Using the DAL in Advertiser Reporting</h3>
+<p>The simplicity and flexibility of the DAL enables powerful use cases for advertiser reporting. Most experiences are backed by a single logical table, <em>ads.advertiser_metrics</em>. The UI sends a schema describing the shape of the data it wants to see.</p>
+<p>Notice how the definitions of these reports are very similar, with only slight modifications to the schema and/or predicate needed to produce an entirely different result. By convention, performance reports are a time-series showing how metrics change over time, while summary reports show the same data aggregated into a single data point per metric. Other reports can be produced quite easily with similarly small modifications. For example, an advertiser can get a performance report across all campaigns in an account by including both <em>ad_campaign_uuid</em> and <em>day_of</em> in the schema simultaneously.</p>
+<p>Advertisers can also use a report builder to specify exactly which dimensions and metrics to include—similar to a pivot table—as well as a third-party API for programmatic integrations. Through the DAL these implementations become greatly simplified, as the inherently dynamic nature of the experiences matches closely with the capabilities provided by <em>FetchData</em>.</p>
+<h3>Outcome and Next Steps</h3>
+<p>Usage of the DAL for advertiser reporting had a dramatic impact on the turnaround time for new reports. What used to be a multi-week process can now be accomplished in under two days. Furthermore, this has enabled much more sophisticated tooling for advertisers that would have been infeasible under the original architecture, with dynamic experiences ranging from user-specified filters to full-fledged report builders.</p>
+<p>There are many exciting ways in which the DAL continues to evolve:</p>
+<ul>
+ <li><strong>Use case onboarding.</strong> The DAL was initially built for advertiser reporting, but was designed from the beginning to be general-purpose and domain-agnostic. It has since evolved to serve as a general DAL for ads and expanded into non-ads domains. We expect this trend to continue with time.</li>
+ <li><strong>Additional database integrations.</strong> Connecting the DAL to other databases is relatively straightforward via a connector interface. This makes it easier to connect data that spans across different database technologies, a crucial value add for the DAL.</li>
+ <li><strong>Asynchronous requests.</strong> Async is useful in situations where you need to return larger volumes of data. The DAL extends relatively easily into some aspects of asynchronous execution, but some other parts require a bit of sophistication.</li>
+ <li><strong>Extensibility mechanisms.</strong> While the typical request flow is fully generalized, domain-specific requirements are inevitable. The DAL provides a few extension points in the form of decorators that allow its behavior to be customized in a controlled manner to facilitate this complexity.</li>
+</ul>
+<h1>Conclusion</h1>
+<p>We discussed the implementation of a Data Abstraction Layer that provides an abstraction between the producer and consumer of datasets, which enables teams at Uber to move fast and build powerful experiences on top of data. We also described a case study of how the DAL was used to solve complex problems in advertiser reporting.</p>
+<h2>Acknowledgments</h2>
+<p><em>Cover Photo Attribution: “Beautiful aerial view of the teotihuacan pyramid of the sun and Moon in Mexico” by Marie Hernandez is licensed to Uber.</em></p>
+<p><em>Apache®, Apache® Hive™, and Hive™ are either registered trademarks or trademarks of the Apache Software Foundation in the United States and/or other countries. No endorsement by The Apache Software Foundation is implied by the use of these marks.</em></p>

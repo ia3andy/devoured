@@ -1,0 +1,170 @@
+<h1>BetterWright</h1>
+<p><strong>The token-efficient browser for AI agents.</strong></p>
+<p>One persistent, policy-guarded browser your agent returns to turn after turn. Drive it from your own agent (skill, MCP, or JS API) — or hand whole tasks to its built-in browser agent and just read the answer.</p>
+<pre><code>npm install -g betterwright &amp;&amp; betterwright init
+
+betterwright run -c "await page.goto('https://example.com'); return page.title()"
+# \{"ok": true, "result": "Example Domain", ...}</code></pre>
+<p><code>init</code> downloads the browser, wires up whichever agents it finds on your machine, and proves it works by loading a real page. One command, no choices to make up front.</p>
+<p><strong>Compressed snapshots</strong> instead of raw HTML or a full accessibility dump · read-only tasks finish in <strong>one model turn</strong> · persistent sessions so you don't re-pay login and navigation cost every step.</p>
+<hr>
+<h2>Two ways to use it</h2>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>You want…</th>
+   <th>You get…</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Integrated</strong></td>
+   <td>your agent (Claude Code, Codex, Pi, any MCP client, your own code) to browse as one part of a bigger job</td>
+   <td>a skill, MCP server, or JS API through which <em>your</em> agent mans the browser step by step</td>
+  </tr>
+  <tr>
+   <td><strong>Standalone agent</strong></td>
+   <td>to hand over a whole browser task and read back one answer</td>
+   <td><code>betterwright exec "&lt;task&gt;"</code> — BetterWright's own browser-tuned agent loop does the driving; you (or your agent) get one JSON result</td>
+  </tr>
+ </tbody>
+</table>
+<p>They share everything — the same persistent sessions, vault, network policy, and snapshots — so you can start with one and mix in the other later.</p>
+<h3>1. Integrated — your agent drives the browser</h3>
+<p>Any agent that can run a shell command can drive the browser. <code>betterwright skill</code> prints the instructions that teach it how — CLI usage plus operator guidance. No server, no SDK, no glue code.</p>
+<pre><code># The short version: init detects your agent hosts and wires them all.
+betterwright init
+
+# Or do it by hand, one host at a time:
+betterwright skill --install       # ~/.claude/skills + ~/.agents/skills (browser + e2e-review)
+betterwright skill --install --all # also ~/.cursor/skills
+betterwright skill --status        # where it landed, and whether it is current
+betterwright skill &gt;&gt; ~/.codex/AGENTS.md   # Codex reads an instructions file
+
+# Any custom agent — the same instructions ship as SKILL.md in this repo
+# and the npm package (node_modules/betterwright/SKILL.md); copy it wherever
+# your agent reads skills, or print it with `betterwright skill`.
+
+# MCP (stdio server: browser, browser_login, browser_download, browser_handoff, browser_doctor)
+npm install -g betterwright @modelcontextprotocol/sdk
+claude mcp add betterwright -- npx betterwright mcp
+betterwright mcp --check           # why does my client show no tools?
+
+# Pi Coding Agent (native persistent tools, trusted login, approval-gated downloads)
+pi install npm:betterwright</code></pre>
+<p>After an npm upgrade, <code>setup</code> / <code>update</code> refresh already-installed skill files, and <code>doctor</code> says so if one is still stale.</p>
+<p>Or drive it from your own code:</p>
+<pre><code>import \{ BetterWright } from "betterwright";
+
+const bw = new BetterWright();
+await bw.run("await page.goto('http://localhost:5173')", \{ session: "dev" });
+const title = await bw.run("return page.title()", \{ session: "dev" });
+console.log(title.result);
+await bw.close();</code></pre>
+<p><code>run()</code> takes a string of async Playwright JavaScript with sandboxed globals — <code>page</code>, <code>snapshot</code>, <code>screenshot</code>, <code>human</code>, <code>credentials</code>, and friends — and returns one result envelope.</p>
+<h3>2. Standalone — BetterWright <em>is</em> the browser agent</h3>
+<p>BetterWright ships its own browser-tuned agent loop. Plug in a model, hand it a task in plain language:</p>
+<pre><code>betterwright auth --login codex     # OAuth sign-in, no API key to paste
+betterwright exec "find the top Hacker News story and give me its title and points" --model gpt-5.6-sol</code></pre>
+<p>The loop observes with compressed snapshots, acts, verifies, captures a proof screenshot, and prints <strong>one JSON object</strong> — answer, steps, token usage, proof path.</p>
+<p><strong>Models are selected by real id</strong>, not by adapter nickname. Pass the model id you want (<code>gpt-5.6-sol</code>, <code>claude-opus-4-8</code>, <code>qwen3:8b</code>, …).</p>
+<table>
+ <thead>
+  <tr>
+   <th>You have…</th>
+   <th>Typical start</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>ChatGPT / Codex subscription</td>
+   <td><code>betterwright auth --login codex</code> → <code>--model gpt-5.6-sol</code></td>
+  </tr>
+  <tr>
+   <td>Anthropic API key</td>
+   <td><code>ANTHROPIC_API_KEY=…</code> → <code>--model claude-opus-4-8</code></td>
+  </tr>
+  <tr>
+   <td>xAI (OAuth or API key)</td>
+   <td><code>betterwright auth --login grok</code> or <code>XAI_API_KEY</code> → <code>--model grok-4.3</code></td>
+  </tr>
+  <tr>
+   <td>Local Ollama</td>
+   <td>pull a tool-calling model → <code>--model qwen3:8b</code> or <code>ollama/…</code></td>
+  </tr>
+  <tr>
+   <td>Local vLLM</td>
+   <td>serve with tool-calling enabled → <code>--model &lt;id&gt;</code> or <code>vllm/&lt;id&gt;</code></td>
+  </tr>
+  <tr>
+   <td>OpenRouter</td>
+   <td><code>OPENROUTER_API_KEY=…</code> → <code>--model &lt;author/model&gt;</code></td>
+  </tr>
+  <tr>
+   <td>Any OpenAI-compatible <code>/v1</code></td>
+   <td><code>--base-url https://host/v1 --model &lt;id&gt;</code></td>
+  </tr>
+ </tbody>
+</table>
+<p>Run bare <strong><code>betterwright</code></strong> for the interactive console: one browser session across tasks, steps streaming as they happen, <code>/model</code>, <code>/endpoint</code>, and <code>/models</code>, plus an <code>ask</code> tool so the agent can check with you before consequential choices.</p>
+<p><strong>Use it as a sub-agent.</strong> Because <code>exec</code> is one shell command in and one JSON object out, a <em>coding</em> agent can delegate entire browser tasks to it:</p>
+<pre><code>betterwright exec "log in to staging and download this month's invoice" --model gpt-5.6-sol</code></pre>
+<h2>Tokens are the bottleneck</h2>
+<p>An agent's browser loop is <em>observe → decide → act</em>, and the observe step is where context windows go to die. BetterWright's whole observation stack is built around that problem:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Mechanism</th>
+   <th>Token effect</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Compressed agent snapshots</strong></td>
+   <td>Playwright's <code>mode: "ai"</code> accessibility tree with everything an agent cannot act on pruned out.</td>
+  </tr>
+  <tr>
+   <td><strong>Diff mode</strong></td>
+   <td>After an action, return <strong>only what changed</strong> — not the page again</td>
+  </tr>
+  <tr>
+   <td><strong>Interactive-only filter</strong></td>
+   <td>Drop static text nodes; keep what the agent can click, fill, or read</td>
+  </tr>
+  <tr>
+   <td><strong>Single-call finish</strong></td>
+   <td>Read-only tasks complete in <strong>one model turn</strong></td>
+  </tr>
+  <tr>
+   <td><strong>Persistent session</strong></td>
+   <td>One long-lived browser: no re-login, no re-navigation.</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Watch it, coach it, take the wheel</h2>
+<p>Every run can carry a self-hosted live view: a web page showing the browser in real time, with chat to guide the agent between turns and a <strong>handoff</strong> flow for the moments automation shouldn't finish alone — MFA, a resistant CAPTCHA, a consequential click.</p>
+<pre><code>betterwright exec "…" --live-view          # watch the whole run
+betterwright view --expose tailscale       # drive a headless VPS browser from your laptop
+betterwright view --set-password           # lock every viewer behind a password</code></pre>
+<h2>Why not just Playwright?</h2>
+<p>Playwright is built for tests: trusted scripts, known selectors, teardown at the end. An agent is the opposite — untrusted model output deciding its next step from what it sees, in a browser that must still be there next turn.</p>
+<h2>Install</h2>
+<p>Requires <strong>Node.js 22+</strong>. Setup downloads the pinned native BetterChromium browser for this host; GPU-less Linux runs it with the SwiftShader software renderer.</p>
+<pre><code>npm install -g betterwright
+betterwright init      # guided: browser + agent wiring + a real page load</code></pre>
+<h2>Getting a password back out</h2>
+<p>The vault fills logins without ever handing a secret to model code — which would leave <em>you</em> locked out of a password your agent generated during a signup. So there is a separate, human-only door:</p>
+<pre><code>betterwright vault list                # metadata: site, username, when
+betterwright vault copy &lt;id&gt;           # password → clipboard, never the screen
+betterwright vault show &lt;id&gt; --reveal  # print it (refuses to a pipe or a file)</code></pre>
+<h2>Sessions and profiles</h2>
+<p>All state lives under <code>$BETTERWRIGHT_HOME</code> (default <code>~/.betterwright</code>): the persistent browser profile, the credential vault, and artifacts.</p>
+<ul>
+ <li><code>--session &lt;name&gt;</code> — parallel lanes in <strong>one</strong> browser, sharing one cookie jar.</li>
+ <li><code>--profile &lt;name&gt;</code> — a <strong>separate identity</strong>: its own cookie jar, session daemon, and history.</li>
+</ul>
+<h2>Scope and responsible use</h2>
+<p>BetterWright automates a browser under your direction, including signing in and interacting with simple CAPTCHAs on sites you are authorized to use. It is not built for bulk account creation, credential stuffing, or scraping behind anti-bot walls at scale.</p>
+<h2>License</h2>
+<p>MIT.</p>

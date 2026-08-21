@@ -1,0 +1,181 @@
+<h1>Postgres 19: How Our Advice Has Changed Since We Wrote It</h1>
+<p>Over the years we have written a lot about how data gets into Postgres, how it sits on disk, and how indexes help you find it again. Some of that advice was written against Postgres 10 or 11. A surprising amount of it is still exactly what we would tell you for the upcoming Postgres 19 release. Functionality described here is based on current betas; minor details may still change before GA.</p>
+<p>This post revisits Crunchy posts in the “load, storage, indexes, and partitioning” bucket: what we wrote, which version moved the needle, and what we would tell you to do now. Along the way: async I/O, more resilient <code>COPY</code>, LZ4 by default, richer BRIN shapes, skip scan, and smoother partition operations.</p>
+<h2>Async I/O: faster scans and vacuum on modern storage</h2>
+<p>In 2019 we benchmarked a BRIN index against a B-tree and a parallel sequential scan on the same time-series table. Sometimes BRIN won. Sometimes the parallel seq scan won: four workers chewing through the heap beat a clever index. That was the right lesson for Postgres 11: indexes are a tradeoff against what the executor can already do in parallel.</p>
+<p>Postgres 18 made those heap reads substantially faster.</p>
+<p><strong>Async I/O</strong> lets backends queue multiple disk reads instead of waiting on each one. Sequential scans, bitmap heap scans (the path BRIN and many bitmap index plans finish with), and vacuum all benefit. Community benchmarks have shown up to ~3× on cold, latency-bound storage, a big deal for cloud disks. Defaults matter here: <code>io_method = worker</code> is on out of the box; on Linux 5.1+ you can try <code>io_method = io_uring</code>.</p>
+<p>Postgres 19 builds on that: I/O workers can autoscale (<code>io_min_workers</code> / <code>io_max_workers</code>), read-ahead scheduling improved, and <code>EXPLAIN (ANALYZE, IO)</code> can show what the async subsystem is doing. Parallel query is still there; each worker can queue several reads and keep making progress while some of them are still in flight, so you get more useful work between waits. Parallel autovacuum workers also landed in 19 (<code>autovacuum_max_parallel_workers</code> and per-table <code>autovacuum_parallel_workers</code>), so maintenance <em>can</em> fan out, but the defaults are conservative: tune them when vacuum is falling behind on large tables.</p>
+<p>One related default flip: <strong>JIT is off by default in Postgres 19</strong> (it had been on since 12). The old cost model was unreliable, so large analytical or parallel scans that used to compile at runtime no longer will unless you turn <code>jit</code> back on. If those workloads matter to you, re-enable explicitly and re-check plans after upgrade.</p>
+<p><strong>Postgres 19 advice:</strong> Keep choosing indexes for selectivity, and re-test BRIN-vs-parallel plans on your storage with <code>EXPLAIN (ANALYZE, BUFFERS, IO)</code> after you upgrade. Tune <code>effective_io_concurrency</code> / <code>maintenance_io_concurrency</code> with the new defaults in mind (they rose to 16 in 18). Treat async I/O as more headroom for the heap paths, alongside good <code>COPY</code>, TOAST modeling, BRIN, and covering indexes.</p>
+<h2>Loading data: COPY is still king, and now more resilient</h2>
+<p><strong>What we wrote:</strong> In Fast CSV and JSON Ingestion in PostgreSQL with COPY (2018, Postgres 10), Jonathan Katz showed the classic pattern: generate CSV or newline-delimited JSON, pipe it into <code>psql</code>, and let <code>COPY ... FROM STDIN</code> do the heavy lifting. Prefer <code>COPY</code> over row-by-row <code>INSERT</code>. Store JSON as <code>jsonb</code>. Add a GIN index when you need containment queries.</p>
+<p>That advice was right then and is still right now. The load path itself did not need reinventing; it got more capable.</p>
+<p><strong>What changed:</strong></p>
+<table>
+ <thead>
+  <tr>
+   <th>Version</th>
+   <th>Change that matters for loads</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>16</strong></td>
+   <td><code>COPY FROM</code> can map a sentinel string to a column <code>DEFAULT</code></td>
+  </tr>
+  <tr>
+   <td><strong>17</strong></td>
+   <td><code>ON_ERROR ignore</code> skips bad type conversions and keeps loading; <code>LOG_VERBOSITY</code> reports what was skipped</td>
+  </tr>
+  <tr>
+   <td><strong>18</strong></td>
+   <td><code>REJECT_LIMIT</code> caps how many bad rows you will tolerate; <code>LOG_VERBOSITY silent</code> quiets the noise; CSV handling of <code>\.</code> is clearer</td>
+  </tr>
+  <tr>
+   <td><strong>19</strong></td>
+   <td>Faster text/CSV parsing via SIMD; <code>ON_ERROR SET_NULL</code> turns invalid values into NULL; skip multiple header lines; <code>COPY TO</code> can emit JSON (and a single JSON array with <code>FORCE_ARRAY</code>) and can target partitioned tables directly</td>
+  </tr>
+ </tbody>
+</table>
+<p><code>FREEZE</code> on an initial load into a freshly created or truncated table is still the right performance trick when you want to skip a later freeze vacuum.</p>
+<p><strong>Postgres 19 advice:</strong> Keep using <code>COPY</code> for bulk ingest, including imperfect feeds. A practical 19-era load looks like this:</p>
+<pre><code>COPY events (event_id, occurred_at, payload)
+FROM STDIN
+WITH (
+  FORMAT csv,
+  HEADER 2,
+  DEFAULT '__DEFAULT__',
+  ON_ERROR set_null,
+  LOG_VERBOSITY verbose
+);</code></pre>
+<p><code>HEADER 2</code> skips two lead-in lines. <code>ON_ERROR set_null</code> keeps the row and nulls only the bad field instead of discarding the whole line. Prefer <code>ON_ERROR ignore</code> when a bad cell should drop the row entirely; pair that with <code>REJECT_LIMIT</code> when you want a hard cap on how many skips you will tolerate.</p>
+<p>Prefer <code>FREEZE</code> for empty staging tables that you load once and then promote. And when you need to export partitioned data or hand JSON to another system, <code>COPY TO</code> handles the parent directly:</p>
+<pre><code>COPY events TO STDOUT WITH (FORMAT json);
+COPY events TO STDOUT WITH (FORMAT json, FORCE_ARRAY);</code></pre>
+<p>Plain <code>FORMAT json</code> streams newline-delimited JSON (NDJSON/JSONL: one object per line), which is handy for batch pipelines. <code>FORCE_ARRAY</code> wraps the whole result in a single JSON array, which some web APIs expect.</p>
+<h2>TOAST: same mechanism, faster default compression</h2>
+<p><strong>What we wrote:</strong> In Postgres TOAST: The Greatest Thing Since Sliced Bread? (2024), Elizabeth Christensen walked through the 8 kB page, the ~2 kB <code>toast_tuple_target</code>, storage strategies, and the practical guidance: updating a toasted row rewrites toast chunks, frequent access of compressed values has a cost, and large JSON or text that you query often belongs in a better data model, not in a giant toasted blob.</p>
+<p>That mental model is still the right one. TOAST did not get replaced; it got a better default compressor.</p>
+<p><strong>What changed:</strong></p>
+<table>
+ <thead>
+  <tr>
+   <th>Version</th>
+   <th>Change</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>14</strong></td>
+   <td>LZ4 becomes available via <code>default_toast_compression = 'lz4'</code> or per-column <code>COMPRESSION lz4</code></td>
+  </tr>
+  <tr>
+   <td><strong>19</strong></td>
+   <td>LZ4 becomes the <strong>default</strong> (<code>default_toast_compression</code> flips from <code>pglz</code> to <code>lz4</code>); native <code>REPACK</code> (with <code>CONCURRENTLY</code>) rewrites tables without a long exclusive lock</td>
+  </tr>
+ </tbody>
+</table>
+<p><strong>Postgres 19 advice:</strong> Keep Elizabeth’s modeling advice. Prefer structured columns for hot lookup data when you can. Prefer <code>EXTERNAL</code> when you have already compressed the payload yourself. On a fresh Postgres 19 cluster, LZ4 is what new toasted values get unless you override it.</p>
+<p>When you do need a rewrite to reclaim bloat, Postgres 19’s native <code>REPACK</code> is the clean path; <code>CONCURRENTLY</code> keeps the table readable and writable while the new heap is built:</p>
+<pre><code>REPACK (CONCURRENTLY, ANALYZE) events;</code></pre>
+<p><code>CONCURRENTLY</code> needs a primary key or index-based replica identity. It is not MVCC-safe in the same narrow sense as <code>TRUNCATE</code>: a concurrent transaction that took a snapshot before the final swap and had not yet touched the table can briefly see it as empty.</p>
+<h2>BRIN: still tiny, richer opclasses, faster to build</h2>
+<p><strong>What we wrote:</strong> In PostgreSQL BRIN Indexes: Big Data Performance With Minimal Storage (2019, Postgres 11), Jonathan showed BRIN crushing a B-tree on size for append-mostly sensor data. Later posts sharpened when BRIN shines: high correlation with physical order. Random or shuffled layouts need a different shape of index.</p>
+<p><strong>What changed:</strong></p>
+<table>
+ <thead>
+  <tr>
+   <th>Version</th>
+   <th>Change</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>14</strong></td>
+   <td><code>minmax_multi</code> opclasses store multiple min/max values per range; Bloom BRIN opclasses work for equality on less-correlated data</td>
+  </tr>
+  <tr>
+   <td><strong>17</strong></td>
+   <td>Parallel <code>CREATE INDEX</code> for BRIN</td>
+  </tr>
+ </tbody>
+</table>
+<p><strong>Postgres 19 advice:</strong> Start with Paul’s question: is this column correlated with physical order? If yes, use BRIN. On 14+, prefer multi-minmax when the table is large and not perfectly ordered. Tune <code>pages_per_range</code> to your typical filter width.</p>
+<p>On Postgres 17+, BRIN builds on large tables can use parallel workers automatically. Re-run the bake-off on your storage, especially cloud disks, and pick the winner with fresh numbers.</p>
+<h2>Covering indexes: INCLUDE still helps, and skip scan covers more queries</h2>
+<p><strong>What we wrote:</strong> In Why Covering Indexes in Postgres Are Incredibly Helpful (2018, Postgres 11), Jonathan introduced B-tree <code>INCLUDE</code> columns so queries could satisfy <code>SELECT</code> lists from the index alone. That tradeoff is unchanged. <code>INCLUDE</code> is still how you build a covering index without polluting the sort key.</p>
+<p><strong>What changed:</strong></p>
+<table>
+ <thead>
+  <tr>
+   <th>Version</th>
+   <th>Change</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>17</strong></td>
+   <td>More efficient B-tree scans for multi-value lookups such as <code>IN (...)</code></td>
+  </tr>
+  <tr>
+   <td><strong>18</strong></td>
+   <td>B-tree <strong>skip scan</strong>: a multicolumn index can be used when equality predicates hit later columns and omitted leading columns have low cardinality</td>
+  </tr>
+ </tbody>
+</table>
+<p><strong>Postgres 19 advice:</strong> Still use <code>INCLUDE</code> when you know a hot query’s filter columns and its select list. For your other indexes, check whether skip scan already covers a query before you add another index, especially when the leading column has low cardinality.</p>
+<h2>Partitioning: still for lifecycle, now smoother to operate</h2>
+<p><strong>What we wrote:</strong> In Partitioning with Native Postgres and pg_partman (2022), Elizabeth Christensen framed partitioning as a scale and lifecycle tool: archive old ranges by detaching, create tomorrow’s child, let pg_partman handle the calendar. That still works.</p>
+<p><strong>What changed:</strong></p>
+<table>
+ <thead>
+  <tr>
+   <th>Version</th>
+   <th>Change</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>14</strong></td>
+   <td><code>DETACH PARTITION ... CONCURRENTLY</code>: online detach with lighter locking</td>
+  </tr>
+  <tr>
+   <td><strong>15</strong></td>
+   <td>Cleaner FK behavior when an <code>UPDATE</code> moves a row between partitions</td>
+  </tr>
+  <tr>
+   <td><strong>17</strong></td>
+   <td>Identity columns on partitioned tables; exclusion constraints when they equality-compare the partition key</td>
+  </tr>
+  <tr>
+   <td><strong>18</strong></td>
+   <td><code>VACUUM</code> / <code>ANALYZE ... ONLY</code> on the parent; <code>NOT VALID</code> FKs on partitioned tables</td>
+  </tr>
+  <tr>
+   <td><strong>19</strong></td>
+   <td>Native <code>MERGE PARTITIONS</code> / <code>SPLIT PARTITION</code>; <code>COPY TO</code> works on partitioned parents; <code>vacuumdb --analyze-only</code> analyzes partitioned parents by default</td>
+  </tr>
+ </tbody>
+</table>
+<p><strong>Postgres 19 advice:</strong> Keep partitioning for retention and operational boundaries first. For day-to-day rotation, prefer concurrent detach. When you need to coarsen history or split a hot range, Postgres 19 can do it in SQL:</p>
+<pre><code>ALTER TABLE events
+  MERGE PARTITIONS (events_2024_01, events_2024_02, events_2024_03)
+  INTO events_2024_q1;</code></pre>
+<p>Plan merge/split for a maintenance window: they take <code>ACCESS EXCLUSIVE</code> on the parent and do not yet offer <code>CONCURRENTLY</code>. Exporting a partitioned table is simpler too: <code>COPY TO</code> runs directly on the root relation and pulls rows from all descendants.</p>
+<h2>What hasn’t changed</h2>
+<ol>
+ <li><strong>Prefer <code>COPY</code> over row-by-row <code>INSERT</code> for bulk loads.</strong></li>
+ <li><strong>Store JSON as <code>jsonb</code>, not text <code>json</code>.</strong></li>
+ <li><strong>Keep hot data out of TOAST when you can.</strong></li>
+ <li><strong>Indexes are a tradeoff, not free.</strong></li>
+ <li><strong>The planner may skip your index.</strong> Verify with <code>EXPLAIN (ANALYZE, BUFFERS)</code>.</li>
+ <li><strong>B-tree is the default workhorse.</strong></li>
+ <li><strong>BRIN wins on correlated, append-mostly columns.</strong></li>
+ <li><strong>Covering indexes (<code>INCLUDE</code>) enable index-only scans.</strong></li>
+ <li><strong>Partition for lifecycle and cheap drops first.</strong></li>
+ <li><strong>Unique indexes on partitioned tables need the partition key.</strong></li>
+ <li><strong>Use a default partition as a safety net, and drain it.</strong></li>
+ <li><strong>pg_partman still handles the schedule.</strong></li>
+</ol>
+<p>The advice did not flip. Postgres got better at delivering it: more resilient loads, faster compression by default, more BRIN shapes, wider B-tree usefulness, quicker disk reads, and smoother partition operations. If you still follow those older posts on Postgres 19, keep the mental model, update the edges of the checklist, and re-test after upgrade with <code>EXPLAIN (ANALYZE, BUFFERS, IO)</code>.</p>
