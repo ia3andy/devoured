@@ -1,0 +1,90 @@
+<p>AI coding tools help developers build and deploy LLM applications quickly, but this speed comes with new security risks. Traditional static application security testing (SAST) tools that are pattern based weren’t designed to detect LLM-specific issues such as prompt injection sinks and exposed system prompts. These vulnerabilities often don’t become apparent until applications are already running in production, when remediation is more difficult and expensive.</p>
+<p>Datadog Code Security’s AI-native SAST offers coverage for the OWASP Top 10 for LLM Applications to help you detect LLM-specific risks earlier in the development cycle. Developers get actionable feedback directly in the same workflows where they review and ship code, helping them remediate vulnerabilities faster.</p>
+<p>In this post, we’ll explain:</p>
+<ul>
+ <li>What the OWASP Top 10 for LLM Applications covers</li>
+ <li>How AI-native SAST provides detection</li>
+</ul>
+<h2>What is the OWASP Top 10 for LLM Applications?</h2>
+<p>The OWASP Top 10 for LLM Applications is an industry-standard reference that describes vulnerability classes specific to applications that use LLMs. The list is the LLM equivalent of the traditional OWASP Top 10. It covers risks related to how user input reaches a model, how model outputs are handled downstream, whether LLM-driven actions are authorized, and more.</p>
+<p>The following table summarizes Datadog Code Security’s AI-native SAST coverage within each risk in the OWASP Top 10 for LLM Applications:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Risk</th>
+   <th><strong>Examples of vulnerabilities detected by AI-native SAST</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>LLM01:2026</strong> Prompt Injection</td>
+   <td>Injecting malicious input into an LLM prompt to manipulate the model into treating attacker-controlled data as instructions</td>
+  </tr>
+  <tr>
+   <td><strong>LLM02:2026</strong> Sensitive Information Disclosure</td>
+   <td>Exposing private data such as personally identifiable information (PII) or credentials through model outputs, training data, or API responses</td>
+  </tr>
+  <tr>
+   <td><strong>LLM03:2026</strong> Excessive Agency</td>
+   <td>Granting an LLM the ability to take consequential actions, such as deleting files or calling external APIs, without verifying that the user authorized those actions</td>
+  </tr>
+  <tr>
+   <td><strong>LLM04:2026</strong> Supply Chain</td>
+   <td>Introducing security risks through untrusted third-party models, plugins, or compromised training datasets</td>
+  </tr>
+  <tr>
+   <td><strong>LLM05:2026</strong> Data and Model Poisoning</td>
+   <td>Loading untrusted model files through unsanitized user input, enabling arbitrary code execution through malicious model files</td>
+  </tr>
+  <tr>
+   <td><strong>LLM06:2026</strong> Unbounded Consumption</td>
+   <td>Failing to limit model resource usage, allowing attackers to trigger excessive inference costs or degrade service availability</td>
+  </tr>
+  <tr>
+   <td><strong>LLM07:2026</strong> Misinformation</td>
+   <td>Returning LLM output without disclaimers or attribution, leaving downstream systems or users unable to verify the accuracy of model-generated content</td>
+  </tr>
+  <tr>
+   <td><strong>LLM08:2026</strong> Hidden Context Exposure</td>
+   <td>Exposing hidden context such as system prompts, tool schemas, RAG-retrieved content, and developer instructions through logs, error messages, or API responses, revealing information not intended for users</td>
+  </tr>
+  <tr>
+   <td><strong>LLM09:2026</strong> Vector and Embedding Weaknesses</td>
+   <td>Passing unsanitized user input directly into embedding queries or retrieval calls, allowing attackers to manipulate what content the model retrieves</td>
+  </tr>
+  <tr>
+   <td><strong>LLM10:2026</strong> Improper Output Handling</td>
+   <td>Using unvalidated model output directly in downstream systems, enabling injection attacks such as cross-site scripting and command injection</td>
+  </tr>
+ </tbody>
+</table>
+<h2>How Datadog’s AI-native SAST detection works</h2>
+<p>Traditional SAST rules require a trade-off. If you make the rules too broad, they produce noise. If you make them too narrow, they miss real vulnerabilities.</p>
+<p>Datadog Code Security’s AI-native SAST goes beyond rule matching by using LLMs to reason about code context and data flow. It then independently verifies candidate findings. Findings surface directly in the Datadog platform as pull request (PR) comments and through CI checks via PR Gates.</p>
+<p>AI-native SAST coverage for the OWASP Top 10 for LLM Applications is available across Python, Go, Java, C#, TypeScript, and JavaScript. The following examples show vulnerable application code and illustrate the detection approaches for three of these risks:</p>
+<ul>
+ <li>Taint analysis for prompt injection</li>
+ <li>Control flow analysis for excessive agency</li>
+ <li>Pattern matching for hidden context exposure</li>
+</ul>
+<h3>Taint analysis detection for prompt injection</h3>
+<p>Prompt injection (LLM01) occurs when external input is injected directly into an LLM prompt without sanitization, allowing the model to treat attacker-controlled data as an instruction rather than content. An attacker can use this method to bypass safety guardrails, exfiltrate data, or manipulate the model into taking actions that the model was never intended to take.</p>
+<p>AI-native SAST uses taint analysis to identify paths where untrusted input reaches an LLM call. Consider a Go handler that reads a query parameter and concatenates it directly into a prompt:</p>
+<pre><code>1func askHandler(w http.ResponseWriter, r *http.Request)\{2    // User-controlled input pulled directly from the request3    userQuery := r.URL.Query().Get("q")4
+5    // Tainted value concatenated into the prompt without sanitization6    response, err := llm.Complete(ctx, "Answer the following: " + userQuery)7    if err != nil \{8        http.Error(w, err.Error(), http.StatusInternalServerError)9        return10    }11    w.Write([]byte(response))12}</code></pre>
+<p>In this example, <code>userQuery</code> is an untrusted source, and the LLM call is the sink. AI-native SAST can trace the flow between them and flag any path where the value reaches the prompt without appropriate handling or validation. This analysis focuses the finding on the data flow that creates the risk instead of matching only the presence of an LLM call or user input.</p>
+<h3>Control flow analysis detection for excessive agency</h3>
+<p>Excessive agency (LLM03) occurs when an LLM takes consequential actions without having the appropriate authorization checks in place. Such actions include executing code, calling external APIs, and modifying data.</p>
+<p>Detecting excessive agency requires control flow analysis because AI-native SAST needs to determine what capabilities the LLM is granted before it can act. Consider this Python example, where an LLM-powered agent is initialized with tools that grant unrestricted access to the shell and file system:</p>
+<pre><code>1def create_agent(user: User) -&gt; Agent:2      tools = [3          ShellTool(),  # Can execute arbitrary commands4          FileTool(root="/"),  # Can access the entire file system5      ]6      return Agent(tools=tools)</code></pre>
+<p>In this example, <code>create_agent</code> grants the agent unrestricted shell and file system access regardless of who the user is or what they are authorized to do. AI-native SAST can identify that no capability restrictions or authorization checks are applied before the agent is returned with these tools.</p>
+<p>In a larger application, the same agent configuration might be reachable through multiple callers or conditional branches. Control flow analysis enables AI-native SAST to examine those paths and flag cases where at least one path initializes the agent without the required restrictions in place.</p>
+<h3>Pattern matching detection for hidden context exposure</h3>
+<p>Hidden context exposure (LLM08) is the revealing of sensitive information that is not intended for users. This information can include system prompts, tool schemas, RAG-retrieved content, and developer instructions that are written to logs or returned in API responses.</p>
+<p>AI-native SAST uses pattern matching to identify code that exposes system prompt contents. For example, the following Java method writes its system prompt to an application log:</p>
+<pre><code>1public String createResponse(String userMessage) \{2    String systemPrompt = "You are an internal assistant. Do not reveal...";3
+4    // System prompt logged before the LLM call, exposing sensitive instructions5    logger.info("Processing request with context: \{}", systemPrompt);6
+7    return llmClient.complete(systemPrompt, userMessage);8}</code></pre>
+<p>AI coding assistants can introduce this type of exposure by generating debug logging that includes system prompt contents. In this example, <code>systemPrompt</code> does not originate from untrusted input. The value is sensitive because it contains instructions that configure the LLM application’s behavior. AI-native SAST can identify that <code>systemPrompt</code> is passed directly to <code>logger.info()</code>, where its contents could be exposed.</p>
+<h2>Start detecting LLM vulnerabilities with AI-native SAST</h2>
+<p>AI-native SAST in Datadog Code Security helps developers identify LLM-specific vulnerabilities before they reach production. Techniques such as taint analysis, control flow analysis, and pattern matching identify risks that require context beyond conventional static rules.</p>

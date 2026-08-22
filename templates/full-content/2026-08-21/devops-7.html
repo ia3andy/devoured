@@ -1,0 +1,89 @@
+<h1>Agent Substrate</h1>
+<p>NOTE: This is not an officially supported Google product. This project is not eligible for the Google Open Source Software Vulnerability Rewards Program.</p>
+<h2>What is Agent Substrate?</h2>
+<p>Agent Substrate delivers a performant, high density runtime environment for large scale agent deployments. The agent substrate control plane provides full lifecycle management for agent sandboxes, delivering sub-second agent resume/suspend operations, and allows heavy multiplexing of agents onto the same computer infrastructure. It supports multiple sandbox technologies including microVMs and gVisor, enabling consistent lifecycle operations for all sandbox types.</p>
+<p>At its core, Agent Substrate maps a larger set of “actors” (applications such as agents) onto a smaller set of ready “workers”, relying on the fact that agent-like applications tend to be idle most of the time to achieve heavy multiplexing. It provides functionality to manage an actor’s lifecycle (e.g. create/destroy, suspend/resume), to assign actors to workers in real time, and to route incoming traffic to them.</p>
+<p>Agent Substrate is intended to be a low-opinion system. The workloads it manages don't have to be literal AI agents, but those are the best example of the kind of applications it is designed for. It is not an SDK for building agents, but rather a system for running them at scale.</p>
+<p>Agent Substrate leverages Kubernetes for the infrastructure provisioning and worker lifecycle management (Kubernetes Pods). It builds on top of Kubernetes features like Pods and Pod autoscaling, while Agent Substrate provides agent-specific scheduling and control to achieve lower latency. Using Kubernetes as the underlying system enables consistent infrastructure management across all workloads types that are required for end to end agentic deployments and allows holistic infrastructure optimizations for RL scenarios that span agentic, inference and training cycles.</p>
+<h2>Demo</h2>
+<p><em>Watch the Agent Substrate cluster multiplex ~250 stateful actors across just 8 physical pods.</em></p>
+<p>This demo highlights the core developer experience and "Agentic Infrastructure" capabilities of Substrate:</p>
+<ol>
+ <li><strong>Instant Actor Teleport:</strong> High-performance suspend and resume of actors onto any available worker in the pool with sub-second activation.</li>
+ <li><strong>State Persistence:</strong> Persistent working memory (volatile RAM) and filesystem state preserved perfectly across hibernation cycles via full-state snapshots.</li>
+ <li><strong>Agent Swarm Multiplexing:</strong> Demonstrates 30x+ oversubscription by "juggling" a large registry of stateful actors onto a small pool of shared physical pods.</li>
+</ol>
+<h2>Framework Agnostic &amp; Compatibility</h2>
+<p>Agent Substrate is designed to be <strong>framework and agent harness agnostic</strong>. Because it manages standard OCI containers at the kernel level (via gVisor), it can host agents built on any stack.</p>
+<ul>
+ <li><strong>Agent Development Kit (ADK):</strong> Native support for ADK-compatible actor identity and persistent working memory.</li>
+ <li><strong>LangChain:</strong> Ideal execution environment for long-running, stateful LangChain agents and sandboxed tool-calling.</li>
+ <li><strong>Claude Code &amp; CodeX:</strong> Support for high-density, stateful coding environments that preserve terminal and filesystem state across sessions.</li>
+ <li><strong>Model Context Protocol (MCP):</strong> Deploy secure, sandboxed MCP servers as Substrate Actors to provide durable tools for any LLM.</li>
+</ul>
+<h2>Ecosystem &amp; Examples</h2>
+<ul>
+ <li><strong>Agent Executor:</strong> A distributed agent runtime that demonstrates building a secure, hyper-scalable agent harness on Agent Substrate.</li>
+</ul>
+<h2>Status and compatibility</h2>
+<p>Agent Substrate is currently in early development. It is not ready for production use, and the APIs are almost guaranteed to change. We are not making any guarantees about backward compatibility at this stage, and everything in this project may be changed.</p>
+<h3>Supported Kubernetes Releases</h3>
+<p>Currently we aim to support the latest stable release of Kubernetes, and the previous minor release.</p>
+<h2>Community</h2>
+<p>For announcements, technical discussions, and community support, please join the ate-dev Google Group.</p>
+<p>We host a weekly community meeting every Thursday from 10:00am - 11:00am PST.</p>
+<h2>Developing</h2>
+<p>We welcome contributions of all kinds, but the project is VERY young. Our immediate focus is on building out the core system and demos, so we may not be able to review or merge contributions that don't align with those goals in the near term.</p>
+<h2>Quickstart (Development)</h2>
+<p>To quickly set up the complete environment:</p>
+<ol>
+ <li>Make sure you have Go, kubectl, and docker installed and configured on your dev machine. We will automatically manage other dependencies via Go, including kind.</li>
+ <li>Run the following steps:</li>
+</ol>
+<pre><code># create cluster and local registry (IPv4; IP_FAMILY=dual|ipv6 overrides)
+hack/create-kind-cluster.sh
+
+# install ate, valkey, rustfs
+hack/install-ate-kind.sh --deploy-ate-system
+
+# install counter demo
+hack/install-ate-kind.sh --deploy-demo-counter
+
+# install kubectl-ate
+go install ./cmd/kubectl-ate
+
+# create an atespace (required before creating actors), then a counter actor in it
+kubectl ate create atespace demo
+kubectl ate create actor my-counter-1 -a demo --template=ate-demo-counter/counter
+
+# port-forward the network router to bind to local port `8000`
+kubectl port-forward -n ate-system svc/atenet-router 8000:80</code></pre>
+<ol>
+ <li>In a <strong>separate terminal</strong>, send an HTTP request to increment the counter:</li>
+</ol>
+<pre><code>curl -X POST -H "Host: my-counter-1.demo.actors.resources.substrate.ate.dev" -i http://localhost:8000/</code></pre>
+<h2>Demos</h2>
+<p>We provide several sample applications demonstrating Agent Substrate's capabilities:</p>
+<ol>
+ <li><strong>Counter Demo</strong>: A stateful Go HTTP server demonstrating state preservation across suspends/resumes, and dynamic CRD routing.</li>
+ <li><strong>Sandbox Demo (Antigravity)</strong>: A secure, sandboxed execution environment (running Alpine Linux) that allows arbitrary shell execution while preserving filesystem state across sessions.</li>
+ <li><strong>Claude Code Multiplex</strong>: Demonstrates oversubscribing physical hardware by multiplexing multiple Claude Code agents onto a limited pool of workers.</li>
+ <li><strong>Multi-Template</strong>: Two ActorTemplates running different binaries share one WorkerPool, across three namespaces.</li>
+ <li><strong>Request Parking</strong>: An oversubscribed pool where the router holds inbound requests until a worker frees up, instead of returning 503.</li>
+ <li><strong>Autoscaled WorkerPool</strong>: Scales a WorkerPool on its assigned-worker count with an HPA fed by prometheus-adapter.</li>
+</ol>
+<h2>Tour</h2>
+<h3>Commands</h3>
+<ul>
+ <li><code>cmd/ateapi</code>: The core control plane API server exposing gRPC endpoints to manage actor and worker lifecycles.</li>
+ <li><code>cmd/atelet</code>: A node-level DaemonSet that supervises physical worker pods, coordinates snapshotting, and manages state transfers.</li>
+ <li><code>cmd/atecontroller</code>: A Kubernetes controller that reconciles WorkerPool and ActorTemplate custom resources.</li>
+ <li><code>cmd/atenet</code>: A combined networking controller providing DNS, Envoy routing, and proxy sidecars.</li>
+ <li><code>cmd/ateom-gvisor</code>: An interior-pod helper running inside sandboxed worker pods to execute <code>runsc</code> checkpoint and restore commands.</li>
+ <li><code>cmd/ateom-microvm</code>: The micro-VM peer of <code>ateom-gvisor</code>, running actors as cloud-hypervisor VMs.</li>
+ <li><code>cmd/podcertcontroller</code>: A "polyfill" that provides Pod Certificate signers that will eventually ship in upstream Kubernetes (with different names).</li>
+ <li><code>cmd/kubectl-ate</code>: A CLI tool for managing Agent Substrate resources.</li>
+ <li><code>cmd/benchmarking</code>: Synthetic workloads used by the load tests, including <code>glutton</code>, which consumes RAM, disk, and file descriptors on demand.</li>
+ <li><code>tools/setup-gcp</code>: A provisioning utility to set up the necessary GCP infrastructure resources (GKE, GCS, IAM).</li>
+ <li><code>demos/</code>: Sample applications demonstrating Agent Substrate capabilities.</li>
+</ul>

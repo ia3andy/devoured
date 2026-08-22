@@ -1,0 +1,48 @@
+<p>The Rust team is happy to announce a new version of Rust, 1.98.0. Rust is a programming language empowering everyone to build reliable and efficient software.</p>
+<p>If you have a previous version of Rust installed via <code>rustup</code>, you can get 1.98.0 with:</p>
+<pre><code>$ rustup update stable</code></pre>
+<p>If you don't have it already, you can get <a href="https://www.rust-lang.org/install.html"><code>rustup</code></a> from the appropriate page on our website, and check out the <a href="https://doc.rust-lang.org/stable/releases.html#version-1980-2026-08-20">detailed release notes for 1.98.0</a>.</p>
+<p>If you'd like to help us out by testing future releases, you might consider updating locally to use the beta channel (<code>rustup default beta</code>) or the nightly channel (<code>rustup default nightly</code>). Please <a href="https://github.com/rust-lang/rust/issues/new/choose">report</a> any bugs you might come across!</p>
+<h2>What's in 1.98.0 stable</h2>
+<h3>Algebraic floating-point methods</h3>
+<p>The floating-point types <code>f32</code> and <code>f64</code> now have "algebraic" methods for addition, subtraction, multiplication, division, and remainder. These allow optimizations on these operations using the algebraic properties of real numbers, even though these properties do not hold with the limitations of floating-point representations. The exact set of optimizations is not specified, but may be similar to the kind of optimization you would see with the <code>-ffast-math</code> option in other languages.</p>
+<p>For example, floating-point addition is <a href="https://en.wikipedia.org/wiki/Associative_property#Nonassociativity_of_floating-point_calculation">not associative</a>, so a sum like <code>a + b + c + d</code> must be evaluated in the left-associative order in which it is parsed, like <code>((a + b) + c) + d</code>. If you write the same sum as a chain of <code>algebraic_add</code> calls, then the compiler is free to reorder it, perhaps like <code>(a + b) + (c + d)</code> to evaluate the partial sums simultaneously. Broader loop-vectorization is often enabled by using these algebraic methods as well.</p>
+<p>These methods are non-deterministic, since the compiler is free to choose different optimizations, but they never cause undefined behavior. See the <a href="https://doc.rust-lang.org/stable/core/primitive.f32.html#algebraic-operators">library documentation</a> and the original <a href="https://github.com/rust-lang/libs-team/issues/532">API change proposal</a> for more details.</p>
+<h3>Buffered integer formatting</h3>
+<p>All of the primitive integer types now have a <a href="https://doc.rust-lang.org/stable/core/primitive.usize.html#method.format_into"><code>format_into</code></a> method that takes a <code>&amp;mut NumBuffer&lt;Self&gt;</code> parameter, which is a buffer that is large enough to hold the decimal format of any value of that type. The buffer itself is opaque, but the method returns the formatted <code>&amp;str</code> with a lifetime borrowed from that buffer.</p>
+<p>This method also bypasses much of the dynamic dispatch that you would get with buffered <code>write!</code> formatting, which can be a boon to performance. The <a href="https://github.com/dtolnay/itoa-benchmark"><code>itoa-benchmark</code></a> repo now shows that <code>format_into</code> performs similarly to <code>itoa</code> itself, so this could serve as a standard replacement for that dependency and others like it.</p>
+<h3>Fix interaction between <code>ManuallyDrop</code> and <code>Box</code></h3>
+<p>Prior to Rust 1.96.0, there was a bug in the Rust compiler, which made the following code undefined behavior:</p>
+<pre><code>let mut x = ManuallyDrop::new(Box::new(1));
+unsafe \{ ManuallyDrop::drop(&amp;mut x) };
+let x = x; // UB!</code></pre>
+<p>This is because the compiler considers it undefined behavior to move a <code>Box</code> that has been dropped (deallocated), and <code>ManuallyDrop</code> used to propagate that, such that moving <code>ManuallyDrop&lt;Box&lt;_&gt;&gt;</code> where the box has been dropped would also be considered UB.</p>
+<p>In Rust 1.96.0 we fixed this, so this code was no longer UB. In this release we have updated the <code>ManuallyDrop</code> documentation, providing a stable guarantee that this code will continue to not be UB in the future. See <a href="https://doc.rust-lang.org/stable/std/mem/struct.ManuallyDrop.html#pre-196-interaction-with-box"><code>ManuallyDrop</code> docs</a> and the related <a href="https://rust-lang.github.io/rfcs/3336-maybe-dangling.html">RFC 3336</a> for more information.</p>
+<h3>Stabilized APIs</h3>
+<ul>
+ <li><a href="https://doc.rust-lang.org/stable/std/primitive.str.html#method.substr_range"><code>str::substr_range</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/std/primitive.slice.html#method.subslice_range"><code>[T]::subslice_range</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/core/fmt/struct.NumBuffer.html"><code>core::fmt::NumBuffer</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/core/primitive.usize.html#method.format_into"><code>&lt;\{integer}&gt;::format_into</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/std/process/struct.CommandArgs.html#impl-Send-for-CommandArgs%3C'a%3E"><code>Send/Sync for std::process::CommandArgs</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/core/primitive.f32.html#method.algebraic_add"><code>\{fN}::algebraic_add</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/core/primitive.f32.html#method.algebraic_sub"><code>\{fN}::algebraic_sub</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/core/primitive.f32.html#method.algebraic_mul"><code>\{fN}::algebraic_mul</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/core/primitive.f32.html#method.algebraic_div"><code>\{fN}::algebraic_div</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/core/primitive.f32.html#method.algebraic_rem"><code>\{fN}::algebraic_rem</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/core/num/struct.NonZero.html#method.from_str_radix-4"><code>NonZero&lt;\{integer}&gt;::from_str_radix</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/std/string/struct.String.html#method.from_utf16le"><code>String::from_utf16le</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/std/string/struct.String.html#method.from_utf16le_lossy"><code>String::from_utf16le_lossy</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/std/string/struct.String.html#method.from_utf16be"><code>String::from_utf16be</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/std/string/struct.String.html#method.from_utf16be_lossy"><code>String::from_utf16be_lossy</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/core/primitive.slice.html#method.strip_circumfix"><code>[T]::strip_circumfix</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/core/primitive.str.html#method.strip_circumfix"><code>str::strip_circumfix</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/core/sync/atomic/struct.Atomic.html#method.from_mut"><code>Atomic&lt;T&gt;::from_mut</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/core/sync/atomic/struct.Atomic.html#method.get_mut_slice"><code>Atomic&lt;T&gt;::get_mut_slice</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/core/sync/atomic/struct.Atomic.html#method.from_mut_slice"><code>Atomic&lt;T&gt;::from_mut_slice</code></a></li>
+ <li><a href="https://doc.rust-lang.org/stable/std/range/legacy/index.html"><code>std::range::legacy</code></a></li>
+</ul>
+<h3>Other changes</h3>
+<p>Check out everything that changed in <a href="https://github.com/rust-lang/rust/releases/tag/1.98.0">Rust</a>, <a href="https://doc.rust-lang.org/nightly/cargo/CHANGELOG.html#cargo-198-2026-08-20">Cargo</a>, and <a href="https://github.com/rust-lang/rust-clippy/blob/master/CHANGELOG.md#rust-198">Clippy</a>.</p>
+<h2>Contributors to 1.98.0</h2>
+<p>Many people came together to create Rust 1.98.0. We couldn't have done it without all of you. <a href="https://thanks.rust-lang.org/rust/1.98.0/">Thanks!</a></p>
