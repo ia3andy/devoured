@@ -1,0 +1,91 @@
+<h1>There continue to be reasons for software to be slow</h1>
+<p>Dan Luu recently published a blog post which talks about how various kinds of things are cheaper to do nowadays by virtue of having access to LLMs such as building specialized solutions (e.g. JITs, indexes for search-like problems) as well as workload-specific optimizations.</p>
+<blockquote>
+ <p>We’re not quite at the point where we want to write everything in assembly, but some variant of what Nolan Lawson said about testing, you can choose how many bugs you want now, which I less eloquently noted here, is becoming more true for performance.</p>
+</blockquote>
+<p>I believe that this statement as written is well-intentioned but incorrect, in much of the same way in which the statement made by Lawson is well-intentioned but incorrect, and in the same way that formal methods advocates arguing that an increasingly larger fraction of software will be formally verified are well-intentioned but incorrect.</p>
+<p>In essence, the argument that’s been offered in all of these places goes something like:</p>
+<blockquote>
+ <ol>
+  <li>Desirable property X used to cost $A over the budget $B</li>
+  <li>Pre-LLMs, the reason people didn’t aim for X was it was over budget</li>
+  <li>Post-LLMs, getting X costs $A/N &lt; $B because N &gt;&gt; 1.</li>
+ </ol>
+ <p>If these premises hold, then people will now spend $A/N for X.</p>
+</blockquote>
+<p>On the face of it, if you’ve personally found LLMs useful at improving property X, the argument seems sensible. But it only works in practice if the premises hold.</p>
+<p>I agree that there are situations where these premises hold. Will certain highly experienced people with deep domain expertise (like the ones cited in Luu’s post) do a bunch more optimizations, or work on teams which ship many more optimizations than before? Yeah, I think that’s definitely going to happen.</p>
+<p>However, based on what I’ve seen so far, the situations in which the premises hold are far outweighed by the situations in which they do not hold.</p>
+<p>In this post, I’m going to give examples of situations in which I’ve seen these premises not holding.</p>
+<h2>The tolerance for ‘not X’ goes up</h2>
+<p>One of the differences with the advent of LLMs is that the work you would do synchronously now potentially needs to be done asynchronously, due to latency of agentic loop iterations.</p>
+<p>As a concrete example of this, I’ve been working on improving git performance for our monorepo at work recently. If you took the performance numbers we see today on a good day, and you gave them to me from 2022, and told me that people find the same numbers acceptable, I would likely have given you a very skeptical or confused look.</p>
+<p>As another example, the latency for LLM-based auto-complete used to be much higher than standard IDE auto-complete when it was introduced. Around that time, if you saw videos of developers live-coding, you’d notice them having small pauses waiting for the LLM suggestions. But historically, one of the reasons auto-completion was purportedly prized was the “instant” feedback!</p>
+<p>This point also applies to things like compilation speed, link times, time to run tests etc. In general, people’s tolerances for synchronous work and asynchronous work are quite different.</p>
+<p>If you’re a performance-minded person, it can be hard to accept that people are actually fine with putting up with worse performance in software, especially if you already believe that the performance of said software is “too slow.” It can be doubly-frustrating if the same people are willing to put up with worse performance <em>specifically in exchange for more features</em>, especially if you already believe that the said software is “too bloated.”</p>
+<h2>The budget was zero from the start</h2>
+<p>Outside of well-paying tech companies that treat developers well, granting them a fair amount of autonomy, it’s common in many companies for the software function to be perceived as a “cost center” instead of a “profit center”.</p>
+<p>There may not even be a CI process – it may be entirely reliant on manual QA. Getting budget approvals might take ages.</p>
+<p>And yet, the business might be doing well! For example, the company might have a government-granted monopoly. Or it might have some other form of power.</p>
+<p>If the environment is entirely focused on keeping costs low, it likely requires a fair bit of effort to convince a manager of the return on investment (RoI) of working on performance. It’s plausible that this effort is better spent elsewhere.</p>
+<h2>The budget got reduced post-LLMs</h2>
+<p>Say the budget started out at non-zero. For example, you might’ve already been spending about 1 week on performance every quarter.</p>
+<p>Even so, there’s an implicit assumption that the budget $B for obtaining the property X is unchanged post-LLMs. This assumption often fails to hold.</p>
+<p>If you browse the r/experienceddevs subreddit, it’s not uncommon to see engineers talking about how, over the past year, timelines for projects are getting squeezed tighter, because management expects things to take much less time due to LLMs.</p>
+<h2>The cost reduction factor N is over-estimated</h2>
+<p>It is one thing to implement an optimization. It is another thing to ship the optimization in heavily-used production software. It is yet another thing to set up a ratchet to prevent the code from regressing in the future. It is yet another thing to make sure the ratchet is reliable (low/no false negatives/positives), efficient (runs sufficiently quickly) and stable (doesn’t need constant upkeep).</p>
+<p>In my previous post on code review, I gave an example of a situation where a colleague tried to reduce latency for an operation by moving it to a background process, and increased the risk of a lock-acquisition failure.</p>
+<p>More generally, it’s easy for people unfamiliar with a system to jump in with “performance optimizations” that actually compromise an aspect of the design that is critical to correctness.</p>
+<p>As a more prominent example, Jarred Sumner (creator of Bun) supposedly had a fork of the Zig compiler with parallelized semantic analysis and codegen.</p>
+<p>One of the key contributors to the Zig compiler, Matthew Lugg, articulated why this change was not upstreamable:</p>
+<blockquote>
+ <p>Parallel semantic analysis has been an explicitly planned feature of the Zig compiler for a long time, and it has heavily influenced the design of the self-hosted Zig compiler. However, implementing this feature correctly has implications not only for the compiler implementation, but for the Zig language itself! Therefore, to implement this feature without an avalanche of bugs and inconsistencies, we need to make language changes.</p>
+ <p>(..) The rewritten type resolution semantics were designed to avoid these issues, but Bun’s Zig fork does not incorporate the changes (and has not otherwise solved the design problems), which means their parallelized semantic analysis implementation will exhibit non-deterministic behavior. That’s pretty much a non-starter for most serious developers: you don’t want your compilation to randomly fail with a nonsense error 30% of the time.</p>
+</blockquote>
+<p>Another way to look at this point is that the cost of writing the code is only one part of the picture. It may not be the dominant cost.</p>
+<p>As two high-level examples:</p>
+<ul>
+ <li>If there is already a large amount of data stored in a format that’s not amenable to optimized processing, the cost of optimizing performance needs to account for the cost of reorganizing the data into the right form, while maintaining the reliability, performance and correctness of existing read and write paths. It also needs to account for the cost of migrating the existing code. Worse, you might not even know all the read and write paths, in which case the cost of figuring those out needs to be taken into account.</li>
+ <li>If you’re paying for compute over the data, experimenting with different strategies to optimize the computation can itself be expensive. For example, if you’re hitting a flakiness bug only in 1/1000 CI runs, and you can’t reproduce it out of CI, then the cost of CI time to reproduce the bug with sufficient detail can easily dwarf the cost of writing the fix.</li>
+</ul>
+<p>Relatedly, one other challenge that comes up is that it’s more difficult to estimate the long tail of costs associated with maintenance: lost code comprehension lost due to the complexity of optimizations, the need to hire more experienced people who can maintain the system, additional correctness checks needed, and so on.</p>
+<h2>Budget was never the reason for not aiming for X</h2>
+<p>Instead of cost, I think it’s more useful to think about what work gets done in terms of priority.</p>
+<p>For simplicity, let’s say we’re talking about sprint-based planning. Say, on average, pre-LLMs, each person on the team tackled 4 tickets per sprint. Suppose that performance work usually ended up being #6 on the list for someone. At 4 tickets per sprint, this means the performance work would just keep staying on the sprint planning board across several sprints as an aspirational goal.</p>
+<p>Now, post-LLMs, say each person can tackle 12 items. Is that list going to stay the same, with just more items pulled in from the backlog so that everyone has enough work?</p>
+<p>I suspect the answer here for most people is going to be No. If you were not able to successfully advocate for performance work as a higher priority pre-LLMs, it’s unclear as to why you’d be able to do it post-LLMs. You can just do it on the side for sure (aka “asking for forgiveness instead of permission”), but you could also do that pre-LLMs.</p>
+<h2>Re-visiting Luu’s examples</h2>
+<p>From Luu’s post, there are two examples I’d like to discuss, because the code is available, and they represent complex tasks:</p>
+<ol>
+ <li>pgrust: A rewrite of Postgres in Rust.</li>
+ <li>FRE: A regex engine built by an agent loop running over a month.</li>
+</ol>
+<hr>
+<p>For pgrust, the headline here is excellent performance on ClickBench, supposedly due to the use of LLM-driven optimization. The other point that’s brought up is that supposedly people don’t write JITs (in the context of databases) because that’s too difficult, but LLMs make that accessible.</p>
+<p>Based on a cursory view, it’s unclear as to how much of this excellent performance is down to performance-hacking that overfits the benchmark vs an excellent design that generalizes. For example, if you look at the cost model, you’ll see that it explicitly references ClickBench all over the place.</p>
+<p>It’s possible that I’m misreading things, but this seems like a clear-cut case of overfitting to the benchmark.</p>
+<p>On the point about other people not writing JITs, there are at least a few database engines which implement JITs.</p>
+<ul>
+ <li>Umbra (HTAP), and its commercialized fork CedarDB: Umbra currently sits at the top of ClickBench, with CedarDB not far behind.</li>
+ <li>SingleStore (HTAP): Their SIGMOD 22 paper explicitly cites work on compiling queries for HyPer.</li>
+ <li>Amazon Redshift (OLAP): Compiles queries to C++.</li>
+ <li>Apache Impala (OLAP): Generates LLVM IR.</li>
+</ul>
+<hr>
+<p>For FRE, the README states:</p>
+<blockquote>
+ <p>FRE is an LLM-generated regex engine made with minimal human intervention. It appears to be overfitted to BurntSushi’s rebar benchmarks and doesn’t have great general performance, although there are some uses cases where it’s actually pretty fast.</p>
+</blockquote>
+<p>I asked an LLM to estimate the implementation SLOC for rust-lang/regex and danluu/fre, and it came back with 35K for rust-lang/regex and 670K for danluu/fre.</p>
+<p>Luu makes the following notes about preferences:</p>
+<blockquote>
+ <p>There’s no particular reason to use a “software factory” regex engine that doesn’t beat a well-tested regex engine on holdout benchmarks, but one notable thing about FRE was that the native AOT compiled version did quite well at longer searches. We noted that, it stands to reason that one could run the native code compiler in another thread while ripgrep was running its normal matcher and then cut over to the native code when it finished compiling and generally get better performance.</p>
+</blockquote>
+<p>It’s unclear if such an approach makes sense from the POV of software developed in a team context, for general use, which has reliability requirements, and responsibility is assigned to maintainers when things go wrong.</p>
+<h2>Closing thoughts</h2>
+<p>To be clear, I don’t <em>want</em> slower (or buggier) software.</p>
+<p>Historically, there is a clear trend of performance tools getting better over time. From browser DevTools to eBPF, at different layers, there are increasingly more tools for debugging performance issues. Hardware also keeps getting faster.</p>
+<p>At the same time, I think there’s general agreement that the average piece of software is getting slower and more resource-hungry, and that webpages are getting heavier, etc.</p>
+<p>I think some part of it is certainly real. For example, if you’ve used coding harnesses shipped by any of the major model providers, you’ve probably noticed how poor they are in terms of performance, resource utilization and overall bugginess.</p>
+<p>At the same time, I’m willing to consider that some part of it is imagined. For example, most people, across age groups, think that morality has declined, but it hasn’t.</p>
+<p>So yeah, maybe this is useful to keep in mind when you next run into an example of slow software, because whether you like it or not, I think you’re going to hit it regardless.</p>

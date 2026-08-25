@@ -1,0 +1,177 @@
+<h2>AeroSpork — an i3-like tiling window manager for macOS</h2>
+<p>AeroSpork is an i3-style tiling window manager for macOS. Windows are leaves of a layout tree, workspaces are emulated rather than mapped onto native Spaces, and nothing requires disabling System Integrity Protection. It is configured in TOML, driven from a CLI, and ships a settings GUI.</p>
+<p>It is a fork of AeroSpace by Nikita Bobko, which is where the tree model, the workspace emulation and most of the command surface come from. Both are MIT licensed.</p>
+<h2>Why I forked it</h2>
+<p>I ran AeroSpace daily on four monitors behind a DisplayLink dock, and three things wore me down. It felt sluggish. Long sessions drifted, so state that was correct at login was not correct by the evening. And the DisplayLink panels were a coin flip: workspaces came back on the wrong screens after every undock, because monitors are matched by name, regex or index, and none of those survive a redock. Two identical displays are indistinguishable to a name match.</p>
+<p>I sent the monitor work upstream as PR #1526 in July 2025. It was closed the next day without review. That is the maintainer's call on their own project, and upstream is clear that it keeps a deliberately small surface, so I kept the work here instead.</p>
+<p>What that turned into, in this codebase:</p>
+<ul>
+ <li><strong>The DisplayLink problem</strong> is <code>model/MonitorFingerprint.swift</code>. A display is matched on the per-display UUID first, then EDID vendor/model/serial from CoreGraphics, then name, then size. DisplayLink panels report no EDID at all, so the UUID is the only key that separates two of them. Screen reconfiguration is also debounced, because a dock connects in several stages and fires the change notification more than once.</li>
+ <li><strong>The sluggishness</strong> is two changes rather than a rewrite. Bursts of accessibility events coalesce into one layout pass on a 50ms debounce (<code>util/RefreshDebouncer.swift</code>), and <code>MacApp.setFrame</code> skips the AX write when a window already sits at its target frame, which matters over a DisplayLink link where every write repaints a framebuffer. I have not published speedup numbers; <code>dev-docs/performance.md</code> says which measurements exist and why the benchmark could not settle the rest.</li>
+ <li><strong>The drift</strong> is mostly workspace lifecycle. Workspaces are created on demand and released when they empty, instead of being materialized for every name a keybinding mentions.</li>
+</ul>
+<h2>Tech stack</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Concern</th>
+   <th>Implementation</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Language</td>
+   <td>Swift, 6.0 language mode (<code>Package.swift</code>); <code>.swift-version</code> pins toolchain 6.4</td>
+  </tr>
+  <tr>
+   <td>Minimum OS</td>
+   <td>macOS 13.0 (Ventura)</td>
+  </tr>
+  <tr>
+   <td>UI</td>
+   <td>SwiftUI/AppKit: a <code>MenuBarExtra</code> and a native pane-toolbar <code>Settings</code> scene</td>
+  </tr>
+  <tr>
+   <td>Third-party dependencies</td>
+   <td>TOMLKit (config parsing) and Sparkle (in-app updates)</td>
+  </tr>
+  <tr>
+   <td>CLI/app IPC</td>
+   <td>POSIX <code>AF_UNIX</code> stream socket, length-prefixed framing (<code>Sources/Common/util/UnixSocket.swift</code>)</td>
+  </tr>
+  <tr>
+   <td>Global hotkeys</td>
+   <td>Carbon <code>RegisterEventHotKey</code> (<code>config/HotkeyBinding.swift</code>)</td>
+  </tr>
+  <tr>
+   <td>Volume control</td>
+   <td>CoreAudio (<code>util/SystemVolume.swift</code>)</td>
+  </tr>
+  <tr>
+   <td>Display identity</td>
+   <td>CoreGraphics <code>CGDisplayCreateUUIDFromDisplayID</code>, <code>CGDisplayVendorNumber</code>, <code>CGDisplayModelNumber</code>, <code>CGDisplaySerialNumber</code></td>
+  </tr>
+  <tr>
+   <td>Window IDs</td>
+   <td>C shim over the private <code>_AXUIElementGetWindow</code> (<code>Sources/PrivateApi/</code>)</td>
+  </tr>
+  <tr>
+   <td>Build</td>
+   <td>SwiftPM for the CLI and debug builds; XcodeGen plus <code>xcodebuild</code> for the <code>.app</code>, since SwiftPM cannot produce a bundle</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Why these choices</h3>
+<p>If you are weighing this against upstream, the reasoning matters more than the table.</p>
+<p><strong>Two dependencies instead of four, and each removal was a wrapper going away.</strong> BlueSocket was wrapping a local Unix socket, so it became <code>AF_UNIX</code> directly. HotKey was wrapping Carbon's <code>RegisterEventHotKey</code>, which is one call plus the bookkeeping to unregister it. ISSoundAdditions was wrapping CoreAudio. swift-collections supplied one ordered dictionary. The ANTLR-generated shell grammar parsed command strings that <code>/bin/bash -c</code> already parses. Every one of those is a thing that can break on an OS update, or need a version bump before the app can be rebuilt, in exchange for code the platform already provides. Sparkle is the one addition, and only because there is no App Store update path to inherit.</p>
+<p><strong>Display identity comes from CoreGraphics, not IOKit.</strong> Upstream reads EDID through <code>IOServiceMatching("IODisplayConnect")</code>. That IOKit class does not exist on Apple Silicon, so the iterator yields nothing and vendor/model/serial come back <code>nil</code> for every display. CoreGraphics returns the same values and adds the per-display UUID, which is the only field that survives a DisplayLink dock.</p>
+<p><strong>The private <code>_AXUIElementGetWindow</code> stays, and it costs something.</strong> It is the only way to get a window id that is stable across refreshes, and window identity is what the whole tree is keyed on. The price is that the Mac App Store is permanently out: private symbols fail review, and the Accessibility APIs this app is built on do not work in a sandbox anyway. Hence Developer ID signing, notarization, and Sparkle rather than TestFlight.</p>
+<p><strong>Workspace placement survives a restart of AeroSpork.</strong> Workspaces are emulated, so nothing outside the process knows a window belongs to one; at a cold start a window is bound by where it physically sits, and the workspace chosen for each monitor is the first key-bound name in sort order — which a named workspace like <code>A</code> can never be. Placement is now remembered, keyed on the window id the macOS window server issues. That id is stable for exactly as long as that server runs, so an update, a crash or a Quit keeps it and a logout, a reboot or an application relaunching does not. Where the id is gone there is no honest way to recognise a window — every terminal window reports the same accessibility identifier — so it falls back to placing by location rather than guessing, and <code>on-window-detected</code> remains the way to state intent.</p>
+<p><strong>The Xcode project is generated, not committed.</strong> <code>project.yml</code> plus XcodeGen produces it, because SwiftPM cannot build an app bundle but a checked-in <code>.pbxproj</code> is a merge conflict waiting to happen. Debug builds skip Xcode entirely.</p>
+<p><strong>The config writer is line-based on purpose.</strong> Re-serializing the whole file would be far simpler, and would destroy every comment plus anything the GUI cannot model, such as per-monitor gap arrays. Instead it rewrites only the keys you changed, preserves what the panes cannot model (a rich monitor fingerprint, a fallback list) field for field on every save, and refuses the few shapes it cannot rewrite safely, pointing you at the Raw TOML pane. That is what makes a GUI safe to put on top of a dotfile.</p>
+<pre><code>Sources/
+├── aerosporkApp/    # app entry point (@main)
+├── AppBundle/       # the window manager: tree/, layout/, command/, config/, model/, mouse/, ui/
+├── Cli/             # command-line client
+├── Common/          # shared with the CLI, incl. the socket implementation
+└── PrivateApi/      # C shim for _AXUIElementGetWindow
+</code></pre>
+<h2>Differences from AeroSpace</h2>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>AeroSpace</th>
+   <th>AeroSpork</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Monitor matching by hardware UUID / EDID</td>
+   <td>❌ name, regex or number only</td>
+   <td>✅ also pins DisplayLink panels</td>
+  </tr>
+  <tr>
+   <td>Settings GUI</td>
+   <td>❌ "will never provide a GUI for configuration"</td>
+   <td>✅ 7 native panes</td>
+  </tr>
+  <tr>
+   <td>Notarized builds</td>
+   <td>❌</td>
+   <td>✅ signed, notarized, stapled</td>
+  </tr>
+  <tr>
+   <td>Third-party dependencies</td>
+   <td>4</td>
+   <td><strong>2</strong></td>
+  </tr>
+  <tr>
+   <td>Config schema</td>
+   <td>one syntax</td>
+   <td>v2 shorthand, older syntax still parses</td>
+  </tr>
+  <tr>
+   <td>Windows keep their workspace across a restart</td>
+   <td>❌</td>
+   <td>✅ also their monitor</td>
+  </tr>
+  <tr>
+   <td>Command surface</td>
+   <td><strong>larger</strong></td>
+   <td>smaller</td>
+  </tr>
+  <tr>
+   <td>Maturity</td>
+   <td><strong>public beta, larger community</strong></td>
+   <td>younger fork</td>
+  </tr>
+ </tbody>
+</table>
+<p><strong>Config schema.</strong> <code>mod</code> plus <code>workspaces</code> generates the usual i3 keymap, and <code>[keys]</code>, <code>[monitors]</code> and <code>[on-window]</code> replace the longer upstream spellings. An existing config is migrated once on first launch, and only when the result is proven to parse to the same effective configuration; otherwise the file is left alone. The original is kept beside it as <code>*.pre-v2</code>.</p>
+<p><strong>Settings GUI.</strong> Seven native preference panes in a compact macOS toolbar, over a comment-preserving writer that only rewrites the keys you changed. Opening Settings and changing nothing leaves the file byte-identical, and editing one section never rewrites another. The selected pane is remembered. Raw TOML validates against the same parser the app uses at startup and adds native Find, line numbers, restrained syntax highlighting, section navigation, cursor position, and clickable source diagnostics, so no config key is unreachable from the GUI.</p>
+<h3>Coming from AeroSpace</h3>
+<p>A fork, not a drop-in replacement. Configs and scripts need small edits.</p>
+<ul>
+ <li><code>AEROSPACE_*</code> environment variables are gone and not aliased. A script reading <code>$AEROSPACE_FOCUSED_WORKSPACE</code> gets an empty string with no error. The names are <code>AEROSPORK_FOCUSED_WORKSPACE</code>, <code>AEROSPORK_PREV_WORKSPACE</code>, <code>AEROSPORK_WINDOW_ID</code> and <code>AEROSPORK_WORKSPACE</code>.</li>
+ <li><code>if.during-aerospace-startup</code> is spelled <code>if.during-aerospork-startup</code>. Unknown keys are fatal, so the old spelling fails at startup and names the line.</li>
+ <li>Feature parity is a non-goal. The fork carries less surface area than upstream.</li>
+</ul>
+<h2>Installation</h2>
+<p>Download the notarized universal (arm64 + x86_64) build from the releases page, move <code>AeroSpork.app</code> to <code>/Applications</code>, and grant Accessibility permission when prompted. A Homebrew cask is published at <code>wbsmolen/tap</code>:</p>
+<pre>brew install --cask wbsmolen/tap/aerospork</pre>
+<p>Installed copies check for updates themselves through Sparkle, against a signed appcast served from <code>aerospork.app/appcast.xml</code>. Updates are verified against an EdDSA public key in the app's Info.plist, so a build refuses anything it cannot verify. Automatic checking is off until you allow it; <strong>Check for Updates…</strong> in the menu bar checks on demand. There is no App Store update path to inherit, because the Accessibility APIs this app is built on do not work in a sandbox.</p>
+<p>Because update checks are the only network request AeroSpork can make, and the Accessibility permission it needs is a broad one, aerospork.app/privacy.html sets out exactly what is stored, what is sent, and what is not: no analytics, no telemetry, and no system profile.</p>
+<h2>Configuration</h2>
+<p>AeroSpork reads whichever of these exists, and reports an error at startup if both do: <code>~/.aerospork.toml</code> or <code>$\{XDG_CONFIG_HOME}/aerospork/aerospork.toml</code> (<code>XDG_CONFIG_HOME</code> defaults to <code>~/.config</code>). With neither, it falls back to a complete default bundled in the app. Saved changes hot-reload, so you never need to run <code>reload-config</code> by hand.</p>
+<pre>mod = "alt"                 # generates the i3 keymap: alt-h/j/k/l, alt-shift-h/j/k/l, ...
+workspaces = "1-9"          # alt-1..9 to switch, alt-shift-1..9 to move a window
+
+[gaps]
+inner = 8
+outer = 8
+
+[keys]                      # anything here overrides a generated binding
+alt-enter = "exec-and-forget open -na Ghostty"
+
+[monitors]                  # pin a workspace to a screen
+1 = "main"
+2 = \{ uuid = "AAAAAAAA-0000-4000-8000-000000000001" }
+
+[on-window]                 # where a window goes when it appears
+"com.apple.mail" = "move-node-to-workspace 3"</pre>
+<h2>CLI</h2>
+<p>36 subcommands, with man pages and bash/fish/zsh completion.</p>
+<pre>aerospork focus left                        # focus the window to the left
+aerospork workspace 1                       # switch workspace
+aerospork move-node-to-workspace 2          # move the focused window
+aerospork layout tiles horizontal vertical  # cycle layout
+aerospork list-monitors                     # connected displays and how they are identified
+aerospork --help</pre>
+<h2>Development</h2>
+<pre>./build-debug.sh     # SwiftPM debug build into .debug/ (uses ~/.aerospork-debug.toml)
+./build-release.sh   # signed release; needs a Developer ID Application certificate
+./run-tests.sh       # tests, format and lint
+./build-docs.sh      # man pages and docs site</pre>
+<h2>License</h2>
+<p>MIT. The original AeroSpace copyright is retained alongside the fork's in <code>LICENSE.txt</code>. Active development; features and configuration may still change.</p>

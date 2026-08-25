@@ -1,0 +1,133 @@
+<p>A good SQL index comes from the queries your application runs, not from the table schema. Composite indexes need the right column order: equality columns first, then the column you sort or range on. <code>EXPLAIN ANALYZE</code> is how you verify it: a sequential scan over 1 million comments takes 17ms, and the right composite index answers in 0.04ms.</p>
+<p>What does a good SQL index look like?</p>
+<p>The answer will vary based on your queries and access paths. The only way to confidently know is to examine the query plans with <code>EXPLAIN ANALYZE</code> and figure out from there which index might help.</p>
+<p>So let's do exactly that. I seeded a Postgres 18 instance in Docker with an issue tracker: 100 users, 10,000 issues, and 1 million comments. By the end, one query drops from 436ms to half a millisecond.</p>
+<h2>What Is a SQL Index?</h2>
+<p>An index stores your chosen columns in sorted order, with every entry pointing back to its full row. The default kind in every major database is the <strong>B-tree</strong>: a shallow tree, a few levels deep even at millions of rows. A sequential scan reads all 1 million comments; an index scan descends those few levels and fetches only the matches.</p>
+<h2>Start With the Query, Not the Table</h2>
+<p>You don't pick indexes by staring at the schema; they come from the queries your application actually runs.</p>
+<p>My <code>comments</code> table serves three access patterns:</p>
+<ul>
+ <li>All comments by a user</li>
+ <li>All comments for an issue</li>
+ <li>Comments for an issue from one user, newest first, last month only</li>
+</ul>
+<h2>Reading the First Plan</h2>
+<p>The first pattern, with no index beyond the primary key:</p>
+<pre><code>EXPLAIN ANALYZE
+SELECT COUNT(*)
+FROM comments
+WHERE user_id = 1;
+
+---
+Finalize Aggregate
+  -&gt;  Gather
+        -&gt;  Partial Aggregate
+              -&gt;  Parallel Seq Scan on comments  (actual time=0.010..11.727 rows=3356.67 loops=3)
+                    Filter: (user_id = 1)
+                    Rows Removed by Filter: 329977
+Execution Time: 17.066 ms
+</code></pre>
+<p><code>EXPLAIN ANALYZE</code> runs the query for real and prints the plan Postgres used: a <code>Parallel Seq Scan</code> reads all 1 million rows to count 10,070, in <strong>17ms</strong>.</p>
+<p>Create the index and rerun the query:</p>
+<pre><code>CREATE INDEX ix_comments_user_id
+ON comments (user_id);
+</code></pre>
+<pre><code>Aggregate
+  -&gt;  Index Only Scan using ix_comments_user_id on comments  (actual time=0.024..0.348 rows=10070.00 loops=1)
+        Index Cond: (user_id = 1)
+        Heap Fetches: 0
+Execution Time: 0.612 ms
+</code></pre>
+<p>17ms down to <strong>0.6ms</strong>. It's an <code>Index Only Scan</code> because the index alone can answer a <code>COUNT(*)</code>: Postgres never touches the table.</p>
+<h2>Column Order Is Everything</h2>
+<p>The third access pattern is the interesting one:</p>
+<pre><code>SELECT *
+FROM comments
+WHERE issue_id = 10
+  AND user_id = 29
+  AND created_at &gt;= NOW() - INTERVAL '1 month'
+ORDER BY created_at DESC;
+</code></pre>
+<p>With no index, it's another sequential scan: <strong>16.6ms</strong>. With single-column indexes on <code>issue_id</code> and <code>user_id</code>, Postgres intersects them with a <code>BitmapAnd</code> and still sorts the survivors: <strong>0.6ms</strong>, in three steps.</p>
+<p>A composite index answers the whole query in one motion:</p>
+<pre><code>CREATE INDEX ix_comments_issue_user_date
+ON comments (issue_id, user_id, created_at DESC);
+</code></pre>
+<pre><code>Index Scan using ix_comments_issue_user_date on comments  (actual time=0.019..0.026 rows=2.00 loops=1)
+  Index Cond: ((issue_id = 10) AND (user_id = 29) AND (created_at &gt;= (now() - '1 mon'::interval)))
+Execution Time: 0.039 ms
+</code></pre>
+<p>All three conditions moved into the <code>Index Cond</code>, and the <code>Sort</code> is gone: the index already returns rows ordered by <code>created_at DESC</code>. Runtime: <strong>0.04ms</strong>, over 400x faster.</p>
+<p>A composite index sorts by its first column, then the second within equal values, then the third. Postgres jumps straight to the <code>issue_id = 10, user_id = 29</code> section and reads it in order.</p>
+<p>Column order also decides what else the index can serve: <code>issue_id</code> alone works, <code>issue_id</code> plus <code>user_id</code> works, but <code>user_id</code> alone doesn't (its values are scattered across the whole tree). This is the <strong>leftmost prefix rule</strong>, and it's why the index on <code>user_id</code> stays.</p>
+<p>The rule of thumb: <strong>equality columns first, then the column you sort or range on</strong>.</p>
+<h2>The Query Our New Index Can't Serve</h2>
+<p>Every issue tracker runs this dashboard query: the 25 newest open issues, each with its latest comment, fetched by a <code>LATERAL</code> subquery:</p>
+<pre><code>SELECT i.id, c.body, c.created_at
+FROM issues i
+CROSS JOIN LATERAL (
+  SELECT body, created_at
+  FROM comments
+  WHERE issue_id = i.id
+  ORDER BY created_at DESC
+  LIMIT 1
+) c
+WHERE i.status = 'open'
+ORDER BY i.created_at DESC
+LIMIT 25;
+</code></pre>
+<pre><code>Nested Loop  (actual time=0.790..352.076 rows=6537.00 loops=1)
+  -&gt;  Seq Scan on issues i  (rows=6537.00 loops=1)
+  -&gt;  Limit  (rows=1.00 loops=6537)
+        -&gt;  Sort  (actual time=0.053..0.053 rows=1.00 loops=6537)
+              -&gt;  Bitmap Index Scan on ix_comments_issue_user_date  (loops=6537)
+Execution Time: 435.794 ms
+</code></pre>
+<p>The composite index gets used, but its entries are sorted by <code>user_id</code> before <code>created_at</code>, so a <code>Sort</code> runs 6,537 times, once per open issue: <strong>436ms</strong>.</p>
+<p>Column order strikes again. For this access path, <code>created_at</code> must come right after <code>issue_id</code>:</p>
+<pre><code>CREATE INDEX ix_comments_issue_date
+ON comments (issue_id, created_at DESC);
+</code></pre>
+<pre><code>Each probe becomes a one-row index scan: 25ms. But the LIMIT still can't stop the loop, because issues arrive unsorted. One more index streams them newest-first:
+
+CREATE INDEX ix_issues_status_date
+ON issues (status, created_at DESC);
+</code></pre>
+<pre><code>Limit  (actual time=0.086..0.465 rows=25.00 loops=1)
+  -&gt;  Nested Loop  (actual time=0.085..0.463 rows=25.00 loops=1)
+        -&gt;  Index Scan using ix_issues_status_date on issues i  (rows=25.00 loops=1)
+        -&gt;  Limit  (rows=1.00 loops=25)
+              -&gt;  Index Scan using ix_comments_issue_date on comments  (rows=1.00 loops=25)
+Execution Time: 0.489 ms
+</code></pre>
+<p>Every node reads only what it returns: 25 issues, 25 probes, one comment each. <strong>0.5ms</strong>, nearly 900x faster.</p>
+<h2>What Do Indexes Cost?</h2>
+<p>Every insert, update, and delete now maintains every index, so each one you add slows writes a little. They take disk space, too:</p>
+<pre><code>SELECT indexrelname AS index_name,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes
+WHERE relname = 'comments';
+</code></pre>
+<p>Each composite index weighs <strong>30 MB</strong> for 1 million comments, against about 7 MB per single-column one. And <code>(issue_id, created_at DESC)</code> makes the plain <code>issue_id</code> index redundant, so drop it. Index the queries you actually run, not the ones you might run someday.</p>
+<h2>Summary</h2>
+<ul>
+ <li><strong>Design indexes from your queries, not your tables.</strong></li>
+ <li><strong>Composite indexes need the right column order</strong>: equality columns first, then the sort column.</li>
+ <li><strong><code>LIMIT</code> only helps when an index feeds it rows already in order.</strong></li>
+ <li><strong><code>EXPLAIN ANALYZE</code> is the proof.</strong> Read the plan, not just the timing.</li>
+ <li><strong>Every index costs writes and space.</strong></li>
+</ul>
+<h2>Frequently Asked Questions</h2>
+<h3>What is a composite index?</h3>
+<p>A composite index stores several columns together, sorted by the first column, then by the second within equal values, then by the third. Postgres can jump straight to the section matching the leading columns and read it in order.</p>
+<h3>What order should columns go in a composite index?</h3>
+<p>Equality columns first, then the column you sort or range on. On the demo query, an index on (issue_id, user_id, created_at DESC) moved all three conditions into the index condition and removed the sort, going from 16.6ms to 0.04ms.</p>
+<h3>What is the leftmost prefix rule?</h3>
+<p>A composite index only serves queries that use its leading columns. With (issue_id, user_id, created_at DESC), filtering on issue_id works and issue_id plus user_id works, but user_id alone doesn't, because its values are scattered across the whole tree.</p>
+<h3>Why is my query still doing a sort when it uses an index?</h3>
+<p>The index returns rows in the wrong order. A dashboard query hit the index on (issue_id, user_id, created_at DESC), which sorts by user_id before created_at, so Postgres ran a sort once per open issue, 6,537 times, and the query took 436ms.</p>
+<h3>What is an Index Only Scan in Postgres?</h3>
+<p>An Index Only Scan means the index alone can answer the query, so Postgres never touches the table. Counting comments for one user ran as an Index Only Scan with zero heap fetches, in 0.6ms instead of a 17ms sequential scan.</p>
+<h3>Do indexes slow down writes?</h3>
+<p>Yes. Every insert, update, and delete maintains every index on the table, so each one you add slows writes a little. Indexes take disk space too: each composite index here weighed 30 MB for 1 million comments, against about 7 MB per single-column index.</p>

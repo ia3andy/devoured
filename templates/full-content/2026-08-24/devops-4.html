@@ -1,0 +1,38 @@
+<p>The folks at Microsoft Azure recently wrote up a post incident review for a networking issue in their West U.S region. From the included timeline, it looks like the impact was on the order of five hours. It’s a pretty short write-up, but let’s take a look at the contributors.</p>
+<blockquote>
+ <p>On 23 July 2026, a break-fix repair was initiated on an optical device to address a network reliability risk.</p>
+</blockquote>
+<p>The first contributor mentioned in the write-up was work that was done to repair a device in their networking stack. Here I can’t help but think of the first bullet in my conjecture on why reliable systems fail. They made a change to the system in order to fix an ongoing problem, and due to a set of circumstances, things got worse rather than better.</p>
+<blockquote>
+ <p>A defect in our blast radius analysis system incorrectly expanded the scope of the repair event to include all optical devices egressing a specific datacenter.</p>
+</blockquote>
+<p>The second contributor mentioned was a (presumably) latent defect in their system. Note the irony of the failure mode here: I suspect this blast radius analysis system usually contributes to reliability, but in this case it hurt reliability by increasing the blast radius.</p>
+<blockquote>
+ <p>The safety validation step, which is designed to confirm that at least one of the two redundant datacenter paths remains available, ran but incorrectly concluded the operation was safe.</p>
+</blockquote>
+<p>The third contributor mentioned was a safety check (good!) that passed even though the action was unsafe (bad!).</p>
+<blockquote>
+ <p>The checks validated each device individually rather than evaluating the aggregate effect of isolating all devices at once, a scenario that was not accounted for because the system was never designed to process a full datacenter’s worth of devices in a single request.</p>
+</blockquote>
+<p>The reason it failed was due to an interaction with the second contributor: the blast radius being all of the optical devices egressing the datacenter. The designers never envisioned that the check would have to handle the sort of scenario that occurred as a result of the blast radius analysis system defect.</p>
+<blockquote>
+ <p>As a result, routes were withdrawn from multiple devices simultaneously, disrupting connectivity between the datacenter and the WAN – therefore impacting traffic entering or leaving the West US region.</p>
+</blockquote>
+<p>It sounds like this change effectively disconnected the West US datacenter from the internet.</p>
+<blockquote>
+ <p>Once the route withdrawals took effect at 14:44 UTC, physical links and routing adjacencies continued to appear healthy, which initially masked the correlation between the break-fix activity and the connectivity disruption</p>
+</blockquote>
+<p>Here we have our fourth contributor: the operators were receiving misleading signals from the system. The links and routes looked healthy, even though connectivity was broken.</p>
+<blockquote>
+ <p>The impact presented as a WAN routing anomaly, as third-party networks could not reach Azure in the region, rather than as a datacenter connectivity failure.</p>
+</blockquote>
+<p>Our fifth contributor is another flavor of misleading signals. The symptoms presented as a routing issue between Azure and third-parties.</p>
+<blockquote>
+ <p>Although all physical work in the region was stopped, our engineers could not correlate to this recent change because the preparation activities in advance of the break-fix did not succeed, so the physical layer and traffic appeared healthy.</p>
+</blockquote>
+<p>This is the sixth contributor mentioned in the writeup. The writing is a little oblique here, but I think what they are saying is that the repair event did not show up in their event log because the repair event didn’t actually complete. It sounds like the preparation activities were the ones that triggered the incident. But, because the repair event didn’t actually happen, the operators looking for events that correlate in time with the onset of the incident didn’t see the triggering event because it didn’t show up in the log of events. That’s my best guess, anyways.</p>
+<blockquote>
+ <p>Our automated recovery and rollback system detected the device failures, and attempted multiple retries to restore the affected devices. However, because that system depended on the same datacenter connectivity that had been disrupted, its automated rollback attempts were unsuccessful.</p>
+</blockquote>
+<p>This is the seventh and final contributor mentioned. Azure has an automated recovery and rollback system (good!), but the failure mode in this case prevented automated rollback from succeeding (bad!).</p>
+<p>As always, I’d love to know more about how the operators identified what the failure mode actually was, and how they traced it back to the optical device repair work.</p>

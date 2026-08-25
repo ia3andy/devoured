@@ -1,0 +1,111 @@
+<h1>DigitalOcean Inference Router, Now Cache-Aware: Why the Cheapest Model Isn't Always the Best Deal</h1>
+<p>Coinbase CEO Brian Armstrong recently posed the question every company scaling AI is asking: how do you keep spend flat while token usage grows exponentially? This isn’t hypothetical. It’s confronting companies across every sector:</p>
+<ul>
+ <li>Uber exhausted its annual AI coding budget within the first four months of the year and subsequently introduced a $1,500 monthly limit per employee.</li>
+ <li>Walmart placed token limits on its internal Code Puppy agent after employees repeatedly asked it to solve similar problems.</li>
+ <li>A Priceline employee reported that a routine Cursor renewal came back 4-5x more expensive.</li>
+</ul>
+<p>Usage caps may help control the bill, but they also limit productive work. A better answer is to improve the economics of every request through better defaults, routing, <em>and</em> making caching work for your specific workload scenarios.</p>
+<p>Today, we’re making DigitalOcean Inference Router cache-aware. In April, we launched preference-aware routing, so our router could match each request to the model that best fit a developer’s task and priorities. Now, it can also account for the value of context that’s already cached. This advances Inference Router from selecting the right model for each request toward optimizing the entire agentic session across quality, cost, and cache locality. With this release, our Inference Router now offers a comprehensive set of controls for you to build an intelligence layer that fits how your team actually works.</p>
+<h2>A warm cache can be more valuable than a cheaper model</h2>
+<p>Caching is a critical consideration when building agents, because they repeatedly send the same large body of context: system instructions, tool definitions, repository context, and an accumulating conversation history.</p>
+<p>Here’s how top providers are putting caching to work:</p>
+<ul>
+ <li>Z.ai uses a 90.9% cache-hit rate as its average assumption for coding workloads when estimating usage for its coding plans.</li>
+ <li>Anthropic shares that Claude Code uses prompt caching to make back-to-back calls cheaper and faster.</li>
+ <li>OpenAI reports that cached prompts can reduce latency by up to 80%.</li>
+</ul>
+<p>For agents, caching is not a marginal optimization. It shapes the cost and latency of almost every subsequent model call. At DigitalOcean, we are seeing this first-hand as we scale more models on behalf of customers. With the recent release of Kimi K3, we’ve observed an aggregate cache-hit rate of 90%+ across our own workloads as developers use the model for coding and long-horizon tasks; individual workloads will differ.</p>
+<p>Cache-aware routing changes the economics of model routing. Consider, as an illustration, an agent with 90,000 input tokens already cached on Claude Sonnet 5 out of a 100,000 token context. At the standard pricing of $2.5 per million input tokens (with cache writing enabled) and $0.2 per million cached tokens, a 90% cache hit makes the next request cost approximately $0.043 in input tokens. <em>(Pricing information is current as of the publication date.)</em></p>
+<p>While GLM‑5.2 appears cheaper at its $0.7 per million uncached input rate, switching models discards the warm cache and forces re-processing of the full 100,000 input token context. On the assumption in this illustration, that request would cost $0.07: approximately 1.6 times more than staying on the nominally more expensive model in this scenario. Sticking with the warm model requires prefilling only the 10,000 uncached tokens; switching requires all 100,000—10x more prompt processing before generation can even begin. That doesn’t translate into a 10x latency increase, since prefill performance varies by model and serving system. But it does explain why a cache-breaking switch can meaningfully increase time to first token, even when the destination model is otherwise faster.</p>
+<h2>How Inference Router supports cache-aware routing</h2>
+<p>Before the launch of cache-aware routing, Inference Router evaluated each request independently. It could correctly determine that another model was more affordable or better suited to the context presented, but didn’t recognize that the request belonged to an ongoing agent session with a warm prompt cache.</p>
+<p>But the act of switching models can invalidate the existing cache and force the destination model to process the entire prompt again. For agents that repeatedly send large system instructions, tool definitions, repository context, and conversation history, using the “cheaper” model can make the next request more expensive and slower. Another complication is that it can also change model behavior partway through an agent’s loop.</p>
+<p>When customers told us they needed more control over that tradeoff, we built cache-aware routing. It introduces two complementary mechanisms: explicit model affinity for applications that already manage sessions, and a routing-budget policy that determines when breaking affinity is worth the additional cost.</p>
+<h3>Explicitly associate requests with a custom HTTP header: <code>X-Model-Affinity</code></h3>
+<p>Applications that already maintain session or task identifiers can pass an explicit affinity key with each request:</p>
+<pre><code>import os
+import uuid
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.environ["MODEL_ACCESS_KEY"],
+    base_url="https://inference.do-ai.run/v1/",
+)
+
+session_id = str(uuid.uuid4())
+messages = []
+user_turns = [
+    "Help me debug this failing test.",
+    "Here's the stack trace, what's causing it?",
+    "That fixed it, now can you also add a regression test?",
+]
+
+for user_turn in user_turns:
+    messages.append(\{"role": "user", "content": user_turn})
+
+    response = client.chat.completions.create(
+        model="router:&lt;your-router-name&gt;",
+        messages=messages,
+        extra_headers=\{
+            "X-Model-Affinity": session_id,
+        },
+    )
+    assistant_reply = response.choices[0].message.content
+    messages.append(\{"role": "assistant", "content": assistant_reply})
+</code></pre>
+<p>The first request is routed according to the developer’s configured task, model pool, and routing preferences. Requests with the same <code>X-Model-Affinity</code> value are then treated as part of the same unit of work, allowing Inference Router to preserve the session’s model binding and reuse its cached context. Affinity identifiers should represent meaningful units of work: a coding session, research task, support conversation, or individual agent run. When the application starts a genuinely new task, it can provide a new identifier, allowing the Inference Router to make a fresh preference-aware decision.</p>
+<p>For common agentic requests, Inference Router can also infer affinity if an explicit identifier is not available. It derives a stable session key from the request context that remains unchanged across turns, including system and developer instructions, tool definitions, and the first user message. If that stable prefix changes, Inference Router treats the cache as cold and establishes a new binding. This reassigns the session to a model, which then starts accumulating its own warm cache from scratch.</p>
+<h3>Control cache-breaking switches with a routing budget</h3>
+<p>Model affinity headers are ideal for applications that already track meaningful units of work—such as research tasks and support conversations—and want deterministic control over which requests share the same model binding. With this release, we’ve also introduced the routing budget: a complementary control that keeps Inference Router evaluating alternative models without requiring any changes to your application code.</p>
+<p>When the routing policy proposes switching models, Inference Router calculates the incremental cost of leaving the session’s warm cache. It does this by comparing the cached input cost of staying on the current model with the uncached cost of rebuilding the context on the candidate model, then evaluates that cost against the session’s cumulative switching spend.</p>
+<p>Developers can define this trade-off with a maximum switching budget, set relative to what the session would have cost had it stayed on the existing model. For example, <code>X-Routing-Max-Switch-Spend-Pct: 20</code> limits cumulative switching costs to 20% above that baseline. Model selection and economics remain separate: the router identifies its preferred model, while the routing budget determines whether switching to it is worth the additional input cost.</p>
+<pre><code>curl -i "https://inference.do-ai.run/v1/chat/completions" \
+  -H "Authorization: Bearer $MODEL_ACCESS_KEY" \
+  -H "Content-Type: application/json" \
+  `# X-Model-Affinity is managed by the router if not set explicitly` \
+  -H "X-Routing-Max-Switch-Spend-Pct: 20" \
+  -d '\{
+    "model": "router:software-engineering",
+    "messages": [
+      \{"role": "user", "content": "Summarize this in 2 sentences."}
+    ]
+  }'
+</code></pre>
+<p>Together, developers can use these controls to choose the appropriate level of involvement:</p>
+<ul>
+ <li>Use <code>X-Model-Affinity</code> when the application already has an authoritative session or task identifier.</li>
+ <li>Let Inference Router automatically detect affinity based on stable agent context across related turns.</li>
+ <li>Configure <code>X-Routing-Max-Switch-Spend-Pct</code> to control how much additional input cost the router can incur by switching models.</li>
+</ul>
+<h3>New Analyze Page</h3>
+<p>We have updated the Analyze page to give you detailed visibility into how your router makes cache-aware decisions.</p>
+<p>In the top-line router view, you can quickly get answers to questions like:</p>
+<ul>
+ <li>What is overall caching efficiency?</li>
+ <li>How many requests switched models?</li>
+ <li>How many were held to keep the cache warm and what is the overall latency as a result?</li>
+</ul>
+<p>This lets you get a high level snapshot of your router at a glance.</p>
+<p>From here, you can drill down further into the behavior of specific models and tasks to get a more detailed understanding of the traffic mix. This makes it easier to identify specific model hotspots, validate routing strategy, and tune router preferences over time.</p>
+<p>We’ve also added trend tracking for cache efficiency giving you visibility at both request and token level over time. This makes it easier to spot cache regressions, understand performance trends, and validate the impact of prompt and cache tuning changes.</p>
+<p>Together, these views help teams move from high-level monitoring to targeted optimization right from the Inference Router UI.</p>
+<h2>Routing that starts with developer preferences</h2>
+<p>When we launched DigitalOcean Inference Engine and Inference Router, we gave developers a way to define tasks, create model pools, and express whether they wanted to optimize for quality, cost, or latency. Inference Router then semantically matches each request to a task and applies those preferences to select a model. Developers can start with DigitalOcean presets—opinionated, routinely updated model selections informed by our evaluations—or define their own tasks, model pools, and priorities. Either path works out of the box: no router training or application-side routing logic required. Early customer LawVo reported reducing inference costs by more than 40% while maintaining the accuracy, speed, and reliability its users expected*.</p>
+<p>This approach is grounded in years of research into preference-aware routing. In <em>Arch-Router: Aligning LLM Routing with Human Preferences</em>, our team introduced a compact 1.5-billion-parameter model that maps requests to developer-defined domains and actions and can incorporate new models without retraining. We published the model with open weights—the broader approach remains available through Plano, our Apache-licensed open-source AI proxy and data plane. That research originated from a simple observation: benchmarks are useful, but they are not preferences.</p>
+<h2>Model benchmarks are maps, not routing tables</h2>
+<p>Benchmarks let us compare models under controlled, repeatable conditions. They help narrow a large model catalog, identify broad strengths, and bootstrap routing before an application has enough real-world traffic to run its own evaluations. That makes them a valuable starting point for DigitalOcean presets.</p>
+<p>But model performance is conditional on the surrounding application: the system prompt, tool definitions, context, output constraints, conversation history, and definition of success. Change the agent harness, and the relative ranking of models changes with it. A model that performs best on an isolated coding benchmark may not be the ideal choice for use within a coding agent operating across a large repository with dozens of tools and a long conversation history.</p>
+<p>Relatedly, one developer may prefer a particular model’s visual style for image generation, while another may prioritize instruction following, tool-call reliability, latency, or cost. Neither preference can be inferred from a general-purpose leaderboard. Preselecting a model on benchmark scores alone is not intelligent routing. Routing is only intelligent once it knows what the developer is optimizing for. Over time, it becomes a personalization problem. But even a preference-aware router can make the wrong economic decision if it evaluates every request in isolation.</p>
+<h2>Better defaults, better routing, and better caching</h2>
+<p>Across sectors, the knee-jerk response to rapidly growing inference bills has often been to ration access. Yet Coinbase has publicly reported that 91% of Coinbase employees were not reaching their existing usage caps. Lowering those caps would have generated more alerts and friction without addressing what actually drove most of the spend. Coinbase instead moved toward cheaper defaults, task-aware routing, and better caching, which it reports improved LibreChat’s cache hit rate from 5% to 60%.</p>
+<p>These three controls reinforce one another:</p>
+<ul>
+ <li><strong>Better defaults</strong> prevent every request from beginning on the most expensive model.</li>
+ <li><strong>Preference-aware routing</strong> selects models based on the task and the developer’s values.</li>
+ <li><strong>Cache-aware routing</strong> preserves the accumulated economic value of an agentic session instead of discarding it between turns.</li>
+</ul>
+<p>A cheap default may not meet the quality bar for a complex task. A benchmark-driven router may not reflect an application’s real evaluations. A cache-aware system should not preserve a warm model when it is no longer appropriate for the work. No single technique is sufficient on its own. The objective is not to maximize tokens or blindly minimize their price, but rather to maximize useful intelligence per dollar spent while preserving the quality, latency, and reliability each application requires.</p>
+<p>Routing is only intelligent when it understands what you are optimizing for and what switching away from an in-progress task actually costs. The DigitalOcean Inference Router gives you the control and visibility to build an intelligence layer that fits how your team actually works. Use it now to create a preset or custom router and add model affinity to your next agentic workflow. All figures in this post are illustrative and based on the pricing, models, and configurations available as of the publication date; third-party figures are as reported by those parties. Results and savings vary with configuration, implementation, and usage, and are not guaranteed. All marks are the property of their respective owners, and no affiliation or endorsement is implied.</p>
+<hr>
+<p><em>*Disclaimer: This reflects LawVo’s own reported experience in its own environment and is not necessarily representative of results other customers will achieve.</em></p>

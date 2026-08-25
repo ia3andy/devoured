@@ -1,0 +1,64 @@
+<p>As applications grow in complexity, they may be split into multiple independent microservices, each with its own deployment pipeline.</p>
+<p>There are many characteristics defining microservices, but from a deployment perspective, <a href="https://martinfowler.com/articles/microservices.html">Martin Fowler notes that</a>:</p>
+<blockquote>
+ <p>These services are built around business capabilities and are independently deployable by fully automated deployment machinery.</p>
+</blockquote>
+<p>Independently deployable microservices don’t inherently need any special orchestration as projects in Octopus are already independently deployable. However, it is often useful to be able to promote a set of microservices as a single unit between environments, for example, from Test to Production. And while microservices are ideally independent, in practice, they often require a particular deployment order.</p>
+<p>To support these scenarios, Octopus provides the <a href="https://octopus.com/docs/projects/coordinating-multiple-projects/deploy-release-step">Deploy a Release</a> step, which allows one project to trigger the deployment of another project. This allows you to create an orchestration project that coordinates the deployment of multiple microservices.</p>
+<p>In the previous post, you created a project that demonstrates blue/green deployments.</p>
+<p>In this post, you’ll create an orchestration project that coordinates the sequential deployment of multiple Kubernetes microservices.</p>
+<h2>Prerequisites</h2>
+<ul>
+ <li>An <a href="https://octopus.com/start">Octopus Cloud</a> account. If you don’t have one, you can sign up for a free trial.</li>
+ <li>The Octopus AI Assistant Chrome extension. You can install it from the <a href="https://chromewebstore.google.com/detail/octopus-ai-assistant/agfpjjibnieiihjoehophlbamcifdfha">Chrome Web Store</a>.</li>
+</ul>
+<p>The Octopus AI Assistant will work with an on-premises Octopus instance, but it requires more configuration. The cloud-hosted version of Octopus doesn’t need extra configuration. This means the cloud-hosted version is the easiest way to get started.</p>
+<h2>Creating the project</h2>
+<p>Paste the following prompt into the Octopus AI Assistant and run it:</p>
+<pre><code>* Create a token account called "Mock Token".
+* Create a feed called "Docker Hub" pointing to "https://index.docker.io" using anonymous authentication.
+* Add a target called "Mock K8s", with the tag "Kubernetes", using the token account, pointing to "https://mockk8s.octopusdemos.com", using the health check image "octopusdeploy/worker-tools:6.5.0-ubuntu.22.04" from the "Docker Hub" feed, using the worker pool "Hosted Ubuntu".
+
+---
+
+Create a Kubernetes project called "20. Microservice 1", and then:
+* Place the project in the "Orchestrator" project group.
+* Configure the Kubernetes steps to use client side apply (client side apply is required by the "Mock K8s" target).
+* Disable verification checks in the Kubernetes steps (verification checks are not supported by the "Mock K8s" target).
+* Enable retries on the Kubernetes step.
+
+---
+
+Create a Kubernetes project called "20. Microservice 2", and then:
+* Place the project in the "Orchestrator" project group.
+* Configure the Kubernetes steps to use client side apply (client side apply is required by the "Mock K8s" target).
+* Disable verification checks in the Kubernetes steps (verification checks are not supported by the "Mock K8s" target).
+* Enable retries on the Kubernetes step.
+
+---
+
+Create an Orchestration project called "20. Kubernetes Microservice Orchestration" managing the projects "20. Microservice 1" and "20. Microservice 2".</code></pre>
+<p>The document separator (<code>---</code>) is used to split the prompt into multiple sections. Each section is applied sequentially, which allows you to create different types of resources in a single prompt.</p>
+<p>The first section creates the shared infrastructure: a token account, a Docker Hub feed, and a <a href="https://octopus.com/docs/kubernetes/targets/kubernetes-api">Kubernetes target</a> pointing to a mock Kubernetes server. The mock server exposes just enough of the Kubernetes API to allow deployment steps to execute successfully, without requiring access to a real Kubernetes cluster.</p>
+<p>The second and third sections each create identical Kubernetes microservice projects.</p>
+<p>The fourth section creates the orchestration project, which is the focus of this post.</p>
+<h2>The orchestration project</h2>
+<p>The <code>Kubernetes Microservice Orchestration</code> project uses the <code>Deploy a Release</code> step type to trigger deployments of each child project. Its deployment process contains two sequential steps:</p>
+<ul>
+ <li><strong>Deploy K8s Microservice 1</strong> — deploys a release of <code>K8s Microservice 1</code></li>
+ <li><strong>Deploy K8s Microservice 2</strong> — deploys a release of <code>K8s Microservice 2</code></li>
+</ul>
+<p>The child projects are deployed sequentially: <code>K8s Microservice 2</code> only begins once <code>K8s Microservice 1</code> has completed successfully. This ordering ensures that any service dependencies are respected.</p>
+<p>Or, if you prefer, both child projects could be deployed in parallel by configuring the step <a href="https://octopus.com/docs/projects/steps/conditions#start-trigger">start trigger</a>.</p>
+<p>The orchestration project uses a lifecycle promoting releases through <code>Development</code>, <code>Test</code>, and <code>Production</code> environments in sequence. When a deployment is triggered for an environment, both child projects are deployed to that same environment.</p>
+<h2>The deployment process</h2>
+<p>The first step is to create a release of the child projects. There is nothing special about the release creation process for the child projects.</p>
+<p>Once a release is available for each child project, a release of the orchestration project can be created. The projects referenced by the <code>Deploy a Release</code> steps will be presented much like a package reference, allowing you to select the release of each child project to deploy.</p>
+<p>Deploying the orchestration project release triggers the deployment of each child project in sequence to the same environment. In this way, the orchestration project serves as a single deployment unit for the set of microservices.</p>
+<p>Importantly, it is still possible to deploy a release of each child project independently, without using the orchestration project. The <code>Deploy a Release</code> step can skip the deployment of a child project if it has already been deployed to the target environment, or it can redeploy the child project. This allows the child projects to retain their independence while still allowing them to be promoted together as a single unit when required.</p>
+<h2>What just happened?</h2>
+<p>You created a sample setup consisting of:</p>
+<ul>
+ <li>Two child Kubernetes microservice projects (<code>K8s Microservice 1</code> and <code>K8s Microservice 2</code>)</li>
+ <li>A parent orchestration project (<code>Kubernetes Microservice Orchestration</code>) that uses <code>Deploy a Release</code> steps to coordinate the sequential deployment of both microservices</li>
+</ul>
