@@ -1,0 +1,145 @@
+<p>I have been probably obsessed with two things in the last few years: Nix as a tool to explore innovative ideas that require the capability to rebuild the world and replacing ELF with SQLite as an executable format. You might have noticed that these two ideas are well suited to each other.</p>
+<p>I explored the idea during my PhD thesis but found feedback from others unmotivating. Radical ideas are hard to sell, as you are working against the inertia of the established solution.</p>
+<p>One of the end results of that exploration was sqlelf, a tool that lets you explore an ELF file declaratively using SQL. I wrote a paper, <a href="https://arxiv.org/abs/2405.03883">arXiv:2405.03883</a>, that I failed to get published and a follow-up post on querying with it. SELECT name FROM elf_symbols instead of fiddling with readelf and grep. It was remarkably simple by leveraging virtual tables over the ELF: however I found it to be a refreshing improvement to explore the ELF file format. I knew however that there is still something much bigger to be done.</p>
+<p>I never let the idea go and with the recent improvements with LLMs, I find it compelling to revisit these ideas to explore further. Specifically, can we replace ELF with SQLite as an executable format? 🤔</p>
+<p>Not “a database that describes an executable”, but the actual file you chmod +x and run.</p>
+<pre><code>$ file hello
+hello: SQLite 3.x database, application id 0x53454c46, user version 1
+
+$ ./hello
+Hello, world!
+
+$ sqlite3 hello 'SELECT soname FROM ldd'
+libc.so.6
+</code></pre>
+<p>I developed a pretty fleshed out prototype. It is called <strong>SELF</strong>, the <em>Structured Executable &amp; Linkable Format</em>, because I am unoriginal. It is on <a href="https://github.com/fzakaria/selfdb">GitHub</a> if you are interested. I’m surprised about all the interesting things that fall out of this idea.</p>
+<h2>§ELF is a database that refuses to admit it</h2>
+<p>Working through my PhD, I realized something that bugged me. ELF is <em>already</em> a database. It just implements many database primitives by hand, along with a surprising number of data structures for performance, like a bloom filter for symbol lookup.</p>
+<table>
+ <thead>
+  <tr>
+   <th>ELF mechanism</th>
+   <th>The database primitive it reinvents</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>.strtab / .dynstr</td>
+   <td>string interning</td>
+  </tr>
+  <tr>
+   <td>.hash / .gnu.hash</td>
+   <td>an index (CREATE INDEX)</td>
+  </tr>
+  <tr>
+   <td>section header table</td>
+   <td>sqlite_schema, a table of tables</td>
+  </tr>
+  <tr>
+   <td>st_name → offset into .strtab</td>
+   <td>a foreign key, done by hand</td>
+  </tr>
+  <tr>
+   <td>sh_offset / sh_size</td>
+   <td>the record layout of a b-tree page</td>
+  </tr>
+  <tr>
+   <td>.gnu.version_r</td>
+   <td>a column</td>
+  </tr>
+  <tr>
+   <td>objcopy --strip-debug</td>
+   <td>DELETE + VACUUM</td>
+  </tr>
+  <tr>
+   <td>ldconfig cache, debuginfod</td>
+   <td>out-of-band indexes over the above</td>
+  </tr>
+ </tbody>
+</table>
+<p>If you ever have to analyze or parse ELF, the kernel, ld.so, binutils, LIEF, goblin, readelf, you are re-implementing the same parser over and over again. Every producer re-implements the same serializer.</p>
+<p>The format itself is incredibly terse, designed for a world where disk space and network bandwidth was at an extreme premium. Modifying the format is hard, you often have to zero out sections and add new ones since it is packed so tightly. There is also no self-describing schema. ELF itself is a very generic format that supports sections of data that by convention are interpreted in specific ways but the format does not enforce it.</p>
+<p>SQLite is the counter-example. They are a self-describing format that is extremely stable. It is designed to be extended to support new features without breaking existing consumers and supporting a wide range of queries performantly.</p>
+<p>If we were to replace ELF with SQLite, what would fall out and can all of the necessary information be represented in a SQLite database? The answer is yes, and it is surprisingly simple.</p>
+<h2>§What falls away</h2>
+<p>A SELF file needs two tables to run: <code>self_meta</code> is the ELF header as key/value pairs and <code>segments</code> is the load image, one row per program header with the bytes in a <code>BLOB</code>:</p>
+<pre><code>CREATE TABLE segments (
+  id      INTEGER PRIMARY KEY,
+  type    TEXT NOT NULL,
+  offset  INTEGER NOT NULL,
+  vaddr   INTEGER NOT NULL,
+  filesz  INTEGER NOT NULL,
+  memsz   INTEGER NOT NULL,
+  r INTEGER, w INTEGER, x INTEGER,
+  align   INTEGER NOT NULL DEFAULT 4096,
+  content BLOB
+);
+</code></pre>
+<p>A single table for the symbol table replaces many of the ELF sections and the <code>.gnu.hash</code> index. It is a single table with a single index:</p>
+<pre><code>CREATE TABLE symbols (
+  id      INTEGER PRIMARY KEY,
+  name    TEXT NOT NULL,
+  version TEXT,
+  value   INTEGER,
+  size    INTEGER,
+  type    TEXT,
+  bind    TEXT,
+  defined  INTEGER NOT NULL,
+  exported INTEGER NOT NULL
+);
+CREATE INDEX idx_symbols_name ON symbols(name, version);
+</code></pre>
+<p>Our capability to include an index is equivalent to <code>.gnu.hash</code> and <code>.hash</code> in ELF, but it is a proper b-tree index maintained by SQLite instead of a hand-rolled bloom filter.</p>
+<p>Surprisingly a lot more falls out as well: <code>.dynstr</code> is gone, because <code>name</code> is <code>TEXT</code> and SQLite already interns strings, symbol versioning is a column, not the <code>.gnu.version_r</code> / <code>.gnu.version_d</code> contraption and there is no need for a <code>strings</code> table.</p>
+<p>Other tables exist as well for metadata which exist for tooling: <code>sections</code>, <code>notes</code>, <code>dynamic_entries</code>. Delete them and the program still runs, which means <code>strip(1)</code> is a transaction:</p>
+<pre><code>$ sqlite3 hello 'DELETE FROM sections; DELETE FROM notes; VACUUM;'
+$ ./hello
+Hello, world!
+</code></pre>
+<p>All the tools that operate on ELF files for reading, reduce to queries over the database. Any tool that modifies an ELF file, like <code>strip</code>, can operate on the database within a transaction rather than performing fragile offset surgery: <code>strip</code> is a <code>DELETE</code> and <code>VACUUM</code>. <code>patchelf</code> is an <code>UPDATE</code>.</p>
+<p>Any information missing from the schema can be easily exposed via a view. For example, <code>ldd</code> is a query over the <code>needed</code> table, which is a join of the <code>symbols</code> table with the <code>segments</code> table to find the sonames of the libraries needed by the program.</p>
+<pre><code>CREATE VIEW exports AS SELECT name, version, type, size FROM symbols WHERE exported = 1;
+CREATE VIEW imports AS SELECT name, version FROM symbols WHERE defined = 0;
+CREATE VIEW ldd     AS SELECT ord, soname FROM needed ORDER BY ord;
+</code></pre>
+<h2>§How does it work?</h2>
+<p>SQLite reserves a 4-byte <a href="https://sqlite.org/pragma.html#pragma_application_id"><code>application_id</code></a> at byte offset 68 of its header, for exactly this purpose. We stamp it <code>SELF</code>, so an ordinary SQLite database never matches.</p>
+<p>We can now leverage <a href="https://docs.kernel.org/admin-guide/binfmt-misc.html">binfmt_misc</a>, the subsystem that allows you to invoke any binary as if it were native. We need only to register the magic to trigger on and an interpreter that will invoke our new file format.</p>
+<p>On NixOS the registration is a few lines matching the SQLite magic at offset 0 <em>and</em> <code>SELF</code> at 68.</p>
+<p>For now, I have a small tool <code>elf2self</code> that converts an ELF file into a SELF file. It is a simple <code>postFixup</code> hook you can opt into per package on NixOS. The tool reads the ELF, extracts the program headers and symbol table, and writes them into the SQLite database.</p>
+<p><code>self-exec</code> is the interpreter. It is a small C program linked against <code>libsqlite3</code>. Its implementation is remarkably similar to that of <code>ld.so</code> but it fetches the program headers and symbol table from the database instead of reading them from the ELF file. It maps the loadable segments into memory, relocates them, and jumps to the entry point.</p>
+<blockquote>
+ <p><strong>Note</strong> <code>self-exec</code> has to stay an ELF file. An interpreter that also matches the registration recurses straight into <code>-ELOOP</code>.</p>
+</blockquote>
+<h2>§Dynamic linking</h2>
+<p>Running a static program was quick and easy but <em>boring</em> and unimaginative. The interesting part is dynamic linking, which is where the database shines.</p>
+<p>I explored two different ways to do dynamic linking. The first is to keep <code>ld.so</code> and just replace the lookup with a SQL query via <code>glibc</code> <a href="https://man7.org/linux/man-pages/man7/rtld-audit.7.html">rtld-audit</a> interface, to quickly iterate on the design. The second is to replace <code>ld.so</code> entirely with a new dynamic linker that does the entire lookup and binding in SQL.</p>
+<p>glibc’s rtld-audit interface lets an audit library intercept every shared object lookup (<code>la_objsearch</code>) before any filesystem search happens, <code>dlopen</code> included. The audit library can then answer the question “which library satisfies this symbol?” with a SQL query instead of walking the <code>RUNPATH</code> and <code>LD_LIBRARY_PATH</code>.</p>
+<p>I was curious what a fully SQL dynamic linker would look like, so I prototyped one. It is called <code>self-ld</code> and it is a small C program that implements the dynamic linker entirely in SQL.</p>
+<h2>§Cost &amp; Benchmark</h2>
+<p>The two things that often matter when replacing a well-established format are size and latency. How much bigger is a SELF file than an ELF file, and how much slower is it to run?</p>
+<p><strong>Size.</strong> A SELF file carries SQLite’s b-tree overhead and lands at roughly double the ELF. Stripping them and deleting them is a transaction. A stripped <code>coreutils</code> SELF is 1,794,048 B against the ELF’s 1,768,632 B, that is <strong>within 1%</strong>.</p>
+<p><strong>Latency.</strong> I benchmarked various binaries from a 15 KiB <code>hello</code> to a 42 MiB <code>gdb</code> linking 47 libraries.</p>
+<p>There is a fixed ~5 ms to open SQLite and start the interpreter, plus a copy proportional to the image. That copy is worse than it looks, because the b-tree pages are not mapped into memory. Two processes running the same SELF binary do not share text pages the way a normally-<code>mmap</code>‘d ELF does, because the bytes are copied out of the b-tree rather than mapped.</p>
+<h2>§The system is a closure</h2>
+<p>A SQLite database though need not merely be a single executable. It can be a <em>closure</em>, a single file that contains a program and all of its transitive dependencies. The <code>ldd</code> output of a program is ambiguous: it only lists the sonames of the libraries it needs, not the specific files that satisfy those needs.</p>
+<p>We can do the same in SELF by storing the resolved path of each edge in the database:</p>
+<pre><code>CREATE TABLE objects (id INTEGER PRIMARY KEY, path TEXT UNIQUE,
+                      soname TEXT, kind TEXT, is_root INTEGER);
+CREATE TABLE needs (
+  object_id     INTEGER REFERENCES objects(id),
+  ord           INTEGER NOT NULL,
+  soname        TEXT NOT NULL,
+  resolved_path TEXT REFERENCES objects(path)
+);
+</code></pre>
+<p><code>self closure</code> packs a binary and its transitive dependencies into <strong>one database</strong> with those edges filled in. Shared library resolution stops being a guess and becomes a foreign key and <code>ldd</code> becomes a <code>JOIN</code>.</p>
+<h2>§How far does this go? One file, one userland</h2>
+<p>I hope you’ve been with me so far, because this is where it gets really interesting. We can go even further and pack <strong>multiple closures</strong> into a single database.</p>
+<p>I pointed <code>self closure</code> at every ELF binary on this system’s <code>PATH</code>: 723 executables, which pull in 400 distinct shared libraries. 1,123 objects, 346,386 symbols, 3,808 dependency edges, all as <strong>one SQLite file</strong>.</p>
+<p><strong>611.9 MiB of database against 644.4 MiB of ELF files.</strong> The whole userland, as one queryable file, is <em>smaller</em> than the files it came from. The b-tree cost that doubled a single <code>hello</code> amortises to nearly nothing across 1,123 objects and is roughly 6% over the actual program bytes.</p>
+<p>Many common idioms we use in ELF immediately fall out of the database. For example, <code>LD_PRELOAD</code> is a row in a table rather than an environment variable. The <code>preload</code> table is a list of objects to map last, so their exports win. This means that turning <code>LD_PRELOAD</code> on and off is a transaction.</p>
+<h2>§Where it stands</h2>
+<p>The format is done and round-trips between ELF and SELF losslessly. The tooling is done and can query, modify, and pack closures. Lookup through SQL works on unmodified glibc programs perfectly and the native-SQL loader works enough to explore it as a possibility for ideas.</p>
+<p>The whole thing is at <a href="https://github.com/fzakaria/selfdb">fzakaria/selfdb</a>. <code>nix run .#self-vm</code> boots a NixOS VM where <code>hello</code> is a SQLite database. 🙌</p>
+<p>Nix lets us explore radical ideas like this. We can rebuild the world down to the Linux kernel if needed. We need not be constrained by the existing decisions and constraints of the past. We can explore new ideas and see what falls out. I hope you find this idea as interesting as I do.</p>

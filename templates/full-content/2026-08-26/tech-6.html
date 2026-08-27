@@ -1,0 +1,94 @@
+<p>Agents increasingly write TypeScript programs to coordinate tools and process their results. Once those programs touch real applications, some steps require authentication, while others need human approval.</p>
+<p>Executing that code with <code>eval</code> gives it the same access as the application around it, including its secrets and internal services, and leaves no durable way to pause at those boundaries.</p>
+<p>Today, we're releasing the Run SDK, a package for executing untrusted JavaScript and TypeScript without giving it direct access to your application or system. Applications expose narrow host functions and can interrupt execution for authentication or human-in-the-loop approval. The program resumes after a decision without repeating completed work.</p>
+<pre><code>pnpm add run</code></pre>
+<h2>A small interface to the host</h2>
+<p>The Run SDK evaluates JavaScript or type-stripped TypeScript in a fresh QuickJS context inside a worker thread, with no direct route to Node.js or the network.</p>
+<p>The application exposes selected operations through <code>hostFunctions</code>. These are regular functions that become callable globals inside the sandbox:</p>
+<pre><code>import \{ run } from 'run';
+
+const result = await run(\{
+  source: `
+    const orders = await store.listOrders("customer_123");
+    const total = orders.reduce((sum, order) =&gt; sum + order.amount, 0);
+    return \{ count: orders.length, total };
+  `,
+  hostFunctions: \{
+    store: \{
+      listOrders: async (customerId: string) =&gt; \{
+        return database.orders.findMany(\{ customerId });
+      },
+    },
+  },
+});
+
+if (result.status === 'completed') \{
+  console.log(result.value);
+}</code></pre>
+<p>Here, the generated program knows about <code>store.listOrders()</code>. The database client and its credentials remain in the application.</p>
+<p>Calls cross the sandbox boundary through serialization. A host function may return a promise, so existing service clients can sit behind this interface without being passed into the sandbox.</p>
+<p>You can try this in the playground. Code you run there can only reach the host functions on the page.</p>
+<h2>Code mode in practice</h2>
+<p>The Run SDK is the internal module powering code mode tool execution in the AI SDK. Giving an agent a program changes the unit of work. One model response can describe the calls and the logic connecting them:</p>
+<pre><code>const result = await run(\{
+  source: `
+    const accountId = "account_123";
+    const [account, invoices] = await Promise.all([
+      crm.getAccount(accountId),
+      billing.listInvoices(accountId),
+    ]);
+    const overdue = invoices.filter(invoice =&gt; invoice.status === "overdue");
+    return \{ account: account.name, overdue };
+  `,
+  hostFunctions: \{
+    crm: \{ getAccount },
+    billing: \{ listInvoices },
+  },
+});</code></pre>
+<p>The two requests happen concurrently, and invoice filtering stays local to the program. Only the useful result returns to the application.</p>
+<p>This is a good fit for agents that work across several internal services. A research agent can combine search results before answering. A support agent can inspect an account without putting an entire billing response back into its context.</p>
+<p>The same package can power a code interpreter or a product feature that accepts customer-defined transformations. In both cases, the application chooses the available data and operations.</p>
+<p>Host functions work best when they map to actions in your product, like refunding an order. Exposing <code>orders.refund(id)</code> gives the application a clear place to check the user and the order. A generic request function would make that authority much harder to reason about.</p>
+<h2>Native support for human-in-the-loop and auth</h2>
+<p>Reading invoices is different from issuing a refund. When generated code reaches a sensitive operation, the host function can interrupt execution:</p>
+<pre><code>import \{ getHostFunctionContext } from 'run';
+
+const hostFunctions = \{
+  documents: \{
+    publish: async (draftId: string) =&gt; \{
+      const context = getHostFunctionContext();
+      if (context.resume === undefined) \{
+        context.interrupt(\{
+          kind: 'approval',
+          message: `Publish $\{draftId}?`,
+        });
+      }
+      if (context.resume.resolution !== true) \{
+        return \{ published: false };
+      }
+      return publishDraft(draftId);
+    },
+  },
+};</code></pre>
+<p>When the run is interrupted, the result includes a signed token the application can save with an approval request and use to resume the run when a decision arrives.</p>
+<p>Resuming replays the program, but settled host function calls use their recorded results. Host function work completed before the interruption does not run again. The interrupted function receives the approval and continues from there.</p>
+<p>This mechanism also works when a workflow must wait for authentication. The application owns the waiting period; the worker does not need to remain alive.</p>
+<h2>Running within limits</h2>
+<p>A sandbox still needs to account for code that loops forever or produces an oversized result. <code>createRunner()</code> sets shared limits:</p>
+<pre><code>import \{ createRunner } from 'run';
+
+const runner = createRunner(\{
+  limits: \{
+    timeoutMs: 10_000,
+    memoryLimitBytes: 32 * 1024 * 1024,
+  },
+});</code></pre>
+<p>Limits can also be set per run. The defaults cover the QuickJS heap and the values crossing the host boundary; applications can tighten them for their workload.</p>
+<p>Each invocation receives a new QuickJS context. Dynamic evaluation is disabled and built-in prototypes are hardened. This boundary applies to the generated program, while host functions remain trusted application code and must perform their normal authorization checks.</p>
+<p>The Run SDK is intended for JavaScript computation inside an application. Workloads that require an operating system, package installation, or process-level isolation should use Vercel Sandbox instead.</p>
+<h2>Extracting the execution layer</h2>
+<p>The first version of this runtime lived inside <code>just-bash</code> as <code>js-exec</code>, backed by QuickJS. It let agents write TypeScript against the shell's virtual filesystem and command set.</p>
+<p>We extracted that layer into the Run SDK and replaced the Node-shaped environment with application-defined host functions. We tested the underlying mechanism in <code>eve</code>, using it to run agent-generated TypeScript against real tools. It now powers code mode in the AI SDK where existing AI SDK tools are mapped to host functions, while the Run SDK handles their sandboxed execution.</p>
+<h2>Getting started</h2>
+<p>The Run SDK supports Node.js 22.13+ and Bun. You will need pnpm or another package manager installed on your local development machine.</p>
+<pre><code>pnpm add run</code></pre>

@@ -1,0 +1,126 @@
+<p>Every useful agent reaches beyond your codebase. It posts to Slack, opens pull requests, queries Snowflake, or calls an internal API. That reach is what makes it valuable, and it's also where the risk lives, because for years, granting it meant provisioning a long-lived token and hoping it never leaked.</p>
+<p>Vercel Connect replaces long-lived tokens with ones your code requests at runtime, scoped to the task and expiring on their own.</p>
+<p>During the public beta, we've grown the ecosystem past 100 connectors, unified how they work, and added the governance capabilities teams need in production.</p>
+<p>Today, Vercel Connect is generally available.</p>
+<h2>Vaults don't fix long-lived tokens</h2>
+<p>Managing credentials has become its own workload. Teams write rotation scripts, copy secrets across environments, and share tokens between users. Putting a token in a vault made it harder to steal, but no less dangerous once stolen. It never expires, and no vault limits what a leaked credential can do.</p>
+<p>Agents compounded the problem by touching more systems with greater autonomy, more often. Yet the tools to contain a secret haven't changed.</p>
+<p>With Vercel Connect, your app never stores credentials. It requests one:</p>
+<ul>
+ <li>You register a connector once for a provider like Slack, GitHub, Snowflake, Shopify, or your own OAuth service</li>
+ <li>You attach it to the projects and environments that need it</li>
+ <li>Your code requests a token at runtime, and it refreshes automatically</li>
+ <li>Your app has no provider secret to commit by accident</li>
+</ul>
+<pre><code>vercel connect create slack --name acme-slack</code></pre>
+<p>Create a Slack connector named acme-slack</p>
+<pre><code>import \{ getToken } from '@vercel/connect';
+const token = await getToken('slack/acme-slack', \{  subject: \{ type: 'app' },});</code></pre>
+<p>Request an app-level Slack token</p>
+<p>Requesting a token doesn't require another secret. Every deployment on Vercel carries an OIDC identity, and the SDK uses it to prove who's asking.</p>
+<h2>What changes when access becomes a request</h2>
+<p>The difference shows up in the properties of the credential:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Property</th>
+   <th>Stored token</th>
+   <th>Vercel Connect</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Lifetime</td>
+   <td>Never expires</td>
+   <td>Short-lived, refreshed automatically</td>
+  </tr>
+  <tr>
+   <td>Reach</td>
+   <td>Everything the agent could need</td>
+   <td>Scoped to the task in the request</td>
+  </tr>
+  <tr>
+   <td>Identity</td>
+   <td>One shared bot for every user</td>
+   <td>App or a specific named user</td>
+  </tr>
+  <tr>
+   <td>Rotation</td>
+   <td>Mint, update copies, redeploy</td>
+   <td>None to perform</td>
+  </tr>
+  <tr>
+   <td>Revocation</td>
+   <td>Rotate and redeploy</td>
+   <td>One command, per user or all tokens</td>
+  </tr>
+ </tbody>
+</table>
+<p>Credentials that used to sit in environments long after the work finished now expire on their own. Nothing lingers for an attacker to find.</p>
+<blockquote>
+ “Minting short-lived tokens instead of keeping provider credentials in paused sandboxes has removed a whole class of security risk for us.” — Fraser Brown, BuildPass
+</blockquote>
+<p>Scoping happens per request. One step of an agent might read a repository, the next opens an issue, and each asks for only that.</p>
+<p>How fine-grained a token can be depends on the service, and GitHub is the clearest example. Requests can restrict a token to a single repository with read-only permissions, rather than trusting a standing grant organization-wide.</p>
+<p>The open-source GitHub Tools SDK puts this into practice. Choose a preset like <code>code-review</code>, and it mints tokens with only the required scopes.</p>
+<p>Identity is per request as well. Tokens act as the app by default, but pass a named user as the <code>subject</code> and the token acts on their behalf, scoped to what they authorized during a one-time consent flow.</p>
+<h2>Connectors for the services you already use</h2>
+<p>Vercel Connect now ships with 100+ preset connectors for developer tools and SaaS providers like Notion, Shopify, and Workday, as well as managed connectors for Slack, GitHub, Linear, Salesforce, and more.</p>
+<p>Your own services follow the same model via custom OAuth and API Key authentication, and any OAuth-capable MCP server can serve as a connector.</p>
+<p>Finding and creating them is faster, too. Browse the full catalog on the Vercel website, create a connector in fewer steps, and manage everything from the dashboard, CLI, or API.</p>
+<blockquote>
+ “Vercel Connect allowed us to quickly deploy new AI agents and channel integrations to our teams, while saving us the time and headache of rolling our own secure token management.” — Pat Dunn, EF World Journeys USA
+</blockquote>
+<h2>Governance that scales with your team</h2>
+<p>Teams adopting Vercel Connect need more than scoped tokens. They need to control who manages connectors and to track how access is used.</p>
+<p>GA adds three capabilities:</p>
+<ul>
+ <li>Fine-grained RBAC controls who can create and manage connectors</li>
+ <li>Audit logs record authorization and connector activity</li>
+ <li>Token and trigger observability shows usage across projects</li>
+</ul>
+<p>Together with per-environment attachment and one-command revocation, access becomes something you can inspect and prove.</p>
+<p>When an auditor asks who had access to a system and when, the answer is a query against the audit log, not an investigation across projects and Slack threads.</p>
+<h2>Wherever your agents run</h2>
+<p>Vercel Connect is available wherever you and your users are:</p>
+<ul>
+ <li>Custom Environments are supported, so a <code>qa</code> environment gets its own connector alongside production, preview, and development</li>
+ <li>eve supports Connect out of the box, with connections declared per agent</li>
+ <li>Chat SDK support brings the same model to conversational apps</li>
+</ul>
+<h3>Build connected apps in v0</h3>
+<p>Apps and agents built in v0 use the same model.</p>
+<p>Tell v0 which service your app needs, and it sets up the connector during the build. Slack, GitHub, and other managed connectors need nothing on the provider's side, and since tokens are minted at runtime, the generated app has no secret to keep.</p>
+<p>The KERNEL team shipped a voice-driven browser agent this way:</p>
+<blockquote>
+ “v0 handles all the auth wiring with Connect, so instead of getting stuck managing API keys, I could just let anyone bring their own AI Gateway and KERNEL access via OAuth and start playing.” — Danny Prevoznik, KERNEL
+</blockquote>
+<h2>Events flow in, without a secret either</h2>
+<p>Requesting tokens is half the picture. Your agent also needs to hear about events.</p>
+<p>Triggers handle this without putting a secret back in your app. When a user posts in Slack, the provider sends the event to Vercel Connect. It verifies the signature server-side, re-attests the event with an OIDC identity, and forwards it to your project. Forwarded events arrive even with Deployment Protection enabled.</p>
+<p>Your app has no bot token to act with and no signing secret to verify webhooks, yet the full loop still runs.</p>
+<p>Moonpig Group runs its internal legal agent on this loop in production:</p>
+<blockquote>
+ “We're using Connect in production today. Our internal legal agent handles Slack, Jira, and Google Drive through Connect, so we don't manage tokens, secrets, or event subscriptions ourselves.” — Jorian Kalse, Moonpig Group
+</blockquote>
+<h2>Built around a single call</h2>
+<p>Underneath everything is <code>getToken</code> from the Vercel Connect SDK.</p>
+<p>Whether your agent is built on eve or the AI SDK, runs as a background job in Vercel Workflows, or is a loop you wrote yourself, it asks for a credential the same way.</p>
+<p>Around that call, adapters handle the wiring:</p>
+<ul>
+ <li><code>@vercel/connect/eve</code> supplies the credentials behind an agent's connections</li>
+ <li><code>@vercel/connect/chat</code> hooks Connect into Chat SDK adapters</li>
+ <li><code>@vercel/connect/betterauth</code> and <code>@vercel/connect/authjs</code> produce provider configs for Better Auth and Auth.js</li>
+ <li><code>@vercel/connect/ai-sdk</code> and <code>@vercel/connect/mcp</code> do the same for AI SDK tools and MCP clients, whether your agent calls tools directly or through a server</li>
+</ul>
+<p>For eve agents and Chat SDK applications, the two secrets a Slack integration usually keeps in your environment, <code>SLACK_BOT_TOKEN</code> and <code>SLACK_SIGNING_SECRET</code>, are gone from your app entirely.</p>
+<h2>Pricing and availability</h2>
+<p>Vercel Connect is available on all plans, with pricing based on token requests and trigger events. The Hobby plan includes 500 token requests and 1,000 triggers per month at no additional cost. Pro plans are billed at $3 per 1,000 token requests and $0.95 per 1,000 triggers, with custom pricing on Enterprise.</p>
+<p>If you used Vercel Connect during the beta, your current billing terms stay unchanged until September 25, 2026, when the updated pricing takes effect.</p>
+<h2>Get started</h2>
+<ul>
+ <li>Deploy a software factory template with Vercel Connect or browse the source</li>
+ <li>Follow the complete guide in the knowledge base or read the changelog</li>
+ <li>Hand the prompt below to your coding agent to set up Vercel Connect:</li>
+</ul>
+<p>Help me set up Vercel Connect in this application. Install the Vercel Connect skill first with <code>npx skills add vercel/vercel-plugin --skill vercel-connect</code> and follow it. Read vercel.com/docs/connect.md for anything the skill does not cover. Link the project (<code>vercel link</code>) and pull a local OIDC token (<code>vercel env pull</code>). Ask me which provider to connect, create a connector for it, and attach it to this project. Then install @vercel/connect and request a token at runtime with getToken. Make a test call against the provider to confirm it works. If you have any questions or get stuck, don't assume the answer, just ask me.</p>
