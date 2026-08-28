@@ -1,0 +1,291 @@
+<p>Well, truth be told these are not all that new (couple of months), but I finally have gotten around to research it.</p>
+<p>So, let's see what's what. For starters I need some test data. Luckily, I have explain.depesz.com DB…</p>
+<p>Extracted all plans to side table, with this structure:</p>
+<pre><code>=$ \d all_plans
+            Table "public.all_plans"
+ Column | Type | Collation | Nullable | Default 
+--------+------+-----------+----------+---------
+ id     | text |           | not null | 
+ plan   | text |           |          | 
+Indexes:
+    "all_plans_pkey" PRIMARY KEY, btree (id)</code></pre>
+<p>In total, there are 1.6 million rows there, with average length of 22kB, max length (of plan) ~ 9.5MB, and total length of all plans around 33GB.</p>
+<p>First test case is <em>word</em> “sususu". I picked this string as it is uncommon (only 93 plans with it).</p>
+<p>Original Pg, with no magic:</p>
+<pre><code>=$ explain (analyze on, buffers on, costs off) select count(*) from all_plans  where plan ~ 'sususu';
+                                              QUERY PLAN
+───────────────────────────────────────────────────────────────────────────────────────────────────────
+ Finalize Aggregate (actual time=41431.824..41442.352 rows=1.00 loops=1)
+   Buffers: shared hit=2007647 read=941087
+   -&gt;  Gather (actual time=41367.015..41442.322 rows=3.00 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=2007647 read=941087
+         -&gt;  Partial Aggregate (actual time=41391.421..41391.422 rows=1.00 loops=3)
+               Buffers: shared hit=2007647 read=941087
+               -&gt;  Parallel Seq Scan on all_plans (actual time=1591.041..41391.268 rows=31.00 loops=3)
+                     Filter: (plan ~ 'sususu'::text)
+                     Rows Removed by Filter: 541276
+                     Buffers: shared hit=2007647 read=941087
+ Planning Time: 0.305 ms
+ Execution Time: 41442.639 ms
+(14 rows)</code></pre>
+<p>OK. So we see that it took ~ 40 seconds, it was 3-way parallel seq scan.</p>
+<p>Great. Luckily we know that we can optimize it using pg_trgm:</p>
+<pre><code>=$ create extension pg_trgm;
+CREATE EXTENSION
+&nbsp;
+=$ create index trgm_idx on all_plans using gin (plan gin_trgm_ops);
+CREATE INDEX
+Time: 1007956.846 ms (16:47.957)
+&nbsp;
+=$ select pg_size_pretty( pg_relation_size('trgm_idx'::regclass));
+ pg_size_pretty 
+----------------
+ 1667 MB
+(1 row)</code></pre>
+<p>That took a while….</p>
+<p>But now:</p>
+<pre><code>=$ explain (analyze on, buffers on, costs off) select count(*) from all_plans  where plan ~ '(su)\{3}';
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Aggregate (actual time=1615.599..1615.600 rows=1.00 loops=1)
+   Buffers: shared hit=6038 read=29131
+   -&gt;  Bitmap Heap Scan on all_plans (actual time=38.302..1615.518 rows=93.00 loops=1)
+         Recheck Cond: (plan ~ '(su)\{3}'::text)
+         Rows Removed by Index Recheck: 2879
+         Heap Blocks: exact=2884
+         Buffers: shared hit=6038 read=29131
+         -&gt;  Bitmap Index Scan on trgm_idx (actual time=1.829..1.830 rows=2972.00 loops=1)
+               Index Cond: (plan ~ '(su)\{3}'::text)
+               Index Searches: 1
+               Buffers: shared hit=9 read=21
+ Planning:
+   Buffers: shared read=1
+ Planning Time: 0.365 ms
+ Execution Time: 1615.620 ms
+(15 rows)</code></pre>
+<p>Nice. 1.6 second, used index.</p>
+<p>Now. For the <em>new stuff</em>.</p>
+<p>First, is pg_tre, with initial (well, at least for me) announcement here.</p>
+<p>Installation is somewhat trivial:</p>
+<pre><code>=$ git clone --recurse-submodules https://codeberg.org/gregburd/pg_tre.git
+=$ cd pg_tre
+=$ make
+=$ sudo make install</code></pre>
+<p>and then, in DB:</p>
+<pre><code>=$ CREATE EXTENSION pg_tre;
+CREATE EXTENSION
+&nbsp;
+=$ CREATE INDEX plan_tre ON all_plans_tre USING tre (plan);
+NOTICE:  pg_tre: collected 1701834577 trigram entries from 1623920 heap tuples
+NOTICE:  pg_tre: built 755269 posting trees
+NOTICE:  pg_tre: built range tier with 1407 ranges across 47 pages
+NOTICE:  pg_tre: build complete, indexed 1623920 heap tuples into 755269 trigrams
+CREATE INDEX
+Time: 26127621.037 ms (07:15:27.621)</code></pre>
+<p>OH. MY. $DEITY. 7 hours. And how about size?</p>
+<pre><code>=$ select pg_size_pretty( pg_relation_size('plan_tre'::regclass));
+ pg_size_pretty
+────────────────
+ 21 GB
+(1 row)</code></pre>
+<p>You might have noticed that I changed table name – it's identical to <em>all_plans</em>, but I made a copy so I can test all approaches at the same time.</p>
+<p>So. Let's see if the new index is fast…</p>
+<pre><code>=$ explain (analyze on, buffers on, costs off) SELECT * FROM all_plans_tre WHERE plan %~~ tre_pattern('su\{3}', 0);
+                                     QUERY PLAN
+────────────────────────────────────────────────────────────────────────────────────
+ Bitmap Heap Scan on all_plans_tre (actual time=2.182..2292.506 rows=85.00 loops=1)
+   Recheck Cond: (plan %~~ 'su\{3}'::tre_pattern)
+   Rows Removed by Index Recheck: 357
+   Heap Blocks: exact=431
+   Buffers: shared hit=5967
+   -&gt;  Bitmap Index Scan on plan_tre (actual time=0.132..0.132 rows=442.00 loops=1)
+         Index Cond: (plan %~~ 'su\{3}'::tre_pattern)
+         Index Searches: 0
+         Buffers: shared hit=7
+ Planning:
+   Buffers: shared hit=14
+ Planning Time: 0.135 ms
+ Execution Time: 2292.584 ms
+(13 rows)</code></pre>
+<p>Well, it's faster than seq scan, but it's not as fast as trigram. <em>BUT</em>, docs say this:</p>
+<blockquote>
+ <p>Where pg_tre is not the answer<br>
+   Exact substring / LIKE: pg_trgm is battle-tested and ships with every PG install. Use it.</p>
+</blockquote>
+<p>My search was clearly very simplistic. So let's try something more “fun":</p>
+<pre><code>=$ explain (analyze, buffers, costs off) select * from all_plans  where plan ~ '(?&lt;=e.)aa[bc]c[b-d]';
+                                     QUERY PLAN
+─────────────────────────────────────────────────────────────────────────────────────
+ Bitmap Heap Scan on all_plans (actual time=124.424..39356.809 rows=40.00 loops=1)
+   Recheck Cond: (plan ~ '(?&lt;=e.)aa[bc]c[b-d]'::text)
+   Rows Removed by Index Recheck: 5137
+   Heap Blocks: exact=5005
+   Buffers: shared hit=19212 read=103648
+   -&gt;  Bitmap Index Scan on trgm_idx (actual time=7.965..7.966 rows=5177.00 loops=1)
+         Index Cond: (plan ~ '(?&lt;=e.)aa[bc]c[b-d]'::text)
+         Index Searches: 1
+         Buffers: shared hit=177
+ Planning:
+   Buffers: shared hit=1
+ Planning Time: 1.789 ms
+ Execution Time: 39356.895 ms
+(13 rows)</code></pre>
+<p>But I can't use this regexp for tre:</p>
+<pre><code>=$ explain (analyze, buffers, costs off) select * from all_plans_tre  where plan %~~ tre_pattern('(?&lt;=e.)aa[bc]c[b-d]');
+ERROR:  pg_tre: invalid regex pattern:</code></pre>
+<p>Interestingly, it seems to have an error in message, as it ends with <em>:</em>, but there is nothing afterwards.</p>
+<p>So, what good is it for?</p>
+<p>Well, apparently it has support for fuzzy matching built-in.</p>
+<p>For example:</p>
+<pre><code>=$ select word from word_stats where word  %~~ tre_pattern('postgresql', 1);
+                word
+────────────────────────────────────
+ autopostgresqlbackup
+ metadatapostgresqlserver
+ rpostgresql
+ inpostgresql
+ postgresl
+ postgresml
+ postgresql
+ Postgresql
+ PostgresqlDatabaseServices
+ postgresqlmatches
+ postgrestls
+ postgresxl
+ usrpostgresplanif
+ InternalPostgresqlDatabaseServices
+ libpostgresql
+ VRTSpostgresql
+(16 rows)</code></pre>
+<p>The number at the end is related to Levenshtein distance. So it can do pretty cool things. I think that using this on list of words, and then extracting using normal trigram could be great:</p>
+<pre><code>=$ EXPLAIN ( analyze, buffers, costs off)
+WITH re AS (
+    SELECT
+        string_agg(
+            word,
+            '|'
+        ) AS ex
+    FROM
+        word_stats
+    WHERE
+        word %~~ tre_pattern(
+            'postgresql',
+            1
+        )
+)
+SELECT
+    *
+FROM
+    all_plans
+WHERE
+    plan ~ (
+        SELECT
+            re.ex
+        FROM
+            re
+    );
+                                                 QUERY PLAN
+────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bitmap Heap Scan on all_plans (actual time=684.096..9993.531 rows=846.00 loops=1)
+   Recheck Cond: (plan ~ (InitPlan 1).col1)
+   Rows Removed by Index Recheck: 12951
+   Heap Blocks: exact=12946
+   Buffers: shared hit=28794 read=94765
+   InitPlan 1
+     -&gt;  Finalize Aggregate (actual time=638.129..638.264 rows=1.00 loops=1)
+           Buffers: shared read=14464
+           -&gt;  Gather (actual time=629.474..638.250 rows=3.00 loops=1)
+                 Workers Planned: 2
+                 Workers Launched: 2
+                 Buffers: shared read=14464
+                 -&gt;  Partial Aggregate (actual time=619.772..619.773 rows=1.00 loops=3)
+                       Buffers: shared read=14464
+                       -&gt;  Parallel Seq Scan on word_stats (actual time=309.658..619.756 rows=5.33 loops=3)
+                             Filter: (word %~~ 'postgresql@1'::tre_pattern)
+                             Rows Removed by Filter: 800091
+                             Buffers: shared read=14464
+   -&gt;  Bitmap Index Scan on trgm_idx (actual time=680.737..680.737 rows=13797.00 loops=1)
+         Index Cond: (plan ~ (InitPlan 1).col1)
+         Index Searches: 1
+         Buffers: shared hit=693 read=15219
+ Planning:
+   Buffers: shared hit=1
+ Planning Time: 2.671 ms
+ Execution Time: 9994.121 ms
+(26 rows)</code></pre>
+<p>In here I searched through list of words to find the ones that kinda look like <em>postgresql</em>, and then built (not in safe way, but it's just test) regexp that matches any of them, and then used trigram index for search. Not bad.</p>
+<p>Anyway. I think that while it might have some uses, currently there are some rough edges that will require more work. But it definitely looks interesting…</p>
+<p>So, let's look at pg_re2.</p>
+<p>Installation is pretty simple:</p>
+<pre><code>=$ sudo apt-get install libre2-dev
+=$ sudo pgxnclient install re2</code></pre>
+<p>And then you can:</p>
+<pre><code>=$ create extension re2;
+CREATE EXTENSION</code></pre>
+<p>Sweet. Now, we can try it:</p>
+<pre><code>=$ explain (analyze on, buffers on, costs off) SELECT * FROM all_plans_re2 WHERE plan @~ '(su)\{3}';
+                                          QUERY PLAN
+───────────────────────────────────────────────────────────────────────────────────────────────
+ Gather (actual time=247.527..23113.592 rows=93.00 loops=1)
+   Workers Planned: 2
+   Workers Launched: 2
+   Buffers: shared hit=2007641 read=941087
+   -&gt;  Parallel Seq Scan on all_plans_re2 (actual time=1067.656..23075.232 rows=31.00 loops=3)
+         Filter: (plan @~ '(su)\{3}'::text)
+         Rows Removed by Filter: 541276
+         Buffers: shared hit=2007641 read=941087
+ Planning Time: 0.290 ms
+ Execution Time: 23113.893 ms
+(10 rows)</code></pre>
+<p>What?! 23 seconds? Scan, without index, using normal <em>~</em> operator, built-in Pg, took a bit over 40 seconds?! I tested it couple of times, and confirmed the result.</p>
+<p>So, let's add custom re2 index:</p>
+<pre><code>=$ CREATE INDEX re2idx ON all_plans_re2 USING gin (plan gin_re2_ops);
+CREATE INDEX
+Time: 898682.472 ms (14:58.682)
+&nbsp;
+=$ select pg_size_pretty( pg_relation_size('re2idx'::regclass));
+ pg_size_pretty
+────────────────
+ 2927 MB
+(1 row)</code></pre>
+<p>So, making the index took less time than trigram index, and it's almost 2x the size of trigram index. So, how does it behave?</p>
+<pre><code>=$ explain (analyze on, buffers on, costs off) SELECT * FROM all_plans_re2 WHERE plan @~ '(su)\{3}';
+                                     QUERY PLAN
+─────────────────────────────────────────────────────────────────────────────────────
+ Bitmap Heap Scan on all_plans_re2 (actual time=21.121..958.796 rows=93.00 loops=1)
+   Recheck Cond: (plan @~ '(su)\{3}'::text)
+   Rows Removed by Index Recheck: 2879
+   Heap Blocks: exact=2884
+   Buffers: shared hit=6033 read=29142
+   -&gt;  Bitmap Index Scan on re2idx (actual time=19.322..19.323 rows=2972.00 loops=1)
+         Index Cond: (plan @~ '(su)\{3}'::text)
+         Index Searches: 1
+         Buffers: shared hit=10 read=21
+ Planning:
+   Buffers: shared read=1
+ Planning Time: 0.368 ms
+ Execution Time: 958.857 ms
+(13 rows)</code></pre>
+<p>Pretty cool. It's significantly faster than trigram. What about more complex regexp?</p>
+<pre><code>=$ explain (analyze on, buffers on, costs off) SELECT * FROM all_plans_re2 WHERE plan @~ '(^|^.|[^e].)aa[bc]c[b-d]';
+                                      QUERY PLAN
+──────────────────────────────────────────────────────────────────────────────────────
+ Bitmap Heap Scan on all_plans_re2 (actual time=24.061..2267.620 rows=376.00 loops=1)
+   Recheck Cond: (plan @~ '(^|^.|[^e].)aa[bc]c[b-d]'::text)
+   Rows Removed by Index Recheck: 4801
+   Heap Blocks: exact=5005
+   Buffers: shared hit=11775 read=111084
+   -&gt;  Bitmap Index Scan on re2idx (actual time=11.902..11.903 rows=5177.00 loops=1)
+         Index Cond: (plan @~ '(^|^.|[^e].)aa[bc]c[b-d]'::text)
+         Index Searches: 1
+         Buffers: shared hit=72 read=104
+ Planning:
+   Buffers: shared read=1
+ Planning Time: 0.449 ms
+ Execution Time: 2267.799 ms
+(13 rows)</code></pre>
+<p>This regexp should be functionally the same as <em>plan ~ ‘(?&lt;=e.)aa[bc]c[b-d]'</em>, and it does return the same number of rows. In ~ 50% of the time!</p>
+<p>Why can't I use <em>(?&lt;=…</em>? It's limitation of re2 library. To make it fast certain things have been removed.</p>
+<p>All things said – there is some interesting work related to regular expressions in PostgreSQL. Some of it already provides great results. Some of it looks more like promise for bright future. But still, it does look interesting…</p>

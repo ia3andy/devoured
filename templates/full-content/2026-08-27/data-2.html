@@ -1,0 +1,98 @@
+<p>In July, several Confluent colleagues and I published <em>The LogDrive: Composable Durability for Cloud-Based Shared Logs</em>. The paper evolves the concepts of Virtual Consensus in Delos by decomposing the Loglet abstraction into AtomicLog and LogDrive, moving composition below sequencing to a new durability abstraction. This post describes these new abstractions in the context of Virtual Consensus, focusing on how they support RAID-like composability for shared logs.</p>
+<p>The ideas of the paper came out of a research project led by Mahesh Balakrishnan, Gardner Vickers, and Lucas Bradstreet. The project itself was to build a Kafka-on-S3 service to run in Confluent Cloud and the project ultimately became K2 or Kora 2, the next evolution of the Kora engine (which powers Confluent Cloud’s Kafka service). The first product built on K2 was Freight Clusters (Kafka on S3). The research that led to the LogDrive paper originated in Conflux, the scalable metadata service in K2 which acts as sequencer and metadata database for the fleet of leaderless brokers, akin to WarpStream’s agents.</p>
+<p>Conflux is a multi-master state-machine replication service built over a shared log based on Virtual Consensus which uses cloud services such as S3 and DynamoDB as the backing storage service.</p>
+<p>But this post isn’t about K2, nor even Conflux, its about extending the shared log protocol Virtual Consensus for better composability, specifically, being able to use RAID-like semantics to build logs with striping and quorums over diverse backing storage without having to rewrite the stack.</p>
+<h2>A brief recap of Virtual Consensus</h2>
+<p>I recommend reading my previous posts on Virtual Consensus to better understand this post:</p>
+<ul>
+ <li>
+  <p>An Introduction to Virtual Consensus in Delos</p></li>
+ <li>
+  <p>Steady on! Separating Failure-Free Ordering from Fault-Tolerant Consensus</p></li>
+</ul>
+<p>But in any case, I will do a quick recap to set the scene for describing the new abstractions introduced by the LogDrive paper.</p>
+<p>Traditional replicated-log protocols tend to combine sequencing, durable storage, failure handling, and membership changes. Virtual Consensus separates these responsibilities between a VirtualLog and a sequence of Loglets.</p>
+<p>The VirtualLog exposes one logical address space over a chain of independent Loglets. One Loglet is active, while its predecessors are sealed. The active Loglet provides the steady-state data path: it accepts appends and establishes a durable order within a fixed configuration—failure-free ordering. Basically the happy steady state where everything is running fine.</p>
+<p>The VirtualLog provides the control plane. When the active Loglet experiences a failure and must be replaced, the VirtualLog seals it, records its final tail, and extends the chain with a new Loglet.</p>
+<p>Virtual Consensus separates the protocol into <strong>failure-free ordering</strong> (Loglet) and <strong>fault-tolerant consensus </strong>(VirtualLog). A Loglet does not need to implement recovery from partial failure, such as leader elections or membership changes. In that sense, it can be much simpler to implement than Raft. It only needs to order entries with a fixed configuration and provide fault-tolerant <code>seal</code> and <code>checkTail</code> operations so that the VirtualLog can terminate the segment safely.</p>
+<h2>The Problem With Append and Loglet Composition</h2>
+<p>There is a limitation to the Loglet abstraction when it comes to Loglet composition. By composition I mean building Loglets that are composed of other Loglets. For example, building a generic QuorumLoglet over a set of child Loglets, or a StripingLoglet that stripes writes across a set of child Loglets.</p>
+<p>The fundamental write operation of the Loglet is <code>append(value) -&gt; address</code>.</p>
+<p><em>An append both assigns a position and stores the value</em>.</p>
+<p>Striping works despite this coupling of sequencing with storage. A StripedLoglet routes each <code>append</code> to one child Loglet <code>append</code> and translates the returned child address into its own address space. This works provided that each child allocates contiguous addresses (for address translation between child and parent address space).</p>
+<p>But while <code>append</code> can work for striping, it does not compose cleanly for a QuorumLoglet. A parent can forward an append to several child Loglets, but each child independently assigns the address. Partial failures and retries may place corresponding values at different addresses across the child Loglets, creating divergence.</p>
+<p>An external sequencer could assign positions first, but the Loglet API has no operation for storing a value at a caller-selected address (it only has <code>append</code>). The parent would have to ignore the children’s ordering and somehow add its own sequencing and reordering machinery. Doesn’t sound like much fun.</p>
+<p>In Delos, quorum replication was therefore implemented inside the NativeLoglet. The NativeLoglet consists of a sequencer and a set of Log Servers. The sequencer assigns an address to each append and then writes the value at that address to a quorum of Log Servers. Crucially, the Log Servers expose <code>write(address, value)</code>, not <code>append(value).</code></p>
+<p>Loglet composition via <code>append</code> is the problem. This now brings us to the new abstractions: AtomicLog and LogDrive.</p>
+<h2>Making Loglets More Composable</h2>
+<p>The AtomicLog together with the LogDrive is an implementation of the Loglet API. From the VirtualLog’s perspective, AtomicLog is simply another Loglet: it supports <code>append</code>, <code>readNext</code>, <code>checkTail</code>, <code>prefixTrim</code> and <code>seal</code>, and it can be replaced through the normal Virtual Consensus reconfiguration mechanism.</p>
+<p>The further decomposition of the Loglet is as follows:</p>
+<ul>
+ <li>
+  <p><strong>The AtomicLog</strong> is responsible for sequencing and general log semantics but delegates durability. Sequencing/addressing is achieved via a soft-state sequencer (which we can consider is part of the AtomicLog).</p></li>
+ <li>
+  <p><strong>The LogDrive</strong> (sitting below the AtomicLog) is concerned with durability rather than sequencing. It exposes a flat numbered address space of durable single-value registers together with <code>weakTail</code>, an operation that lets AtomicLog reconstruct the tail from backing storage after the sequencer has disappeared.&nbsp;</p></li>
+</ul>
+<p>Composition into stripes and quorums exists at the LogDrive level, <em>below sequencing</em>. That is, composition is via the LogDrive API, not the AtomicLog (Loglet) API.</p>
+<p>The LogDrive API does not include append, as composition requires writes to use caller-defined addresses:</p>
+<pre><code>interface LogDrive \{
+  void write(long address, ByteBuf payload);
+  ByteBuf read(long address);
+  TailDesc weakTail(int K);
+  struct TailDesc \{
+    long nonContiguousTail;
+    Set&lt;Long&gt; holes;
+  }
+}</code></pre>
+<h3>Appends</h3>
+<p>An AtomicLog append consists of a three step process:</p>
+<ol>
+ <li>
+  <p>Acquire the next free slot from the sequencer (the slot is the address)</p></li>
+ <li>
+  <p>Write the append value to the acquired address via the LogDrive</p></li>
+ <li>
+  <p>Complete the slot</p></li>
+</ol>
+<p>The sequencer is essentially a map of: address -&gt; \{FREE, ACQUIRED, COMPLETED}, though the sequencer uses the term slot instead of address.&nbsp;</p>
+<p>Multiple addresses can be written concurrently using a windowed write discipline: the sequencer permits up to (K) appends to be in flight ahead of the contiguous log tail T. The contiguous tail is the first unwritten address and the non-contiguous tail is the lowest unwritten address after which all addresses are unwritten (or alternatively the last written address + 1).</p>
+<p>On a completeSlot(slot) call, the sequencer blocks until all prior slots are also completed. In the figure above, we see that the window of four addresses which is being written to concurrently has holes in addresses 3 and 5. The LogDrive writes for 4 and 6 can finish out of order but their sequencer <code>completeSlot</code> calls cannot complete until all preceding slots have completed. Only once address 3 has been written to and completeSlot(3) is called, can address 4 complete and the contiguous tail advance to slot 5. So while writes to the LogDrive can complete out-of-order, the appends at the AtomicLog are strictly completed in address order.</p>
+<h3>checkTail</h3>
+<p>When a Loglet is unsealed, <code>checkTail</code> simply asks the sequencer what the tail is. This is the fast-path as the sequencer keeps all its state in memory. Should the sequencer become unavailable, then the AtomicLog can only discover the tail by inspecting log storage (slow-path). The LogDrive offers the <code>weakTail</code> command for this purpose.</p>
+<p>While the AtomicLog checkTail returns a scalar contiguous tail (T) address, the LogDrive weakTail returns:</p>
+<ul>
+ <li>
+  <p><strong>N</strong>: the non-contiguous tail (first unwritten address after which all addresses are unwritten, or alternatively, the highest written address + 1)</p></li>
+ <li>
+  <p><strong>H</strong>: The holeset, the unwritten addresses within the write window.</p></li>
+</ul>
+<p>As seen in Fig 9, the write window can create a Swiss cheese of holes at the tail of the log. The weakTail result implicitly describes the state of the write window. The write discipline maintains <code>N − T ≤ K</code>. Therefore, every hole lies in the address range <code>[max(0, N − K), N)</code>, while all addresses below that range are guaranteed to be written.</p>
+<p>The window provides concurrency while bounding the number of holes that incomplete or slow writes can create. Limiting the window size allows the tail to be recovered or checked efficiently by examining at most the last <code>K</code> addresses rather than scanning an unbounded address space.&nbsp;</p>
+<h2>LogDrive composition</h2>
+<p>There are three main types of LogDrive:</p>
+<ul>
+ <li>
+  <p><strong>Primitive LogDrive</strong>: A thin interface over remote storage, such as a cloud database, KV store or object storage. For example, one might implement a DynamoDBLogDrive, or an S3LogDrive, which are thin shims.</p></li>
+ <li>
+  <p><strong>StripedLogDrive</strong>: A log drive with a set of child log drives where each child is a stripe. Maps addresses to stripes and performs address translation between its own address space and that of its children.</p></li>
+ <li>
+  <p><strong>QuorumLogDrive</strong>: Also has a set of child log drives. Each read, write, weakTail is a quorum operation over its child logdrives.</p></li>
+</ul>
+<p>Striped and Quorum LogDrives call the LogDrive API of their children—the LogDrive API is the compositional interface. So we can compose LogDrives arbitrarily: quorums over stripes over primitives, or stripes over quorums over primitives and even over heterogenous primitives. The base of the tree must ultimately consist of primitive implementations.</p>
+<h3>read/write composition</h3>
+<p>A call to <code>write(a, v)</code> in the root LogDrive will flow down as calls to <code>write(a,v)</code> in child LogDrives, according to the type LogDrive.</p>
+<p>A QuorumLogDrive forwards <code>write(a, v)</code> to its child LogDrives and waits for a write quorum (Qw). Flexible quorums apply here, where the read-quorum (Qr) is computed as <code>N-Qw+1</code>. So if <code>N=3</code>, <code>Qw=2</code>, then the <code>Qr=2</code>. If <code>N=5</code>, <code>Qw=4</code>, then <code>Qr=2</code>. Because the parent supplies <em>a</em>, every child receives the same value for the same address. Partial success can leave an address unwritten on some children, but it cannot cause their logical address assignments to diverge as independent child <em>append</em> calls can.</p>
+<h3>weakTail composition</h3>
+<p>The Loglet API <code>checkTail</code> command returns <code>T</code>, the contiguous tail (plus a boolean whether the Loglet is sealed). However, this is not enough for quorum composition. A single scalar value per child tail does not provide enough information for a QuorumLogDrive to compute its tail value.</p>
+<p>The write window of each child LogDrive may individually resemble Swiss cheese of holes but when unioned together form a contiguous slice of quorum-written addresses.</p>
+<h2>Motivations Behind the Log Drive</h2>
+<h3>Cheap adaptation to new storage services</h3>
+<p>A Primitive LogDrive is intended to be a thin adapter over some backing storage service such as DynamoDB, S3, or a KV store. Because it only needs to implement the small LogDrive API, a new primitive can be relatively simple, on the order of a few hundred lines of code rather than a new shared-log implementation.</p>
+<h3>Reusable composition</h3>
+<p>Striping and quorum replication live in generic StripedLogDrive and QuorumLogDrive implementations. These operate over the LogDrive API and therefore do not care whether their children are backed by DynamoDB, S3, S3 Express One Zone, or something else.</p>
+<h3>Evolving durability configurations over time</h3>
+<p>Virtual Consensus adds another useful property: different Loglets in the same VirtualLog can use different LogDrive configurations.</p>
+<p>A log might initially use an AtomicLog backed by a singleton DynamoDBLogDrive. A later reconfiguration could extend the VirtualLog with a new AtomicLog backed by a QuorumLogDrive over several S3 Express One Zone LogDrives, perhaps spread across availability zones or regions. The old configuration remains responsible for its existing segment while new appends move to the new one, and the old segment can eventually age out as the log prefix is trimmed.</p>
+<h2>Final thoughts on Abstractions</h2>
+<p>You might be thinking that you’ve seen all these patterns before and there’s nothing groundbreaking here, and in some ways you’d be right. But what the paper contributes are the <em>formalized abstractions</em>.</p>
+<p>The contribution of LogDrive is instead the abstraction: reducing durability to a numbered collection of single-value registers plus <code>weakTail</code>, while moving sequencing above it into AtomicLog. The interesting part is that the weaker abstraction is the more composable one. By reducing durability to its essential behavior, LogDrive provides a better building block for constructing shared logs.</p>

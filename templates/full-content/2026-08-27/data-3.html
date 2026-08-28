@@ -1,0 +1,105 @@
+<h1>Benchmarking RocksDB’s Three Amplification Factors</h1>
+<p>If you've read anything about RocksDB, LevelDB, Cassandra, or any other LSM-tree database, you've met the three amplification factors:</p>
+<ul>
+ <li><strong>Space amplification</strong> — bytes on disk ÷ bytes of live data</li>
+ <li><strong>Read amplification</strong> — I/O operations per logical read</li>
+ <li><strong>Write amplification</strong> — bytes written to disk ÷ bytes your application handed over</li>
+</ul>
+<p>They're always presented the same way: three tidy definitions, a sentence about how tuning is a tradeoff between them, and a link to the official tuning guide. Which says, memorably:</p>
+<blockquote>
+ <p><em>"Unfortunately, configuring RocksDB optimally is not trivial. Even we as RocksDB developers don't fully understand the effect of each configuration change. If you want to fully optimize RocksDB for your workload, we recommend experiments and benchmarking, while keeping an eye on the three amplification factors."</em></p>
+</blockquote>
+<p>That's the RocksDB team telling you to go measure. Almost nobody does.</p>
+<p>So I did. Everything below is measured on one machine, with code you can run. The numbers are less interesting than what it took to get them honest — I'll get to the three benchmarks that fooled me first.</p>
+<p><strong>Setup:</strong> Apple M4 Pro (14 cores, 48 GB), macOS 26.6, RocksDB via the <code>rocksdict</code> Python bindings 0.3.29. 113-byte records (13-byte key, 100-byte value). <strong>Compression disabled</strong> throughout — I want to measure amplification, not LZ4's opinion of it. All numbers come from RocksDB's own statistics counters (<code>rocksdb.flush.write.bytes</code>, <code>rocksdb.compact.write.bytes</code>, <code>rocksdb.bloom.filter.useful</code>) and from <code>du</code>-style walks of the database directory.</p>
+<p>This is a laptop, not a server. Absolute latencies are warm-page-cache numbers and would look very different on a loaded machine with cold storage. <strong>The shapes of the curves are the point, not the absolute values.</strong></p>
+<h2>1. Deleting half the keys made the database bigger</h2>
+<p>The theory: a delete in an LSM-tree isn't a delete. It's a <em>write</em> — a tombstone record marking the key as gone. The original value stays on disk until compaction merges it away, and the tombstone itself can generally only be dropped at the bottommost level, because dropping it earlier would let an older value on a lower level resurrect.</p>
+<p>So deleting data should temporarily <em>increase</em> disk usage. Here's what it actually looks like:</p>
+<p>I wrote 1,000,000 keys — 107.8 MB of logical data, 111.5 MB on disk, a very tidy <strong>1.04× space amplification</strong>. Then I deleted every other key.</p>
+<p>Live data drops in a straight line: 107.8 MB → 53.9 MB. Disk usage goes the other way, climbing to a peak of <strong>127.6 MB while only 80.8 MB of it was live</strong> — a space amplification of <strong>1.58×</strong>. I had deleted 250,000 keys and gained 16 MB.</p>
+<p>The sawtooth is compaction fighting back. Each cliff is a compaction pass reclaiming space; each climb between them is tombstones accumulating faster than compaction retires them. After forcing a full compaction at the end: 56.0 MB on disk for 53.9 MB of data. Back to 1.04×.</p>
+<p><strong>The practical version:</strong> if you run a delete-heavy workload and watch a disk-usage graph, the spike is not a bug and disk usage is a lagging indicator of what you actually store. If you're near a disk threshold, a bulk delete is the <em>last</em> thing that will save you in the next five minutes.</p>
+<h2>2. Every L0 file costs a lookup another microsecond</h2>
+<p>Level 0 is the odd level out. Files there are direct memtable dumps, so their key ranges overlap, so a lookup can't know which one holds the key — it has to check all of them, newest first. Levels 1 and below are partitioned into non-overlapping ranges, so one file per level suffices.</p>
+<p>That means read cost should grow linearly in the number of L0 files. I turned off auto-compaction and built L0 by hand, one SST at a time, measuring <code>get()</code> latency for keys that live only in the <em>oldest</em> file — the worst case, since every newer file has to be ruled out first.</p>
+<p>With bloom filters off, it's about as clean a straight line as you'll get from a real system: <strong>1.29 µs at one L0 file, 23.29 µs at 24</strong> — roughly <strong>0.96 µs of added latency per file</strong>, an 18× degradation.</p>
+<p>With bloom filters on (10 bits/key), the same workload goes <strong>1.38 µs → 2.54 µs</strong>. The filter absorbs essentially the whole thing. The <code>rocksdb.bloom.filter.useful</code> counter climbs to 139,637 rejections over the last generation's probes, which is the filter turning "read the index, decompress a block, scan it, find nothing" into a few hundred nanoseconds of bit-checking, 23 times per lookup.</p>
+<p><strong>The practical version:</strong> the default <code>level0_file_num_compaction_trigger</code> of 4 is not arbitrary — it's a cap on exactly this. And bloom filters aren't a nice-to-have for negative lookups; they're what keeps L0 from being a linear scan.</p>
+<h2>3. The same 2 million writes cost 4.4× more in random order</h2>
+<p>Write amplification is the one you pay for the other two. Compaction reclaims space and keeps reads fast by rewriting data it has already written, sometimes many times over as records migrate down the levels.</p>
+<p>I wrote 2,000,000 keys (216 MB of application data) and tracked what RocksDB actually put on disk.</p>
+<p>With <strong>random</strong> keys: flush wrote 223.7 MB, compaction wrote <strong>758.3 MB</strong>. Total 982 MB of disk writes for 216 MB of data — <strong>4.56× write amplification</strong>, still climbing when the run ended. Forcing a full compaction afterward pushed it to <strong>5.61×</strong>.</p>
+<p>With <strong>sequential</strong> keys: 222.8 MB from flush, and compaction wrote <strong>exactly zero bytes</strong>. Write amplification <strong>1.03×</strong>.</p>
+<p>That zero is the interesting number. Ascending keys produce SSTs whose key ranges don't overlap anything, so RocksDB places each flushed file directly at a deep level and never needs to merge it. No merging, no amplification.</p>
+<p>This is a real and useful optimization — it's why bulk-loading sorted data into RocksDB is so fast. It's also a trap, because it means <strong>every benchmark that inserts sequential keys reports write amplification that a production workload will never see.</strong> If you've seen a "RocksDB writes 1.0× " claim, check the key order.</p>
+<h2>4. One knob, and it isn't the important one</h2>
+<p>Now the tradeoff. <code>level0_file_num_compaction_trigger</code> controls how many L0 files accumulate before compaction fires. Low means eager compaction: more write amplification, less of everything else. High means lazy. That's the theory, anyway.</p>
+<p>I swept it from 1 to 64 against an identical workload (800k random writes, 200k overwrites, 100k deletes) and measured all four consequences. Then I ran the whole sweep a second time with background I/O throttled to 16 MB/s, to simulate a server where compaction is disk-bound rather than free.</p>
+<p><strong>When compaction keeps up</strong> (blue), the theory holds — for exactly one metric. Write amplification falls <strong>6.29× → 2.83×</strong> as the trigger goes from 1 to 8, then flattens (it bottoms out at 2.76× and stays there). Space amplification moves the opposite way, 1.58× → 1.75×. Read latency and throughput barely budge.</p>
+<p>Why does it flatten? Because L0 never exceeded <strong>5 files</strong> regardless of the setting. On 14 cores with a fast SSD, compaction drains L0 continuously, so a trigger of 8 and a trigger of 64 describe a threshold that is never reached. The knob stops existing.</p>
+<p><strong>When compaction is disk-bound</strong> (orange), everything changes at once, and the trigger becomes noise:</p>
+<table>
+ <tbody>
+  <tr>
+   <td></td>
+   <td><strong>compaction keeps up</strong></td>
+   <td><strong>disk-bound at 16 MB/s</strong></td>
+  </tr>
+  <tr>
+   <td>L0 files</td>
+   <td>0–5</td>
+   <td>11–17</td>
+  </tr>
+  <tr>
+   <td>Space amplification</td>
+   <td>1.58–1.75×</td>
+   <td>2.07–3.12×</td>
+  </tr>
+  <tr>
+   <td>Read latency p50</td>
+   <td>2.5–3.0 µs</td>
+   <td>3.2–3.9 µs</td>
+  </tr>
+  <tr>
+   <td>Throughput</td>
+   <td>~215k ops/s</td>
+   <td>69–83k ops/s</td>
+  </tr>
+  <tr>
+   <td>Write stalls</td>
+   <td>0 ms</td>
+   <td>7,600–10,200 ms</td>
+  </tr>
+ </tbody>
+</table>
+<p>Throughput drops by <strong>2.8×</strong>. Space amplification nearly doubles. And the run accumulates <strong>eight to ten seconds</strong> of write stalls — RocksDB deliberately throttling the application because L0 is backed up.</p>
+<p>Note the counterintuitive bit: write amplification <em>drops</em> to 1.7–2.1× in the disk-bound runs. That isn't an improvement. The compaction work simply hadn't happened yet when I measured. It's debt, not savings.</p>
+<p><strong>The practical version:</strong> I went looking for a clean three-way tradeoff dial and found something more useful. The L0 trigger is a real knob with a real, monotonic effect on write amplification — within the regime where compaction can keep up. Whether compaction can keep up is decided by your I/O budget, not by this setting, and it dominates all three amplification factors put together. Tune your compaction throughput before you tune your compaction thresholds.</p>
+<h2>Three benchmarks that lied to me</h2>
+<p>This is the part I'd most want to read in someone else's post, so: three of my first four experiments produced clean, plausible, completely meaningless results. All three failure modes are things RocksDB does <em>right</em>, which is exactly why they're easy to miss.</p>
+<p><strong>1. Disjoint key ranges made read amplification vanish.</strong> My first read-amp benchmark had each generation write a distinct ascending key range: generation 0 wrote keys 0–49,999, generation 1 wrote 50,000–99,999, and so on. Latency came out perfectly flat — 1.5 µs whether there was 1 L0 file or 24 — and <code>rocksdb.bloom.filter.useful</code> dropped to zero after the third generation.</p>
+<p>Every SST stores its minimum and maximum key. RocksDB checks that range <em>before</em> consulting a bloom filter or reading an index. My generations were disjoint, so 23 of 24 files were excluded on range alone, for free. I had accidentally built the best case and measured it.</p>
+<p>The fix: every generation now writes two sentinel keys at the extremes of the keyspace, forcing all L0 files to span the full range so none can be skipped. That's also what a realistic random-write workload looks like.</p>
+<p><strong>2. Sequential inserts made write amplification vanish.</strong> Covered above, but it bears repeating as a benchmarking lesson: my first write-amp run reported 1.03× with compaction doing literally zero bytes of work. I nearly published that as "write amplification is overstated." It was 4.56× the moment I randomized key order.</p>
+<p><strong>3. Waiting for quiescence erased the entire tradeoff.</strong> My first version of the sweep called "wait for compaction to finish" before measuring, because that seemed like the clean, reproducible thing to do. Every single trigger setting converged to identical space amplification (1.40–1.46×) and identical read latency. Of course they did — I was measuring seven configurations <em>after</em> removing the only difference between them. L0 was zero everywhere.</p>
+<p>Compaction settings only manifest under load. Measuring a database at rest tells you about the compactor, not the configuration.</p>
+<p>The common thread: <strong>RocksDB is full of optimizations that make naive benchmarks look great.</strong> Range-based file skipping, direct-to-deep-level placement, background compaction that catches up the instant you stop writing. If your benchmark result is suspiciously clean, you have probably measured a fast path rather than your workload.</p>
+<h2>What I'd actually take away</h2>
+<ul>
+ <li><strong>Measure under load, at steady state, with your key distribution.</strong> Key <em>order</em> alone moved write amplification by 4.4×. No amount of config tuning is worth as much as benchmarking the access pattern you actually have.</li>
+ <li><strong>Deletes are writes, and disk usage lags reality.</strong> Plan capacity for the peak during a bulk delete, not the trough after it.</li>
+ <li><strong>Bloom filters are load-bearing.</strong> 18× read degradation without, 1.8× with, on identical data.</li>
+ <li><strong>Compaction throughput dominates compaction thresholds.</strong> Starving background I/O cost 3× throughput, doubled space amplification, and produced ten seconds of write stalls — while the knob I was actually studying moved nothing.</li>
+ <li><strong>Write amplification going down is not always good news.</strong> Sometimes it means compaction is behind and you're looking at deferred work.</li>
+</ul>
+<p>And the meta-lesson, which is really just the tuning guide's advice with receipts attached: the RocksDB developers weren't being modest when they said they can't predict the effect of a config change. I couldn't reliably predict the effect of <em>four</em> config changes on a laptop, in a controlled experiment, with the statistics counters right in front of me. Benchmark your own workload.</p>
+<h2>Run it yourself</h2>
+<p>All four experiments, the chart code, and the raw JSON results are <a href="https://github.com/mukul2604/rocksdb-amp-bench?ref=hackernoon.com">here</a>:</p>
+<pre><code>bench/exp1_space_amp.py     # write 1M, delete 500k, watch disk climb
+bench/exp2_read_amp.py      # L0 files 1 -&gt; 24, bloom on/off
+bench/exp3_write_amp.py     # random vs sequential key order
+bench/exp4_tradeoff.py      # trigger sweep x compaction I/O budget
+bench/plot.py               # charts
+</code></pre>
+<p>Each script is self-contained, seeded, and takes under a minute. Run them, disagree with me, and tell me what your hardware says — the interesting result here isn't any single number, it's how easily a benchmark can produce a confident wrong one.</p>

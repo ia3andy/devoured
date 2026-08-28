@@ -1,0 +1,168 @@
+<h1>WeMM-Embedding: WeChat Multi-Modal Embedding</h1>
+<p>WeMM-Embedding is a family of universal multimodal embedding models developed by the WeChat Vision team. It provides unified representations for text, images, videos, visual documents, and interleaved multimodal inputs, achieving state-of-the-art performance across multiple benchmarks covering diverse tasks and domains.</p>
+<h2>Model Zoo</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Model</th>
+   <th>Matryoshka dimensions</th>
+   <th>Hugging Face</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>WeMM-Embedding-2B</td>
+   <td><code>64, 128, 256, 512, 1024, 2048</code></td>
+   <td><a href="https://huggingface.co/tencent/WeMM-Embedding-2B">🤗 Link</a></td>
+  </tr>
+  <tr>
+   <td>WeMM-Embedding-4B</td>
+   <td><code>64, 128, 256, 512, 1024, 2560</code></td>
+   <td><a href="https://huggingface.co/tencent/WeMM-Embedding-4B">🤗 Link</a></td>
+  </tr>
+  <tr>
+   <td>WeMM-Embedding-9B</td>
+   <td><code>64, 128, 256, 512, 1024, 2048, 4096</code></td>
+   <td><a href="https://huggingface.co/tencent/WeMM-Embedding-9B">🤗 Link</a></td>
+  </tr>
+ </tbody>
+</table>
+<p>All models support text, images, videos, visual documents, and interleaved multimodal inputs. Embeddings are obtained from the last-layer hidden state at the dedicated <code>&lt;embedding&gt;</code> token position, followed by L2 normalization. Audio input is not currently supported.</p>
+<h2>Installation</h2>
+<pre><code>pip install -r requirements.txt</code></pre>
+<h2>Transformers</h2>
+<p>We recommend using <code>transformers==5.2.0</code> for inference and reproducibility, as newer versions may differ in preprocessing behavior.</p>
+<pre><code>python examples/transformers_inference.py \
+  --model /path/to/WeMM-Embedding-2B \
+  --image /path/to/image.jpg \
+  --video /path/to/video.mp4 \
+  --dimension 2048</code></pre>
+<p>The example produces independent text, image, and video embeddings. Omit <code>--dimension</code> for the full embedding dimension.</p>
+<h2>Sentence Transformers</h2>
+<pre><code>python examples/sentence_transformers_inference.py \
+  --model /path/to/WeMM-Embedding-2B \
+  --image /path/to/image.jpg \
+  --video /path/to/video.mp4 \
+  --dimension 2048</code></pre>
+<p><code>SentenceTransformer</code> loads the model directly, so a Hugging Face model id such as <code>tencent/WeMM-Embedding-2B</code> also works in place of a local path. Text, image, and video inputs go through <code>SentenceTransformer.encode()</code>, and MRL is selected with <code>--dimension</code>.</p>
+<h2>Serving</h2>
+<p>Tested versions: vLLM <code>0.27.0</code> and SGLang <code>0.5.9</code>.</p>
+<p>vLLM:</p>
+<pre><code>MODEL_PATH=/path/to/WeMM-Embedding-2B
+vllm serve "$MODEL_PATH" \
+  --runner pooling \
+  --chat-template "$MODEL_PATH/embedding_chat_template.jinja"</code></pre>
+<p>SGLang:</p>
+<pre><code>MODEL_PATH=/path/to/WeMM-Embedding-2B
+python scripts/patch_sglang_video.py
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --is-embedding \
+  --enable-precise-embedding-interpolation</code></pre>
+<p>Equivalent one-command wrappers are available in <code>scripts/serve_vllm.sh</code> and <code>scripts/serve_sglang.sh</code>.</p>
+<h2>Matryoshka Embeddings</h2>
+<p>For a supported dimension <code>d</code>, truncate the full embedding and normalize it again:</p>
+<pre><code>embedding = torch.nn.functional.normalize(embedding[..., :d], dim=-1)</code></pre>
+<p>On MMEB-v2, the 2B model at 256 dimensions retains 98.7% of its full-dimensional image and video performance.</p>
+<h2>Evaluation</h2>
+<h3>MMEB-v2</h3>
+<p>Results on 78 datasets. Image and video tasks use Hit@1, while visual-document tasks use NDCG@5. Higher is better.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Model</th>
+   <th>Size</th>
+   <th>AVG</th>
+   <th>Image</th>
+   <th>Video</th>
+   <th>VisDoc</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>WeMM-Embedding</strong></td>
+   <td><strong>2B</strong></td>
+   <td><strong>77.9</strong></td>
+   <td><strong>79.6</strong></td>
+   <td><strong>70.8</strong></td>
+   <td><strong>80.7</strong></td>
+  </tr>
+  <tr>
+   <td><strong>WeMM-Embedding</strong></td>
+   <td><strong>4B</strong></td>
+   <td><strong>79.2</strong></td>
+   <td><strong>80.8</strong></td>
+   <td><strong>72.1</strong></td>
+   <td><strong>82.0</strong></td>
+  </tr>
+  <tr>
+   <td><strong>WeMM-Embedding</strong></td>
+   <td><strong>9B</strong></td>
+   <td><strong>80.6</strong></td>
+   <td><strong>81.9</strong></td>
+   <td><strong>74.3</strong></td>
+   <td><strong>83.3</strong></td>
+  </tr>
+ </tbody>
+</table>
+<h3>MMEB-v3</h3>
+<p>Results on 190 tasks. V3-All includes the 78 MMEB-v2 tasks, 53 text tasks, 47 agent tasks, 11 audio tasks, and MCMR.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Model</th>
+   <th>Size</th>
+   <th>V3-All</th>
+   <th>Text</th>
+   <th>Agent</th>
+   <th>MCMR</th>
+   <th>Audio</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>WeMM-Embedding</strong></td>
+   <td><strong>2B</strong></td>
+   <td><strong>56.0</strong></td>
+   <td><strong>45.3</strong></td>
+   <td><strong>45.1</strong></td>
+   <td><strong>42.5</strong></td>
+   <td><strong>0.0</strong></td>
+  </tr>
+  <tr>
+   <td><strong>WeMM-Embedding</strong></td>
+   <td><strong>4B</strong></td>
+   <td><strong>58.2</strong></td>
+   <td><strong>47.9</strong></td>
+   <td><strong>49.0</strong></td>
+   <td><strong>41.9</strong></td>
+   <td><strong>0.0</strong></td>
+  </tr>
+  <tr>
+   <td><strong>WeMM-Embedding</strong></td>
+   <td><strong>9B</strong></td>
+   <td><strong>59.5</strong></td>
+   <td><strong>48.8</strong></td>
+   <td><strong>51.0</strong></td>
+   <td><strong>49.3</strong></td>
+   <td><strong>0.0</strong></td>
+  </tr>
+ </tbody>
+</table>
+<p>Text results use NDCG@5; agent, MCMR, and audio results use Hit@1.</p>
+<pre><code>cd mmeb_v3_eval
+DATA_ROOT=/path/to/MMEB-V3 bash scripts/download_data.sh
+MODEL_PATH=/path/to/WeMM-Embedding-2B DATA_BASEDIR=/path/to/MMEB-V3 \
+OUTPUT_DIR=exps/wemm_embedding bash scripts/run_eval.sh</code></pre>
+<h2>Citation</h2>
+<pre><code>@article\{wemm-embedding,
+      title=\{WeMM-Embedding: WeChat Multi-Modal Embedding Technical Report}, 
+      author=\{Junjie Zhou and Ke Mei and Lei Li and Tianyi Wang and Fengyun Rao and Jing Lyu},
+      year=\{2026},
+      eprint=\{2608.24053},
+      archivePrefix=\{arXiv},
+      primaryClass=\{cs.CV},
+      url=\{https://arxiv.org/abs/2608.24053}, 
+}</code></pre>
+<h2>License</h2>
+<p>Unless otherwise noted, Tencent-authored code in this repository is released under the Apache License 2.0.</p>
