@@ -1,0 +1,183 @@
+<h1>Tailcat</h1>
+<p><em>"Tailscale without Tailscale, by Tailscale"</em></p>
+<p>Tailcat is a remix of Tailscale open source pieces to act like netcat, but over Tailscale's data plane, without Tailscale's control plane. Tailscale's data plane (<code>magicsock</code>, internally) gives you point-to-point WireGuard®-encrypted tunnels between two machines with DERP as the NAT-hole-punching communication side channel and the ultimate relay-of-last-resort if NAT traversal fails. Instead of using the Tailscale control plane, all <code>tailcat</code> connection metadata is exchanged out of band, however you want.</p>
+<p>The <code>tailcat</code> CLI (in <code>cmd/tailcat</code>) is built on the <code>tailcat</code> Go library (importable as <code>github.com/tailscale/tailcat</code>).</p>
+<p>Whether you use <code>tailcat</code> as a CLI tool or library, one side runs a <code>tailcat</code> server (listener) and gets back a short connection token. The other side passes that token to <code>tailcat</code>'s client side to connect. All traffic between the two is encrypted end-to-end with WireGuard. The initial connection bootstraps through a DERP server, and then magicsock performs NAT traversal to upgrade to a direct peer-to-peer UDP connection when possible (usually!).</p>
+<p>You don't need a Tailscale account, root/admin access on the machine (it doesn't alter your machine's routing tables, DNS, etc.). It's just a userspace library and CLI tool.</p>
+<p>And it's all open source.</p>
+<p>You can use our free rate-limited DERP relays (the default DERP map is https://tailcat.dev/derpmap.json) or you can run your own.</p>
+<p>There's also an experimental in-browser web demo (tailcat compiled to WebAssembly) at https://tailscale.github.io/tailcat/ that can send and receive files or text, interoperating with the CLI. Browser traffic is relayed over DERP only, with no direct connections until WebRTC support.</p>
+<h2>Install</h2>
+<pre><code>$ go install github.com/tailscale/tailcat/cmd/tailcat@latest</code></pre>
+<p>Or with Nix flakes, run it directly or install it:</p>
+<pre><code>$ nix run github:tailscale/tailcat
+$ nix profile install github:tailscale/tailcat</code></pre>
+<h2>Usage</h2>
+<h3>Pipe stdin/stdout between two machines</h3>
+<p>Server starts, printing out its ephemeral address:</p>
+<pre><code>$ tailcat
+# Selected bootstrap relay region 302, San Francisco
+# 🐈 Server listening with new address: tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu
+(hangs, waiting...)</code></pre>
+<p>And then the client can:</p>
+<pre><code>$ echo hello | tailcat tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu
+$</code></pre>
+<p>Then the server unblocks:</p>
+<pre><code>$ tailcat
+# Selected bootstrap relay region 302, San Francisco
+# 🐈 Server listening with new address: tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu
+hello
+$</code></pre>
+<h3>Expose local ports through the tunnel</h3>
+<p>Or you can serve a local TCP port, forwarded to localhost:</p>
+<pre><code>$ tailcat --serve=8080,8443 # or --serve=all
+# 🐈 Server listening with new address: tcXXXXXXXXX</code></pre>
+<p>And then the client:</p>
+<pre><code>$ tailcat tcXXXXXXXXX 8080
+GET / HTTP/1.1
+Host: foo
+
+HTTP/1.1 200 OK
+....</code></pre>
+<h3>Auth-free SSH server</h3>
+<p>On Linux and macOS, you can run an SSH server too with no auth. (If you want auth, you can just <code>tailcat --serve=22</code> and proxy to your system SSH server)</p>
+<pre><code>$ tailcat --serve=no-auth-ssh
+# 🐈 Server listening with new address: tcXXXXXXXXX</code></pre>
+<p>And on the client side:</p>
+<pre><code>$ tailcat ssh tcXXXXXXXXX
+$ tailcat ssh tcXXXXXXXXX ls -la</code></pre>
+<h3>Misc commands</h3>
+<p>Ping to test connectivity; each pong reports whether it arrived via a DERP relay or a direct path. <code>--until-direct</code> keeps pinging (up to <code>--timeout</code>, default 10s) until a direct path works, exiting non-zero if one doesn't:</p>
+<pre><code>$ tailcat ping --until-direct &lt;token&gt;
+pong in 42.1ms via DERP(sfo)
+pong in 1.2ms via 203.0.113.7:41641</code></pre>
+<p>Run a command through a SOCKS5 proxy routed over the tunnel:</p>
+<pre><code>$ tailcat socks &lt;token&gt; curl http://server.tailcat:8081/</code></pre>
+<p>Tokens also work directly as URL hostnames: the SOCKS proxy recognizes and dials them, so the token argument is optional. (Tokens are case-sensitive; this works with curl and most CLI tools, but not with browsers, which lowercase hostnames.)</p>
+<pre><code>$ tailcat socks curl http://&lt;token&gt;:8081/</code></pre>
+<p>Act as an exit node so the client can reach the server's network:</p>
+<pre><code>$ tailcat --serve=exit-node</code></pre>
+<p>Parse a connection token and print its contents (the server's WireGuard public key and DERP info) as JSON, without connecting to anything:</p>
+<pre><code>$ tailcat parse tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu
+\{
+    "ServerPublic": "nodekey:9c8d2e6728da80a1dd37e275a82595b42d9a838610bc53f74a7670d1610f2e34",
+    "RegionID": 302
+}</code></pre>
+<p>Resolve a short token (which references a DERP region by ID, requiring clients to fetch the DERP map) into a longer self-contained one with the DERP server info embedded, letting clients connect more quickly:</p>
+<pre><code>$ tailcat resolve tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu
+tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFygaFhToGjYWhudGMzMDJhLmlwbi5kZXZhNG0yMDguMTExLjM5LjM4YTZzMjYwNzpmNzQwOjA6M2Y6OjcyMA</code></pre>
+<p>Parsing that resolved token shows the embedded DERP info:</p>
+<pre><code>$ tailcat parse tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFygaFhToGjYWhudGMzMDJhLmlwbi5kZXZhNG0yMDguMTExLjM5LjM4YTZzMjYwNzpmNzQwOjA6M2Y6OjcyMA
+\{
+    "ServerPublic": "nodekey:9c8d2e6728da80a1dd37e275a82595b42d9a838610bc53f74a7670d1610f2e34",
+    "Region": [
+        \{
+            "Nodes": [
+                \{
+                    "HostName": "tc302a.ipn.dev",
+                    "IPv4": "208.111.39.38",
+                    "IPv6": "2607:f740:0:3f::720"
+                }
+            ]
+        }
+    ]
+}</code></pre>
+<p>A server can print the long self-contained form directly with the <code>--full-address</code> flag.</p>
+<h2>Key Management</h2>
+<p>A server's address (connection token) is derived from its WireGuard key, so the key you use determines who can reach you:</p>
+<ul>
+ <li><strong>Ephemeral keys (the default):</strong> each server run generates a fresh key in memory and prints an address nobody has ever seen. When the process exits, the key is discarded and the address is dead forever. This is the safe default: sharing that address only ever refers to that one run.</li>
+ <li><strong>Saved keys:</strong> <code>tailcat genkey</code> generates a key saved to disk so the address stays stable across restarts. The flip side: anyone you've <em>ever</em> shared that address with can connect to any future server using that key, unless you restrict clients with <code>--allow</code> (see <code>tailcat genkey --client</code>).</li>
+</ul>
+<p>The CLI says at startup which kind it's using, so you know whether you're starting a fresh single-use server or re-listening on an address you may have shared in the past.</p>
+<pre><code>$ tailcat genkey --region=nyc
+# prints the token; key saved to ~/.config/tailcat/keys/default.private.json
+
+# later; the key named "default" is used automatically once it exists:
+$ tailcat --serve=8080
+# 🐈 Server listening with saved key "default": tcXXXXXXXXX
+
+# ... unless you force a one-off ephemeral key:
+$ tailcat --serve=8080 --key=new
+# 🐈 Server listening with new address: tcXXXXXXXXX</code></pre>
+<p>That is, <code>default</code> is a magic key name: once it exists, plain <code>tailcat</code> silently uses it instead of generating an ephemeral key, and the startup line above is what tells you which happened. Use <code>--key=new</code> to get an ephemeral key anyway, <code>--key=&lt;name&gt;</code> to use a different saved key, or <code>tailcat genkey --delete --key=default</code> to remove the saved default key. <code>tailcat genkey --list</code> lists your saved keys.</p>
+<p>Tokens can also be published as DNS TXT records and looked up by name; a DNS name works anywhere the CLI takes a token:</p>
+<pre><code># If example.com has a TXT record "tailcat=tc..."
+$ tailcat example.com 8080
+$ tailcat ssh example.com
+$ tailcat ping example.com</code></pre>
+<h2>Examples</h2>
+<h3>Protected SSH server over DNS</h3>
+<p>Who needs port forwarding or port knocking? This runs an SSH server reachable from anywhere by name, with no open inbound ports on the server, where WireGuard authenticates the client before the SSH server ever sees a packet.</p>
+<p>On the client machine, generate a client identity keypair. It prints the public key, which is all the server needs to know:</p>
+<pre><code>client$ tailcat genkey --client
+# wrote file to ~/.config/tailcat/keys/client-default.private.json
+nodekey:cfb6bfa77a0654d7450947fd6acef17d2cd848da1d30b2540b13dac272ddfd16</code></pre>
+<p>On the server, generate a server keypair pinned to its nearest DERP region (see why below), then serve SSH to only that client:</p>
+<pre><code>server$ tailcat genkey --fixed-region
+# wrote file to ~/.config/tailcat/keys/default.private.json
+tcXXXXXXXXX
+
+server$ tailcat --serve=22 --allow=nodekey:cfb6bf...ddfd16
+# 🐈 Server listening with saved key "default": tcXXXXXXXXX</code></pre>
+<p>Publish the token in DNS as a TXT record:</p>
+<pre><code>my-server.example.com. 300 IN TXT "tailcat=tcXXXXXXXXX"</code></pre>
+<p>And then the client side is just:</p>
+<pre><code>client$ tailcat ssh my-server.example.com</code></pre>
+<p>Client modes automatically use the saved <code>client-default</code> key when it exists, so no extra flags are needed to present the allowed identity. Anyone else's handshake is silently ignored: they can't reach the SSH server, or even learn that one is running.</p>
+<h3>Bring your own DERP relay</h3>
+<p>Nothing requires Tailscale's relays: run your own DERP server (it needs a hostname with a TLS certificate, which derper can get itself via Let's Encrypt), then generate a server key that uses it by passing its hostname (or several, comma-separated) as the region:</p>
+<pre><code>server$ tailcat genkey --region=derp.example.com
+tcomFwWCCAIsKOqPUux6ClG2RM4A_vOq4VBzGgHGGjq9OsJuFKSWFygaFhToGhYWhwZGVycC5leGFtcGxlLmNvbQ
+
+server$ tailcat --serve=22</code></pre>
+<h3>Go library</h3>
+<p>A minimal server that answers any TCP port through the tunnel and prints its token.</p>
+<pre><code>package main
+
+import (
+	"fmt"
+	"log"
+	"net"
+
+	"github.com/tailscale/tailcat"
+)
+
+func main() \{
+	s := &amp;tailcat.Server\{
+		OnTCP: func(port uint16) func(net.Conn) \{
+			return func(c net.Conn) \{
+				fmt.Fprintf(c, "hello from port %v\n", port)
+				c.Close()
+			}
+		},
+	}
+	if err := s.Start(); err != nil \{
+		log.Fatal(err)
+	}
+	fmt.Println(s.ConnBlob())
+	select \{}
+}</code></pre>
+<h2>How it works</h2>
+<h3>Connection tokens</h3>
+<p>A Tailcat server is identified by a connection token (called a ConnBlob internally). It looks like <code>tcXYZ...</code> and is a <code>"tc"</code> prefix followed by base64-encoded CBOR containing the server's WireGuard public key and DERP info.</p>
+<h3>Network stack</h3>
+<ul>
+ <li><strong>WireGuard</strong> -- a userspace WireGuard implementation for encrypting all tunnel traffic.</li>
+ <li><strong>magicsock</strong> -- Tailscale's transport layer that multiplexes traffic over direct UDP and DERP relays.</li>
+ <li><strong>Netstack</strong> (gVisor) -- a userspace TCP/IP stack that terminates TCP connections inside the process.</li>
+ <li><strong>DERP relay</strong> -- Tailscale's encrypted relay protocol, used as a rendezvous channel and as a fallback data path when direct connectivity isn't possible.</li>
+</ul>
+<h3>Connection flow</h3>
+<ol>
+ <li><strong>Server starts.</strong> It generates (or loads) a WireGuard keypair, connects to a DERP relay, and prints its connection token to stderr.</li>
+ <li><strong>Client parses the token</strong> to learn the server's public key and DERP region.</li>
+ <li><strong>Discovery handshake.</strong> The client sends a "Meow" ping message to the server through the DERP relay.</li>
+ <li><strong>WireGuard tunnel.</strong> With both sides configured as WireGuard peers, the standard WireGuard handshake proceeds.</li>
+ <li><strong>NAT traversal.</strong> In parallel, each side advertises its UDP endpoints to the other in disco messages over DERP, attempting UDP hole-punching.</li>
+ <li><strong>Data transfer.</strong> The client dials a TCP port on the server through the tunnel.</li>
+</ol>
+<h2>Stability</h2>
+<p>Tailcat is free to use, but it comes with no API or CLI stability promises: the Go API, the CLI flags and output, and the wire format may all change. The public rate-limited Tailcat DERP relays have no uptime SLAs or throughput targets.</p>
+<h2>History</h2>
+<p>Tailcat began life in September 2023. It was open sourced August 2026 at the TailscaleUp conference.</p>

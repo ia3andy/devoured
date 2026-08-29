@@ -1,0 +1,229 @@
+<h1>MiniMax-H3 on 8×H200: 1.95× Lossless, Up to 6.24× at 0.76–0.91 SSIM</h1>
+<h2>TL;DR</h2>
+<p>We benchmarked MiniMax-H3 video generation on 8× NVIDIA H200 with SGLang Diffusion, holding prompts, seeds, resolution, frame rate, and denoising steps fixed across six workloads.</p>
+<ul>
+ <li><strong>SGLang's dense, lossless path is 1.85–1.95× faster than Diffusers</strong> with no approximation: the same denoising work, on a faster runtime.</li>
+ <li><strong>Stacking step reuse and sparse attention reaches up to 6.24×, at 0.76–0.91 mean SSIM.</strong> The fastest tested profile, SubBlock 0.80 + Cache-DiT stride, delivers <strong>5.06×/5.72×</strong> on 5 s/10 s T2VA and <strong>5.86×/6.24×</strong> on FL2VA. The cost is not uniform: FL2VA holds 0.85–0.91 SSIM there, while T2VA drops to 0.76–0.78.</li>
+ <li><strong>For a quality-first default, use Cache-DiT alone</strong> (up to 2.99×, mean SSIM 0.90–0.92). For a balanced trade-off, <strong>SubBlock 0.75 + Cache-DiT stride</strong> gives 4.90–5.93× at SSIM 0.79–0.90.</li>
+ <li>The gains come from three layers that compose: <strong>fused kernels</strong>, <strong>step reuse</strong> (Cache-DiT skips redundant denoising steps), and <strong>SubBlock sparse attention</strong> (NVIDIA's block-sparse forward, which cuts the cost of the steps that do run).</li>
+</ul>
+<h2>Background</h2>
+<p>While SGLang Diffusion already delivers a fast lossless path for MiniMax-H3, faster <em>lossy</em> generation of high-quality video has long been sought after by the community. Video diffusion is dominated by two costs: the denoising loop runs the same transformer dozens of times, and each step spends most of its budget in attention over a very long token sequence.</p>
+<p>Three accelerations attack that from different directions, and they compose:</p>
+<ul>
+ <li><strong>Fused kernels</strong> cut the fixed cost of every step without changing its math.</li>
+ <li><strong>Cache-DiT</strong> reuses results between denoising steps, so some steps never run.</li>
+ <li><strong>SubBlock sparse attention</strong> reduces the cost of the steps that do run, by skipping attention blocks whose contribution is below a threshold.</li>
+</ul>
+<h2>Detailed Results</h2>
+<h3>T2VA</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Mode</th>
+   <th>5 s median / speedup</th>
+   <th>10 s median / speedup</th>
+   <th>5 s mean SSIM</th>
+   <th>10 s mean SSIM</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Diffusers</td>
+   <td>74.34 s / 1.00×</td>
+   <td>207.71 s / 1.00×</td>
+   <td>—</td>
+   <td>—</td>
+  </tr>
+  <tr>
+   <td>SGLang lossless</td>
+   <td>39.67 s / 1.87×</td>
+   <td>112.44 s / 1.85×</td>
+   <td>1.0000</td>
+   <td>1.0000</td>
+  </tr>
+  <tr>
+   <td>Cache-DiT conservative</td>
+   <td>28.02 s / 2.65×</td>
+   <td>78.28 s / 2.65×</td>
+   <td>0.8986</td>
+   <td>0.9179</td>
+  </tr>
+  <tr>
+   <td>SubBlock 0.75</td>
+   <td>30.90 s / 2.41×</td>
+   <td>77.12 s / 2.69×</td>
+   <td>0.8006</td>
+   <td>0.8301</td>
+  </tr>
+  <tr>
+   <td>SubBlock 0.75 + Cache-DiT conservative</td>
+   <td>21.41 s / 3.47×</td>
+   <td>57.48 s / 3.61×</td>
+   <td>0.7936</td>
+   <td>0.8288</td>
+  </tr>
+  <tr>
+   <td>Cache-DiT stride</td>
+   <td>18.13 s / 4.10×</td>
+   <td>52.07 s / 3.99×</td>
+   <td>0.8037</td>
+   <td>0.8078</td>
+  </tr>
+  <tr>
+   <td>SubBlock 0.75 + Cache-DiT stride</td>
+   <td>15.16 s / 4.90×</td>
+   <td>38.21 s / 5.44×</td>
+   <td>0.7713</td>
+   <td>0.7834</td>
+  </tr>
+  <tr>
+   <td>SubBlock 0.80</td>
+   <td>29.49 s / 2.52×</td>
+   <td>72.85 s / 2.85×</td>
+   <td>0.7858</td>
+   <td>0.8193</td>
+  </tr>
+  <tr>
+   <td><strong>SubBlock 0.80 + Cache-DiT stride</strong></td>
+   <td><strong>14.68 s / 5.06×</strong></td>
+   <td><strong>36.29 s / 5.72×</strong></td>
+   <td><strong>0.7584</strong></td>
+   <td><strong>0.7765</strong></td>
+  </tr>
+ </tbody>
+</table>
+<h3>FL2VA</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Mode</th>
+   <th>5 s median / speedup</th>
+   <th>10 s median / speedup</th>
+   <th>5 s mean SSIM</th>
+   <th>10 s mean SSIM</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Diffusers</td>
+   <td>80.44 s / 1.00×</td>
+   <td>217.31 s / 1.00×</td>
+   <td>—</td>
+   <td>—</td>
+  </tr>
+  <tr>
+   <td>SGLang lossless</td>
+   <td>41.31 s / 1.95×</td>
+   <td>114.02 s / 1.91×</td>
+   <td>1.0000</td>
+   <td>1.0000</td>
+  </tr>
+  <tr>
+   <td>Cache-DiT conservative</td>
+   <td>26.90 s / 2.99×</td>
+   <td>78.24 s / 2.78×</td>
+   <td>0.9389</td>
+   <td>0.9771</td>
+  </tr>
+  <tr>
+   <td>SubBlock 0.75</td>
+   <td>31.27 s / 2.57×</td>
+   <td>76.95 s / 2.82×</td>
+   <td>0.8946</td>
+   <td>0.9385</td>
+  </tr>
+  <tr>
+   <td>SubBlock 0.75 + Cache-DiT conservative</td>
+   <td>20.64 s / 3.90×</td>
+   <td>56.39 s / 3.85×</td>
+   <td>0.8924</td>
+   <td>0.9414</td>
+  </tr>
+  <tr>
+   <td>Cache-DiT stride</td>
+   <td>18.02 s / 4.46×</td>
+   <td>51.31 s / 4.24×</td>
+   <td>0.8903</td>
+   <td>0.9248</td>
+  </tr>
+  <tr>
+   <td>SubBlock 0.75 + Cache-DiT stride</td>
+   <td>14.27 s / 5.64×</td>
+   <td>36.62 s / 5.93×</td>
+   <td>0.8629</td>
+   <td>0.9202</td>
+  </tr>
+  <tr>
+   <td>SubBlock 0.80</td>
+   <td>29.74 s / 2.71×</td>
+   <td>72.44 s / 3.00×</td>
+   <td>0.8837</td>
+   <td>0.9350</td>
+  </tr>
+  <tr>
+   <td><strong>SubBlock 0.80 + Cache-DiT stride</strong></td>
+   <td><strong>13.73 s / 5.86×</strong></td>
+   <td><strong>34.80 s / 6.24×</strong></td>
+   <td><strong>0.8498</strong></td>
+   <td><strong>0.9144</strong></td>
+  </tr>
+ </tbody>
+</table>
+<h2>Where the Speedup Comes From</h2>
+<p><strong>Fused kernels</strong> reduce the cost of each step that still runs. The H3 path fuses indexed AdaLN updates, gated residuals, SwiGLU activation, and QK RMSNorm with 3D RoPE.</p>
+<p><strong>Cache-DiT</strong> attaches one DBCache context to MiniMax-H3's shared DiT block stack. After the warmup steps, it evaluates the configured boundary blocks and compares the normalized residual change with the previous cached state. All cache modes use <code>Fn=1</code>, <code>Bn=0</code>, and four warmup steps.</p>
+<p><strong>SubBlock sparse attention</strong> reduces the KV blocks read on computed steps. It uses <code>n_k=n_q=4</code>; the first ten denoising steps use dense attention, and SubBlock is enabled afterward. The minimum sequence length is <code>4096</code>.</p>
+<h2>The Kernel Layer</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Operator</th>
+   <th>Eager composition</th>
+   <th>SGLang kernel</th>
+   <th>Speedup</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>AdaLN modulation (indexed scale-shift)</td>
+   <td>136.7 μs</td>
+   <td>38.2 μs</td>
+   <td>3.58×</td>
+  </tr>
+  <tr>
+   <td>AdaLN gated residual (indexed)</td>
+   <td>93.2 μs</td>
+   <td>46.6 μs</td>
+   <td>2.00×</td>
+  </tr>
+  <tr>
+   <td>SwiGLU activation (in place)</td>
+   <td>364.5 μs</td>
+   <td>105.2 μs</td>
+   <td>3.46×</td>
+  </tr>
+  <tr>
+   <td>QK RMSNorm</td>
+   <td>334.0 μs</td>
+   <td>76.9 μs</td>
+   <td>4.35×</td>
+  </tr>
+  <tr>
+   <td>QK RMSNorm + 3D RoPE, one kernel</td>
+   <td>1335.6 μs</td>
+   <td>109.8 μs</td>
+   <td>12.16×</td>
+  </tr>
+ </tbody>
+</table>
+<h2>How SubBlock Sparse Attention Works</h2>
+<p>SubBlock is a training-free router for block-sparse attention. It divides the sequence into 64-token query and key blocks, then splits each block into four 16-token sub-blocks on both sides. A lightweight pooling and log-sum-exp score estimates each key block's unnormalized softmax mass for each query block and head. The router keeps the highest-scoring key blocks and passes their indices to the block-sparse attention kernel.</p>
+<h2>Acknowledgement</h2>
+<ul>
+ <li><strong>SGLang Diffusion Team</strong> — wrote the first version of this post, drives the SGLang kernel work these results build on, and provides the diffusion runtime, the fused kernels, and the parallelism measured here.</li>
+ <li><strong>Ji Huang (@IPostYellow), Ant Group</strong> — ran the H200 benchmark, brought SubBlock sparse attention into SGLang Diffusion, and revised this post.</li>
+ <li><strong>Cache-DiT Team</strong> — @DefTruth and the vipshop.com team, for Cache-DiT and for support integrating its cache profiles into SGLang Diffusion.</li>
+ <li><strong>MiniMax</strong> — for open-sourcing MiniMax-H3, the model every measurement here runs on.</li>
+ <li><strong>NVIDIA</strong> — for the underlying SubBlock sparse attention support, including the block-sparse attention forward these results depend on.</li>
+</ul>

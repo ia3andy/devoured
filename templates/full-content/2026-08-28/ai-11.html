@@ -1,0 +1,144 @@
+<p>Many industries rely on relational databases that are queried with SQL. Most SQL is machine-written, but humans alone likely write billions of custom SQL queries each month prompted by business questions. They are quite good at it — humans score 92.96% on BIRD, a realistic benchmark for translating natural-language questions into SQL.</p>
+<p>However, AI performance on text-to-SQL has lagged behind. LLM scores on the BIRD leaderboard improved from just below 70% in 2024 to 82% today. Frontier models like GPT-5.6 Sol Ultra and Claude Fable 5 can score in the mid-80s, albeit at a cost that is prohibitive for high-volume applications. This isn’t for lack of training data: SQL is widely represented in the internet content used in LLM pretraining. The challenge for AI is in navigating the ambiguous questions and highly-contextual schema that characterize real-world examples.</p>
+<p>A common approach for improving AI performance on tasks people understand well is building agentic scaffolding. Systems such as OpenHands, AI co-scientist, and MetaGPT decompose a task into stages, each with its own prompt or model call. Text-to-SQL scaffolds follow the same pattern. A schema-linking stage narrows thousands of columns down to a candidate set. Real-world, enterprise data systems (including databases, data warehouses, and data lakehouses) contain up to millions of columns. Answering business questions often involves understanding which columns to use. Academic benchmarks are simpler. A generation stage samples queries. A self-correction stage repairs execution errors. A selection stage votes among the survivors. Every component is a separate call, and the orchestration is typically tuned for a given benchmark.</p>
+<p>Scaffolding is an attempt to get over the limitations of model reasoning by making it adhere to a sequence of steps that mirrors how a human would approach the task. And yet, the best scaffolded models still lag 11 points behind humans on SQL. Human professionals acquire their skills with repeated experience, not by being handed a list of instructions — the same should be true of LLMs. Experience with the task should be used to train better reasoning about queries and databases into the model, instead of simply updating the prompts it receives from the scaffold.</p>
+<p>In this blog post we describe fine-tuning a model that achieves human-level accuracy on text-to-SQL without scaffolding, using reinforcement learning with verifiable rewards (RLVR) on Tinker.</p>
+<p>Extracting the correct answer with SQL is a verifiable task that can be trained in a straightforward manner. However, the performance gap of SQL models suggested that the standard recipe can be improved. Our approach has two crucial improvements: an expert-verified training set purged of the label errors that could poison RLVR, and a reward-shaping technique that targets two common failure modes of RLVR in this domain.</p>
+<p>The trained model, ReViSQL-K2.6, exceeds the human mark of 92.96% when picking from 16 samples (SC-16) at a cost of $0.56 per task. It is more accurate than Fable 5 and GPT-5.6 Sol Ultra at 12–15% of their cost, and much more accurate than any scaffolded model on the leaderboard.</p>
+<h2>Curating high-quality training data</h2>
+<p>RLVR is effective at improving domain-specific reasoning, but it is sensitive to data with incorrect labels. In RLVR, the scalar reward is the entire learning signal for the training step. Mislabeled instances reverse the signal, degrading learning significantly. Our research found that algorithmic tweaks cannot compensate for this loss — cleaning up the data is crucial for RLVR to work well.</p>
+<p>We found existing text-to-SQL data to be extremely noisy. Our analysis has shown that many widely known benchmarks contain large amounts of noise. We sampled 2.5k instances from BIRD Train, a training dataset for text-to-SQL. Our audit found errors in every component of the dataset: the questions, the external knowledge supplied, and in more than half of the “golden SQL queries” that the model’s answer is compared against.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Error type</th>
+   <th>Share of audited instances</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Gold SQL query incorrect</td>
+   <td>52.1%</td>
+  </tr>
+  <tr>
+   <td>Natural language question flawed</td>
+   <td>26.2%</td>
+  </tr>
+  <tr>
+   <td>External knowledge entry wrong</td>
+   <td>18.2%</td>
+  </tr>
+  <tr>
+   <td>Unanswerable given the schema (discarded)</td>
+   <td>1.5%</td>
+  </tr>
+  <tr>
+   <td>At least one of the above</td>
+   <td>61.1%</td>
+  </tr>
+ </tbody>
+</table>
+<p>We cleaned up the training set in a multi-stage process. First, an LLM (OpenAI’s o3) and a human expert reviewed each instance and flagged errors. The expert review found that the LLM auditor was precise in catching annotation mistakes (90.6% precision) but only caught 24.5% of the errors flagged by humans. The errors and proposed fixes from this first stage were sent to a different expert for verification. Where the verifier disagreed with the initial auditor, the sample was sent back for additional loops of conflict resolution.</p>
+<p>We released the cleaned-up training set to the community as BIRD-Platinum.</p>
+<p>We suspected that the evaluation dataset, BIRD Mini-Dev, likewise contained annotation errors. A first cleanup pass of BIRD Mini-Dev was done by Arcwise and corrected errors in 32.3% of instances. We did a second pass that confirmed the vast majority of Arcwise’s flags and found many more, bringing the total detected error rate in BIRD Mini-Dev to 52.8%. The evaluation set with the gold query errors cleaned up was released as Arcwise-Plat-SQL.</p>
+<h2>BIRD-Platinum lifts RLVR above prior best models</h2>
+<p>We fine-tuned Kimi-K2.6 with RLVR on BIRD-Platinum to produce ReViSQL-K2.6. Training on verified data alone lifted ReViSQL-K2.6 well above both frontier generalist LLMs and the leading open-weight fine-tuned text-to-SQL models on Arcwise-Plat-SQL, with an accuracy score of 88.55%. This shows that the annotation errors in standard training data were the binding constraint on RLVR for text-to-SQL.</p>
+<p>To demonstrate that this approach generalizes to other models and eval sets we didn’t touch, we fine-tuned Qwen3-235B-A22B with RLVR on BIRD-Platinum and the original BIRD Train. We tested the model on two new text-to-SQL benchmarks, widely considered more difficult than BIRD:</p>
+<ul>
+ <li><strong>Spider2-SQLite</strong>: a variant of the Spider2 benchmark that contains complex queries with 5.2× as many tokens on average as Arcwise-Plat-SQL.</li>
+ <li><strong>Spider2-Snow</strong>: a variant of Spider2 that uses the Snowflake SQL dialect.</li>
+</ul>
+<p>Training on the more carefully curated BIRD-Platinum improves the model’s accuracy by 16% on Arcwise-Plat-SQL, 12% on Spider2-SQLite, and 14% on Spider2-Snow compared to BIRD Train. This indicates that our verified data produces a more transferable learning signal across benchmarks and SQL dialects.</p>
+<h2>Accurate reward signal for text-to-SQL RLVR</h2>
+<p>Training on clean data brought the fine-tuned model closer to human parity, but a gap of over 4% remained. We looked at the cases where the model failed to identify patterns, which led us to examine the reward function used in training.</p>
+<p>Standard text-to-SQL RLVR assigns a reward of 1 when the generated query returns the same result as the gold query on the benchmark database. This mirrors the scoring used in evaluation, but doesn’t fully capture the general behavior we want the model to learn. We focused on two ways result-based reward can diverge from the intended behavior and amended the reward function to address them.</p>
+<h3>Divergence 1: execution match is not semantic equivalence</h3>
+<p>The standard result-based reward checks the generated query’s output on a single database instance, but this doesn’t guarantee that the result would hold for a different one. A wrong join key or a dropped predicate can be missed when the particular database instance does not expose the error. Only queries that are semantically equivalent are guaranteed to produce the same result on any database instance.</p>
+<p>We test for the semantic equivalence of SQL queries with VeriEQL, a solver that uses bounded verification and incurs negligible CPU costs relative to the total training costs (less than 0.1%). In a pilot training run, we found that 32.8% of positive result-based rewards were given to queries that weren’t fully equivalent to the correct one. That means that nearly one time in three, the reward reinforced the wrong query.</p>
+<p>We updated the reward signal by downweighting it in cases where the query was accepted by execution matching but wasn’t equivalent according to VeriEQL. With an additional source of verification, the reward pushes training towards the correct query that generalizes to different database instances.</p>
+<h3>Divergence 2: outcome rewards are blind to provided knowledge</h3>
+<p>BIRD-style problems provide external knowledge alongside the question in a prompt. A result-based reward conditions only on the final result, which means it cannot distinguish a model that read the provided information from one that guessed correctly based on its pretraining priors. For example, because “sodium = 0” and “sodium &lt; 5” produce the same result set, a result-based reward cannot distinguish a model that correctly uses external knowledge to choose “sodium = 0” from one that memorizes or hallucinates “sodium &lt; 5.” In the absence of a gradient pushing models to incorporate external knowledge, they tend to default to the prior. In a pilot analysis on a validation set, 24.2% of failures were traced to the model ignoring the necessary information that was supplied.</p>
+<p>We address this with rule-based process rewards. The model must emit a requirement block that translates each external-knowledge entry into an explicit query constraint, and a verification block that audits the generated query against those constraints, with penalties for non-compliance. Our process reward encourages the model to ground its reasoning and generation in the provided knowledge rather than blindly relying on its pre-trained prior. The rewards are rule-based rather than model-graded, making the scoring cheap and free from contamination by a judge model’s priors.</p>
+<h2>Training recipe</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Component</th>
+   <th>Setting</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Base model</td>
+   <td>moonshotai/Kimi-K2.6</td>
+  </tr>
+  <tr>
+   <td>Training data</td>
+   <td>BIRD-Platinum</td>
+  </tr>
+  <tr>
+   <td>Train/validation split</td>
+   <td>85:15</td>
+  </tr>
+  <tr>
+   <td>RL objective</td>
+   <td>CISPO</td>
+  </tr>
+  <tr>
+   <td>Batch size</td>
+   <td>64</td>
+  </tr>
+  <tr>
+   <td>Group size</td>
+   <td>16</td>
+  </tr>
+  <tr>
+   <td>Learning rate</td>
+   <td>5×10−5</td>
+  </tr>
+  <tr>
+   <td>LoRA rank</td>
+   <td>32</td>
+  </tr>
+  <tr>
+   <td>Maximum number of input tokens</td>
+   <td>32,768</td>
+  </tr>
+  <tr>
+   <td>Maximum interaction turns between the model and the environment (a database instance)</td>
+   <td>5</td>
+  </tr>
+  <tr>
+   <td>Maximum number of output tokens per turn</td>
+   <td>3,072</td>
+  </tr>
+  <tr>
+   <td>VeriEQL reward shaping</td>
+   <td>An execution match refuted by VeriEQL receives a penalty of 0.2</td>
+  </tr>
+  <tr>
+   <td>Process reward shaping</td>
+   <td>Non-compliance with the required external knowledge analysis receives a penalty of 0.1</td>
+  </tr>
+  <tr>
+   <td>Checkpoint selection</td>
+   <td>Highest validation accuracy</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Results</h2>
+<p>We present ReViSQL-K2.6, the model fine-tuned on Tinker with verified data and both reward modifications. Under greedy decoding (single sample, temperature = 0) our model achieves an accuracy of 91.37% on Arcwise-Plat-SQL at a cost of $0.035 per task. This is an 8.4 point improvement over OpenSearch, the strongest prior open-source pipeline, at a 37% lower cost. The cost advantage is a direct consequence of removing auxiliary scaffolding around the model.</p>
+<p>If ReViSQL-K2.6 votes among 16 candidates generated with temperature = 1, accuracy rises to 92.97% at a cost of $0.56 per task. This is the first time a text-to-SQL AI system has exceeded the human benchmark to our knowledge.</p>
+<h2>Conclusion</h2>
+<p>When AI shows poor performance in a domain-specific task, the common response is to add scaffolding around the task execution. This approach improved performance for text-to-SQL models somewhat, but it ultimately hits the ceiling imposed by the base model’s capability. This doesn’t mean that scaffolding is worthless. Rather, it suggests that the task knowledge contained in the scaffold belongs in the training signal, the same training that would uplift the model’s overall capacity.</p>
+<p>The common thread with our previous work on AI trained for financial judgment is that custom models can outperform the frontier on a wide range of tasks involving expert taste and judgment, often at a fraction of the cost. This requires expert judgment to be part of the training process: in identifying how AI fails, labeling the training data, and aligning training to the intended behavior.</p>
+<p>In the case of text-to-SQL we saw major improvements from both a rigorous cleanup of the data and the shaping of the reward function to teach the model the correct skill. This took more effort upfront, but the resulting model achieves better performance at lower cost than both humans and scaffolded models. Putting task expertise into task-specific training is ultimately what scales.</p>
+<h2>Citation</h2>
+<p>Please cite this work as:</p>
+<pre><code>Zhu, Yuxuan et al., "Human-Level Text-to-SQL via Reinforcement Learning on Verified Data, Without Pipeline Engineering", arXiv:2603.20004 (2026).</code></pre>
+<pre><code>@article\{zhu2026revisql,
+  title = \{Human-Level Text-to-SQL via Reinforcement Learning on Verified Data, Without Pipeline Engineering},
+  author = \{Zhu, Yuxuan and Jin, Tengjun and Choi, Yoojin and Kang, Daniel},
+  journal = \{arXiv preprint arXiv:2603.20004},
+  year = \{2026}
+}</code></pre>

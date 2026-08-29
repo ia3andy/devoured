@@ -1,0 +1,108 @@
+<p>Big Pineapple, the platform behind 1.1.1.1, Gateway DNS, DNS Firewall, AS112, and several other Cloudflare DNS services, stores over 250 billion DNS cache entries at any given time. At that scale, wasting a single byte per entry costs more than 250 gigabytes of memory across our fleet.</p>
+<p>Five successive changes to how cache entries are stored in memory cut the per-entry footprint by over 50%. Across our fleet, these changes freed up roughly 100 terabytes of memory, equivalent to the amount of RAM in 130 of our Gen 13 servers. The cache also got faster. Insert throughput rose 43% and lookup latency dropped 19%, as fewer allocations and better memory locality meant we did not trade speed for space.</p>
+<h2>What we cache</h2>
+<p>On cold start, Big Pineapple starts out with an empty cache. As DNS queries arrive, the cache fills until it hits its maximum entry count, at which point we evict older or less popular items to make room.</p>
+<p>The exact cache size varies by data center. When EDNS Client Subnet (ECS) is in use, authoritative servers return different answers depending on the client's network, so we cache multiple versions of the same query. This increases both the number of entries and the memory each one consumes, making the optimizations in this post especially impactful for ECS-heavy locations.</p>
+<p>Each item in the cache is a key-value pair. The key identifies what was queried:</p>
+<pre><code>pub struct CacheKey \{
+    qname: Name,
+    qtype: Rtype,
+    authenticated: bool,
+    tag: Vec&lt;u8&gt;,
+}</code></pre>
+<p>The value stores the DNS response itself: the answer, authority, and additional record sections, along with metadata like the creation time, a hit counter, and the Time-to-Live (TTL).</p>
+<pre><code>pub struct CacheEntry \{
+    timestamp: UnixTimeStamp,
+    pub inception: Instant,
+    pub ttl: Ttl,
+    pub hits: u32,
+    pub answers: Vec&lt;Record&gt;,
+    pub authority: Vec&lt;Record&gt;,
+    pub additional: Vec&lt;Record&gt;,
+    pub errors: Vec&lt;ExtendedError&gt;,
+    ...
+}</code></pre>
+<p>Both structs have room for improvement. Several fields use types that carry overhead we don't need once the entry is stored.</p>
+<h2>Benchmarking memory usage</h2>
+<p>To measure the impact of each change, we benchmark by filling the cache with randomly generated entries that roughly match the traffic distribution we see in production: 56% A records, 25% AAAA, and 19% TXT. Each entry contains between one and four records.</p>
+<p>TXT records serve as a stand-in for all non-A/AAAA record types in the benchmark. Their size is randomized between 64 and 224 bytes, close to the average response size we see for variable-length record types.</p>
+<p>We track memory usage using a custom allocator that wraps Rust’s System allocator and records the number and size of allocations per cache entry. Alongside memory, we measure insert throughput and lookup latency across the full cache flow to make sure memory savings don’t come at the cost of performance.</p>
+<p>These inputs approximate production rather than reproduce it exactly. Process memory also depends on traffic mix, cache occupancy, allocator state, and memory used outside the cache. We therefore measured resident memory across production instances during the rollout.</p>
+<h2>The cost of capacity</h2>
+<p>Vec&lt;T&gt; stores three fields: a pointer to heap-allocated data, the current length, and the total capacity. When you push an item, Vec checks whether the length exceeds the capacity and reallocates if needed. If there’s room, it just appends the item and increments the length.</p>
+<p>Once we store a DNS response in the cache, however, we never modify it again. The capacity field serves no purpose, but still costs 8 bytes per Vec. The over-allocated heap space is wasted as well, as a Vec with capacity for eight items but only five stored leaves three slots unused on the heap.</p>
+<p>Using Box&lt;[T]&gt; solves both problems. It can’t grow after creation, so it doesn’t need a capacity field or reserve space for future elements. The same applies to String, which also carries a capacity field. Box&lt;str&gt; drops it.</p>
+<p>Each cache entry stores 8 Vec and String fields. Replacing them with Box&lt;[T]&gt; and Box&lt;str&gt; saves 8 bytes per field, 64 bytes per entry. It also eliminates the excess heap memory that Vec reserves for future growth. The combined savings add up to over 15 terabytes with over 250 billion cache entries.</p>
+<h2>Fewer lists, fewer pointers</h2>
+<p>Rather than storing the answer, authority, and additional sections in separate lists, we can store a single list with offsets to the start of each section. Since DNS record counts per section fit in a u16, we can use a u16 (2 bytes) for each offset, compared to the 8-byte pointer and 8-byte length that each separate Box&lt;[T]&gt; requires.</p>
+<p>This removes two lists, each with an 8-byte pointer and 8-byte length, and replaces them with two 2-byte offsets, saving 28 bytes per entry.</p>
+<p>These savings do not always map directly to the number of bytes removed from individual fields. Rust inserts padding to satisfy alignment requirements and rounds a struct’s size up to a multiple of its alignment. Removing a small field can therefore eliminate additional padding. For example, we also packed several boolean fields into a single bitflag. This reduced the surrounding padding, causing the struct to shrink by more than the size of the individual booleans.</p>
+<h2>Dropping the owner</h2>
+<p>Each DNS record has an owner, the domain the record belongs to. In many cases, this owner is identical to the domain being queried.</p>
+<p>The DNS wire format handles repeated owners using name compression, as defined in RFC 1035. Rather than encoding the same domain twice, subsequent occurrences store a 2-byte pointer to the first occurrence.</p>
+<p>This works well on the wire, but in our cache we store the full owner name alongside each record. Following compression pointers during cache lookups is expensive on the hot path, so we trade memory for speed.</p>
+<p>Most records, however, have an owner identical to the queried domain. For those, we can drop the owner entirely and infer it at read time. When the owner differs, such as the A records behind a CNAME, we store the full name.</p>
+<pre><code>pub struct Record \{
+    owner: Option&lt;Box&lt;Name&gt;&gt;,
+    class: Class,
+    ttl: Ttl,
+    rtype: Rtype,
+    data: RecordData,
+}</code></pre>
+<p>When owner is None, response construction restores the queried domain from the cache key, avoiding a heap allocation. This means the record is no longer self-contained, but the cache key is already available during every lookup. When the owner differs, Some stores a pointer to the full name on the heap.</p>
+<p>In practice, most cached records have an owner identical to the queried domain, so the majority require no heap allocation for the owner field.</p>
+<h2>Enum sizing</h2>
+<p>Rust enums are sum types: each variant can carry different data, but the enum is always the size of its largest variant.</p>
+<p>For record data, it seems natural to store each DNS record type as an enum variant. But the enum is always as large as its largest variant. In our case, that’s NAPTR at 136 bytes. It stores three variable-length text fields, a domain name, and two integers. As a result, the full enum, including the variant tag and padding, becomes 144 bytes.</p>
+<p>An A record only needs 4 bytes, and an AAAA record needs 16 bytes. A and AAAA make up over 80% of our traffic, so most records waste over 120 bytes on padding. Since a single cache entry can store many records this quickly adds up.</p>
+<h3>Boxing the variants</h3>
+<p>To solve this problem, we can box the larger variants of the enum, moving them to a separate heap allocation. The enum then stores an 8-byte pointer to the heap, where the data takes up only the size it actually requires.</p>
+<p>For A and AAAA records, this saves 120 bytes per record. Smaller variant types like TXT and CNAME also benefit. They still occupy the 24-byte enum, but their heap allocation is sized to their actual data rather than padded to 144 bytes.</p>
+<h3>The costs of boxing</h3>
+<p>Boxing has two costs. The first is allocator overhead. Each boxed variant becomes a separate heap allocation, and allocators round up to the nearest size class. Big Pineapple uses jemalloc, an allocator designed for multithreaded, allocation-heavy workloads.</p>
+<p>The second cost is poor memory locality. Without boxing, the record enum values for a cache entry sit in a single contiguous allocation. With boxing, data for each boxed variant lives in a separate heap region. Reading it requires following a pointer, and when that pointer lands far from the rest of the entry, the CPU has to fetch a new cache line.</p>
+<h2>Storing records in wire format</h2>
+<p>As a middle ground, we store just the record data as raw bytes, while keeping the rest of the cache entry as structured fields. Instead of a list of parsed enum variants, we store the records as a single Box&lt;[u8]&gt; containing each record encoded as a 2-byte length prefix followed by its raw bytes.</p>
+<p>This eliminates the per-variant enum overhead and the boxed heap allocations from the previous optimization. The data also becomes packed contiguously, which improves CPU cache locality.</p>
+<p>When building a DNS response from cached records, most record types can be copied directly from the buffer into the outgoing message. Previously, each parsed record had to be serialized field by field back into DNS wire format. The new layout skips that work for A, AAAA, TXT, and all DNSSEC record types by copying their encoded bytes directly.</p>
+<h2>The results</h2>
+<p>Per-instance memory usage dropped across all percentiles. At p99, memory dropped from 9.3 GB to 5.3 GB, a 43% reduction in resident memory. At p90, memory dropped from 6.5 GB to 3.8 GB, a 42% reduction. Instances with fuller caches saw the largest absolute savings.</p>
+<p>In our benchmarks, these five optimizations reduced the per-entry memory footprint from 953 bytes to 420 bytes, a 56% reduction. Per-entry allocations dropped from 1.1 KB to 461 bytes. The reductions measured in production are smaller because resident memory includes the cache alongside all other process data. After the rollouts settled, aggregate working-set memory across the fleet was roughly 100 terabytes lower.</p>
+<p>Performance also improved. Cache insert throughput increased by 43%, while lookup latency dropped by 19%.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Metric</th>
+   <th>Before</th>
+   <th>After</th>
+   <th>Change</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Per-entry net footprint</td>
+   <td>953 bytes</td>
+   <td>420 bytes</td>
+   <td>-56%</td>
+  </tr>
+  <tr>
+   <td>Per-entry allocations</td>
+   <td>1.1 KB</td>
+   <td>461 bytes</td>
+   <td>-58%</td>
+  </tr>
+  <tr>
+   <td>Cache insert throughput</td>
+   <td>625,000 entries/s</td>
+   <td>893,000 entries/s</td>
+   <td>+43%</td>
+  </tr>
+  <tr>
+   <td>Cache lookup latency</td>
+   <td>828 ns</td>
+   <td>670 ns</td>
+   <td>-19%</td>
+  </tr>
+ </tbody>
+</table>
+<p>We plan to reinvest the freed memory into increasing cache capacity without increasing our memory usage, which improves cache hit rates and reduces upstream query volume. We're also exploring further optimizations to the cache itself.</p>
