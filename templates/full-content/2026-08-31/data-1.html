@@ -1,0 +1,51 @@
+<h1>Beyond Offset Lag: Computing Time in Queue for Apache Hudi Data Lake Pipelines at Petabyte Scale</h1>
+<h3>Key Takeaways</h3>
+<ul>
+ <li>Kafka Offset lag tells you how far behind a consumer is rather than telling you how old the data is. For Apache Hudi pipelines, these measurements are two completely different things. Confusing them leads to data freshness SLA violations.</li>
+ <li>The time-in-queue metric is computed by reading the Kafka checkpoint from the latest Hudi commit file in S3, seeking to that offset in the Kafka topic, and measuring the timestamp delta between that message and the current time. Changes to producers, consumers, or existing pipeline infrastructure are not required.</li>
+ <li>The algorithm must handle the case where the latest Hudi commit contains no checkpoint metadata. For example, when a parallel legacy pipeline made the most recent commit, requiring the algorithm to walk back through commit history to find the most recent commit that contains checkpoint metadata.</li>
+ <li>Once deployed, time-based lag becomes a first-class data contract metric. Pipeline owners can define custom freshness SLAs per pipeline and receive alerts when the lake data ages beyond their threshold.</li>
+ <li>Offset monitoring and time-lag monitoring are complementary. Running both gives you a complete picture of pipeline health that neither metric provides on its own.</li>
+</ul>
+<h2>The Problem</h2>
+<p>At Twilio, the data lake is the foundation for analytics, reporting, and machine learning across the company’s product lines: messaging, email, voice, and more. Internal teams rely on this data to understand product usage, drive business decisions, and power machine learning models such as anomaly or fraud detection. The pipelines that feed this lake use Apache Hudi Delta Streamer to land data from Kafka, processing over five trillion records monthly as of Q4 2025, across self-hosted Kafka clusters, peaking at 12.9 million messages per second on Cyber Monday 2025. At that scale, we realized it was critical to give pipeline owners a precise way to define and enforce custom freshness SLAs. We were looking for a signal that was actionable without adding any overhead to live pipelines.</p>
+<p>Traditional consumer lag metrics like consumer offset lag (<code>records-lag-max</code>) and even Hudi’s <code>kafkaDelayCount</code> looked fine. It seemed like consumers were keeping up with Kafka, but downstream analytics teams kept reporting stale data that was sometimes hours old. The issue wasn't Kafka throughput; it was a visibility gap. Hudi Delta Streamer manages its own checkpoints, which are stored alongside the table data in S3 and separate from Kafka's consumer group offset tracking. Standard lag monitoring tools like Burrow track a consumer group’s committed offsets, which Hudi doesn’t populate by default, so they had no awareness of whether Hudi had actually committed that data to the lake.</p>
+<p>The real question we needed to answer was how far behind is the latest Hudi commit from the messages currently sitting in the Kafka topic?</p>
+<h2>Rethinking Lag as Time</h2>
+<p>How far behind is the Hudi job from messages in the Kafka topic? In other words, we wanted to compute and report how long it has been since the first unconsumed message arrived in the Kafka topic after a successful Hudi commit.</p>
+<h3>How Offset Tracking Works in Hudi</h3>
+<p>HoodieStreamer (formerly HoodieDeltaStreamer) utilizes a checkpoint mechanism to track exactly what data has been ingested and prevent reprocessing of that same data. For Kafka sources, this checkpoint represents the exact topic offsets (per partition) or timestamps that have been successfully processed and committed to storage.</p>
+<ul>
+ <li>For checkpoint storage, the checkpoint is embedded directly in the <code>.hoodie</code> commit files as <code>deltastreamer.checkpoint.key</code>.</li>
+ <li>In terms of resilience, upon failure or restart, HoodieStreamer reads the latest commit file, retrieves this key, and resumes reading from the exact offset it left off.</li>
+ <li>Kafka offset is stored as a string: <code>topicName,0:offset0,1:offset1</code>.</li>
+</ul>
+<p>From this timeline of events, we can find the latest commit using the Apache Hudi SDK and extract the per-partition offsets that were last successfully written to the lake.</p>
+<p>What makes this approach practical is that it requires nothing new from the pipelines themselves. The offset that Hudi already commits to S3 and the timestamps already on Kafka messages are enough to compute the true data freshness. We compute it with an external job called the metrics reporter. The metrics reporter is purely an external observer that reads artifacts the system already produces, requiring neither new instrumentation nor producer changes.</p>
+<h2>How the Algorithm Works</h2>
+<p>The metrics reporter runs every fifteen minutes in production. For each pipeline, the reporter completes the following tasks:</p>
+<ul>
+ <li>Fetch the latest Hudi commit from the active timeline in S3. Walk through commits in reverse chronological order, the most recent first, to find the latest commit that contains a <code>deltastreamer.checkpoint.key</code>. This approach gives us the per-partition offsets of the last successfully committed batch. This is the exact offset Hudi has already consumed and committed to the lake.</li>
+ <li>Seek to the checkpoint offset in each Kafka partition. This seeking positions the consumer at the first message Hudi has not yet committed to the lake. That message is still in Kafka, having arrived after the last successful Hudi write.</li>
+ <li>Read that message and get its timestamp X. This timestamp records when the data arrived in Kafka. It has been sitting there, waiting to be picked up by the next Hudi run.</li>
+ <li>Compute lag: <code>currentTimestamp - X = how long that data has been waiting</code></li>
+ <li>Cap at seven days if lag exceeds the threshold. This cap prevents unbounded values for inactive or stopped pipelines. If no valid checkpoint is found within the search depth, the reporter suppresses the metric entirely rather than publishing a misleading value.</li>
+</ul>
+<h3>Edge Cases and Considerations</h3>
+<h4>Clock Skew Across Producers</h4>
+<p>Because the lag metric uses the message timestamp set by the producer, producers whose system clocks drift ahead can make lag appear artificially low (or even negative). The algorithm floors the lag at zero using <code>Math.max(0L, currentTimeMs - record.timestamp())</code>.</p>
+<h4>Multi-Partition Topics</h4>
+<p>At scale, Kafka topics have many partitions. The checkpoint stored in Hudi contains one offset per partition. The algorithm seeks each partition to its respective checkpoint offset and polls for the next available record. This approach provides one candidate message per partition. We then take the record with the earliest timestamp across all partitions, not the average nor the latest.</p>
+<h4>Multiple Hudi Table Writers and Kafka Checkpoints</h4>
+<p>In production, a Hudi table can have multiple writers and not all of them commit Kafka checkpoint metadata. This situation commonly arises during migrations. The root cause was that the original algorithm only looked at the most recent commit. We changed the algorithm to walk back through the timeline in reverse chronological order up to <code>MAX_COMMIT_DEPTH</code> commits until it finds the most recent commit that actually contains a <code>deltastreamer.checkpoint.key</code>.</p>
+<h4>The Epoch Timestamp Trap</h4>
+<p>When Hudi fails to locate a commit with checkpoint metadata, it doesn't error out. Instead, it silently defaults to a timestamp of epoch zero, <code>19700101000000000</code>. We had to explicitly guard against epoch defaults and pivot our logic. By switching to <code>currentTime - timestamp_of_first_unconsumed_message</code>, we finally started answering the right question.</p>
+<h4>SLA as a Ratio, Not a Binary</h4>
+<p>An "SLA ratio" is a design choice we arrived at in production. Our initial SLA metric was binary, breached or not. The problem was that it only fired after the SLA was already missed. Switching to a 0.0-1.0 ratio gives teams a leading signal, allowing them to set a warning at 0.7 and a critical alert at 1.0.</p>
+<h3>What's Next</h3>
+<p>If you want to apply this pattern, you need three things:</p>
+<ul>
+ <li>Access to your Hudi table's <code>.hoodie/</code> directory on S3</li>
+ <li>A Kafka client to seek arbitrary offsets</li>
+ <li>A scheduler to run the reporter periodically.</li>
+</ul>

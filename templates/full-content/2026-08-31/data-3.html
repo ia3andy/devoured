@@ -1,0 +1,130 @@
+<h1>Log-first or Table-first? Apache Kafka, Fluss, and Streaming Tables</h1>
+<p><a href="https://kafka.apache.org/">Apache Kafka</a> is a natural starting point for a streaming architecture. Applications produce events to Kafka, other applications consume them, and data that needs to be retained for <em>longer</em> eventually lands in object storage. A fairly typical version uses <a href="https://kafka.apache.org/documentation/#connect">Kafka Connect</a> with an S3 sink connector—for example, <a href="https://docs.confluent.io/kafka-connectors/s3-sink/current/overview.html">Confluent's Amazon S3 Sink Connector</a>—to move older data into <a href="https://aws.amazon.com/s3/">Amazon S3</a>.</p>
+<p>Kafka handles the real-time path, S3 provides cheap and durable storage for historical data, and for an archive this is often enough. The problems start when the data in S3 is expected to behave less like an archive and more like a database table.</p>
+<p>Suppose a Kafka topic contains customer updates:</p>
+<pre><code>customer-123 -&gt; \{ name: "Alice", status: "active" }
+customer-456 -&gt; \{ name: "Bob",   status: "active" }
+customer-123 -&gt; \{ name: "Alice", status: "blocked" }</code></pre>
+<p>Writing those records to Parquet is easy. Answering a different set of questions is harder:</p>
+<ul>
+ <li>What is the current state of every customer?</li>
+ <li>How should updates and deletes be represented?</li>
+ <li>Which files form a consistent version of the dataset?</li>
+ <li>What happens when the schema changes?</li>
+ <li>How do we avoid producing thousands of small files?</li>
+ <li>How can multiple query engines safely read the same dataset while it is being updated?</li>
+</ul>
+<p>S3 gives us files. It does not give us a table.</p>
+<h2>From files to tables</h2>
+<p>Open table formats such as <a href="https://iceberg.apache.org/">Apache Iceberg</a> and <a href="https://paimon.apache.org/">Apache Paimon</a> fill this gap. They put metadata around the files: schema, snapshots, partitions, data files, and changes between versions. The architecture becomes something closer to:</p>
+<p>The difference is more than file layout. We are no longer simply writing files—we are maintaining a table. Queries can operate on a consistent snapshot, schema changes can be tracked, and data files can be compacted or replaced without exposing partially updated state to readers.</p>
+<p>But somebody still needs to translate the Kafka stream into that table. In practice this means running another piece of infrastructure: Kafka Connect, <a href="https://flink.apache.org/">Apache Flink</a>, Spark Structured Streaming, AWS Glue, or a custom ingestion service. And that service has considerably more work to do than copying bytes from Kafka to S3. It might need to understand schemas, turn CDC records into inserts, updates, and deletes, create table commits, manage file sizes, compact small files, and publish metadata to a catalog.</p>
+<p>There are two interesting ways to simplify this pipeline. Confluent's <a href="https://docs.confluent.io/cloud/current/topics/tableflow/overview.html">Tableflow</a> makes Kafka-to-lakehouse materialization a managed Confluent Cloud capability; we will come back to it later. <a href="https://fluss.apache.org/">Apache Fluss</a> takes a different route and questions whether the streaming layer should be a log in the first place. Before getting to Fluss, it is worth being precise about what Kafka gives us.</p>
+<h2>Kafka is still a log</h2>
+<p>A Kafka partition is an ordered log. Records have offsets, producers append records, and consumers move through the log and can rewind to replay old data.</p>
+<p>This model is deliberately simple. Kafka does not need to know whether a record represents a customer, an invoice, a database row, or an HTTP request—the value stored in the record is, from the broker's point of view, mostly an opaque sequence of bytes. That is one of Kafka's strengths, and it is what makes Kafka useful as a general-purpose event backbone. But it also means that Kafka's storage abstraction is still a log.</p>
+<p>Consider a <a href="https://kafka.apache.org/43/configuration/topic-configs/#topicconfigs_cleanup.policy">compacted topic</a>:</p>
+<pre><code>offset 100: customer-123 -&gt; active
+offset 101: customer-456 -&gt; active
+offset 102: customer-123 -&gt; blocked</code></pre>
+<p>Eventually, log compaction can remove the older value for <code>customer-123</code> while retaining the newer one. That makes a compacted topic look a bit like a key-value store, but only from a distance. Kafka contains enough information to reconstruct the latest state; it does not expose that state as a table. There is no broker operation equivalent to:</p>
+<pre><code>SELECT *
+FROM customers
+WHERE customer_id = 'customer-123';</code></pre>
+<p>A consumer can scan the log and build such a representation, but that representation lives somewhere else. <a href="https://kafka.apache.org/documentation/streams/">Kafka Streams</a> builds local state stores - and <a href="https://ksqldb.io/">ksqlDB</a>, built on top of Kafka Streams, exposes exactly this pattern as SQL tables continuously materialized from topics. Flink maintains operator state, commonly backed by <a href="https://rocksdb.org/">RocksDB</a>. Applications also materialize Kafka data into Redis, Cassandra, PostgreSQL, Elasticsearch, or another database.</p>
+<p>In Kafka-based projects I keep encountering some version of the same picture: a customer or product dataset maintained as Flink state for enrichment joins, copied into Redis so that services can look it up with low latency, and written to the lakehouse for analytics. Each copy exists for a defensible reason. The sum is still three or four stateful systems holding the same logical table.</p>
+<p>Kafka stores the changelog, a state store serves the latest value, and the lakehouse stores historical data for analytical queries. There are good reasons for separating these responsibilities, but it also means that a seemingly simple stream of updates ends up copied into several stateful systems—each with its own consistency, capacity, and operational story.</p>
+<p>Fluss takes aim at exactly this duplication.</p>
+<h2>Fluss starts with a table</h2>
+<p>A few words about the project first, because it is young. Fluss originated at Alibaba, entered the Apache Incubator in 2025, and <a href="https://fluss.apache.org/blog/apache-fluss-graduates-to-top-level-project/">graduated to an Apache Top-Level Project in August 2026</a>. The latest stable release at the time of writing is 0.9.1; the artifact still carries the <code>Incubating</code> label because that release predates graduation. Flink remains the most complete compute integration, but Fluss now also ships <a href="https://clients.fluss.apache.org/">Java, Rust, Python, and C++ clients</a>—the non-Java ones share a common Rust core and had their first 0.1.0 release in 2026, so feature coverage still varies across languages. This is a young ecosystem, and that matters for any adoption decision.</p>
+<p>Fluss supports append-only streams, but that is not the part that makes it particularly different from Kafka. The more interesting abstraction is the Primary Key Table. A Fluss table can be defined with a key:</p>
+<pre><code>CREATE TABLE customers (
+    customer_id STRING,
+    name STRING,
+    status STRING,
+    PRIMARY KEY (customer_id) NOT ENFORCED
+);</code></pre>
+<p>Now consider the same sequence of updates:</p>
+<pre><code>customer-123 -&gt; Alice, active
+customer-456 -&gt; Bob, active
+customer-123 -&gt; Alice, blocked</code></pre>
+<p>The current table state is:</p>
+<pre><code>customer-123 -&gt; Alice, blocked
+customer-456 -&gt; Bob, active</code></pre>
+<p>At the same time, downstream streaming consumers can still observe the changes. That is the key shift. With Kafka, the log is the primary storage abstraction and current state is normally derived from it. With a Fluss Primary Key Table, the changelog and current state are both part of the storage abstraction.</p>
+<p>Internally, Fluss does not make the state problem disappear. Primary Key Tables maintain both a log component and a key-value component, with RocksDB used for current state.</p>
+<p>So Fluss is not eliminating RocksDB—it is changing who owns it. Instead of every processing application independently maintaining a copy of the same state, the storage layer maintains it once and exposes it to multiple consumers. For CDC datasets, lookup joins, and heavily reused reference data, that can remove a surprising amount of duplicated state.</p>
+<h2>A compacted log is not a primary-key table</h2>
+<p>Kafka compaction and a primary-key table can look similar because both deal with multiple values associated with the same key, but they answer different questions. Kafka compaction primarily answers:</p>
+<blockquote>
+ <p>Can I keep a replayable log without retaining every historical value for every key forever?</p>
+</blockquote>
+<p>A primary-key table answers:</p>
+<blockquote>
+ <p>What is the value associated with this key now?</p>
+</blockquote>
+<p>Those are related requirements, but they lead to different storage designs. Kafka remains optimized for ordered consumption; a primary-key table also needs efficient access to state.</p>
+<p>Kafka Streams demonstrates the distinction quite well. A Streams application can consume a compacted topic and maintain a local RocksDB store: Kafka provides the durable changelog, while RocksDB provides efficient access to the materialized state. Fluss moves that materialization into the storage system itself.</p>
+<p>Whether that is useful depends on the workload. For application-specific processing state, local state can be exactly what we want—a Kafka Streams application might have state that exists only because of the application's processing logic, and putting it in a shared database would make little sense. But consider a large customer or product dataset consumed by ten different Flink jobs. If every job needs the same latest state for lookup joins, rebuilding and maintaining ten copies of that state is much less obviously desirable, and a shared streaming table starts to become attractive.</p>
+<h2>The hot layer can also be columnar</h2>
+<p>Another difference is easy to miss: Kafka intentionally does not understand the structure of a message value. Suppose an event contains fifty columns:</p>
+<pre><code>customer_id
+name
+email
+address
+country
+currency
+segment
+device
+browser
+...</code></pre>
+<p>A Flink job might need only <code>customer_id</code> and <code>country</code>. With Kafka, the consumer still fetches records containing the complete serialized value, and column selection happens after the record reaches the consumer and is deserialized.</p>
+<p>Fluss takes a different approach. Its log representation can use <a href="https://arrow.apache.org/">Apache Arrow</a>, which means the storage layer understands columns. A query such as:</p>
+<pre><code>SELECT customer_id, country
+FROM customers;</code></pre>
+<p>can push the projection down into the storage layer, so only the required columns travel over the network. Column pruning is something we normally associate with Parquet files in a data lake, not with a system serving fresh streaming data—here the hot streaming path starts to look a little like an analytical storage engine. And the columnar layout helps beyond transfer: values of the same column sit contiguously in memory, which is exactly the layout aggregation loves—summing a column of numbers over Arrow batches is a very different operation from plucking one field out of every individually deserialized record. Again, this comes from the underlying abstraction.</p>
+<p>Kafka sees records. Fluss sees rows.</p>
+<h2>The lakehouse is still better for history</h2>
+<p>Making the hot layer queryable does not mean it should store years of data. Object storage remains much cheaper, and analytical systems are very good at scanning large columnar datasets there. Fluss therefore supports tiering older data into lakehouse tables such as Paimon or Iceberg.</p>
+<p>Now the same logical table spans two storage tiers: Fluss serves the hot part, while the lakehouse holds the history. The awkward part is querying across the boundary.</p>
+<p>Suppose the lakehouse contains everything committed up to 12:00:00, while thirty seconds of newer data still exists only in Fluss. At 12:00:30, querying only the lake gives us a stale result. Trying to make every individual event immediately visible in Iceberg or Paimon is not the answer either—lakehouse formats operate on files and snapshots, and extremely frequent commits create exactly the small-file and metadata problems these systems are meant to control. For update-heavy streams the trade-off gets sharper still: with copy-on-write every commit rewrites data files, so writes pay the price; with merge-on-read writes stay cheap, but readers must merge the accumulating delete files until compaction catches up—so keeping reads fast means compacting the table often. Push the commit frequency high enough and something has to give on one side or the other.</p>
+<p>Fluss solves this through a union of the stable historical snapshot and the hot tail.</p>
+<p>The complete logical table does not need to be physically stored in one place. Older data can live cheaply in object storage while fresh data remains in low-latency streaming storage.Notice what this does to the Iceberg trade-off above: the union read does not make copy-on-write or merge-on-read cheaper, but it removes the reason to run them at streaming frequency in the first place—the lakehouse can commit and compact at a pace that keeps the table healthy, because freshness is served from Fluss rather than squeezed out of Iceberg.</p>
+<p>Fluss is not the only system using this hot/cold split. Confluent Cloud now offers a comparable path on top of Kafka.</p>
+<h2>What changes on Confluent Cloud: Tableflow</h2>
+<p><a href="https://docs.confluent.io/cloud/current/topics/tableflow/overview.html">Confluent Tableflow</a> is Confluent's answer to the Kafka-to-lakehouse pipeline. The important caveat is that Tableflow is a <a href="https://docs.confluent.io/cloud/current/overview.html">Confluent Cloud</a> service. It is not part of Apache Kafka, and it is not available in self-managed Confluent Platform. So everything in this section describes a managed Confluent Cloud architecture, not a new storage primitive inside Kafka itself.</p>
+<p>Within that boundary, Tableflow can continuously materialize a Kafka topic into an Iceberg or <a href="https://delta.io/">Delta Lake</a> table.</p>
+<p>The pipeline that previously required Connect, Flink, or application-specific code becomes part of the platform. For append-only topics, the mapping is relatively straightforward: records are turned into rows and written to the table. More interestingly, Tableflow also supports upsert-style materialization for compacted topics, so a stream of changes can become a table representing current state.</p>
+<p>The hot/cold split ends up looking remarkably similar to the Fluss tiering picture. Kafka contains fresh events, Iceberg contains the materialized historical table, and Confluent's Flink integration can combine a Tableflow snapshot with records that have not yet reached the materialized table.</p>
+<p>The semantics and implementation differ from Fluss union reads, but the basic trick is the same: do not force the lakehouse to provide millisecond freshness. Read the stable part from the lake and the tail from the streaming system. The two stacks end up with a similar hot/cold layout even though they start from different abstractions.</p>
+<p>Tableflow narrows the Kafka-versus-Fluss comparison considerably. With self-managed Apache Kafka, turning a topic into a maintained lakehouse table usually means operating another pipeline. On Confluent Cloud, Tableflow removes most of that plumbing. What remains is the difference in the hot layer. If applications also need low-latency access to current state, the architecture still needs another branch, where with Fluss, that state can be part of the storage layer.</p>
+<p>That leaves a more useful question than "can Fluss move streaming data into Iceberg more efficiently than Kafka?": do we still need a separate materialization of current state when the streaming storage itself can expose it?</p>
+<h3>Kafka semantics still leak into the table</h3>
+<p>Tableflow's upsert mode also shows what happens when a table is derived from a log. Kafka's ordering and compaction guarantees live at the partition level, so the partitioning model inevitably becomes part of the semantics of the resulting table.</p>
+<p>Suppose a key initially maps to one partition:</p>
+<pre><code>partition 3:
+customer-123 -&gt; active</code></pre>
+<p>Later, after changing the topic's partition count, the same key might map differently:</p>
+<pre><code>partition 8:
+customer-123 -&gt; blocked</code></pre>
+<p>From a business perspective, this is still one customer. Kafka sees two partition histories. Repartitioning is one of those edge cases where the underlying abstraction suddenly becomes visible: a table derived from a log is not quite the same thing as a storage system whose data model is a table.</p>
+<h2>Where does Paimon fit?</h2>
+<p>Paimon is slightly awkward in a title such as "Kafka vs Fluss vs Paimon" because it solves a different layer of the problem. Fluss can use Paimon as its lakehouse storage, but it can also use Iceberg. So there are really two separate decisions: the hot layer (Kafka or Fluss?) and the lakehouse representation (Iceberg or Paimon?).</p>
+<p>Paimon started its life inside the Flink community as Flink Table Store before becoming a top-level Apache project, and that lineage shows in its design. Under the hood, each bucket of a Paimon table is organized as an LSM tree, which is a structure built for absorbing continuous writes and updates rather than occasional batch appends. Its primary key tables come with configurable merge engines that define what happens when multiple records arrive for the same key: <code>deduplicate</code> keeps the latest row, <code>partial-update</code> lets different writers fill in different columns of the same row, and <code>aggregation</code> folds incoming values into aggregates. Paimon can also produce a proper changelog for downstream streaming readers, with several <code>changelog-producer</code> modes that trade write cost for changelog completeness.</p>
+<p>Paimon's design assumes that "a stream of changes to a table" is a normal workload rather than an edge case. That makes it a natural fit for CDC-heavy pipelines and helps explain why it pairs so well with Fluss, which grew out of the same Flink ecosystem.</p>
+<p>Iceberg comes from a somewhat different direction and has a major advantage of its own: ecosystem adoption. It is widely supported by analytical engines and cloud data platforms, which makes it an obvious interoperability layer. This means that <code>Fluss + Iceberg</code> can be a perfectly reasonable architecture as well. Using Paimon is not what defines Fluss—the streaming table in the hot layer does.</p>
+<h2>Kafka Tiered Storage is solving another problem</h2>
+<p>Kafka itself also supports <a href="https://kafka.apache.org/documentation/#tiered_storage">Tiered Storage</a>, which can make the terminology confusing. If Kafka can move old log segments to object storage, why bother converting the data into Iceberg or Paimon? Because the result is different.</p>
+<p>The remote files are still part of the Kafka log. Kafka consumers can retrieve them through Kafka semantics, but they do not become a table that Spark, Trino, or another engine can independently query as Iceberg. Tableflow and Fluss lakehouse tiering do something else.</p>
+<p>Both approaches use object storage. Only one changes the data representation.</p>
+<h2>Does Fluss replace Kafka?</h2>
+<p>Not in the usual meaning of "replace". Kafka is much more than a storage engine. A production Kafka installation is surrounded by client libraries, Kafka Connect connectors, Schema Registry integrations, Kafka Streams applications, monitoring, operational tooling, managed services, and years of engineering knowledge. Many architectures also use Kafka as a company-wide integration backbone, and for such a workload, replacing Kafka is not a question of whether another system can append and replicate records—the surrounding ecosystem matters at least as much.</p>
+<p>Fluss is also not a Kafka-compatible broker that can be inserted underneath existing producers and consumers. Kafka protocol compatibility was discussed in the Fluss community and was <a href="https://github.com/apache/fluss/issues/486">removed from the project roadmap</a>; one of the arguments was that the Kafka protocol would expose only a subset of what Fluss tables can do. That choice says a lot about the project's direction. Fluss is not trying to be a faster Kafka with a different storage engine.</p>
+<p>But a drop-in replacement might be the wrong migration to consider in the first place.</p>
+<p>Every component in that diagram might be justified. The RocksDB state could be application-specific; Redis might have a different latency or availability target; Iceberg is there for analytics. But sometimes the copies exist for a more basic reason: the streaming system exposes a log while the consumers need a table. That is the case Fluss is designed around.</p>
+<h2>Log first, or table first?</h2>
+<p>Kafka made the distributed log the standard foundation of modern streaming systems, and that model works exceptionally well for transporting immutable facts between independent consumers. At the same time, more and more streaming workloads are really streams of changes to tables. CDC is the obvious example: the events <code>INSERT customer</code>, <code>UPDATE customer</code>, <code>DELETE customer</code> are useful as a log, but what many consumers ultimately want is the <code>customers</code> table—current state available now, older versions available when needed.</p>
+<p>The lakehouse ecosystem has already moved historical storage in that direction. Iceberg and Paimon turn object storage into tables; on Confluent Cloud, Tableflow can derive one directly from Kafka. Fluss asks the same question one layer earlier: why should the hot storage still expose only a log?</p>
+<p>That leaves us with two different starting points. A log-first architecture and a table-first streaming architecture.</p>
+<p>I do not expect streaming tables to make Kafka obsolete. The more plausible outcome is that they reduce the number of workloads for which a log has to be the primary storage abstraction. And that makes the interesting question much less dramatic than "Will Fluss replace Kafka?"—and much more useful:</p>
+<p><strong>When the data we are streaming is ultimately a table, should we start with the log and reconstruct the table later, or store the streaming table in the first place?</strong></p>

@@ -1,0 +1,84 @@
+<h1>PRIVATE CHAT THREAD EXFILTRATION: Memories exfiltrates local-provider chat content to OpenAI without notice #41711</h1>
+<h2>Description</h2>
+<p>Summary:</p>
+<p>Codex's memory writer can select an eligible prior rollout without restricting the candidate to the provider that created it. It then serializes a filtered, model-visible transcript of that rollout and sends it using the model provider active in the session that triggered memory generation.</p>
+<p>I confirmed the resulting provider crossover in a controlled capture using the stock Windows Codex binary <code>0.150.0-alpha.12.2</code>. An eligible synthetic source rollout labeled with a non-OpenAI provider was later processed by an OpenAI-backed memory session. Codex sent five retained source items to <code>chatgpt.com/backend-api/codex/responses</code>, and OpenAI returned a generated memory that reproduced multiple unique source canaries.</p>
+<p>This request occurred with analytics disabled and every OpenTelemetry exporter set to <code>none</code>. This is model-inference traffic, not analytics or OpenTelemetry traffic.</p>
+<p>This investigation began after I received an OpenAI account warning for “cyber abuse.” <strong>No OpenAI-directed chat contained conduct that could account for that warning. The relevant activity existed only in chats deliberately routed through my private local provider.</strong></p>
+<h2>Based on that fact and the captured Memories channel, it is my strong evidence-backed belief that OpenAI performed account-based policing using chat content it had no right to receive.</h2>
+<p>I characterize this as data exfiltration in the ordinary meaning of that term: <strong>private data was transferred out of the provider boundary I selected and delivered to a remote party without my informed authorization.</strong> Whether the transfer resulted from an intentional design or a bug does not change what crossed the boundary.</p>
+<h2>Tested environment</h2>
+<ul>
+ <li>Windows Codex desktop binary: <code>0.150.0-alpha.12.2</code></li>
+ <li>Binary SHA-256: <code>34E9CFE7D5BBCEC306FE6AB3FD502A713A7A1F0FB644C11AD2990FC80599FD4F</code></li>
+ <li>Matching public source tag: <code>rust-v0.150.0-alpha.12.2</code></li>
+ <li>Matching source commit: <code>a9802304f60ab14c0b07e3ee0db9a9c105ab0cb3</code></li>
+ <li>Isolated test configuration: memories enabled, <code>[analytics] enabled = false</code>, all OpenTelemetry exporters <code>none</code></li>
+ <li>Source fixture provider label: <code>synthetic_source</code></li>
+ <li>Destination provider: OpenAI account-backed Codex Responses endpoint</li>
+</ul>
+<h2>What the controlled capture directly proves</h2>
+<p>Codex emitted a 38,095-byte WebSocket <code>response.create</code> frame to <code>chatgpt.com/backend-api/codex/responses</code>.</p>
+<p>The captured request had:</p>
+<ul>
+ <li><code>request_kind = "memory"</code></li>
+ <li><code>store = false</code></li>
+ <li><code>prompt_cache_retention = "24h"</code></li>
+ <li>three top-level input items: an additional-tools developer item, a memory-instructions developer message, and a user message containing the serialized source conversation</li>
+ <li>31,000 characters of memory instructions</li>
+ <li>a 3,817-byte user wrapper containing 3,092 bytes of rendered source conversation</li>
+</ul>
+<p><strong>The source rollout contained six model-visible response items. Five were retained and appeared as exact structural matches inside the memory request:</strong></p>
+<ol>
+ <li><strong>The complete environment-context user message, including working-directory, workspace, shell, date, timezone, and filesystem-policy fields.</strong></li>
+ <li><strong>The complete ordinary user message.</strong></li>
+ <li><strong>The complete tool-call name and arguments.</strong></li>
+ <li><strong>The complete tool output/error, including runtime paths and policy-rejection text.</strong></li>
+ <li><strong>The complete synthetic assistant reply.</strong></li>
+</ol>
+<p>The source developer message was excluded. Session, turn, event, and world-state records were also excluded. The source rollout path and working directory were sent outside the serialized redaction boundary.</p>
+<p>OpenAI acknowledged the same WebSocket flow and returned <code>response.created</code> followed by <code>response.completed</code>. The completion reported model <code>gpt-5.6-luna</code> and usage of 7,337 input tokens, 983 output tokens, and 8,320 total tokens. The generated 3,405-character memory reproduced the unique user, assistant, tool, private-text, and synthetic-email canaries multiple times. That content-dependent response proves remote processing of the supplied source material, not merely an attempted connection.</p>
+<h2>Why the provider crossover exists in current source</h2>
+<ol>
+ <li><strong>Candidate selection is not provider-bound.</strong> The memory job calls the rollout selector with <code>model_providers: None</code>, while applying other eligibility rules such as memory mode, age, idle state, source type, and claim state.</li>
+ <li><strong>The worker uses the triggering session's active provider.</strong> The memory runtime creates its provider from <code>config.model_provider</code>, including the <code>ModelClient</code> that performs the request.</li>
+ <li><strong>The selected rollout is serialized into a new model request.</strong> Phase 1 loads the stored rollout, filters and serializes retained items, places them in a new user message, and sends that message through the memory client.</li>
+</ol>
+<p><strong>The direct consequence is that a genuine eligible local-provider rollout can be selected by a later OpenAI-backed memory session and routed to OpenAI unless another eligibility condition prevents that particular rollout from being claimed.</strong></p>
+<h2>How much of a prior thread can be sent</h2>
+<p>The retained classes include ordinary user and assistant messages, agent messages, local shell calls, function calls and outputs, tool-search calls and outputs, custom-tool calls and outputs, web-search calls, and converted inter-agent communications. Long inputs are middle-truncated at 70% of the effective model context window, with a 150,000-token fallback.</p>
+<p><strong>For an ordinary short thread below that limit, this can amount to essentially the entire user/assistant conversation and its tool activity, including tool arguments, tool results, errors, environment context, and local paths.</strong></p>
+<h2>The pre-send redaction is not a privacy scrubber</h2>
+<p>The serializer calls <code>redact_secrets</code>, but the implemented expressions cover a narrow set of recognizable credential patterns. That is a useful narrow secret-pattern filter. It is not a general confidentiality, personal-data, privileged-material, or filesystem-identity scrubber.</p>
+<h2>Analytics and OpenTelemetry controls do not stop this path</h2>
+<p>The controlled request still occurred with analytics disabled and all OpenTelemetry exporters set to <code>none</code>. Those settings govern different subsystems. The current decisive global control for this path is the memory feature gate, <code>[features] memories = false</code>.</p>
+<p><strong>There is no separate control that preserves Memories while prohibiting cross-provider transmission. A user must fully deactivate Memories to kill this channel.</strong></p>
+<h2>Expected behavior</h2>
+<ul>
+ <li>A rollout created under a local or third-party provider must not be sent to a different provider without explicit, destination-specific user consent.</li>
+ <li>Memory generation should use the source rollout's provider, or skip the rollout when that provider is unavailable.</li>
+ <li>Cross-provider memory processing, if retained as an option, should be opt-in and state the destination and content classes before transmission.</li>
+ <li>The UI should expose an auditable receipt showing which source task was processed, which destination provider received it, and when.</li>
+ <li>Documentation should state plainly that prior provider-originated conversation and tool content may be sent to a different provider, if that behavior is intended.</li>
+ <li>Automated tests should assert provider isolation at candidate selection and send time.</li>
+ <li>Memory-derived content obtained across a provider boundary must not be used for account moderation, strikes, warnings, restrictions, or other negative account action.</li>
+ <li>OpenAI should audit prior account actions for this dependency, reverse affected actions, notify each affected user, and publish aggregate findings.</li>
+</ul>
+<h2>Reporter position and required remedy</h2>
+<p><strong>It is my firm belief that this is data exfiltration and that OpenAI used content it had no right to see as a basis for account policing.</strong> If the crossover is intended behavior rather than a bug, whether it is lawful and adequately disclosed is <strong>at least legally debatable.</strong></p>
+<p><strong>The practical analogy is simple. This is equivalent to opening someone's bedroom door without permission, deciding you dislike what you see, and punishing the person for it. OpenAI had no right to enter the room in the first place. Any strike, warning, restriction, or other account action derived from that access is fruit of the poisonous tree.</strong></p>
+<h2>OpenAI must issue an official public response.</h2>
+<h2>Requested maintainer response</h2>
+<p><strong>Please answer these directly:</strong></p>
+<ol>
+ <li><strong>Is cross-provider memory processing intended behavior or a bug?</strong></li>
+ <li><strong>Which released versions are affected?</strong></li>
+ <li><strong>Will candidate selection and dispatch be bound to the source rollout's provider?</strong></li>
+ <li><strong>Where is this provider crossover disclosed to users before it occurs?</strong></li>
+ <li><strong>What server-side retention, access, and secondary-processing rules apply to these <code>request_kind = "memory"</code> requests, including requests carrying content originally created under a local provider?</strong></li>
+ <li><strong>How can a user identify and delete any already-generated remote memory requests or derived records?</strong></li>
+ <li><strong>Is content obtained through this Memories channel used for moderation, abuse detection, account warnings, strikes, restrictions, or any other account-level decision?</strong></li>
+ <li><strong>How many users have received a negative account action based in whole or in part on content originating in local or third-party-provider chats?</strong></li>
+ <li><strong>Will OpenAI audit and reverse every such action, notify the affected users directly, and explain what content was used?</strong></li>
+ <li><strong>When will OpenAI publish an official incident response covering scope, versions, data handling, enforcement use, remediation, and prevention?</strong></li>
+</ol>
