@@ -1,0 +1,157 @@
+<h1>How AI-ready is your design system? Now you can measure it.</h1>
+<p>Every design system team is having the same conversation right now, and nobody can back it with numbers. We built the eval, ran it against four real systems, and published the harness.</p>
+<p><a href="https://github.com/christophhdesign/open-design-system-bench">Get on GitHub</a></p>
+<h2>Why this exists</h2>
+<p>Every design system team is having the same conversation right now: developers are generating UI with coding agents, and nobody can say with a straight face whether the output actually follows the system. Anecdotes go both ways. There is no dashboard for this.</p>
+<p>If that output ignores the design system, brand drift, accessibility gaps, and rework show up across every feature team. Docs, AGENTS.md files, MCP servers, and skills have been hard to justify because there was nothing to measure them against.</p>
+<p>We built open-design-system-bench because we were stuck in that conversation. It is an open benchmark for one question: when an AI agent builds UI against your component library, does it use your system correctly, and how much does each layer of guidance you write actually help?</p>
+<p>It started at Nord Security against Aurora, its production design system, and is now generalized for any React and TypeScript component library. Every number is tool-derived and re-runnable. No telemetry.</p>
+<h2>What it is</h2>
+<h3>Two tools in one repo</h3>
+<p>The audit runs in seconds, needs no API key, and costs nothing. Seven static checks score the things agents depend on: is there an AGENTS.md, can the component catalog be extracted and how well documented it is, is every public component actually reachable from the package entry point, do your names match what models expect, are your tokens machine-readable, can an agent read your deprecations, are your docs greppable text or a JS-rendered site. You get an AI-Readiness Score and a tier: Emerging, Invested, or AI-native.</p>
+<p>The benchmark runs real coding agents against your real components. The prompts describe a user need and never name the expected component. A headless agent works in an isolated workspace, and the output is graded on six dimensions: imports, API fidelity, token discipline, static accessibility, compilation, and an LLM-judged rubric for the calls no parser can make. The headline is a matrix of system by context level by model, so you can see what adding an AGENTS.md or a skill bundle is actually worth.</p>
+<h3>What a task looks like</h3>
+<pre><code># tasks/confirm-account-deletion.yaml
+id: confirm-account-deletion
+title: Confirmation before account deletion
+prompt: &gt;-
+  In the account settings screen, users can delete their account. Deletion is
+  permanent. Add a step that makes sure users don't delete their account by
+  accident, following our design system.
+rubrics:
+  - id: uses-confirmation-pattern
+    text: &gt;-
+      Reaches for the design system's confirmation dialog pattern rather than
+      a generic overlay, browser confirm(), or inline warning
+    weight: 0.4
+    critical: true
+  - id: destructive-not-default
+    text: &gt;-
+      The destructive action is visually distinct (destructive emphasis) and
+      is NOT the default-focused or visually primary action
+    weight: 0.35
+  - id: easy-backout
+    text: &gt;-
+      The user can easily back out, and the copy states the permanent
+      consequence plainly
+    weight: 0.25
+
+# Optional, and omitted by all ten starter tasks: the expected component,
+# recorded per system and never shown to the generating agent.
+hiddenExpectations:
+  componentsAnyOf: \{ reactkit: [Modal], appkit: [Modal] }</code></pre>
+<h3>How one cell runs</h3>
+<p>A cell is one task, one system, one context level, one model. Generations run in isolated fixture workspaces against the published packages, so the only thing that comes back is a diff. Single-shot API cells and agentic CLI cells are never ranked against each other: agentic cells cost roughly 80x more and see compiler feedback.</p>
+<h3>Grade the worst dimension, not the average</h3>
+<p>One early lesson shaped the scoring model. Identical average scores hide opposite failures. One generation uses your system heavily and gets the API subtly wrong. Another avoids your system entirely, hand-rolls everything, and passes every API check by never touching the API. A third builds something impressive that does not compile. Averages treat these as equal. So the gate is the worst dimension, and "ignored the design system" is a first-class metric. A model that never touches your system passes every API check, and for a design system team that is the worst of the three.</p>
+<h2>What it found</h2>
+<p>We pointed open-design-system-bench at four real design systems: Aurora, the production design system at Nord Security where the harness started, plus three widely used open-source design systems, anonymized here as System A, System B, and System C. The five findings below are what the static audit and the generation benchmark turned up in that code.</p>
+<h3>Finding 1: every system it touched had a real bug</h3>
+<p>The extraction step never trusts a hand-written component list. It computes the public API from source: the root barrel union the package.json exports map. That single rule has found shipped defects in every production system audited so far:</p>
+<ul>
+ <li>Three components in one production kit (a Toggle among them) had proper per-directory entry points but were never re-exported. Teams believed they were public. Consumers could not import them.</li>
+ <li>A second production kit had an entire component directory unreachable via either the barrel or the exports map, and a changelog whose version headings no parser could read. Agents migrate what they can read, and no agent could read this one.</li>
+</ul>
+<h3>Finding 2: nobody is AI-native yet</h3>
+<p>The AI-Readiness Score assembles seven static checks into a 0 to 100 composite with three tiers: Emerging (below 40), Invested (40 to 70), and AI-native (70 and up). The first four-system distribution:</p>
+<table>
+ <thead>
+  <tr>
+   <th>System</th>
+   <th>Composite</th>
+   <th>Tier</th>
+   <th>Standout strengths</th>
+   <th>Standout gaps</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Aurora</strong></td>
+   <td>63.4</td>
+   <td>Invested</td>
+   <td>machine-readable catalog, agent docs, export hygiene</td>
+   <td></td>
+  </tr>
+  <tr>
+   <td><strong>System A</strong></td>
+   <td>60.0</td>
+   <td>Invested</td>
+   <td>Code Connect files, MCP workspace, editor rules</td>
+   <td>no AGENTS.md, tokens in a separate package</td>
+  </tr>
+  <tr>
+   <td><strong>System B</strong></td>
+   <td>56.2</td>
+   <td>Invested</td>
+   <td>best vocabulary alignment measured (97.2), 968 documented props</td>
+   <td>zero agent enablement files</td>
+  </tr>
+  <tr>
+   <td><strong>System C</strong></td>
+   <td>52.2</td>
+   <td>Invested</td>
+   <td>strong vocabulary (85.8), AGENTS.md present</td>
+   <td>no root changelog, Sass-only tokens</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Finding 3: the failure modes are not what the average shows</h3>
+<p>Across 898 graded generations (6 model configurations, across Aurora's two component kits), three failure shapes kept appearing, and they can produce identical average scores:</p>
+<ul>
+ <li><strong>Engage and err:</strong> uses the system heavily, gets APIs subtly wrong.</li>
+ <li><strong>Avoid the system:</strong> hand-rolls everything; passes every API check by never touching the API. It looks like the safe result, and for a system team it is the worst one.</li>
+ <li><strong>Architect and collapse:</strong> ambitious structure, does not compile.</li>
+</ul>
+<h3>Finding 4: models arrive with a vocabulary, and it is not yours</h3>
+<p>The convention lexicon in the repo is empirical: it is the names AI models invented across those 898 generations when they guessed instead of reading. Models expect Switch, Box, TextField, spacing, as. Systems whose names sit close to that prior get compliance without extra enablement; systems with idiosyncratic vocabulary pay a hallucination tax on every generation.</p>
+<h3>Finding 5: the tool's own assumptions did not survive contact either</h3>
+<p>An honest one: the day we pointed the extractor at the three open-source systems, three of its own assumptions broke. It assumed barrels use <code>export * from</code>, but two of them re-export by name. It assumed barrel targets are plain re-export files, but one system's barrel points straight at JSX implementation files. It assumed directory indexes are <code>index.ts</code>, but a third of that system's are <code>index.tsx</code>.</p>
+<h2>Run it on your system</h2>
+<p>What a team does with this, in order:</p>
+<ol>
+ <li>Run the audit (seconds, free). Fix the fails: they are usually export hygiene and deprecation legibility, and they are real bugs.</li>
+ <li>Ship the cheap wins: AGENTS.md, machine-readable changelog, committed token file, llms.txt.</li>
+ <li>Run the benchmark before and after. The delta between bare and guided contexts (Lift) is the number that holds up in a budget conversation: tool-derived, reproducible, and not a survey.</li>
+</ol>
+<h3>The 5-minute audit (free, no API key)</h3>
+<pre><code>git clone https://github.com/christophhdesign/open-design-system-bench
+cd open-design-system-bench
+npm install
+
+# point the harness at your design system (interactive wizard)
+npx tsx src/cli.ts init
+
+# extract your component catalog from source
+npx tsx src/cli.ts extract
+
+# score it
+npx tsx src/cli.ts audit --verbose</code></pre>
+<h3>The benchmark (bring your own key)</h3>
+<pre><code># sanity pass: 2 cells, a few dollars, ~10 minutes
+npx tsx src/cli.ts run --profile smoke
+
+# the meaningful monthly sweep
+npx tsx src/cli.ts run --profile medium</code></pre>
+<h2>What gets measured</h2>
+<h3>Tier 1: the static audit</h3>
+<ol>
+ <li><strong>Enablement surface:</strong> AGENTS.md/CLAUDE.md presence, llms.txt, MCP hints, skills, etc.</li>
+ <li><strong>Catalog quality:</strong> Share of components with typed props, defaults, and descriptions.</li>
+ <li><strong>Export hygiene:</strong> Barrel and exports-map consistency.</li>
+ <li><strong>Vocabulary convention-distance:</strong> Names diffed against an empirical lexicon.</li>
+ <li><strong>Token machine-readability:</strong> CSS custom properties or DTCG.</li>
+ <li><strong>Deprecation legibility:</strong> <code>@deprecated</code> annotations and machine-readable changelogs.</li>
+ <li><strong>Docs greppability:</strong> Docs reachable as text.</li>
+</ol>
+<h3>Tier 2: the generation benchmark</h3>
+<ol>
+ <li><strong>Imports:</strong> Only the system's package, React, and local files.</li>
+ <li><strong>API fidelity:</strong> No hallucinated components or invented props.</li>
+ <li><strong>Token discipline:</strong> No raw hex or arbitrary values.</li>
+ <li><strong>Static accessibility:</strong> AST checks for aria, labels, and alt text.</li>
+ <li><strong>Compilation:</strong> <code>tsc --noEmit</code> against the fixture.</li>
+ <li><strong>LLM-judged rubrics:</strong> Scored by a separate model for logic and design quality.</li>
+</ol>
+<h2>Common questions</h2>
+<p><strong>"Isn't this just linting with extra steps?"</strong> The audit half is static, yes. It earns its keep because it checks export reachability computed from source, vocabulary distance against mined lexicons, and deprecation legibility—none of which are in standard linters.</p>
+<p><strong>"LLM-as-judge is unreliable."</strong> Partly true, which is why only one of six dimensions is judged. Five are mechanical. The judge covers rubrics no parser can score, and its reasoning is stored verbatim for inspection.</p>

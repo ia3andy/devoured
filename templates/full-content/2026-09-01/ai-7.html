@@ -1,0 +1,77 @@
+<p>I let agents run migrations. That is how the work goes now. You describe what you want, something writes the SQL, you read it, you approve it, and a few seconds later the schema is different. The ten minutes after that are the problem.</p>
+<p><code>git diff</code> shows you the migration file. It does not show you what the migration did. And it shows you nothing at all about the row an agent updated on the way past, because updating it seemed reasonable at the time.</p>
+<p>There are good schema diff tools, but they mostly work the same way. You run them afterwards, against two databases, and they hand you a delta. Nothing sits open next to you while the work is happening.</p>
+<p>So I built one. <strong>diffium-db</strong> is a terminal UI, and it is meant to stay open while you work.</p>
+<h2>Resources</h2>
+<ul>
+ <li><a href="https://github.com/kubeden/diffium-db">kubeden/diffium-db</a>, the repo (MIT)</li>
+ <li><a href="https://github.com/kubeden/diffium">kubeden/diffium</a>, the file-diff TUI this one is modelled on</li>
+ <li><a href="https://github.com/anomalyco/opentui">OpenTUI</a>, the terminal framework it is built with</li>
+</ul>
+<h2>What it does</h2>
+<p>You point it at a Postgres, take a baseline, and leave the watcher open. From that moment everything that changed is listed on the left, the change itself is on the right, and it re-reads the database once a second.</p>
+<p>Here it is catching a migration. Two columns and an index appeared on <code>demo.users</code> while I was looking at it:</p>
+<p><em>The left pane is everything that changed since the baseline. The right pane is the object you have selected, before and after.</em></p>
+<p>It watches tables (columns, defaults, identity, constraints, indexes, triggers), views, materialized views, enums and functions. It also watches <strong>rows</strong>. That turned out to be the interesting half, and I will come back to it.</p>
+<p>There are four commands. <code>watch</code> opens the TUI, <code>snapshot</code> takes a baseline, <code>baselines</code> lists the ones you have, and <code>diff</code> prints the changes and exits. That last one takes <code>--exit-code</code>, so it returns 1 when anything changed, which is enough to fail a CI job or stop an agent's loop before it does the next thing.</p>
+<h2>Setting it up</h2>
+<p>You need <a href="https://bun.sh">Bun</a> 1.3 or newer and a Postgres to watch. There is exactly one dependency past that, <code>@opentui/core</code>, so the install is quick.</p>
+<pre><code>git clone https://github.com/kubeden/diffium-db &amp;&amp; cd diffium-db
+bun install
+export DATABASE_URL='postgresql://...'
+</code></pre>
+<p>Then take a baseline and open the watcher:</p>
+<pre><code>bun run src/index.ts snapshot
+bun run src/index.ts watch
+</code></pre>
+<p>That is the whole setup. The repo ships a demo so you can see it move without waiting for an agent to do something. <code>examples/demo/01-baseline.sql</code> builds a small <code>demo</code> schema with users and projects in it, and <code>examples/demo/02-agent-change.sql</code> is what an agent does when you tell it "add billing plans and clean up".</p>
+<p>Two terminals. In the first:</p>
+<pre><code>psql "$DATABASE_URL" -f examples/demo/01-baseline.sql
+bun run src/index.ts snapshot --schema demo
+bun run src/index.ts watch --schema demo
+</code></pre>
+<p>In the second, while the watcher is open:</p>
+<pre><code>psql "$DATABASE_URL" -f examples/demo/02-agent-change.sql
+</code></pre>
+<p>Five changes land on the screen: a new enum, two new columns and a new index on <code>demo.users</code>, an index gone from <code>demo.projects</code>, one row inserted and one row deleted. <code>j</code> and <code>k</code> walk them, <code>s</code> switches between side by side and inline, <code>e</code> writes the whole diff to a file.</p>
+<h2>Where to point it</h2>
+<p>The demo is a demo. For real work, do not point it at production. The point is to let the agent run and read what it did afterwards, and you want that happening somewhere you can throw away.</p>
+<p>So I give the agent a branch. On Neon that is two commands, plus the project id, because I have more than one project and the CLI refuses to guess:</p>
+<pre><code>neonctl branches create --project-id &lt;project&gt; --name agent-run
+neonctl connection-string agent-run --project-id &lt;project&gt;
+</code></pre>
+<p>Point <code>DATABASE_URL</code> at what the second one prints, take your baseline there, and let the agent work on the branch. The branch is copy-on-write off its parent, so it comes up holding the same schema and the same rows as the database you care about. The one I made while writing this took 1.2 seconds. An idle branch suspends its own compute too, so the ones you forget to delete are not sitting there running.</p>
+<p>Then you read the diff. If the migration is what you wanted, run it against the real database. If the agent did something you did not expect, you found that out on a copy, and the copy gets deleted.</p>
+<p>That is the loop, and it is how this post was made. The demo and every screenshot in it ran on a branch of the demo project. The demo database itself still holds the state I left it in.</p>
+<p>Any Postgres works and nothing in the tool is Neon-specific. Branching is what makes this cheap enough to do every time instead of only when you remember.</p>
+<h2>What a row diff can prove</h2>
+<p>Structure is the easy half. Rows are where it gets uncomfortable.</p>
+<p>To tell you that a row changed, you have to remember what it was. Storing every row is not an option for anything real, so diffium-db stores a fingerprint instead: the primary key, plus <code>md5(t::text)</code> of the whole record, plus a short preview. Cheap to compute in the database, cheap to keep, and it separates an insert from an update from a delete exactly. If the key is new, it is an insert. If the key is gone, it is a delete. If the key is the same and the hash moved, someone edited that row.</p>
+<p>That works right up until the table gains a column. Then every hash in the table changes at once, and a naive tool would tell you that every row in it was edited. Nobody edited them. The shape moved underneath them.</p>
+<p>diffium-db does not do that.</p>
+<p><em><code>~3?</code> in the left pane, and the note at the top of the diff. It detected the column change, marked the table, and told me which half of its own answer to trust.</em></p>
+<p>The count is written <code>~3?</code> and not <code>~3</code>, and the first line of the diff says why. Two columns arrived, so every row in the table reads as edited, and the update number is the one part of that answer the tool cannot stand behind.</p>
+<p>Inserts and deletes are still exact, because those come from the primary key and the key does not care what the shape is. Only the update count is guesswork, and printing a guess plain, next to numbers it can prove, would make the whole screen worth less.</p>
+<p>Tables without a primary key, and tables over <code>--row-limit</code> (5000 by default), get a row count and no claims at all. Same principle. I would rather it say less.</p>
+<h2>Structure is text</h2>
+<p>The structural diff rests on one decision, and it explains a lot of the behaviour.</p>
+<p>Every object renders to one canonical block of text with a deterministic line order. A table becomes its columns, then its constraints, then its indexes, then its triggers, always in that order. The structural diff is then just a line diff of those blocks.</p>
+<p>That one choice pays for a lot. Adding a column is one added line instead of a table that vaguely "changed", and side by side, the <code>+2 -0</code> counts and horizontal scrolling through a long default all come free.</p>
+<p><em>The same change inline instead of side by side, so nothing is cut off at the pane edge. <code>s</code> toggles it, <code>w</code> toggles wrapping, and both are remembered between runs.</em></p>
+<p>There is a cost. diffium-db tells you what the database looks like now, not the DDL statement that would get you there. For a watcher that is the right side of the trade. If you want generated migrations, you want a different program.</p>
+<h2>Where the baseline lives</h2>
+<p>A baseline is a stored value, not a live connection, so you can take one now and diff against it tomorrow, keep several named ones, or commit one next to the migration that produced it.</p>
+<p>By default they go in <code>.diffium-db/snapshots/</code> as JSON. Pass <code>--store neon --store-url &lt;url&gt;</code> and they go into a <code>diffium_db</code> schema in Postgres instead. Use that when CI and your laptop need to agree on what "before" means. The watcher never looks at its own schema, so the store URL and the watched URL can be the same database.</p>
+<p>With the branch above, that means the baseline can sit on the branch itself, one schema over from the thing it is describing. The branch is then the entire experiment, and deleting it takes the record with it.</p>
+<h2>Future work</h2>
+<p>What v1 does not do, roughly in the order I want to fix it.</p>
+<p><strong>No ORM awareness.</strong> v1 tells you a column appeared. It cannot tell you which migration file or which model definition put it there. That mapping is an ORM's business and it is the next thing I want. <code>src/orms/</code> is where it goes, documented and deliberately empty.</p>
+<p><strong>Postgres only.</strong> The catalog reading is isolated in <code>src/pg/</code>, and nothing above that boundary knows what a catalog is, so a second dialect has an obvious place to go. It does not exist yet.</p>
+<p><strong>No sequences.</strong> Every <code>bigserial</code> makes one and they move on every insert. Pure noise until someone asks.</p>
+<p><strong>Polling, not replication.</strong> It re-reads once a second. On a large database logical replication would be much cheaper, and that is the obvious thing to do if polling ever starts to hurt.</p>
+<p>One thing is not on that list and never will be. diffium-db does not write to the database it is watching. The only thing it writes is its own store, and only if you point it at one.</p>
+<h2>Closing</h2>
+<p>It is about 2,200 lines of source and 900 of tests. 64 of those tests run with no database at all, and that includes the terminal ones, because OpenTUI will render into memory and let you assert on the screen it drew. So a change to the layout breaks a test instead of quietly looking wrong in a screenshot I forgot to retake.</p>
+<p>What I keep coming back to is the row diff. It would have been easier to print a number for every table and let people assume it meant something. The version that says "I cannot prove this one" is a bit uglier to look at. I will take it. A thing that sits next to an agent and reports on what it did has to be more careful than the agent is.</p>
+<p>It is on GitHub under MIT. If you try it and it tells you something wrong, open an issue.</p>
+<p>Thank you for reading.</p>
