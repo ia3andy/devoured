@@ -1,0 +1,91 @@
+<p>I trained a small transformer from scratch in 1.5hrs on a 5090. Beats many LLMs, and scores the same as TRM/HRM.</p>
+<p>This is an upgrade to my previous model. Faster, better, cheaper and still open source.</p>
+<p>Also gets 7% on ARC-2.</p>
+<h2>Why work on this?</h2>
+<p>I think sample efficiency is the most important problem in AI today and I want to solve it.</p>
+<p>The intention behind this work is to (1) find the limits of sample efficiency when restricted to transformers / today’s deep learning methods and (2) reduce costs so iteration is much faster and cheaper.</p>
+<p>ARC is a great benchmark to test this:</p>
+<ul>
+ <li>Very few samples (only a 1000 puzzles) in a high dimensional space</li>
+ <li>Its a metalearning benchmark, so each puzzle uses a different rule, with some common concepts</li>
+ <li>Very few priors needed: every concept needed in the eval set is present in the train set</li>
+ <li>It is incredibly easy for humans to solve, and accessible to even poor AI researchers</li>
+ <li>Benchmark is still unsaturated (for data efficiency, ignore LLMs and approaches that use tons of synthetic data or human inductive biases)</li>
+</ul>
+<p>Next, I’ll work on new research ideas to break these limits. I’ll try to keep costs low so that anyone in the world can work on this.</p>
+<h1>Tech details</h1>
+<h2>How does it work?</h2>
+<p>The overall approach is similar to last time, but I added a bunch of upgrades. Here’s a quick summary of the approach:</p>
+<ul>
+ <li>Each input-output pair is converted to a sequence of tokens. These sequences are autoregressively trained on by a small transformer. This is done from scratch at test time on both the train set and eval set puzzles (test labels hidden).</li>
+ <li>To enable cross-task learning, each puzzle is given a separate additive embedding (learnt). Since each sequence has two 2D grids, positional are learnt using 3D RoPE embeddings.</li>
+ <li>The sequences are augmented with color and dihedral permutations. During inference, the test inputs are augmented, and the inverse aug is applied on the outputs produced. The 2 most common outputs are submitted (AAIVR).</li>
+</ul>
+<h3>Changes since last time</h3>
+<p>The main goal was to find improvements to the architecture / algorithm that improve the sample efficiency of the model.</p>
+<p>The biggest increases in scores were due to:</p>
+<ul>
+ <li>Modern architecture (SwiGlu instead of GELU, RMSnorm not layernorm, etc.)</li>
+ <li>More data diversity, better shuffling of data</li>
+ <li>scaling up: 8 layers instead of 4</li>
+</ul>
+<p>Biggest decreases in cost were due to:</p>
+<ul>
+ <li>Way fewer augmentations (more sample efficient!)</li>
+ <li>AdamW -&gt; Normuon</li>
+ <li>flash attention with varlen training + flex attention kernels for inference</li>
+</ul>
+<p>A major change is that I don’t train on input tokens anymore. This means the loss function only includes output tokens (which makes the approach supervised). This performs slightly better 40% → 44% but I don’t understand why. Perhaps finite model capacity.</p>
+<p>I also increased the training data by adding the non-overlapping tasks from ARC-2. I did this very carefully to ensure no leakage.</p>
+<blockquote>
+ <p>Context: ARC-2 contains 773 ARC-1 puzzles and 347 new puzzles. Most eval puzzles of ARC-1 are repeated, so if you naively train on ARC-2, then its a dataleak and you will score 100%. I avoid this by carefully filtering out the 773 repeated puzzles (so no leak!)</p>
+</blockquote>
+<h2>Interesting behaviour</h2>
+<p>Since I am no longer training on inputs, this approach is now supervised. What’s weird is that the test loss is now worse, yet it scores better! Also it is more stable and there’s less variance in scores.</p>
+<p>Many ppl today are working on sample efficiency by aiming for the lowest val loss on a small dataset. I think that’s great, but this points out a failure mode in such an approach.</p>
+<h2>Ablations</h2>
+<p>The biggest contribution to performance seems to be good representations (3D RoPE + per-task embedding).</p>
+<ul>
+ <li>Training on inputs performs slightly worse -&gt; ~39%</li>
+ <li>Restricting training set to ARC-1+ConceptARC only performs about the same: ~40%</li>
+ <li>Switching from 3D RoPE to 1D drops score to ~24%</li>
+ <li>Removing the per-task embeddings drops score to ~24%</li>
+ <li>Running the model CompressARC style (training from scratch on each task separately, and unsupervised), gives a drops performance down to ~18%</li>
+ <li>CompressARC but supervised gets ~15%</li>
+</ul>
+<h2>How can others contribute?</h2>
+<p>The code is open source. Feel free to modify it and improve score or reduce cost. (Pls don’t increase training data)</p>
+<p>Try reaching 65% – you won’t need many modifications.</p>
+<h2>Mistakes that I think other approaches are making</h2>
+<p><strong>Assuming recursion is the next big thing.</strong> I do see the appeal, but there aren’t enough ablations to prove this. And my model shows you can reach the same performance without recursion.</p>
+<p><strong>Misleading advertising by HRM/TRM:</strong> I also don’t like that TRM advertised itself as a 7M model when there are O(100M+) embedding weights being trained.</p>
+<p><strong>LLM based approaches on ARC aren’t showing new capabilities anymore:</strong> Increases in LLM scores are now mainly driven by post training and are probably a function of amount of synthetic data. They are learning to solve ARC tasks, not learn general abstract reasoning.</p>
+<h2>Learnings from LLMs on ARC-AGI</h2>
+<p>LLMs have now saturated v1 and v2 of this benchmark. OpenAI’s O1 getting 75% was a big win for LLMs. It suggested that given enough data, LLMs can learn any task during post-training.</p>
+<p>When ARC-2 came out, it reset progress of all LLMs, including the thinking ones. This suggests even post-training doesn’t confer general reasoning capabilities, otherwise a model that performs well on ARC-1 would automatically perform well on ARC-2.</p>
+<h2>Full list of changes</h2>
+<p>Changes that modify training dynamics:</p>
+<ol>
+ <li>Optimizer changed from AdamW-only to NorMuon + auxiliary AdamW</li>
+ <li>LR schedule changed from warmup+cosine to WSD schedule</li>
+ <li>LayerNorm was replaced by RMSNorm</li>
+ <li>FFN changed from Linear -&gt; GELU -&gt; Linear to SwiGLU-style gated FFN</li>
+ <li>Weight decay changed from “non-attention linear only” to explicit group-wise decay</li>
+ <li>Training objective changed from outputs["loss"] to outputs["output_loss"] (supervised style) only</li>
+ <li>Training batching changed from smart bucketing based on length to true random batching</li>
+ <li>Straggler/incomplete batches are now dropped in training</li>
+ <li>Dataset construction now supports/uses broader sources</li>
+ <li>Color augmentation changed from one global epoch-level permutation to per-example augmentation tuples</li>
+ <li>Color permutation domain changed to excludes output-only colors</li>
+ <li>Augmentation generation now deduplicates transformed inputs via hashing</li>
+ <li>Augmentation selection is now epoch-cycled with shuffled candidate order</li>
+ <li>Changes in hyperparams</li>
+ <li>A new dihedral_embedding was added and is now summed into token conditioning</li>
+</ol>
+<p>Speed increases without changing training dynamics:</p>
+<ol>
+ <li>Training batches changed from padded [B,S] to packed token stream with cu_seqlens</li>
+ <li>Attention path changed from padded SDPA masking to packed varlen flash-attention support</li>
+ <li>Dihedral augmentation moved from offline dataset expansion to online augmentation selection</li>
+ <li>Build-time training split changed from ("train","test") to ("train",)</li>
+</ol>

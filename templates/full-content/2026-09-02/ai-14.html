@@ -1,0 +1,116 @@
+<h1>Introducing @huggingface/kernels: 200+ WebGPU Kernels for Local AI</h1>
+<p>One of our biggest goals on the WebAI team at Hugging Face is to make browser inference as fast and as user-friendly as possible. Getting there is a multi-layer effort: models need browser-friendly representations, runtimes need to build efficient execution plans, and the individual GPU operations at the bottom of the stack need to make the most of many different devices and browser implementations.</p>
+<p>Today, we are releasing the first layer of that effort: <a href="https://www.npmjs.com/package/@huggingface/kernels"><code>@huggingface/kernels</code></a>, a minimal library for loading and running optimized WebGPU kernels from the Hugging Face Hub, together with an initial collection of <strong>207 kernels</strong> at <a href="https://huggingface.co/webgpu-kernels">huggingface.co/webgpu-kernels</a>.</p>
+<p>The collection covers operations used across a wide variety of machine learning architectures and workloads. More importantly, each kernel is published as a complete, versioned package: its interface, shader templates, correctness cases, benchmark cases, and usage instructions all live together on the Hub.</p>
+<p>We are also launching <a href="https://webgpu-kernels-fleet.hf.space/">Fleet</a>, an in-browser GPU benchmarking and testing suite that runs and scores the kernels on your hardware. Beyond the results for your own machine, Fleet gives the community a way to contribute performance and correctness evidence from devices we could never cover in a conventional test lab. With your consent, every run adds private evidence that can help us find failures (incorrect results, pathologically slow cases, etc.), improve kernel variants, and make better optimization decisions across real-world hardware.</p>
+<h2>TL;DR</h2>
+<ul>
+ <li><strong>207 WebGPU kernels</strong>, published as individual repositories in the <code>webgpu-kernels</code> organization. Apache-2.0 licensed.</li>
+ <li><strong>A JavaScript loader</strong>, <code>@huggingface/kernels</code>, which downloads, prepares, and runs kernels directly from the Hub.</li>
+ <li><strong>Explicit contracts and reproducible evidence</strong> for every kernel, including manifests, correctness tests, benchmark cases, and WGSL shader templates.</li>
+ <li><strong>Fleet</strong>, a browser-based benchmarking tool that crowdsources correctness and performance evidence across real-world GPUs to help us improve kernels and their variants.</li>
+</ul>
+<h2>Why start with kernels?</h2>
+<p>A model running in the browser eventually becomes a sequence of GPU operations: matrix multiplications, normalizations, convolutions, attention primitives, quantization operations, data-layout transformations, and many more. WebGPU makes these operations available across modern browsers through a portable API, while WGSL provides a common language for the shaders that execute them.</p>
+<p>Portability, however, does not automatically mean performance. Two shaders can implement the same operation and produce the same output while behaving completely differently across different accelerators. Workgroup sizes, memory access patterns, vectorization, data types, and fusion strategies can all affect performance. The best choice can also change with the input shape, device, browser, and available WebGPU features.</p>
+<p>This is why kernels form a foundational layer of fast browser inference. Higher-level runtimes can only be as efficient as the operations they dispatch. By making those operations individually discoverable, testable, benchmarkable, and versioned, we can improve the foundation independently while keeping a stable contract for the layers above it.</p>
+<h2>A kernel repository, not just a shader</h2>
+<p>Each kernel in the collection has its own repository and kernel card. The card documents the operation's semantics, inputs, outputs, attributes, supported data types, source files, and a ready-to-run <code>@huggingface/kernels</code> example.</p>
+<p>For example, <a href="https://huggingface.co/webgpu-kernels/ai.onnx.Add"><code>ai.onnx.Add</code></a> implements elementwise addition with multidirectional broadcasting. It is one of the simplest operations in a neural network, used everywhere from residual connections to adding a bias. Its card documents the two inputs, the broadcasted output shape, supported data types, and the variants available for different shapes and devices.</p>
+<p>Behind the card, the repository contains the artifacts needed to understand and evaluate the implementation:</p>
+<ul>
+ <li><strong><code>manifest.json</code></strong> is the source of truth for the operation contract. It defines inputs, outputs, attributes, type constraints, and shape derivation rules.</li>
+ <li><strong><code>metadata.json</code></strong> records the kernel identifier, digests, and provenance.</li>
+ <li><strong><code>test.json</code></strong> contains correctness cases, so an implementation can be checked against expected behavior.</li>
+ <li><strong><code>bench.json</code></strong> contains benchmark and tuning cases that represent the workloads used to evaluate the kernel.</li>
+ <li><strong><code>*.wgsl.jinja</code></strong> files contain the parameterized WGSL implementations used to produce shaders for a particular request and device.</li>
+</ul>
+<p>This structure turns a shader into a reusable software artifact. The interface is inspectable without reading WGSL, correctness and performance cases travel with the implementation, and published versions can be loaded explicitly rather than depending on an unversioned file URL. Our kernels can also serve as reference implementations for developers building custom WebGPU kernels or integrating these operations into their own runtimes.</p>
+<h2>Loading a kernel from the Hub</h2>
+<p>Install the package from npm:</p>
+<pre><code>npm install @huggingface/kernels@preview</code></pre>
+<blockquote>
+ <p>Running these kernels requires a browser with WebGPU support. WebGPU availability depends on the browser, operating system, GPU, and driver. You can check for it in JavaScript with <code>"gpu" in navigator</code>.</p>
+</blockquote>
+<p><code>@huggingface/kernels</code> provides the bridge between a kernel repository and your application. Call <code>getKernel</code> with a Hub repository ID and a contract version, then invoke the returned function with typed input data and tensor shapes. Here is a small bias-add example:</p>
+<pre><code>import \{ getKernel } from "@huggingface/kernels";
+
+const add = await getKernel("webgpu-kernels/ai.onnx.Add", \{ version: 1 });
+
+const \{ c } = await add(\{
+  a: \{
+    data: new Float32Array([1, 2, 3, 4, 5, 6]),
+    shape: [2, 3],
+  },
+  b: \{
+    data: new Float32Array([10, 20, 30]),
+    shape: [3],
+  },
+});</code></pre>
+<p>The second input is broadcast across the first dimension, producing an output with shape <code>[2, 3]</code>. The loader derives that output shape and logical data type from the manifest contract and the inputs, then allocates <code>c</code> automatically.</p>
+<p>Addition on six floats is deliberately the smallest possible demo. At this size, the GPU round trip costs far more than the math. The point is the call pattern: it stays exactly the same for the heavyweight operations where optimized kernels actually pay off, such as matrix multiplication (<code>ai.onnx.MatMul</code>). Only the repository ID and the inputs change.</p>
+<p>Even this elementary operation illustrates why kernels need variants. Equal-shape addition can use a direct vectorized path, while broadcasted inputs need different indexing logic. The published Add kernel includes variants for equal shapes, vectorized broadcasting, scalar processing, and general broadcasting. The runtime can select an implementation that fits the current call and device without changing the application-facing API.</p>
+<p>The <code>version: 1</code> option selects version 1 of the published <strong>kernel contract</strong>. It is separate from an ONNX opset, an operator's <code>since_version</code>, or a model revision. Keeping those concepts separate lets applications depend on a stable JavaScript-facing contract while kernel implementations evolve behind it.</p>
+<h2>How fast are the kernels?</h2>
+<p>So, how much of a difference do optimized kernels actually make? We put our collection head-to-head with ORT WebGPU on an Apple M4 GPU, using ONNX Runtime Web <code>1.30.0-dev.20260826-b1f76d586a</code>. We started with 1,756 test cases across all 207 operations and kept the 809 cases where both sides produced matching outputs and reliable timings.</p>
+<p>Across those comparisons, our kernels were <strong>2.57x faster by geometric mean</strong> and <strong>1.90x faster at the median</strong>, with 629 wins, 176 losses, and 4 ties. Here is a closer look at four familiar operations:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Operation</th>
+   <th>Compared cases</th>
+   <th>Our WebGPU Kernel</th>
+   <th>ORT WebGPU</th>
+   <th>Speedup</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Add</td>
+   <td>5</td>
+   <td>0.064 ms</td>
+   <td>0.227 ms</td>
+   <td><strong>3.52x</strong></td>
+  </tr>
+  <tr>
+   <td>MatMul</td>
+   <td>29</td>
+   <td>0.115 ms</td>
+   <td>0.131 ms</td>
+   <td><strong>1.14x</strong></td>
+  </tr>
+  <tr>
+   <td>Softmax</td>
+   <td>12</td>
+   <td>0.114 ms</td>
+   <td>0.240 ms</td>
+   <td><strong>2.11x</strong></td>
+  </tr>
+  <tr>
+   <td>LayerNormalization</td>
+   <td>6</td>
+   <td>0.061 ms</td>
+   <td>0.135 ms</td>
+   <td><strong>2.22x</strong></td>
+  </tr>
+ </tbody>
+</table>
+<p>Some individual wins were much bigger. A particularly difficult bilinear Einsum case (<code>i,ij,j</code> with size 4096) ran in 0.136 ms with our kernel versus 1,396 ms with ORT WebGPU: more than <strong>10,000x faster</strong>. A row-wise CumSum over <code>[256, 4096]</code> was <strong>301x faster</strong>, at 0.016 ms versus 4.784 ms. These are unusual cases rather than the speedups you should expect everywhere, but they show how much a specialized kernel can help when a general implementation hits a slow path.</p>
+<p>We timed the work done on the GPU itself, leaving out setup such as loading kernels, creating sessions, uploading inputs, compiling shaders, and reading outputs back. Very short workloads are naturally harder to measure, and small cases can benefit from the GPU cache, so these numbers are best read as a useful comparison rather than a promise for every application.</p>
+<p>They are also results for individual operations, not complete models. Exact performance will change across GPUs and browsers, which is why Fleet is so important for building a broader picture.</p>
+<p>We are also working with the ONNX Runtime team to upstream these improvements so they can benefit the broader ONNX Runtime Web ecosystem.</p>
+<h2>From one device to a fleet</h2>
+<p>WebGPU performance varies across GPUs, browsers, and drivers, so results from one machine only tell part of the story. <a href="https://webgpu-kernels-fleet.hf.space/">Fleet</a> lets anyone run correctness and performance checks in the browser and see how the kernels behave on their hardware.</p>
+<p>With consent, each run privately contributes evidence that helps us spot device-specific failures, compare variants, and improve selection rules. The goal is simple: use broad, real-world coverage to make the kernels faster and more reliable for everyone.</p>
+<h2>Building a shared foundation for WebAI</h2>
+<p>The initial 207 kernels are a starting point, not the end state. Publishing kernels independently on the Hub gives us a common place to inspect contracts, compare implementations, reproduce correctness checks, and improve performance without embedding every shader directly into every runtime.</p>
+<p>The collection is also part of the Hub's broader kernel ecosystem: on the <a href="https://huggingface.co/kernels?platform=webgpu&amp;sort=trending">Kernels page</a>, the WebGPU kernels sit alongside kernels for CUDA, ROCm, Metal, and other platforms, and can be filtered, sorted, and explored like any other artifact on the Hub.</p>
+<p>The pieces reinforce one another:</p>
+<ol>
+ <li>Kernel repositories define transparent, versioned operation contracts.</li>
+ <li><code>@huggingface/kernels</code> makes those operations straightforward to load and run from JavaScript.</li>
+ <li>Fleet crowdsources real-world evidence across a much broader range of devices than a conventional benchmark lab can cover.</li>
+ <li>Every contributed run can reveal failures, guide tuning, improve variant selection, and help validate future kernel versions.</li>
+</ol>
+<p>This is the low-level foundation for the next steps in our browser inference stack. We are excited to connect these kernels to higher-level model tooling, continue expanding operation coverage, and make fast local inference easier to use across the WebAI ecosystem.</p>
+<p>Explore the <a href="https://huggingface.co/webgpu-kernels">WebGPU kernel collection</a>, try <a href="https://www.npmjs.com/package/@huggingface/kernels"><code>@huggingface/kernels</code></a>, and <a href="https://webgpu-kernels-fleet.hf.space/">join the Fleet</a> to contribute evidence from your device and help us make the kernels better for everyone.</p>

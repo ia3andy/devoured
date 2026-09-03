@@ -1,0 +1,148 @@
+<h1>Build your own continuous modernization pipeline with AWS Transform custom</h1>
+<h2>Introduction</h2>
+<p>Development velocity has reached new heights with AI-driven development tools and practices. Organizations are generating code faster than ever before. But that speed carries risk. Researchers Anderson, Parker, and Tan warned in MIT Sloan Management Review, “Legacy systems tend to carry hidden debt; layering AI-generated code on top of them creates additional tangled dependencies.” <strong>The faster you generate code, the faster technical debt compounds</strong> — especially in brownfield environments where outdated frameworks, deprecated libraries, and undocumented services already carry years of accumulated risk.</p>
+<p>As organizations accelerate their software development, manual or periodic processes to synchronize dependencies and update documentation no longer keep pace, and technical debt piles up faster than ever. Continuous modernization built into your pipeline enables you to maintain up-to-date dependencies and documentation across repositories on every commit, preventing future tech debt and improving AI agent accuracy and accountability.</p>
+<p>You can embed AI-powered code transformations directly into your CI/CD pipelines, turning modernization from a periodic project into an automated, ongoing practice. AWS gives you two ways to get there. AWS Transform – continuous modernization is the fully managed option, delivering continuous modernization automatically with no pipeline for you to build or maintain. The Do-It-Yourself (DIY) approach assembles the same practices yourself using AWS Transform custom and your existing CI/CD platform. Choose DIY when you need to fit modernization into a specific pipeline (GitHub Actions, AWS CodePipeline, Jenkins, GitLab CI, and so on), or want to customize the workflow with existing tools like Dependabot.</p>
+<p>In this post, we cover the DIY approach on how to set up a continuous modernization pipeline using AWS Transform custom and demonstrate it in action.</p>
+<h2>The Do It Yourself (DIY) path – continuous modernization pipeline with AWS Transform custom</h2>
+<h3>Sample application: instrumentShop</h3>
+<p>For this walkthrough, we use a dated Java application called instrumentShop — a Java microservices application built with Spring Boot that simulates an online instrument shop to demonstrate four practices: automated dependency remediation, auto-documentation on every commit, scaling transformations across repositories, and continual learning.</p>
+<h4>Architecture overview</h4>
+<p>The instrumentShop application is a Spring Boot microservices application with a <strong>Spring Gateway</strong> (v1.5.19) routing traffic from a single HTTP/8010 entry point to four REST services: <strong>Agents</strong>, <strong>Instruments</strong>, <strong>Consumers</strong>, and <strong>Products</strong>. A <strong>Thymeleaf</strong> client provides server-side rendering, <strong>PostgreSQL 13.1</strong> handles persistence via JDBC, and Hystrix provides circuit-breaking for inter-service calls. A ShopTester utility generates HTTP traffic for testing.</p>
+<p>This application is a strong candidate for continuous modernization:</p>
+<ul>
+ <li>Spring Boot 1.5.19 is years past end of life and carries known CVEs</li>
+ <li>Hystrix has been in maintenance mode since Netflix deprecated it in 2018</li>
+ <li>Cross-service coordination — dependency updates must propagate across multiple microservices</li>
+ <li>Transitive dependency risk — PostgreSQL JDBC drivers and other transitive dependencies accumulate security advisories over time</li>
+</ul>
+<h3>A typical workflow for the continuous modernization pipeline</h3>
+<ul>
+ <li><strong>A developer pushes code to main</strong> — GitHub Actions triggers the auto-documentation workflow, generating updated architecture docs and technical debt reports.</li>
+ <li><strong>Dependabot detects a vulnerable dependency</strong> — A PR opens automatically. GitHub Actions triggers the dependency remediation workflow, runs AWS Transform custom to remediate the code, validates with tests, and pushes the result back to the PR.</li>
+ <li><strong>A platform team defines a new transformation</strong> (e.g., “Upgrade Spring Boot to the latest stable release “) — The scheduled GitHub Actions workflow runs the transformation weekly in non-interactive mode across all instrumentShop microservices and other repositories in the portfolio.</li>
+ <li><strong>The agent learns</strong> — Knowledge items from each execution improve future runs, reducing manual intervention over time.</li>
+</ul>
+<h2>Prerequisites</h2>
+<ul>
+ <li>An active AWS account with permissions for AWS Transform custom</li>
+ <li>AWS Transform CLI installed and configured in your development environment</li>
+ <li>Authentication with AWS credentials configured locally and proper IAM permissions to call AWS Transform</li>
+ <li>Git installed for cloning sample repositories</li>
+ <li>GitHub Dependabot enabled on your repository for automated vulnerability detection</li>
+</ul>
+<h2>Continuous modernization through CI/CD in action</h2>
+<p>Continuous modernization shifts code transformation from a periodic project into an automated, pipeline-driven practice. Instead of scheduling a “modernization sprint” once a year, your CI/CD pipeline identifies and remediates technical debt on every commit, every dependency alert, and across every repository.</p>
+<p>We implement this through four practices, each powered by AWS Transform custom running as a step in GitHub Actions workflows.</p>
+<h3>1. Dependency analysis and remediation</h3>
+<p>GitHub Dependabot scans your repository for known vulnerabilities and generates alerts when a new vulnerability is added or your dependency graph changes—for example, when you push commits that update packages or versions. However, resolving these alerts requires more than bumping a version number. Upgrading a dependency can introduce breaking API changes, require code modifications, or demand configuration updates.</p>
+<p>AWS Transform custom helps handle the code changes needed to resolve the alerts. It runs via a GitHub Actions workflow that triggers automatically to:</p>
+<ul>
+ <li>Fetch the list of latest Dependabot alerts</li>
+ <li>Run AWS Transform custom to analyze the alerts and apply code transformations</li>
+ <li>Run your build and test suite to validate the changes</li>
+ <li>Create a new pull request for each resolved alert</li>
+</ul>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+TRANSFORMATION_NAME="Remediate-Critical-GitHub-Dependabot-Alerts-Java-Maven"
+CODE_PATH="."
+BUILD_CMD="mvn clean install"
+MAX_RETRIES=3
+
+while getopts "n:p:c:" opt; do
+  case $opt in
+    n) TRANSFORMATION_NAME="$OPTARG" ;;
+    p) CODE_PATH="$OPTARG" ;;
+    c) BUILD_CMD="$OPTARG" ;;
+    *) echo "Usage: $0 [-n &lt;transformation-name&gt;] [-p &lt;path&gt;] [-c &lt;build-command&gt;]" &amp;&amp; exit 1 ;;
+  esac
+done
+
+attempt=1
+while [ $attempt -le $MAX_RETRIES ]; do
+  if atx custom def exec \
+    -n "$TRANSFORMATION_NAME" \
+    -p "$CODE_PATH" \
+    -c "$BUILD_CMD" \
+    -x -t; then
+    exit 0
+  fi
+  attempt=$((attempt + 1))
+  sleep 10
+done
+exit 1</code></pre>
+<h3>2. Auto documentation</h3>
+<p>Documentation is one of the most neglected aspects of modern software development. Documentation increases accuracy and acts as a contract between requirements and implementation. AWS Transform custom codebase analysis capability generates structured documentation covering architecture, technical debt, code metrics, and migration planning on every incremental update ensuring every Agent or human that modifies the codebase is working from a true “current state”.</p>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+TRANSFORMATION_NAME="GitHub-PR-Context-Codebase-Analysis"
+CODE_PATH="."
+BUILD_CMD="mvn clean install"
+PR_URL=""
+MAX_RETRIES=3
+
+while getopts "n:p:c:U:" opt; do
+  case $opt in
+    n) TRANSFORMATION_NAME="$OPTARG" ;;
+    p) CODE_PATH="$OPTARG" ;;
+    c) BUILD_CMD="$OPTARG" ;;
+    U) PR_URL="$OPTARG" ;;
+    *) echo "Usage: $0 [-n &lt;name&gt;] [-p &lt;path&gt;] [-c &lt;build-cmd&gt;] [-U &lt;pr-url&gt;]" &amp;&amp; exit 1 ;;
+  esac
+done
+
+attempt=1
+while [ $attempt -le $MAX_RETRIES ]; do
+  if atx custom def exec \
+    -n "$TRANSFORMATION_NAME" \
+    -p "$CODE_PATH" \
+    -c "$BUILD_CMD" \
+    -g "additionalPlanContext=$PR_URL" \
+    -x -t; then
+    exit 0
+  fi
+  attempt=$((attempt + 1))
+  sleep 10
+done
+exit 1</code></pre>
+<h3>3. Scale across repositories</h3>
+<pre><code># .github/workflows/scale-modernization.yml
+name: Scale Modernization
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  transform-repos:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        repo:
+          - magnefique-studios/instrumentShop
+          - magnefique-studios/orderService
+          - magnefique-studios/paymentGateway
+    steps:
+      - name: Checkout $\{\{ matrix.repo }}
+        uses: actions/checkout@v4
+      - name: Run transformation
+        run: |
+          atx custom def exec \
+            --transformation-name "spring-boot-3-upgrade" \
+            --code-repository-path "." \
+            --build-command "mvn clean install" \
+            --non-interactive \
+            --trust-all-tools</code></pre>
+<h3>4. Continual learning</h3>
+<p>Each time AWS Transform custom completes a transformation, a memory agent scans the full execution trajectory and extracts lessons. Lessons include patterns that the agent learned, decisions that the agent made during planning, and feedback you provide during execution. AWS Transform custom automatically attaches these lessons to your transformation definition, which improves accuracy in subsequent runs.</p>
+<h2>Conclusion</h2>
+<p>Continuous modernization moves code transformation out of periodic sprints and into your CI/CD pipeline. By combining GitHub Dependabot’s vulnerability detection with AWS Transform custom agent, orchestrated through GitHub Actions, you can:</p>
+<ul>
+ <li>Remediate dependency vulnerabilities automatically — beyond version bumps to full code adaptation</li>
+ <li>Keep documentation current with every commit, preserving institutional knowledge</li>
+ <li>Scale transformations across hundreds of repositories with consistent quality</li>
+ <li>Improve continuously as the agent accumulates knowledge items from each execution</li>
+</ul>

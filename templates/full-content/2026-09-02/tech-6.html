@@ -1,0 +1,95 @@
+<h2>A Type System Is a Search Oracle</h2>
+<p>Working with models on real code, I keep noticing the same thing. The Rust I get back is better than the C++ I get back, and the Lean is better than either. Not marginally. The Rust compiles and does roughly what I asked; the C++ compiles and does something adjacent to what I asked, and I find out which on a Tuesday three weeks later.</p>
+<p>The published benchmarks say the opposite, and clearly. Rust is a low-resource language as far as a pretrained model is concerned, underrepresented relative to Python by a wide margin, and it scores well below Python on the standard multilingual code benchmarks. Lean barely registers. If you ranked languages by how much of them a model has read, my experience runs backwards down the list.</p>
+<p>Both observations are correct. Reconciling them is the interesting part, and the answer changes what I think a type system is for.</p>
+<h2>What one-shot accuracy leaves out</h2>
+<p>A pass@1 number measures whether the first draft is right. Nobody ships the first draft. The number I care about is different: of the programs that reach production, how many are wrong, and how much work did it take to get there.</p>
+<p>The cleanest experiment I have found on this used Idris, which is a reasonable stand-in for the far end of the type-strength axis. Li and Krishnamachari gave GPT-5 fifty-six Exercism problems in Idris and measured it zero-shot against the same model on other languages.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Language</th>
+   <th>Zero-shot</th>
+   <th>With compiler errors fed back</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Python</td>
+   <td>45 / 50</td>
+   <td>—</td>
+  </tr>
+  <tr>
+   <td>Erlang</td>
+   <td>35 / 47</td>
+   <td>—</td>
+  </tr>
+  <tr>
+   <td>Idris</td>
+   <td>22 / 56</td>
+   <td><strong>54 / 56</strong></td>
+  </tr>
+ </tbody>
+</table>
+<p>Zero-shot, the result is what the benchmarks predict. Idris solves 39% where Python solves 90%. The model has not read much Idris and it shows.</p>
+<p>Then the compiler goes in the loop, and Idris finishes at 96% — above where Python started. The ablation is the part worth sitting with. They also tried feeding the model documentation, and feeding it a guide to classifying Idris errors. Neither worked as well as handing back the local compilation errors. The compiler’s own message, generated from the model’s own broken code, was the most valuable signal available.</p>
+<p>The feedback loop provides the reconciliation. Training data determines where the first draft lands. The type system determines whether the loop that follows converges on something correct or just on something that runs.</p>
+<h2>The same shape at company scale</h2>
+<p>Fifty-six problems in a language nobody deploys is thin evidence for a claim about how software gets written. Some corroboration arrived last month from a direction I was not expecting.</p>
+<p>David Tolnay published eight years of language adoption at Meta, drawn from the source-control tables that back the company’s internal dashboards. The metric is a year-over-year ratio: within each ninety-day window, the fraction of developers who committed in a given language, divided by that same fraction twelve months earlier. Company growth and the seasonal swings in code output both cancel.</p>
+<p>Five languages inflect together around February and March of 2026, and Tolnay dates the cause without hedging: “This timeframe correlates with the uptake in agentic coding among Meta engineers in Q1 of 2026.” The five are TypeScript, Rust, Swift, JavaScript and Go. He discounts one of them himself, attributing the JavaScript growth to configuration files inside TypeScript projects rather than to new JavaScript work. That leaves four, all statically typed. His summary of everything else on the chart: “Other than TypeScript, Rust, Swift, JavaScript, and Go, every other language on the chart is uncorrelated or at best slightly correlated with AI adoption.”</p>
+<p>Two cautions, because this is easy to over-read and I nearly did.</p>
+<p>C++ and Python are flat, and that is not evidence that models write them badly. A growth ratio divides by the base, and these are among the largest languages at Meta. A one percent move in C++ participation can exceed a doubling of Rust in absolute terms while still drawing a flat line, so flatness is consistent with C++ absorbing more engineering effort in 2026 than every surging language combined. Tolnay makes the same observation from the other side when he describes those languages as saturating their addressable market.</p>
+<p>The unit is also a developer rather than a line of code, so someone who writes one file counts like someone who writes the language full time. That matters most at the top of the chart. Tolnay’s own explanation for TypeScript’s growth is that engineers and managers “are producing all kinds of dashboards and personal widgets in TypeScript that they never would have bothered to do without AI.” Dabbling counts at full weight.</p>
+<p>What survives both cautions is the one figure that is not a ratio — Meta engineers wrote twice as much first-party Rust this year as in the previous nine years combined — and the selection itself. Cheap generation applied broadly would have lifted the whole chart. The lift concentrated in languages whose compiler rejects a wrong program before it runs.</p>
+<h2>C++ is the control group</h2>
+<p>If the thesis were “static typing helps,” C++ would be fine. It is statically typed, aggressively so, with a type system elaborate enough to be Turing-complete at compile time. My experience with generated C++ is nonetheless closer to Python than to Rust, and I think that difference is the most informative data point I have.</p>
+<p>The distinction is not static versus dynamic. It is how much a successful compile promises.</p>
+<p>In Rust, a program that compiles has been checked for a specific and useful set of properties: no use-after-free, no data races between threads, no aliasing a mutable reference, every enum match exhausted, every error path acknowledged at the call site. The checker cannot be talked out of these. Defeating it requires writing <code>unsafe</code>, which is a lexically visible, greppable admission that the guarantee stops here.</p>
+<p>In C++, a program that compiles has been checked that the names resolve and the overloads pick out. It has not been checked for use-after-free, iterator invalidation, data races, out-of-bounds access, or signed overflow. An implicit conversion can quietly change the meaning of a call. A <code>reinterpret_cast</code> will convert any pointer into any other pointer with no ceremony at all. Undefined behaviour offers no diagnostic, serving instead as a licence for the optimiser to assume the case never happens.</p>
+<p>So “it compiles” carries far less information in C++ than in Rust, and it is the information content of that signal that determines how useful the compiler is as a reviewer. A checker that can be defeated silently is a checker whose approval means less.</p>
+<pre><code>graph LR
+    A["generated program"] --&gt; B\{"checker"}
+    B --&gt;|"rejected"| C["error text&lt;br/&gt;fed back to the model"]
+    C --&gt; A
+    B --&gt;|"accepted"| D["reaches runtime"]
+    D --&gt; E["wrong in ways&lt;br/&gt;the checker cannot see"]
+    style C fill:#1e3a5f,color:#fff
+    style E fill:#7f1d1d,color:#fff
+</code></pre>
+<p>Every type system is this diagram. What differs between languages is how much of the wrongness flows down the right-hand edge instead of the left. Python sends nearly everything right. C++ sends a great deal right, including most of the memory-safety and concurrency errors that matter. Rust pushes a large, well-defined class of it left. Lean pushes almost all of it left.</p>
+<h2>Lean is the limit case</h2>
+<p>Lean is where the argument stops being about ergonomics and becomes about algorithms.</p>
+<p>A Lean proof is checked by a kernel. It checks or it does not, and the answer is a decision rather than an opinion. That single property changes what you are allowed to do with an unreliable generator, because it makes generation searchable.</p>
+<p>Sampling thirty-two candidate proofs and keeping the one that checks is a sound procedure. You get a correct proof or you get nothing, and you always know which. Delta Prover reaches 95.9% on miniF2F this way, using a general-purpose model with no fine-tuning at all, driving Lean 4 through decomposition and iterative repair against compiler feedback. Recent systems report figures in that range with the same basic shape: propose, check, repair, repeat.</p>
+<p>Now try that in Python. Sample thirty-two implementations, run the tests, keep the ones that pass. What you have is thirty-two programs that agree with your test suite, which is a much weaker statement than thirty-two correct programs, and you have no way to distinguish the two. The oracle is partial, so the search is unsound. You are back to reading the code.</p>
+<p>A verifier you can call cheaply and trust completely turns a mediocre generator into a good one, because brute force becomes admissible. The availability of brute force explains why models are unreasonably good at Lean given how little Lean exists to have been trained on. The scarcity is real. The oracle compensates.</p>
+<h2>What the checker still cannot see</h2>
+<p>Rust that compiles can still be wrong. It can compute the wrong thing correctly, with excellent memory safety, forever. Types constrain the shape of a computation, not its intent, and outside a dependently typed setting they only encode the part of the specification you chose to write down.</p>
+<p>The self-repair literature is consistent about where the remaining difficulty lives: syntactic and type errors turn out to be far more tractable for a model to fix from feedback than logical or algorithmic ones. That finding is usually reported as a limitation. I read it as the mechanism. Moving an error from the second category into the first is what a stronger type system does, and it constitutes the whole of the benefit. An off-by-one in an index becomes a compile error when the index is a distinct type. A forgotten case becomes a compile error when the match must be exhaustive. A stale pointer becomes a compile error when lifetimes are tracked.</p>
+<p>None of that makes the model smarter. It relocates a class of mistakes from the expensive category to the cheap one.</p>
+<h2>Why this matters more for generated code than for mine</h2>
+<p>When I write a function, the code is a partial record of a model I hold in my head. The invariants I did not write down are still real, because I know them and I will maintain them. Review works reasonably well against that background, since a reviewer can ask what I was thinking and get a coherent answer.</p>
+<p>A generated function comes with no such model, arriving instead as locally plausible text. Plausible-but-wrong text is the failure mode human review is worst at catching. Reviewers are good at spotting code that looks wrong. Generated code that is wrong usually looks right — surface plausibility makes the text useful when it happens to be correct.</p>
+<p>The mental model that used to carry the unwritten invariants is gone, leaving a machine checker as the only cheap way to put constraints back. The machine remains indifferent to plausibility. It does not get tired at four in the afternoon, and it refuses to extend the benefit of the doubt to code that reads confidently.</p>
+<p>This is the argument I made from a different direction in an earlier post on provenance: knowing where code came from tells you nothing about whether it is correct, and a signature on a program is not a proof about its behaviour. The conclusion is the same from both sides. As more code is generated, the value of properties a machine can check rises, and the value of properties resting on an author’s understanding falls, because there is no author holding the understanding.</p>
+<h2>The part I have not resolved</h2>
+<p>I would like this to be a measurement rather than an impression, and it is not one yet. My evidence is one controlled experiment on a language nobody deploys, a body of theorem-proving results whose success depends on a total oracle that ordinary programming does not have, an adoption curve that records what engineers reached for rather than whether it worked, and my own experience, which is uncontrolled and which knows what conclusion it prefers.</p>
+<p>What I would want is the number nobody publishes: defects per thousand lines of generated code that reached production, cut by language, controlled for the same task and the same reviewer discipline. Pass@1 on programming puzzles is a poor proxy, and it is the wrong end of the pipeline.</p>
+<p>The mechanism is clear enough to act on regardless. A generator with a nonzero error rate needs a verifier, the strength of the type system sets how much of the specification the verifier can decide, and everything it cannot decide falls to a reviewer whose weakest moment is confident, plausible, wrong code. Choosing a language for a codebase that will be substantially machine-written is now partly a decision about how much of your specification you want the compiler to hold.</p>
+<hr>
+<h2>References</h2>
+<hr>
+<p><em>Disclaimer: Researched and drafted with AI assistance (Claude Opus 5 and Gemini 3.1 Pro). Direction, technical judgment, and final edits are mine. The Idris and Lean figures are quoted from the linked papers, and the Meta figures from Tolnay’s article, rather than reproduced by me; I have no access to the underlying data in any of the three cases. The comparison between generated Rust, C++ and Lean that opens this post is my own working experience and is not a controlled measurement; I have tried to be explicit about which claims rest on it.</em></p>
+<ol>
+ <li>
+  <p><strong>Low-resource programming languages in code LLMs.</strong> Rust is consistently classified among the low-resource languages for code generation, substantially underrepresented in pretraining data relative to Python, with correspondingly lower pass rates on multilingual benchmarks such as MultiPL-E. Reported figures vary between studies, so I have avoided quoting a single number.</p></li>
+ <li>
+  <p><strong>Compiler-Guided Inference-Time Adaptation: Improving GPT-5 Programming Performance in Idris.</strong> Minda Li and Bhaskar Krishnamachari, February 2026. Zero-shot, GPT-5 solves 22 of 56 Exercism problems in Idris, against 45 of 50 in Python and 35 of 47 in Erlang. Of the refinement strategies tested — platform feedback, added documentation, error-classification guides, and local compilation errors — feeding back local compilation errors performed best, raising Idris to 54 of 56.</p></li>
+ <li>
+  <p><strong>Programming language adoption patterns at Meta.</strong> David Tolnay, 11 August 2026. Built from Meta’s code review and source control tables covering all code changes submitted by employees. For each 90-day window the count of developers committing in a language is divided by the total committing in any language to give a market share, then divided by that language’s share in the window ending twelve months earlier; the twelve-month spacing cancels seasonal variation in code output.</p></li>
+ <li>
+  <p><strong>Solving Formal Math Problems by Decomposition and Iterative Reflection.</strong> Delta Prover drives Lean 4 from a general-purpose LLM with no model specialization, using reflective decomposition and iterative proof repair against compiler feedback, and reports 95.9% on miniF2F.</p></li>
+ <li>
+  <p><strong>Iterative feedback loops for LLM code correction.</strong> Across iterative-refinement studies, models improve markedly when given compiler errors and failing test cases, and the residual difficulty concentrates in logical and algorithmic errors rather than syntactic or type errors.</p></li>
+</ol>
