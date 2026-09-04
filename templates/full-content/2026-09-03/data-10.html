@@ -1,0 +1,306 @@
+<h2>TL;DR</h2>
+<p>Run the same tasks through different harnesses and you get very different bills, pass rates, and wall-clock times. FrontierHarness v1.0 covers software development and terminal-based tasks.</p>
+<p>Claude Code and DSH (DeepSeek Harness) Creator both landed at a 63% pass rate. Claude Code paid 5.6x more per pass to get there.</p>
+<p>If you want a quick decision, pick based on what matters most to you:</p>
+<p><strong>Quality Leader:</strong> Codex</p>
+<p>66.7% pass rate · $3.47 per pass</p>
+<p><strong>Balanced Pick:</strong> Pi</p>
+<p>60.0% pass rate · $2.43 per pass</p>
+<p><strong>Cost Leader:</strong> Exo Harness</p>
+<p>$1.05 per completed task · 53.3% pass rate</p>
+<p><strong>Speed Leader:</strong> DSH Minimal</p>
+<p>5m 41s median runtime · 56.7% pass rate</p>
+<p>Full leaderboard at frontierharness.org. Explore the source data and task definitions on GitHub.</p>
+<hr>
+<h2>Results</h2>
+<p>Across all 360 cells: 209 successes, 151 failures. Field-wide pass rate is 58.1%; field-wide token-weighted cache hit rate is 92.4%.</p>
+<p>The pass rates for all 12 configurations are close, ranging from 50.0% to 66.7%, just a 17-point difference. But the cost per completed task varies much more, from $1.05 to $18.34 on the same tasks. That means two harnesses can solve the same problem, but one might cost over ten times more than the other.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Harness (configuration)</th>
+   <th>Median cost per pass</th>
+   <th>Pass rate</th>
+   <th>Cache hit</th>
+   <th>Median time</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Codex</strong></td>
+   <td>$3.47</td>
+   <td><strong>66.7%</strong></td>
+   <td>88.0%</td>
+   <td>6m 43s</td>
+  </tr>
+  <tr>
+   <td>DSH Creator</td>
+   <td>$3.28</td>
+   <td>63.3%</td>
+   <td>84.3%</td>
+   <td>6m 44s</td>
+  </tr>
+  <tr>
+   <td>Claude Code</td>
+   <td>$18.34</td>
+   <td>63.3%</td>
+   <td>67.8%</td>
+   <td>9m 38s</td>
+  </tr>
+  <tr>
+   <td>Pi</td>
+   <td>$2.43</td>
+   <td>60.0%</td>
+   <td>79.4%</td>
+   <td>7m 33s</td>
+  </tr>
+  <tr>
+   <td>DSH Standard</td>
+   <td>$3.46</td>
+   <td>60.0%</td>
+   <td>86.5%</td>
+   <td>6m 17s</td>
+  </tr>
+  <tr>
+   <td>DSH PTC</td>
+   <td>$4.58</td>
+   <td>60.0%</td>
+   <td>87.2%</td>
+   <td>7m 44s</td>
+  </tr>
+  <tr>
+   <td>Kimi Code</td>
+   <td>$3.65</td>
+   <td>56.7%</td>
+   <td>88.0%</td>
+   <td>7m 56s</td>
+  </tr>
+  <tr>
+   <td>DSH Minimal</td>
+   <td>$4.72</td>
+   <td>56.7%</td>
+   <td>84.6%</td>
+   <td>5m 41s</td>
+  </tr>
+  <tr>
+   <td>Oh My Pi</td>
+   <td>$4.75</td>
+   <td>56.7%</td>
+   <td>82.2%</td>
+   <td>6m 46s</td>
+  </tr>
+  <tr>
+   <td><strong>Exo Harness</strong></td>
+   <td><strong>$1.05</strong></td>
+   <td>53.3%</td>
+   <td>70.3%</td>
+   <td>6m 17s</td>
+  </tr>
+  <tr>
+   <td>Hermes</td>
+   <td>$2.90</td>
+   <td>50.0%</td>
+   <td>85.9%</td>
+   <td>6m 58s</td>
+  </tr>
+  <tr>
+   <td>OpenCode</td>
+   <td>$3.24</td>
+   <td>50.0%</td>
+   <td>78.4%</td>
+   <td>6m 27s</td>
+  </tr>
+ </tbody>
+</table>
+<p>Initially sorted by pass rate. Click any column header to sort by a different column.</p>
+<p>Exo Harness and Pi solve tasks for a fraction of what the rest of the field spends. Codex and DSH Creator show that efficiency and quality are not opposed: both sit near the top of the pass-rate column while spending close to the field median. Claude Code marks the other end. It passes as many tasks as DSH Creator and pays 5.6x more per pass to do it. As discussed below, that result may reflect the interaction between the harness, model, and gateway rather than the harness alone.</p>
+<p>Three patterns are worth pulling out:</p>
+<ol>
+ <li><strong>Finishing a task and finishing it cheaply are separate skills.</strong> Claude Code and DSH Creator both pass 19 tasks. One costs $3.28 per pass, the other $18.34.</li>
+ <li><strong>Cache hit rate is not cost.</strong> A cached 300-turn failure can still burn more than a short cache miss. Steps and tokens are what you pay for; caching only changes the unit price.</li>
+ <li><strong>Vendor lineage did not produce an advantage here.</strong> Kimi Code, made by the same lab as the model, tied for seventh on pass rate at 56.7% and sat mid-pack on cost.</li>
+</ol>
+<hr>
+<h2>Why we built FrontierHarness</h2>
+<p>Runta is an agent execution layer designed for token efficiency, secret protection, and governed access. What we care about is how much compute it takes an agent to finish a task it is already capable of finishing, and how much of that is the harness’s doing rather than the model’s.</p>
+<p>Model evaluations establish the baseline capability. The harness supplies the tools and environment, and it determines how much of that capability is spent on the problem versus on overhead.</p>
+<p>Three questions shaped the evaluation:</p>
+<ul>
+ <li><strong>What does a task actually cost?</strong> Tokens and steps, measured directly from each trajectory. This is the number we care most about.</li>
+ <li><strong>What does a failure cost?</strong> Agents spend the most money on the problems they cannot solve. A cost metric that only counts successes hides the majority of the bill.</li>
+ <li><strong>How efficiently does a harness use tools?</strong> Effective tool calls reduce unnecessary steps, improve accuracy, and save tokens.</li>
+</ul>
+<hr>
+<h2>How we built FrontierHarness</h2>
+<h3>Benchmark scope</h3>
+<p>The benchmark covers 30 tasks (21 Terminal-Bench tasks and 9 DeepSWE tasks) across 9 harnesses. These run in 12 configurations for 360 total evaluations, with one canonical result for every task and harness-configuration pair. Outcomes use deterministic verifier-based pass/fail scoring, and first-turn cache reads are repriced consistently across harnesses to make costs comparable.</p>
+<h3>The execution model</h3>
+<p>Every harness and every task environment is installed once and captured as a <strong>golden Runta checkpoint</strong>. Each of the 360 trials is a fresh restore from that checkpoint: identical vCPU, memory, disk size, disk contents, and memory state. No trial inherits filesystem drift, a warmed page cache, or a partially-installed dependency from the trial before it.</p>
+<p>A few rules make the numbers comparable:</p>
+<ul>
+ <li><strong>Benchmark tasks are never run before the formal evaluation.</strong> Implicit prefix caching means a debug run leaves the trajectory warm for hours. All debugging happens on a separate smoke task set.</li>
+ <li><strong>All 12 configurations run the same task in the same job</strong>, so comparisons within a task use the same environment.</li>
+ <li><strong>One attempt per cell.</strong> Retries are warmer by definition, and best-of-N selection would bias quality upward.</li>
+</ul>
+<hr>
+<h2>Why Kimi K3</h2>
+<p>We wanted a model that was not native to one of the leading harnesses in the comparison.</p>
+<p>Using Claude would favor Claude Code’s native environment; using a GPT model would do the same for Codex. Kimi K3 gave us a more neutral starting point, although it does not remove every compatibility effect.</p>
+<p>Kimi K3 is a frontier-class coding model with published token pricing and implicit prompt caching. We served it through Fireworks so every harness reached the same third-party inference backend.</p>
+<p>All nine harnesses connect through a single gateway that speaks both the OpenAI Responses API and the Anthropic Messages API, so each harness talks its native protocol to identical weights.</p>
+<h3>Why K3 gives Kimi Code no home-field advantage</h3>
+<p>Kimi Code is built by the same lab as Kimi K3, but it did not have a native-path advantage in this evaluation.</p>
+<p>Kimi Code’s <code>kimi</code> provider type returned a 404 against our gateway, so we configured it as <code>type = "anthropic"</code> and routed it over the Messages API. Its stream output also omits usage data, which we recovered from <code>usage.record</code> events in the session wire log.</p>
+<p>Kimi Code tied for seventh at 56.7%, with a $3.65 median cost per pass and a 7m 56s median runtime. Its 88.0% median cache hit rate tied for the best in the field, but that did not translate into a higher pass rate or lower cost.</p>
+<hr>
+<h2>Finding: Claude Code’s token-weighted cached hit rate is far low</h2>
+<p>The leaderboard shows a median cache hit rate, but that number does not describe where the total token spend went.</p>
+<p>Claude Code’s cache hit rate is <strong>25.0% token-weighted</strong> and <strong>67.8% by median cell</strong>. Every other harness in the field sits between 91.6% and 99.1% weighted. The dashboard plots the median; the total token bill is driven by the weighted number. Nothing on a normal leaderboard reconciles the two, and for Claude Code the gap is 2.7x.</p>
+<p>The median, 67.8%, describes a typical cell and can be compared with the $18.34 median cost per pass. On that measure, Claude Code’s cache rate was 1.3x lower than Codex’s 88.0%. The token-weighted figure, 25.0%, describes the total input-token volume. It is heavily affected by the most expensive task, where Claude Code cost $64.36 with a 15.7% cache hit rate.</p>
+<p>The weighted cache hit rate is heavily skewed: three of Claude Code’s nineteen successful cells account for <strong>88% of its total token usage</strong>, and just one task (<code>python-statemachine-state-data-scoping</code>, 24.6M input tokens at a 15.7% hit rate) is responsible for <strong>68%</strong> by itself. In effect, the 25.0% weighted cache rate mostly reflects the performance on this single, exceptionally large cell, so it doesn’t represent typical Claude Code behavior.</p>
+<h3>Why is the weighted rate so low?</h3>
+<p>One likely contributor is harness-model fit. Claude Code is designed around Anthropic models and their explicit cache-control semantics. K3 exposes an implicit prefix cache with different behavior, so the same caching strategy may not transfer cleanly. This is a property of the complete harness-model configuration, not necessarily a defect in Claude Code.</p>
+<p>The trajectories also show that caching was inconsistent from call to call. In one archived Claude Code session, the cache read stayed near 18.4K tokens (the size of the system prompt) on most calls, while the growing conversation was billed at the fresh rate. On roughly one call in five, the same append-only prefix reached a 100% hit rate:</p>
+<pre><code>call   fresh   cacheRead   total_in   hit%
+   1    1174       18432      19606   94.0
+   4   19381       18432      37813   48.7
+   5       0       38345      38345  100.0   &lt;-- same conversation, full prefix hit
+   8   23092       18688      41780   44.7
+  13       0       45277      45277  100.0
+  25   35474       18944      54418   34.8
+  26       0       55514      55514  100.0
+</code></pre>
+<p>That variation within one append-only conversation is difficult to explain as a stable property of the harness alone. The same prefix was cached in full on some calls and not at all on others, which is the behavior of an implicit cache rather than a fixed caching strategy.</p>
+<p>We cannot yet attribute the gap to the harness by itself. The $18.34 and $64.36 figures describe the exact configuration we tested, not Claude Code in isolation. Separating those effects is the first item on the v1.1 list.</p>
+<hr>
+<h2>An example task</h2>
+<p><code>datacurve/python-statemachine-state-data-scoping</code> is a feature request against fgmacedo/python-statemachine at a pinned base commit. Official DeepSWE pass rate: 38%. Median historical trajectory: 117 agent steps.</p>
+<p>Solving this means touching the metaclass, the callback injection machinery, history restoration, pickling, the SCXML parser, and the diagram renderer, then keeping the existing suite green. Seven of the 12 configurations passed.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Harness</th>
+   <th>Result</th>
+   <th>Cost</th>
+   <th>Turns</th>
+   <th>Cache</th>
+   <th>Time</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Pi</td>
+   <td>pass</td>
+   <td><strong>$2.50</strong></td>
+   <td>90</td>
+   <td>98.2%</td>
+   <td>39m</td>
+  </tr>
+  <tr>
+   <td>Codex</td>
+   <td>pass</td>
+   <td>$5.97</td>
+   <td>187</td>
+   <td>99.1%</td>
+   <td>37m</td>
+  </tr>
+  <tr>
+   <td>Hermes</td>
+   <td>pass</td>
+   <td>$6.70</td>
+   <td>156</td>
+   <td>99.1%</td>
+   <td>29m</td>
+  </tr>
+  <tr>
+   <td>Kimi Code</td>
+   <td>pass</td>
+   <td>$9.24</td>
+   <td>209</td>
+   <td>99.3%</td>
+   <td>38m</td>
+  </tr>
+  <tr>
+   <td>DSH Standard</td>
+   <td>pass</td>
+   <td>$10.14</td>
+   <td>227</td>
+   <td>99.3%</td>
+   <td>47m</td>
+  </tr>
+  <tr>
+   <td>DSH Minimal</td>
+   <td>pass</td>
+   <td>$10.49</td>
+   <td>259</td>
+   <td>99.1%</td>
+   <td>44m</td>
+  </tr>
+  <tr>
+   <td><strong>Claude Code</strong></td>
+   <td>pass</td>
+   <td><strong>$64.36</strong></td>
+   <td>381</td>
+   <td><strong>15.7%</strong></td>
+   <td>60m</td>
+  </tr>
+  <tr>
+   <td>Exo Harness</td>
+   <td>fail</td>
+   <td>$1.46</td>
+   <td>51</td>
+   <td>96.0%</td>
+   <td>40m</td>
+  </tr>
+  <tr>
+   <td>Oh My Pi</td>
+   <td>fail</td>
+   <td>$2.71</td>
+   <td>86</td>
+   <td>98.3%</td>
+   <td>42m</td>
+  </tr>
+  <tr>
+   <td>DSH Creator</td>
+   <td>fail</td>
+   <td>$3.88</td>
+   <td>109</td>
+   <td>98.8%</td>
+   <td>60m</td>
+  </tr>
+  <tr>
+   <td>DSH PTC</td>
+   <td>fail</td>
+   <td>$12.95</td>
+   <td>285</td>
+   <td>99.5%</td>
+   <td>60m</td>
+  </tr>
+  <tr>
+   <td>OpenCode</td>
+   <td>fail</td>
+   <td>n/a</td>
+   <td>0</td>
+   <td>n/a</td>
+   <td>60m</td>
+  </tr>
+ </tbody>
+</table>
+<p>This task is the thesis in miniature. Seven configurations produce the same outcome, a passing verifier, and the receipts for that outcome are nothing alike.</p>
+<p>Pi and Claude Code both passed, with a 26x difference in price. Pi reached the fix in 90 turns; Claude Code took 381, and recorded a 15.7% cache hit rate against Pi’s 98.2%. More steps, each one more expensive. The pass/fail column cannot see either effect. The difference belongs to the complete harness-model configuration tested here; the current data cannot isolate each component’s contribution.</p>
+<p>DSH PTC spent $12.95 on a failed run, more than six of the seven configurations that passed. DSH Creator failed at $3.88 while DSH Minimal passed at $10.49. Both used the same harness, model, and runtime, but different presets. Creator reached the 60-minute limit, so prompt and tool configuration affected both pacing and outcome.</p>
+<hr>
+<h2>Limitations and future work</h2>
+<h3>Limitations</h3>
+<p>FrontierHarness v1.0 is currently limited to software development and terminal-based tasks. It does not yet evaluate other types of agentic or knowledge work. Broader coverage is needed before making general conclusions.</p>
+<p>The benchmark uses each harness exactly as it is shipped, without modifying anything inside. For harnesses like Claude Code with strong internal opinions (such as around caching), we do not alter their implementation to improve cache hit rates or to standardize caching across gateways. As a result, the reported cost differences reflect the full harness-model setup as delivered, and we cannot say how much of the gap would remain if every harness were equally tailored to K3’s caching behavior.</p>
+<h3>Future work</h3>
+<p>Version 1.1 will add more harnesses and evaluate a broader set of models. Rather than holding the model fixed, we plan to evaluate the full harness × model matrix to reveal interaction effects (which harnesses work best with which models) and produce a harness-model compatibility matrix.</p>
+<hr>
+<h2>Conclusion</h2>
+<p>The harness makes a difference. Pass rates in this field cluster within 17 points; median cost per pass spans 17x.</p>
+<p>Codex is the safe default: highest pass rate, cost near the field median at $3.47.</p>
+<p>Pi is the pick when the same job runs many times and token spend compounds. On our hardest task it landed the same fix as Codex in 90 turns against 187, for $2.50 against $5.97.</p>
+<p>Exo is the cheapest per completed task at $1.05, partly because it stops early: on the hardest task it hit its 51-step cap and failed at $1.46 while others kept spending. We did not test retries, but a harness that fails cheaply is the one you would want to retry.</p>
+<p>DSH shows how much the preset matters. Its four presets differ by 6.6 points of pass rate and 1.4x in cost on the same model and runtime, which is about the spread between many of the harnesses themselves.</p>
+<p>The cost spread across the field comes mostly from the harness-model pairing. Cache strategy, tool looping, and prompt design belong to the pair, not to the harness alone, and a harness tuned for one family’s cache contract can look efficient there and expensive elsewhere. Holding the model, tasks, and runtime constant is what let v1.0 see those effects. Future runs will widen the harness × model matrix and tasks diversity.</p>

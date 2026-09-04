@@ -1,0 +1,132 @@
+<h2>How to monitor AI agent and MCP activity</h2>
+<p>Broken MCP tool calls silently cost real money. Across our agent fleet, seven small MCP-server bugs burned ~$499K/year in tokens and 12,000 eng-hours/year ($1.2M lost) because agents quietly retry instead of surfacing failures.</p>
+<p>Databricks engineers rely heavily on AI agents to streamline and accelerate their work. In turn, these agents require access not only to different Foundation Models but also to MCP servers with tools that enable access to relevant artifacts (e.g., system logs, usage tables, support tickets, wikis). We describe how we looked for cost savings in our agents' use of tools, the challenges we hit along the way, and how OTel tracing in Unity Gateway cut the path from analysis to $1.2M/year in savings to a single hour.</p>
+<p>Enabling our developers to build their agents was a huge unlock on productivity, but as usage ramped up, we also faced increasing costs. We started investigating several optimizations, and one suspicion that we had was the hidden cost of failing tool calls. Specifically, when tools misbehave, the calling agent rarely fails loudly. Instead, it retries, guesses, and eventually works around the problem, quietly burning tokens and developer time the whole way.</p>
+<p>We investigated this suspicion in our agent fleet using Unity Gateway's tracing and Genie One. We found seven small bugs in our tool servers that were costing an estimated <strong>$499K/year in wasted tokens</strong> and about 12,000 engineering hours per year in agent wait time. Overall, this is an estimated <strong>$1.2M/year</strong> in lost productivity.</p>
+<p>When we first deployed AI agents widely at Databricks for coding and internal workflows, it was impossible to manage or even fully understand costs because we lacked visibility into the agents’ tool calls and overall activity. To solve this, we leveraged Unity Gateway, which automatically emits an OpenTelemetry trace for all MCP tool invocations, including the tool name, arguments, error (if any), token counts, latency, and a session ID that ties calls together. Those traces land in a single table that records exactly what our agents did over any time window.</p>
+<p>This makes AI agent cost management more actionable, where instead of seeing only aggregate token spend, we can attribute wasted spend to specific tools, errors, and agent sessions.</p>
+<p>Now that the data is available, the next step is exploration:</p>
+<ul>
+ <li>Which tool errors recur the most?</li>
+ <li>When an agent hits one, how many turns does it take to recover?</li>
+ <li>What does each error cost in tokens and wall-clock wait time?</li>
+</ul>
+<p>Normally, the expensive part of this kind of analysis is the SQL and the schema spelunking. But with Genie One, we just pointed it at the trace table, <strong>asked these exact questions in plain English</strong>, and got answers back in minutes.</p>
+<h2>What the traces revealed: How MCP tool failures drive up AI agent costs</h2>
+<p>Genie One turned a vague suspicion into a ranked, quantified bug list in minutes. Here is an example from a single 24-hour window, showing bugs in our Jira and Google Drive/Docs tool servers:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Bug</th>
+   <th>Errors/day</th>
+   <th>Annual token cost</th>
+   <th>Annual wait time</th>
+   <th>Repeat rate</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Jira: KeyError: 'fields' (get)</td>
+   <td>137</td>
+   <td>$250K</td>
+   <td>2,500 h</td>
+   <td>~30%</td>
+  </tr>
+  <tr>
+   <td>Jira: 'list' object has no attribute 'split'</td>
+   <td>535</td>
+   <td>$87K</td>
+   <td>4,850 h</td>
+   <td>30.5%</td>
+  </tr>
+  <tr>
+   <td>Jira: KeyError: 'fields' (search)</td>
+   <td>32</td>
+   <td>$58K</td>
+   <td>580 h</td>
+   <td>~30%</td>
+  </tr>
+  <tr>
+   <td>GDrive: Invalid field selection</td>
+   <td>417</td>
+   <td>$46K</td>
+   <td>2,740 h</td>
+   <td>54.5%</td>
+  </tr>
+  <tr>
+   <td>Jira: unexpected analysis_prompt kwarg</td>
+   <td>121</td>
+   <td>$42K</td>
+   <td>840 h</td>
+   <td>50.0%</td>
+  </tr>
+  <tr>
+   <td>GDocs: find_text required</td>
+   <td>137</td>
+   <td>$15K</td>
+   <td>440 h</td>
+   <td>14.3%</td>
+  </tr>
+  <tr>
+   <td>Jira: quote_from_bytes() expected bytes</td>
+   <td>30</td>
+   <td>$1.2K</td>
+   <td>73 h</td>
+   <td>66.7%</td>
+  </tr>
+  <tr>
+   <td><strong>Total</strong></td>
+   <td><strong>1,409</strong></td>
+   <td><strong>$499K</strong></td>
+   <td><strong>12,023 h</strong></td>
+   <td>n/a</td>
+  </tr>
+ </tbody>
+</table>
+<p>Take the highest-volume bug, 535 failures a day, as an example. The Jira issues.search tool takes a fields parameter. A list has no .split(), so the server raised 'list' object has no attribute 'split', a raw Python traceback that tells the agent nothing about what it did wrong. So the agent guessed again. On average, it took <strong>12 turns</strong> to recover, and 30% of sessions hit the error more than once.</p>
+<h2>The real lesson: How to design MCP tools for AI agents and LLMs</h2>
+<p>The obvious takeaway is "write better error messages," and the data backs it up. Recovery cost tracks error-message quality almost perfectly:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Error message quality</th>
+   <th>Example</th>
+   <th>Repeat rate</th>
+   <th>Avg turns to recover</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Self-documenting</td>
+   <td>"find_text and replace_text required"</td>
+   <td>14%</td>
+   <td>4.6</td>
+  </tr>
+  <tr>
+   <td>Somewhat informative</td>
+   <td>"Missing required parameters: org, repo"</td>
+   <td>~30%</td>
+   <td>4</td>
+  </tr>
+  <tr>
+   <td>Cryptic traceback</td>
+   <td>"'list' object has no attribute 'split'"</td>
+   <td>30.5%</td>
+   <td>12.1</td>
+  </tr>
+  <tr>
+   <td>Misleading</td>
+   <td>"unexpected keyword argument 'analysis_prompt'"</td>
+   <td>50%</td>
+   <td>13.1</td>
+  </tr>
+ </tbody>
+</table>
+<p>But "good error messages help" is old news. The more interesting question is <em>why</em> the model called these tools "wrong" in the first place. In most of these cases, it didn't.</p>
+<p>MCP tool signatures are often deliberately under-specified. When a signature is vague about fields, the model fills the gap with a reasonable guess, and a JSON array is a reasonable guess for a list of fields. The bug was not that the model called the tool incorrectly. It was that the server accepted only one of several reasonable interpretations and crashed on the rest.</p>
+<p>So the design principle is the reverse of the reflexive one: <strong>tools for agents should adapt to the way LLMs naturally call them,</strong> e.g., coerce the list into a string, default the omitted parameter, absorb the unexpected argument, and so on.</p>
+<h2>The easy part: How we reduced wasted AI agent spend in one hour</h2>
+<p>The fixes themselves were simple. Once Genie One had handed us a ranked list of which errors to fix and what the model was actually sending, applying the fixes across the tool servers was a quick pass with a coding agent. The whole loop (find, quantify, fix) took about an hour.</p>
+<p>The scarce, expensive step was never writing the fix. It was knowing what to fix. Tracing plus Genie One turned that step from a research project into a question you can ask out loud.</p>
+<h2>Closing the loop: How to continuously monitor and reduce AI agent costs</h2>
+<p>As more real work shifts onto agents, silent tool failures become a first-class cost center, the kind that hides inside "usage growth" and never pages anyone. The loop for catching them is cheap and repeatable: Unity Gateway makes agent behavior observable, and Genie One makes that behavior queryable without SQL.</p>

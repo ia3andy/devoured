@@ -1,0 +1,65 @@
+<p>Your API accepts the change. It returns 201 Created or 200 OK, the system has saved the user's change, and the moment the user clicks, the change disappears from the app, only to resurface seconds later. That's if you are lucky. There's no error. The change simply ceased to exist for a while.</p>
+<p>In the era of server-side-rendered applications this was a non-issue: either the state was managed as part of a single request, or the user was too slow to outrun the system. The modern application changed that. It fires off the mutation, invalidates the cache, and wakes up the state management, all in parallel and milliseconds after the write. The snappier your frontend feels, the more reliably it outruns your replica.</p>
+<p>Throw a collaborative product into the mix and it gets worse, because every change sent over a websocket invalidates state on every teammate's open tab and device, and all of them go back to the same endpoints on the same replicas.</p>
+<p>Some of the common workarounds are:</p>
+<ul>
+ <li>pin reads to the primary (which you really want to avoid)</li>
+ <li>add sleep delays</li>
+ <li>set flags in Redis</li>
+</ul>
+<p>Your application has to act like a traffic conductor. It guesses the replication lag using timeouts and Redis flags. The replica already knows exactly where it stands; your code just has no way to ask.</p>
+<p>PostgreSQL 19 adds a way to ask. On the standby:</p>
+<pre><code>WAIT FOR LSN '0/554D1B78';</code></pre>
+<p>The standby blocks until it has replayed that position, then returns and lets the next statement run. That is all a reader needs to know to follow the numbers below.</p>
+<p>There is a great deal more to it, and my friend Gülçin Yıldırım Jelínek wrote it up last week: why it has to be a top-level command rather than a function, the self-deadlock that rule prevents, and the 2016 proposal it grew out of. Read hers for that; it is the account I kept failing to write, and it saved me a lot of work. Everything below is what happened when I put the statement in front of traffic and measured it.</p>
+<h2>What makes a replica lag</h2>
+<p>Replica lag is a combination of factors, and each of them is separately visible. Three of them show up in one query.</p>
+<pre><code>SELECT application_name, write_lag, flush_lag, replay_lag,
+       pg_current_wal_lsn() - replay_lsn AS bytes_behind
+FROM pg_stat_replication;</code></pre>
+<p><code>write_lag</code> and <code>flush_lag</code> are the mechanics of the network and the disk on the standby. The WAL segments travelling over the network and hitting storage. In the same availability zone, interactions take just a fraction of a millisecond. However, in cross-region networks, this time continues to increase. This is your floor.</p>
+<p><code>replay_lag</code> is the problem. Shipping WAL is usually simple; applying it is the part that makes your change visible to queries. Recovery is a single startup process replaying records one at a time, and while prefetch can warm the I/O ahead of it, nothing applies two records at once. It competes with everything else the machine is doing, and your change might be queued behind something far more expensive: a bulk import, index maintenance, anything that produces WAL faster than one process can replay it. That is how lag jumps from milliseconds to seconds.</p>
+<p>The fourth factor is the shape of the read traffic on the replica, which is ironically the thing you were trying to achieve.</p>
+<h2>The routing strategies. Measured.</h2>
+<p>Now back to those common workarounds, measured against <code>WAIT FOR</code>. The workload is straightforward: insert a row on the primary, then read it back like a web request would. Do this 1,000 times with 8 concurrent workers, against a local streaming replica with no added lag.</p>
+<h2>You shall not synchronously commit</h2>
+<p>There's one seemingly simple fix that avoids all of this. Make the primary wait for the standby and you never have to look back. It nearly works, which is the problem.</p>
+<p>Adding the standby to <code>synchronous_standby_names</code> took staleness from 593 out of 600 reads down to somewhere between 3 and 17, depending on the run. That is a fix that passes every test you'll write and then fails in production, because <code>synchronous_commit = on</code> waits for the standby to flush the WAL, not to replay it, and your read lands between those two instants.</p>
+<p>The setting that actually closes the gap is <code>remote_apply</code>, which makes every commit on the primary wait for replay on the standby: the batch job, the migration, and every writer that is never going to read from a replica. <code>WAIT FOR</code> moves that cost to the one reader that needs it, bounded, at the moment it needs the data.</p>
+<h2>The timeout is a routing budget</h2>
+<pre><code>WAIT FOR LSN 'lsn'
+    [ WITH ( option [, ...] ) ]
+
+where option can be:
+
+    MODE 'mode'
+    TIMEOUT 'timeout'
+    NO_THROW</code></pre>
+<p><code>MODE</code> says what the standby has to have done with the WAL. <code>standby_replay</code> is the default and the only one that helps here: it waits until the record has been replayed and is visible to queries.</p>
+<p><code>TIMEOUT</code> is where a read guarantee stops being a database feature and turns into a system architecture choice.</p>
+<h2>Implementing it</h2>
+<p>You may not need any of this. If your reads genuinely tolerate staleness, that is a legitimate architecture and not a gap in it. You will know when you hit the problem.</p>
+<p>Every application or framework that can route reads to a replica already ships a sticky-window version of this: pin to the primary for N seconds, sleep, or keep a flag. <code>WAIT FOR</code> replaces the guess with a fact and leaves the rest of the routing alone. Four steps:</p>
+<ol>
+ <li><strong>After the commit</strong>, on the primary, retrieve the LSN with <code>SELECT pg_current_wal_flush_lsn()</code>.</li>
+ <li><strong>Store the LSN</strong> wherever the session lives. It's a string like <code>0/3F8A120</code> identifying a WAL position and it isn't a secret, although anyone who can read it can work out how fast your primary writes.</li>
+ <li><strong>Before the read</strong>, on the replica, run <code>WAIT FOR LSN '&lt;lsn&gt;' WITH (MODE 'standby_replay', TIMEOUT '…', NO_THROW)</code>. Top-level statement, meaning not inside a function or a DO block; an ordinary READ COMMITTED transaction block is fine. <code>NO_THROW</code> turns errors into a status row you can branch on.</li>
+ <li><strong>Use it.</strong> <code>success</code> means you can go ahead with the read on that standby. <code>timeout</code> or <code>not in recovery</code> means read the primary instead, fail the request, or serve the replica's answer with the staleness flagged so a client that applied the write optimistically can keep it.</li>
+</ol>
+<h3>Which LSN to record</h3>
+<p>Step 1 said <em>after the commit</em>. The tempting shortcut is to take the LSN while you are already in the transaction and save yourself a round trip.</p>
+<h2>The token doesn't stop at the session</h2>
+<p>The LSN is a short string, so it travels: a response header, a field on a job payload, a value you hand to another service. Distributed systems carry this kind of consistency token anyway, and here it happens to be a WAL position.</p>
+<p>That has two consequences. If you can receive tokens from more than one source, keep the larger one, because it is the only one that also guarantees the smaller. And don't compare them as strings. Cast to <code>::pg_lsn</code> and let Postgres do the ordering.</p>
+<h2>Sample implementation</h2>
+<p>The whole pattern is about thirty lines: two pools, a validated token, and a branch.</p>
+<h3>Rails calls it a write</h3>
+<p>The way through is to go under the statement layer, on the connection the read will use.</p>
+<h3>Notes regardless of stack</h3>
+<ul>
+ <li>a transaction block is fine, so wrapped test suites are not a problem.</li>
+ <li>your driver will work. <code>WAIT FOR</code> goes over the extended query protocol every driver speaks.</li>
+ <li>PgBouncer in transaction mode needs no special handling. The wait goes through as its own implicit transaction, and a read issued afterwards in a separate transaction still sees the write.</li>
+</ul>
+<h2>Running it yourself</h2>
+<p>Everything above is in github.com/boringSQL/read-your-writes.</p>

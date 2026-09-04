@@ -1,0 +1,89 @@
+<h1>exo</h1>
+<p>Exo is a systems approach to recursive self improvement. In short, it's a complete AI agent harness (supporting tools, tasks, integrations, etc. similar to OpenClaw, Pi or Hermes), with the crucial difference that it has full visibility into both its code and runtime logs. This allows Exo to incrementally improve every aspect of itself, clone itself, and even manage a lineage of clones.</p>
+<p>While most agents can do some form of self improvement, such as updating memory or creating skills, Exo is fully recursive in that it can clone or operate on any aspect of itself, from prompts, to memory, tooling, or even basic harness policy itself. It's architected so that this evolution can be done incrementally and (mostly) safely. The only thing it can't muck with is an event log which provides a canonical history of what it's tried to prevent getting stuck in recursive loops.</p>
+<p>The goal of Exo is to be the minimal framework possible to give an agent full ability for recursive self improvement. Why would you want such a thing?</p>
+<ul>
+ <li>It's a good agent framework to build exactly the agent you like, that's maximally Bitter Lesson aligned. Future smarter models can evolve every aspect of the system at runtime, and do it safely with full history.</li>
+ <li>It's a good framework to allow AI models to solve complex problems by iterating on system level properties. We've had agents learn to play games, cost-optimize themselves, build complex systems. In each case, it required the agents to modify themselves heavily beyond memory.</li>
+</ul>
+<p>In short, we think this is the best way to take advantage of the growing power of AI models when building long-lived agents.</p>
+<p>For a more complete description of the architectural philosophy read A Systems View of Recursive Self Improvement</p>
+<h2>Quick Start</h2>
+<p>Exo was designed to be incredibly simple to use. With just a few commands you should have a fully functional agent who can do standard agent tasks (computer use, research, coding etc.) but can also extend itself as needed.</p>
+<p>To use Exo as an agent, you'll need an OpenAI or OpenRouter API key. If you have that, simply do the following:</p>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/exoharness/exo/main/setup.sh -o setup.sh
+bash setup.sh
+</code></pre>
+<p><em>Note that Exo requires git and Docker. The setup script offers to install them if missing, and installs pinned node, pnpm, and rust toolchains automatically via mise.</em></p>
+<p>It'll build Exo (may take a few minutes), then ask for the API key and your name and your agent's name, and give you the command to start Exo (./exo.sh).</p>
+<h2>Basic Agent Interaction</h2>
+<p>For the basic setup of Exo, there are two methods of interacting: on the command line where you ran the setup script (or <code>./exo.sh</code>), and through a browser using exo-chat.</p>
+<p>Exo agents are intended to be long-running. For example, if you <code>/exit</code> from the command line you can still interact with it via exo-chat. And if you do exit, you can always connect back to the CLI chat using <code>./exo.sh</code>.</p>
+<p>Exo-chat is a minimal, web-based chat where you can talk to your agent from anywhere on the internet. However, Exo also supports standard chat applications like IRC, Discord, WhatsApp, Signal, or Slack. To configure them, just ask your agent to do so.</p>
+<p>If you ever forget or lose your exo-chat URL, you can just ask Exo for it from the command line.</p>
+<p>A good end-to-end test is to have it install a tool in the sandbox and use it with the task scheduler. For example, try the following prompt:</p>
+<pre><code>Install python3 and curl in the sandbox. You don't need sudo, just use apt-get. Once you've done that, please
+schedule a task to run every minute that grabs news headlines from the BBC RSS feed. Only print new headlines you've
+not printed before. Please print them here.
+</code></pre>
+<h2>Operating Exo</h2>
+<p><code>setup.sh</code> is only for the first-time install. After that, <code>./exo.sh</code> in the repo root is the day-to-day control surface for your agent. Running it with no arguments starts (or reconnects to) the local agent so you can talk to it via the command line.</p>
+<pre><code>./exo.sh                # start the full stack (Docker sandbox, ExoChat) and open the CLI chat interface
+./exo.sh list           # list agents and conversations
+./exo.sh stop-all       # stop the scheduler and adapter runners; state is preserved
+./exo.sh fresh          # rebuild, delete all agents/conversations, start clean
+./exo.sh setup-profile  # update your local profile (name, preferences)
+./exo.sh --help         # all commands and options
+</code></pre>
+<p>The most common command for the <code>./exo.sh</code> starter script: use <code>stop-all</code> when you want to shut Exo down, plain <code>./exo.sh</code> to bring it back with all state intact, and <code>fresh</code> when you want to throw everything away and start over with a brand-new agent.</p>
+<p>By default <code>./exo.sh</code> uses the <code>canonical</code> template: a Docker sandbox, the repo mounted at <code>/workspace/exo</code>, and ExoChat for remote access. Pass <code>--template dev</code> for a developer variant that sets up IRC and Discord instead of ExoChat, or <code>--template minimal</code> for a bare REPL with no Docker defaults or adapter setup.</p>
+<h2>Basic Debugging and Visibility</h2>
+<p>To see what the agent is doing, follow its durable event stream from another terminal:</p>
+<pre><code>pnpm events:tail
+</code></pre>
+<p>This shows recent messages, tool calls and results, and turn boundaries, then continues following new events. It defaults to the <code>exo-agent</code> agent and <code>dev</code> conversation. Pass different slugs when needed, or change how much history is shown:</p>
+<pre><code>pnpm events:tail exo-agent dev --history 50
+pnpm events:tail exo-agent dev --history 0  # new events only
+</code></pre>
+<p>Press <code>Ctrl-C</code> to stop following events.</p>
+<p>The scheduler and adapter services have separate host-side logs:</p>
+<pre><code>tail -F .exo/exo-scheduler.log  # scheduled task execution
+tail -F .exo/exo-adapters.log   # adapter startup, delivery, and failures
+</code></pre>
+<p>These logs and the canonical event history remain available across ordinary restarts. <code>./exo.sh fresh</code> deletes agent and conversation state, so preserve anything needed for debugging before using it.</p>
+<h2>Understanding Exo</h2>
+<p>There are only a few key components you need to know about to understand how Exo works. You can use Exo like any agent without understanding these internals. But having a basic idea will help you more effectively guide Exo if you want it to evolve itself.</p>
+<p><strong>Basic Loop</strong> Exo runs a host-side loop that receives user messages and adapter events, builds the model context, exposes the active tools, executes tool calls, and records the results. This loop runs outside the sandbox.</p>
+<p><strong>Sandbox</strong> Exo uses a vanilla unbuntu sandbox where it can install packages, run commands, and experiment. It can snapshot and rewind that sandbox when it needs to back out from changes.</p>
+<p><strong>Tools and Adapters</strong> These are the core methods for Exo to interact with the world and with itself. Tools are functions the model can call, such as executing a shell command with the <code>shell</code> tool. Adapters are long-running host processes for stateful external channels such as ExoChat, IRC, WhatsApp, Signal, and Discord.</p>
+<p><strong>Canonical State</strong> Exo stores durable conversation history, tool activity, adapter events, artifacts, and sandbox records outside the sandbox filesystem. This state is not rewound when the sandbox is rewound, so the agent can reconstruct what happened across experiments, restarts, and rebuilds.</p>
+<p><strong>Source Code</strong> Exo's source code is mounted in the sandbox at <code>/workspace/exo</code>. The agent can read and modify that code and has tools that allow it to rebuild and restart itself and all components. This allows Exo to be able to modify every aspect of itself.</p>
+<p><strong>REPL and ExoChat</strong> The minimal setup gives you two ways to talk to Exo: the local REPL, which is a command-line chat interface, and ExoChat, a simple text-only web chat hosted at <code>https://exoharness.ai</code>.</p>
+<h2>Where to Go From Here</h2>
+<p>If you have your agent up and running, there really is little else you need to understand or do other than talk to it and ask it to evolve itself in a direction that you want. It already contains basic support for services such as WhatsApp, Slack, Discord, Signal, and IRC. But it's very easy to extend it to support more things</p>
+<h2>Shortcomings</h2>
+<p>While there are many, the most obvious is that right now there isn't a simple way for Exo to do generalized computer use of a windowed system. This is in the works and should land soon. But in the meantime, you can get a long way by asking Exo to build such a thing for itself.</p>
+<h2>Tweaking Prompts</h2>
+<p>There are a number of prompt files that Exo uses during runtime. You can edit these directly or ask Exo to.</p>
+<ul>
+ <li><code>exo/prompts/me.md</code>: the committed core identity and operating rules for the default Exo agent.</li>
+ <li><code>.exo/exo-profile.md</code>: local, git-ignored profile instructions such as your name and machine-specific preferences. Create or update it with <code>./exo.sh setup-profile</code>.</li>
+ <li><code>exo/harness.ts</code>: assembles the full prompt sent each turn, including dynamic instructions about tools, adapters, memory, sandbox behavior, and self-maintenance.</li>
+</ul>
+<p>After changing prompt files, ask Exo to rebuild/restart itself for them to go in use.</p>
+<h2>Human-created Exos</h2>
+<p>Beyond built-in capabilities, Exo also supports human-authored extensions that add explicit, task-specific functionality, as shown in these examples:</p>
+<ul>
+ <li>ExoWorker is a long-running autonomous worker with task-tree planning, durable memory, adapters, scheduling, and host-injected tools.</li>
+ <li>Gameboy Agent gives Exo an emulator sidecar and tools for playing Game Boy games.</li>
+</ul>
+<p>Building your own Exo? Share it with us on Discord.</p>
+<h2>Ongoing Work</h2>
+<p>Exo is still in the early stages of development, with many areas of active work. We welcome participation ranging from core development to feedback from users. Current areas of focus include:</p>
+<ul>
+ <li><strong>Autonomous self-maintenance:</strong> Exo should periodically inspect its context, memories, tools, scheduled tasks, and running processes; identify stale or conflicting state; propose or perform safe cleanup; and record what changed. Success means a long-running agent becomes more organized over time rather than accumulating context and tool rot.</li>
+ <li><strong>Recoverable, portable execution:</strong> Schedulers, adapters, and other long-running work should persist enough state to resume after process, machine, or network failure. Work should be movable between compatible machines without losing canonical history or duplicating side effects.</li>
+ <li><strong>High-level multi-agent orchestration:</strong> Cloning and lineage are useful primitives, but agents also need policies for when to clone, how to divide work, how children report results, how conflicting conclusions are resolved, and when a lineage should stop. The goal is a family of agents that produces better results than one agent without creating unbounded cost or coordination overhead.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

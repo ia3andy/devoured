@@ -1,0 +1,95 @@
+<p>Research reports built by Keenable SELECT, an agent that searches the web in SQL. Every card links the finished report and the full trajectory behind it: each query, tool result, and result set.</p>
+<h2>How it works</h2>
+<p>You ask: “Which AI researchers moved between frontier labs since 2025? For each move list the researcher, the lab they left, where they went and the month.”</p>
+<p>Keenable SELECT runs SQL on the web:</p>
+<pre><code>SELECT
+  SEM_EXTRACT(content, 'researcher'),
+  SEM_EXTRACT(content, 'left lab'),
+  SEM_EXTRACT(content, 'joined lab'),
+  SEM_EXTRACT(content, 'move month')
+FROM WEB_SEARCH(8 diverse queries)
+WHERE SEM_MATCH(content,
+  'named researcher moving
+   between frontier labs, 2025+')</code></pre>
+<p>You get a report.</p>
+<h2>Gallery</h2>
+<ul>
+ <li><strong>Twenty Years of YC Startup-Name Morphology</strong></li>
+ <li><strong>A Living History of Search Engines (1982–2026)</strong></li>
+ <li><strong>America’s Gigawatt AI Data-Center Buildout</strong></li>
+ <li><strong>Atlas of Documented Zoo Animal Escapes</strong></li>
+ <li><strong>Best New Casual Southeast Asian Restaurants in the Bay Area</strong></li>
+ <li><strong>Bollywood Songs Reported as Copied or Inspired</strong></li>
+ <li><strong>Death by GPS: Documented Water, Desert &amp; Cliff Incidents</strong></li>
+ <li><strong>Frontier AI Researcher Moves Since 2025</strong></li>
+ <li><strong>Great Bird Migrations of the World</strong></li>
+ <li><strong>India’s Famous Mango Origins Map</strong></li>
+ <li><strong>Major Open &amp; Open-Weight LLM Releases — 2026 Timeline</strong></li>
+ <li><strong>Marvel Screen Continuities, 2005–2026 — Light Edition</strong></li>
+ <li><strong>Mechanical Keyboard Releases — 10-Year Timeline</strong></li>
+ <li><strong>Nearest Zoo Voronoi Atlas — United States</strong></li>
+ <li><strong>Orbital Launch Atlas, 1957–2026</strong></li>
+ <li><strong>Popular Open-Source AI Agents &amp; Agentic Frameworks</strong></li>
+ <li><strong>Seattle &amp; Bellevue Coffee Enthusiast Tour</strong></li>
+ <li><strong>The AI Lab Founder Family Tree</strong></li>
+ <li><strong>The Great-Chef Kitchen Lineage</strong></li>
+ <li><strong>U.S. Specialty Coffee Roaster Atlas</strong></li>
+ <li><strong>What Goes in Common EDC Packs?</strong></li>
+ <li><strong>Australia’s Big Things — Map and Route</strong></li>
+ <li><strong>Bay Area First-Date Playbook</strong></li>
+ <li><strong>Braintrust (braintrust.dev) — Public-Source Org Chart</strong></li>
+</ul>
+<h2>The system behind the reports</h2>
+<p>Keenable SELECT is an MCP server with one main tool: <code>select</code>. The tool runs one read-only DuckDB <code>SELECT</code> statement on live web data. The server runs the web and semantic operators outside DuckDB, puts their output back into the row set, and then runs the final SQL in DuckDB.</p>
+<p>A traditional web search gives an agent ten links. The agent must then read each page and build the answer from expensive tokens. SELECT moves this work into the query. One call can search more than 1,000 pages, filter them with an exact <code>WHERE</code> clause at no LLM cost, extract fields with one small LLM call per row, and group the rows.</p>
+<h3>MCP tools</h3>
+<ul>
+ <li><code>select</code> takes DuckDB <code>SELECT</code> queries and returns the rows. The server saves every query result as a result set with an id, and a later query can read from that id.</li>
+ <li><code>generate_html_report</code> takes a brief and result set ids. A report model on the server writes an HTML report from the rows and returns a shareable link.</li>
+</ul>
+<h3>Semantic operators</h3>
+<p>The operators live inside normal SQL. The server finds them in the parsed statement, runs them, and replaces them with plain columns. Exact SQL filters run first, so only the surviving rows go to the LLM operators.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Operator</th>
+   <th>What it does</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>WEB_SEARCH('q1', 'q2', ...)</code></td>
+   <td>Searches all queries at the same time, merges ranked results, and removes repeated URLs.</td>
+  </tr>
+  <tr>
+   <td><code>WEB_FETCH('https://a.com', ...)</code></td>
+   <td>Gets the given URLs as Markdown, one row per page.</td>
+  </tr>
+  <tr>
+   <td><code>SEM_EXTRACT(column, 'field description')</code></td>
+   <td>One LLM call per row. It returns one field, or null when the text does not give the value.</td>
+  </tr>
+  <tr>
+   <td><code>SEM_EXTRACT_ALL(column, 'what one value is')</code></td>
+   <td>Like <code>SEM_EXTRACT</code>, but returns all matching values in a list.</td>
+  </tr>
+  <tr>
+   <td><code>SEM_MATCH(column, 'predicate')</code></td>
+   <td>An LLM test per row. Use it as a meaning-based <code>WHERE</code> filter.</td>
+  </tr>
+  <tr>
+   <td><code>SEM_SCORE(column, 'query')</code></td>
+   <td>A low-cost embedding score per row. Use <code>ORDER BY ... DESC LIMIT k</code>.</td>
+  </tr>
+  <tr>
+   <td><code>SEM_NORM(column)</code></td>
+   <td>Gives the same key to values with the same meaning. Use it in <code>GROUP BY</code>.</td>
+  </tr>
+ </tbody>
+</table>
+<p><code>WEB_SEARCH</code> and <code>WEB_FETCH</code> can also run per row. Their arguments can use row columns, for example <code>WEB_SEARCH(name || ' founding year')</code>.</p>
+<h3>Main agent</h3>
+<p>Every report in this gallery comes from two agents: a research agent that uses the MCP server to gather the data, and a report agent that runs inside <code>generate_html_report</code> on the server and writes the page.</p>
+<p>The research agent is a plain tool loop: an LLM with the <code>select</code> tool. It writes and runs its own queries until it can answer, and streams its tool calls, results, and answer as events. A follow-up question continues the conversation on top of the stored transcript. Every run in this showcase asks for an HTML report, so the agent ends each answer with the report link.</p>
+<h3>Report agent</h3>
+<p>A second agent writes each report on the server. It gets the brief, the rows of the result sets, and an authoring guide. It builds the page in a sandboxed Python session that holds the result sets as dataframes, so the data reaches the page without the model retyping it. After each publish, the server renders the draft and returns screenshots and the page's JavaScript error count; the agent fixes the document and publishes again, under a fixed budget. Only the final draft stays live, published as a link.</p>

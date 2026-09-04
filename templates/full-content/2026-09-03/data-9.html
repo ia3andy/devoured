@@ -1,0 +1,125 @@
+<h2>dbt-doctor</h2>
+<p>Static analysis and health checks for dbt projects.</p>
+<p><strong>dbt-doctor</strong> is a clone of <strong>React Doctor</strong> by <strong>Million</strong>. React Doctor is published under the <strong>MIT License</strong>; this project clones and adapts its ideas (CLI, scoring, agent tooling) for <strong>dbt</strong> and remains <strong>MIT</strong> as well. Thank you to the React Doctor maintainers for the original work.</p>
+<p><strong>Static analysis and health checks for dbt projects.</strong></p>
+<p>Find missing docs, missing tests, schema drift risks, stale models, DAG maintainability issues, and CI quality gate failures.</p>
+<p><code>dbt-doctor</code> scans your dbt project and finds maintainability issues before they become production debt:</p>
+<ul>
+ <li>missing model documentation</li>
+ <li>missing dbt tests</li>
+ <li>weak docs/test coverage</li>
+ <li>schema drift risks</li>
+ <li>stale models</li>
+ <li>source freshness gaps</li>
+ <li>naming convention issues</li>
+ <li>oversized DAG areas</li>
+ <li>governance and ownership gaps</li>
+</ul>
+<p>Use it locally, in pre-commit, or as a CI quality gate for analytics engineering teams.</p>
+<h2>Requirements</h2>
+<ul>
+ <li><strong>Node.js 22+</strong></li>
+ <li><strong>dbt layout:</strong> a <code>dbt_project.yml</code> at the project root (or use <code>rootDir</code> in config for monorepos).</li>
+ <li><strong>SQLFluff (recommended):</strong> <code>pip install sqlfluff sqlfluff-templater-dbt</code> - omit if you set <code>skipSqlfluff: true</code> or use <code>customRulesOnly</code> (custom rules only).</li>
+</ul>
+<h2>Quick start</h2>
+<p>From your dbt project root:</p>
+<pre><code>npx dbt-doctor@latest</code></pre>
+<p>You get a <strong>score</strong> (75+ <strong>Great</strong>, 50–74 <strong>Needs work</strong>, under 50 <strong>Critical</strong>) and grouped findings. The score counts <strong>unique rules</strong> that fired (each <code>plugin/rule</code> once), not every occurrence.</p>
+<h2>Install for coding agents</h2>
+<p>Install the <strong>dbt-doctor</strong> skill into detected agents (Cursor, Claude Code, Codex, and others):</p>
+<pre><code>npx dbt-doctor@latest install</code></pre>
+<p>Use <code>--yes</code> to skip prompts. Same behavior as the website’s <code>curl</code> installer, which delegates to this command.</p>
+<h2>GitHub Actions</h2>
+<p>A <strong>composite action</strong> lives in this repo. Example workflow:</p>
+<pre><code>name: dbt Doctor
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write # for sticky PR comments
+
+jobs:
+  dbt-doctor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # required when using diff
+      - uses: northgraindata/dbt-doctor@main
+        with:
+          diff: main
+          github-token: $\{\{ secrets.GITHUB_TOKEN }}</code></pre>
+<p><strong>Notable inputs:</strong> <code>directory</code>, <code>verbose</code>, <code>project</code>, <code>diff</code>, <code>github-token</code>, <code>fail-on</code> (<code>error</code> / <code>warning</code> / <code>none</code>), <code>offline</code>, <code>annotations</code>, <code>setup-sqlfluff</code> (default installs SQLFluff + dbt templater), <code>node-version</code>.</p>
+<p>With <code>github-token</code> on <code>pull_request</code>, findings are posted as a <strong>sticky PR comment</strong>. The action exposes a <strong><code>score</code></strong> output (0–100) for follow-up steps (e.g. score floor checks).</p>
+<p><strong>Bare CLI in CI</strong> (no marketplace action):</p>
+<pre><code>- run: npx dbt-doctor@latest --fail-on warning</code></pre>
+<p>Remember to install SQLFluff in that job unless you rely on <code>skipSqlfluff</code> / <code>customRulesOnly</code>.</p>
+<h2>PR blocking and exit codes</h2>
+<ul>
+ <li><strong><code>--fail-on &lt;level&gt;</code></strong> - <code>error</code> (default), <code>warning</code>, or <code>none</code>. Applies to diagnostics that pass the <strong><code>ciFailure</code></strong> surface (see configuration).</li>
+ <li><strong><code>--diff &lt;base&gt;</code></strong> - only files changed vs <code>main</code> / <code>master</code> or your branch name; good for <strong>regression-only</strong> gates.</li>
+ <li><strong><code>--staged</code></strong> - only staged files (pre-commit). Do not combine with <code>--diff</code>.</li>
+</ul>
+<h2>Configuration</h2>
+<p>Add a <strong><code>.dbt-doctor</code></strong> props file at the project root (<code>KEY=value</code>, <code>#</code> comments - like <code>.env</code>). CLI flags override config.</p>
+<p><strong>Presets</strong> (<code>default</code> | <code>strict</code> | <code>enterprise</code>) control which rule tags run and default CI strictness. Omit <code>preset</code> to run all 122 rules.</p>
+<p><strong>Example <code>.dbt-doctor</code>:</strong></p>
+<pre><code># Full catalog + governance (all 122 rules including native SQL style)
+preset=enterprise
+score_mode=files
+fail_on=warning
+
+# Silence noisy rules on legacy paths
+ignore.rules=dbt-doctor/no-select-star
+ignore.files=models/legacy/**
+
+skip_sqlfluff=false
+offline=false</code></pre>
+<h3>Inline suppressions (SQL / YAML)</h3>
+<p>Use <strong><code>dbt-doctor-disable-next-line</code></strong> on the line above the finding. SQL:</p>
+<pre><code>-- dbt-doctor-disable-next-line dbt-doctor/no-select-star
+select * from \{\{ ref('stg_orders') }}</code></pre>
+<h2>CLI reference</h2>
+<pre><code>Usage: dbt-doctor [directory] [options]
+
+Options:
+  -v, --version              display the version number
+  --lint / --no-lint         enable or skip linting
+  --verbose                  show every rule and per-file details
+  --score                    output only the score
+  --json                     structured JSON report on stdout
+  --json-compact             with --json, minimal whitespace
+  -y, --yes                  skip prompts; scan all workspace packages
+  --full                     full scan (overrides diff in config / CLI)
+  --project &lt;name&gt;           workspace package(s), comma-separated
+  --diff [base]              only files changed vs base branch
+  --staged                   only git-staged files
+  --offline                  skip score API and share URL (local score)
+  --fail-on &lt;level&gt;          error | warning | none
+  --annotations              GitHub Actions annotation format
+  --pr-comment               tune output for sticky PR comments
+  --explain &lt;file:line&gt;      why a rule fired or suppression missed
+  --why &lt;file:line&gt;          alias for --explain
+  -h, --help                 display help
+
+Commands:
+  install|setup               install agent skills (--yes, --dry-run, -c cwd)</code></pre>
+<h2>Scoring</h2>
+<p>Formula (same locally and on the default API):</p>
+<p><code>score = round(100 − (unique error rules × 1.5) − (unique warning rules × 0.75))</code></p>
+<p>Labels: <strong>Great</strong> ≥ 75, <strong>Needs work</strong> ≥ 50, <strong>Critical</strong> &lt; 50.</p>
+<h2>Node.js API</h2>
+<pre><code>import \{ diagnose, toJsonReport, summarizeDiagnostics } from "dbt-doctor/api";
+
+const result = await diagnose("./path/to/dbt-project", \{ offline: false });
+
+console.log(result.score); // \{ score, label } | null in edge cases
+console.log(result.diagnostics);
+console.log(result.project); // ProjectInfo: adapter, model paths, etc.</code></pre>
+<h2>Who made dbt Doctor?</h2>
+<p><strong>dbt Doctor</strong> is built and maintained by <strong>Northgrain Data</strong>, a data engineering agency for modern dbt and Snowflake teams.</p>

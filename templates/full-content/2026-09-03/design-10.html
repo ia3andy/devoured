@@ -1,0 +1,48 @@
+<p>I’ve been polishing DuckDuckGo for iOS’s floating UI, a glass-capsule toolbar that morphs and collapses much like Safari’s. The transition between the tab switcher and a web page took four attempts to fix because the first three were trying to fix the wrong layer.</p>
+<p>The wider pass covered every state around that toolbar, including how it collapses during a scroll and how it makes room for a focused address field. Each change is small in isolation, but together they decide whether the browser chrome feels like one coherent object or a stack of views catching up with each other.</p>
+<h2>The raw problem</h2>
+<p>Switch from the tab switcher back to a tab and, in slow motion, you’d see a faint double image of the bottom toolbar: two overlapping copies of the back and forward arrows, tab count and menu button.</p>
+<p>Everything else about the transition looked right, which made it easy to assume this was a sequencing problem: retime the fade, adjust the crossfade, tighten the easing. Three rounds of that changed what was visible, which felt like progress, but the ghost kept coming back in a different form.</p>
+<p>If the ghost keeps changing shape, you’re tuning parameters on the wrong mechanism.</p>
+<h2>Stop guessing, start measuring</h2>
+<p>I finally fixed it by recording the transition at 60fps with the simulator’s slow-animations mode on, a 10× slowdown, then stepping through it frame by frame with ffmpeg. That’s what it took to see that the real toolbar’s tab-count badge was fully visible 24 frames before the snapshot animation even started. No amount of retiming a snapshot fixes a bug that happens before its code runs.</p>
+<p>It turned out that the duration and curve weren’t the problem, view ownership was. Dismissing the tab switcher triggered an async completion handler that snapped the toolbar to full opacity on the next run-loop turn, with no awareness that a custom transition was mid-flight and already owned that view. Three other code paths could do the same thing.</p>
+<p>I added an ownership check:</p>
+<pre><code>var isTabSwitcherTransitionOwningToolbar = false
+
+if !isTabSwitcherTransitionOwningToolbar \{
+    viewCoordinator.toolbar.alpha = toolbarAlpha(for: percent)
+}
+</code></pre>
+<p>One flag, respected by every path that writes that property, set for exactly as long as the transition owns the view.</p>
+<h2>Bounds aren’t always what’s drawn</h2>
+<p>With the ghosting gone, a second bug surfaced: the toolbar’s rounded bottom corners stayed flat for the whole transition, then snapped into roundness the instant the real toolbar took over.</p>
+<p>The capsule is deliberately drawn a little outside its own view bounds. That’s how it floats near the home indicator without disturbing the rest of the layout. <code>snapshotView(afterScreenUpdates:)</code> only captures a view’s bounds, so every snapshot we animated had the bottom of the capsule sliced off: corners, shadow and all.</p>
+<p>The lesson generalises: a view’s bounds and what it draws become two different rectangles the moment a transform pushes content outside itself. Snapshot the wrong one and you get a silently cropped copy that looks fine until it moves.</p>
+<pre><code>var visibleCapsuleRect: CGRect \{
+    let shadowSpill = materialBackgroundView.layer.shadowRadius
+        + materialBackgroundView.layer.shadowOffset.height
+
+    return bounds.union(
+        materialBackgroundView.frame.insetBy(
+            dx: -shadowSpill,
+            dy: -shadowSpill
+        )
+    )
+}
+</code></pre>
+<p>Ask the view what it draws, not what its bounds say. Snapshot that instead.</p>
+<h2>The squish</h2>
+<p>A separate bug, flagged in review, flattened the Dax logo into a wide oval when opening the tab switcher from an empty new-tab page, but only in list view.</p>
+<p>A snapshot of the whole page was being resized to fit the destination tab-cell frame, and <code>resizableSnapshotView</code> stretches non-uniformly rather than scaling. A grid cell’s proportions are close enough to the screen’s that nobody noticed. A list row is nearly six times wider than it is tall, so the whole page was squashed into a letterbox.</p>
+<p>My first fix matched the snapshot to the container’s width. It stopped the stretch, but replaced it with aggressive cropping that could clip the logo entirely. Fitting on the smaller of the two dimensions, not the larger, is what actually scales instead of crops:</p>
+<pre><code>let scale = min(
+    containerBounds.width / sourceSize.width,
+    containerBounds.height / sourceSize.height
+)
+</code></pre>
+<p>An honest shrink, centred, instead of a fill.</p>
+<h2>When to steal this</h2>
+<p>Any transition that animates a snapshot instead of the live view is worth checking for two failure modes: capturing bounds instead of drawn extent, and resizing instead of scaling.</p>
+<p>Both pass code review because both compile and look correct at the aspect ratio you happened to test. They only show up with a different shape, a wider row or a view with overflow, and by then the fix reads like a timing bug because that’s where the symptom appears.</p>
+<p>It rarely is. Record the transition, step through it frame by frame, and check what rectangle you’re actually asking for before touching a single duration or curve.</p>
