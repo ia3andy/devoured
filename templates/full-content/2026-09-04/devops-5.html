@@ -1,0 +1,274 @@
+<p>In the previous post, we introduced KubeVirtBMC and showed how it provides virtual BMC endpoints for KubeVirt VMs. We tested it with raw IPMI and Redfish commands. That was fun, but the real power of KubeVirtBMC shines when you pair it with actual bare-metal provisioning tools.</p>
+<p>In this post, we’ll walk through a complete end-to-end demo: using Metal3 to manage and provision KubeVirt VMs through KubeVirtBMC, just as if they were physical servers. You’ll be able to follow along and replicate every step.</p>
+<h2>Why Metal3?</h2>
+<p>Metal3 (Metal Kubed) is a CNCF Incubating project that brings bare-metal host management into the Kubernetes ecosystem. Under the hood, it uses OpenStack Ironic to handle the heavy lifting, inspecting hardware, setting boot devices, and writing OS images to disks.</p>
+<p>The core abstraction is the BareMetalHost custom resource. You declare what you want (BMC address, credentials, desired image), and Metal3 takes care of the rest. The typical BareMetalHost lifecycle goes like this:</p>
+<p>Metal3 expects to talk to a BMC via IPMI or Redfish. Physical servers have these built in. KubeVirt VMs don’t—unless you give them one with KubeVirtBMC.</p>
+<h2>What We’re Building</h2>
+<p>Here’s a high-level overview of the demo environment:</p>
+<p>Everything runs in a single Kubernetes cluster. Metal3 manages BareMetalHost resources that point to the virtual BMC endpoints created by KubeVirtBMC. When Metal3 tells Ironic to power on a host or attach a boot image, Ironic sends Redfish requests to the BMC pod. The BMC pod translates these into Kubernetes API calls to control the KubeVirt VM. Metal3 doesn’t know (or care) that it’s talking to a VM.</p>
+<h2>Prerequisites</h2>
+<p>Before we start, make sure you have:</p>
+<ul>
+ <li>A Kubernetes cluster with virtualization support (nested virtualization or bare metal)</li>
+ <li>KubeVirt installed and functional</li>
+ <li>A storage provider (for VM disks)</li>
+ <li>kubectl, helm, and kustomize installed locally</li>
+</ul>
+<h2>Step 1: Install cert-manager</h2>
+<p>Both KubeVirtBMC and Metal3 components require cert-manager for webhook certificates.</p>
+<pre><code>helm upgrade --install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+    --namespace=cert-manager \
+    --create-namespace \
+    --set=crds.enabled=true</code></pre>
+<h2>Step 2: Install KubeVirtBMC</h2>
+<pre><code>helm upgrade --install kubevirtbmc kubevirtbmc \
+    --repo=https://charts.kubevirtbmc.io \
+    --namespace=kubevirtbmc-system \
+    --create-namespace</code></pre>
+<h2>Step 3: Create a KubeVirt VM with BMC</h2>
+<p>We’ll create a VM that simulates a bare-metal server. It needs a disk, a network interface, and it should start in a powered-off state so that Metal3 can manage its lifecycle from scratch.</p>
+<p>Create a PVC for the VM’s root disk:</p>
+<pre><code>cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: metal3-demo-vm-disk
+  namespace: default
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+EOF</code></pre>
+<p>Create the VirtualMachine with <code>runStrategy: Halted</code> so it stays powered off:</p>
+<pre><code>cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: metal3-demo-vm
+  namespace: default
+spec:
+  runStrategy: Halted
+  template:
+    spec:
+      domain:
+        cpu:
+          cores: 4
+        memory:
+          guest: 8Gi
+        devices:
+          disks:
+          - name: rootdisk
+            disk:
+              bus: virtio
+          - name: cdrom
+            cdrom:
+              bus: sata
+          interfaces:
+          - name: default
+            macAddress: "02:00:00:00:00:01"
+            bridge: \{}
+        firmware:
+          bootloader:
+            efi:
+              secureBoot: false
+      networks:
+      - name: default
+        pod: \{}
+      volumes:
+      - name: rootdisk
+        persistentVolumeClaim:
+          claimName: metal3-demo-vm-disk
+EOF</code></pre>
+<p>Now create the VirtualMachineBMC and its credential Secret:</p>
+<pre><code>cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: demo-bmc-secret
+  namespace: default
+stringData:
+  username: admin
+  password: password
+---
+apiVersion: bmc.kubevirt.io/v1beta1
+kind: VirtualMachineBMC
+metadata:
+  name: demo-bmc
+  namespace: default
+spec:
+  virtualMachineRef:
+    name: metal3-demo-vm
+  authSecretRef:
+    name: demo-bmc-secret
+EOF</code></pre>
+<h2>Step 4: Install the Metal3 Stack</h2>
+<h3>Install the Ironic Standalone Operator</h3>
+<pre><code>git clone https://github.com/metal3-io/ironic-standalone-operator.git
+cd ironic-standalone-operator
+make install deploy
+
+kubectl -n ironic-standalone-operator-system wait --for=condition=Available \
+    deploy/ironic-standalone-operator-controller-manager \
+    --timeout=120s</code></pre>
+<h3>Deploy Ironic</h3>
+<p>First, create the namespace and the required TLS certificates:</p>
+<pre><code>kubectl create ns baremetal-operator-system</code></pre>
+<pre><code>cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: selfsigned-issuer
+  namespace: baremetal-operator-system
+spec:
+  selfSigned: \{}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ironic-cacert
+  namespace: baremetal-operator-system
+spec:
+  commonName: ironic-ca
+  isCA: true
+  issuerRef:
+    kind: Issuer
+    name: selfsigned-issuer
+  secretName: ironic-cacert
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ca-issuer
+  namespace: baremetal-operator-system
+spec:
+  ca:
+    secretName: ironic-cacert
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ironic-cert
+  namespace: baremetal-operator-system
+spec:
+  secretTemplate:
+    labels:
+      environment.metal3.io/ironic-standalone-operator: "true"
+  dnsNames:
+  - ironic.baremetal-operator-system.svc
+  - ironic.baremetal-operator-system.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: ca-issuer
+  secretName: ironic-cert
+EOF</code></pre>
+<pre><code>cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  labels:
+    environment.metal3.io/ironic-standalone-operator: "true"
+  name: ironic-credentials
+  namespace: baremetal-operator-system
+type: kubernetes.io/basic-auth
+stringData:
+  username: ironic
+  password: supersecret
+EOF</code></pre>
+<pre><code>cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: ironic.metal3.io/v1alpha1
+kind: Ironic
+metadata:
+  name: ironic
+  namespace: baremetal-operator-system
+spec:
+  apiCredentialsName: ironic-credentials
+  networking:
+    disableHostNetwork: true
+  tls:
+    certificateName: ironic-cert
+    disableVirtualMediaTLS: true
+  version: "37.0"
+EOF</code></pre>
+<h3>Install the Bare Metal Operator</h3>
+<pre><code>git clone https://github.com/metal3-io/baremetal-operator.git
+cd baremetal-operator</code></pre>
+<pre><code>mkdir -p config/overlays/kubevirtbmc-demo
+
+cat &gt; config/overlays/kubevirtbmc-demo/kustomization.yaml &lt;&lt;EOF
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: baremetal-operator-system
+resources:
+- ../../default
+components:
+- ../../components/basic-auth
+- ../../components/tls
+EOF
+
+cat &gt; config/default/ironic.env &lt;&lt;EOF
+DEPLOY_KERNEL_URL=
+DEPLOY_RAMDISK_URL=
+IRONIC_ENDPOINT=https://ironic.baremetal-operator-system.svc
+IRONIC_CACERT_FILE=/opt/metal3/certs/ca/tls.crt
+IRONIC_INSECURE=false
+EOF</code></pre>
+<pre><code>kustomize build config/overlays/kubevirtbmc-demo | kubectl apply -f -</code></pre>
+<h2>Step 5: Register the VM as a BareMetalHost</h2>
+<pre><code>cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: metal3-demo-vm-bmc-secret
+  namespace: default
+stringData:
+  username: admin
+  password: password
+---
+apiVersion: metal3.io/v1alpha1
+kind: BareMetalHost
+metadata:
+  name: metal3-demo-vm
+  namespace: default
+spec:
+  online: true
+  bootMACAddress: "02:00:00:00:00:01"
+  bmc:
+    address: redfish-virtualmedia+http://metal3-demo-vm-virtbmc.default.svc.cluster.local:80/redfish/v1/Systems/1
+    credentialsName: metal3-demo-vm-bmc-secret
+    disableCertificateVerification: true
+  rootDeviceHints:
+    deviceName: /dev/vda
+EOF</code></pre>
+<h2>Step 6: Provision the Host with an OS Image</h2>
+<pre><code>kubectl patch bmh metal3-demo-vm --type=merge -p '
+\{
+  "spec": \{
+    "image": \{
+      "url": "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso",
+      "format": "live-iso"
+    }
+  }
+}'</code></pre>
+<h2>Step 7: Verify and Clean Up</h2>
+<p>To deprovision (wipe the host and return it to the available pool):</p>
+<pre><code>kubectl patch bmh metal3-demo-vm --type=json \
+   -p '[\{"op": "remove", "path": "/spec/image"}]'</code></pre>
+<h2>Gotchas and Tips</h2>
+<ul>
+ <li><strong>MAC address mismatch.</strong> The <code>bootMACAddress</code> in BareMetalHost must match an actual interface on the VM.</li>
+ <li><strong>HTTP vs HTTPS.</strong> KubeVirtBMC serves Redfish over plain HTTP by default. Use <code>redfish-virtualmedia+http://</code>.</li>
+ <li><strong>Virtual media vs network boot.</strong> The <code>redfish-virtualmedia</code> driver boots the IPA ramdisk and provisioning images via virtual media (ISO attachment), which means no PXE, no DHCP, and no provisioning network is required.</li>
+ <li><strong>Ironic host networking.</strong> In this article, we disable host networking solely for demonstration purposes, allowing us to rely on in-cluster DNS.</li>
+ <li><strong>Cross-cluster scenarios.</strong> If Metal3 runs in a different cluster than KubeVirt, you can expose the KubeVirtBMC Services externally using Ingress or NodePort.</li>
+</ul>
+<h2>Why This Matters</h2>
+<ul>
+ <li><strong>CI/CD for bare-metal tools.</strong> Metal3, Ironic, and similar projects can use KubeVirtBMC to run their integration tests on KubeVirt VMs instead of maintaining a fleet of physical servers.</li>
+ <li><strong>Developer inner loop.</strong> If you’re developing bare-metal provisioning features, you can iterate much faster with VMs that spin up in seconds.</li>
+ <li><strong>Training and demos.</strong> Showcasing Metal3 no longer requires a rack of servers. A single Kubernetes cluster with KubeVirt is enough.</li>
+</ul>
+<h2>What’s Next</h2>
+<p>The KubeVirtBMC project is actively evolving. There is more work underway to improve Redfish compatibility and extend the BMC feature set. If you want to follow the progress or contribute, head over to the <a href="https://github.com/kubevirtbmc/kubevirtbmc">GitHub repository</a>.</p>

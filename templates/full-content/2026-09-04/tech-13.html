@@ -1,0 +1,67 @@
+<h2>How Zoom Detects Google Meet Without Microphone Access</h2>
+<p>Zoom uses macOS Control Center logs and Windows microphone privacy records to detect when other applications use the microphone.</p>
+<h2>TL;DR</h2>
+<ul>
+ <li>Zoom can notice that Google Meet, Teams, Slack, and other applications may be in a meeting and offer to start My Notes</li>
+ <li>On macOS, Zoom monitors Control Center’s <code>sensor-indicators</code> log stream</li>
+ <li>The messages contain records such as <code>[mic] Google Chrome (com.google.Chrome)</code></li>
+ <li>Zoom extracts an application identity and detects when microphone use starts or stops</li>
+ <li>On Windows, it obtains equivalent application-usage information from the per-user Capability Access Manager microphone records in the registry</li>
+ <li>Reading this metadata requires neither administrator/root privileges nor Zoom microphone permission</li>
+</ul>
+<h2>Why does Zoom know that Chrome is using the microphone?</h2>
+<p>Zoom’s My Notes feature can take notes during meetings hosted in applications such as Google Meet, Microsoft Teams, and Slack. Before the user starts it, Zoom can display a <strong>Take Note</strong> prompt when it thinks a third-party meeting is in progress.</p>
+<p>That raised an interesting question: how does Zoom recognize the other application before it has started taking notes?</p>
+<p>The answer differs by platform. On macOS, Zoom parses human-readable Unified Logging output. On Windows, it enumerates microphone-usage records in the registry.</p>
+<h2>The macOS detector</h2>
+<p>I statically analyzed the arm64 build of Zoom Workplace 7.1.5 (84650).</p>
+<p>The implementation is in a class named <code>PrivacyEventMonitor</code> inside <code>viper.framework</code>. Its relevant methods are:</p>
+<pre><code>-[PrivacyEventMonitor startMonitoring]
+-[PrivacyEventMonitor handleLogOutput:]
+-[PrivacyEventMonitor parseSystemLogLine:]
+-[PrivacyEventMonitor parseAttributionsStringForMicrophone:]
+-[PrivacyEventMonitor notifyMacAppStateChange:previousStates:]
+</code></pre>
+<p><code>startMonitoring</code> launches <code>/usr/bin/log</code>:</p>
+<pre><code>/usr/bin/log stream \
+  --type log \
+  --level default \
+  --predicate 'subsystem == "com.apple.controlcenter" AND category == "sensor-indicators"' \
+  --style compact
+</code></pre>
+<p>macOS Control Center maintains the orange and green privacy indicators for microphone and camera use. The same subsystem writes the currently responsible applications to Unified Logging. A microphone record for Chrome looks like:</p>
+<pre><code>Sorted active attributions from SystemStatus update: [mic] Google Chrome (com.google.Chrome)
+</code></pre>
+<p>macOS has already supplied the display name and bundle ID. Zoom keeps entries marked <code>[mic]</code>, parses those two fields, and compares each new attribution list with the previous one. An application appearing or disappearing becomes a microphone-start or microphone-stop event; no audio analysis is involved.</p>
+<h2>From Chrome to Google Meet</h2>
+<p>The UI layer contains a product category named <code>chrome</code>, labels it <strong>Google Meet</strong>, and applies notification and per-application blacklist settings. The overall flow is:</p>
+<pre><code>Chrome opens the microphone
+  -&gt; macOS updates Control Center's sensor attribution
+  -&gt; Control Center emits a sensor-indicators log record
+  -&gt; Zoom extracts “Google Chrome” and “com.google.Chrome”
+  -&gt; Zoom detects an application-state transition
+  -&gt; product mapping and notification policy
+  -&gt; optional “Take Note” prompt
+</code></pre>
+<p>This is more accurately called <strong>microphone-use detection</strong> than meeting detection. Chrome could be accessing the microphone for a reason unrelated to Google Meet. Zoom’s higher layers decide whether the signal should produce a prompt.</p>
+<h2>The Windows detector</h2>
+<p>I also statically analyzed Zoom Workplace for Windows x64 7.1.8.46825. Its detector is in <code>viper_async_device.dll</code> and reads this per-user registry key:</p>
+<pre><code>HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\
+CapabilityAccessManager\ConsentStore\microphone
+</code></pre>
+<p>Zoom opens the key with <code>KEY_READ</code>, enumerates packaged application entries and the <code>NonPackaged</code> subtree used by classic desktop applications, and queries each entry’s 64-bit <code>LastUsedTimeStop</code> value. A zero value represents an access interval that has not ended, so Zoom treats that application as currently using the microphone.</p>
+<p>The Windows flow is therefore:</p>
+<pre><code>Chrome opens the microphone
+  -&gt; Windows updates ConsentStore\microphone\NonPackaged
+  -&gt; LastUsedTimeStop remains zero while access is active
+  -&gt; Zoom enumerates the registry records
+  -&gt; Zoom identifies Chrome's executable
+  -&gt; product mapping and notification policy
+  -&gt; optional “Take Note” prompt
+</code></pre>
+<p>This part uses ordinary registry APIs. I found no ETW consumer, audio-session observer, or PCM processing in the application-attribution routine. Static analysis does not establish its polling interval, the feature flags controlling it, or whether detection metadata is included in telemetry.</p>
+<h2>Does this require permission?</h2>
+<p>I tested Zoom’s exact <code>/usr/bin/log stream</code> predicate as an ordinary user, without <code>sudo</code>, and macOS accepted it. Reading the records did not require Microphone, Screen Recording, System Audio Recording, or Accessibility permission.</p>
+<p>On Windows, the key is under <code>HKEY_CURRENT_USER</code> and Zoom requests only <code>KEY_READ</code>, so it likewise requires neither elevation nor microphone access.</p>
+<p>Neither mechanism should be treated as a stable application API. Zoom depends on undocumented macOS log formatting and Windows registry implementation details that either operating-system vendor could change.</p>
+<p>It is a clever use of privacy bookkeeping that both operating systems already expose—and a reminder that privacy indicators can themselves become a source of cross-application activity information.</p>

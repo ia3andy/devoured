@@ -1,0 +1,113 @@
+<h2>TL;DR</h2>
+<p>Three-LLM runs GPT-2, SmolLM2, Qwen, and Phi models locally in the browser by turning their inference graphs into Three.js TSL compute shaders on WebGPU. Try the demo at <a href="https://three-llm.ben3d.ca">https://three-llm.ben3d.ca</a>.</p>
+<p>I started this project to test two things: how far I could push the general compute capabilities of Three.js and WebGPU, and what today's small language models can do when they run in a browser. The models range from a 3-million parameter story generator to a modern 800-million parameter chat model.</p>
+<p>Three.js is known as a rendering library, but its WebGPU renderer also exposes storage buffers, compute dispatches, workgroup memory, atomics, and GPU readback. A language model puts all of those capabilities to work. It needs hundreds of ordered compute dispatches, large matrix-vector products, reductions, persistent attention or recurrent state, and a tight loop between the GPU and JavaScript as each new token appears.</p>
+<p>I built <a href="https://github.com/bhouston/three-llm">Three-LLM</a> as both a test of that compute stack and a usable inference library. It loads ordinary Hugging Face configurations, tokenizers, and SafeTensors checkpoints in the browser, builds the model from reusable <a href="https://threejs.org/docs/TSL.html">Three.js Shading Language</a> (TSL) compute kernels, and runs inference on the user's GPU through WebGPU. It does not need a server-side inference runtime or model-specific WebAssembly binary.</p>
+<p>The package includes CPU reference implementations for validation and GPU implementations for actual use. The library currently recognizes GPT-2, Llama-style, Gemma 3, Phi, and Qwen3.5 architectures. I also made a <a href="https://three-llm.ben3d.ca">quick chat application</a> so you can try five checkpoints without writing an application first:</p>
+<ul>
+ <li>TinyStories GPT-2 3M</li>
+ <li>GPT-2 124M</li>
+ <li>SmolLM2 135M</li>
+ <li>Qwen3.5 0.8B</li>
+ <li>Phi-1.5 1.3B</li>
+</ul>
+<p>I made the demo to test the library without first writing an application. Model files range from 15 MB to 2.8 GB before Three-LLM expands their weights to 32-bit floats. On a phone, stick with TinyStories or SmolLM2. Qwen and Phi need enough memory that many mobile devices will fail to load them.</p>
+<p>Using the library itself starts with a regular Three.js <code>WebGPURenderer</code>:</p>
+<pre><code>import \{ createTSLRunner } from 'three-llm';
+import \{ WebGPURenderer } from 'three/webgpu';
+
+const renderer = new WebGPURenderer();
+await renderer.init();
+
+const runner = await createTSLRunner(
+  'https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/main/',
+);
+
+const result = await runner.generate(renderer, 'Once upon a time,', \{
+  maxNewTokens: 64,
+  temperature: 0.7,
+  topK: 10,
+  onToken: (text) =&gt; console.log(text),
+});
+</code></pre>
+<h2>Before the transformer</h2>
+<p>The central operation remains: y = Wx + b</p>
+<p>An LLM owns many matrices containing learned weights. Inference repeatedly multiplies vectors by those matrices, applies a few nonlinear functions, and moves information between token positions. A transformer gives those operations a particular structure.</p>
+<h2>What happens when an LLM generates one token</h2>
+<p>The full loop has six parts:</p>
+<ol>
+ <li>A tokenizer converts text into a sequence of integer token IDs.</li>
+ <li>An embedding table turns each ID into a vector.</li>
+ <li>A stack of transformer blocks updates that vector using the current token and the preceding context.</li>
+ <li>A final matrix projection produces one score, called a <strong>logit</strong>, for every token in the vocabulary.</li>
+ <li>A sampling rule chooses one token from those scores.</li>
+ <li>The model appends that token and runs again.</li>
+</ol>
+<p>The model generates a sentence one token at a time. It predicts a token, adds it to the context, and repeats until it selects a stop token or reaches a limit.</p>
+<p>Processing the supplied prompt is called <strong>prefill</strong>. Generating subsequent tokens one at a time is called <strong>decode</strong>. These two phases run the same model but have different performance characteristics. Prefill has many known input tokens that a specialized implementation can process together. Decode has only one new token per step and must repeatedly read most of the model's weights.</p>
+<h2>GPT-2, one block at a time</h2>
+<p>GPT-2 first applies byte-level Byte Pair Encoding to the input. BPE repeatedly combines frequent adjacent symbols, giving the model a fixed vocabulary that can still represent any input text.</p>
+<p>Each resulting token ID selects a row from a learned token-embedding table. GPT-2 adds a second learned embedding for the token's position in the sequence. The sum is the first vector sent through the transformer.</p>
+<p>Every GPT-2 block then runs this sequence:</p>
+<ol>
+ <li>Layer normalization</li>
+ <li>Causal multi-head self-attention</li>
+ <li>A residual addition</li>
+ <li>A second layer normalization</li>
+ <li>A two-layer MLP using the GELU activation</li>
+ <li>Another residual addition</li>
+</ol>
+<p>Residual connections add each block's result back to its input. They let later blocks refine a representation without requiring every block to rebuild it.</p>
+<p>After the last block, GPT-2 applies one more normalization and projects the result to the vocabulary. If the vocabulary contains 50,257 tokens, that projection returns 50,257 logits. The sampler turns those scores into the next token ID.</p>
+<h2>Attention is a lookup built from the current context</h2>
+<p>Self-attention lets the current token retrieve information from earlier tokens. Each block projects its input into three vectors for every attention head:</p>
+<ul>
+ <li>A <strong>query</strong> describes what the current position is looking for.</li>
+ <li>A <strong>key</strong> describes what each position offers.</li>
+ <li>A <strong>value</strong> contains the information retrieved from that position.</li>
+</ul>
+<p>The query takes a dot product with each preceding key. Dividing by the square root of the head dimension keeps the scale stable, and softmax converts the scores into weights: Attention(Q,K,V) = softmax(QKᵀ / √d)V</p>
+<p>A causal mask excludes future positions. During generation there are no future tokens yet, but the same rule lets prompt tokens attend only to text that precedes them.</p>
+<p>Recomputing every earlier key and value for every generated token would waste most of the work. A <strong>KV cache</strong> stores them after their first computation. Each decode step writes one new key and value, then compares the new query against the cached keys. The cache grows with context length and becomes an important memory and bandwidth cost.</p>
+<h2>Expressing the model as TSL compute</h2>
+<p>Three-LLM represents each model operation as a small TSL compute kernel. A runner connects those kernels in the order required by the model recipe.</p>
+<p>One GPU invocation owns one output element and loops across the input vector:</p>
+<pre><code>return Fn(() =&gt; \{
+  const outputIndex = instanceIndex.toVar('outputIndex');
+
+  If(outputIndex.lessThan(uint(outputSize)), () =&gt; \{
+    const sum = biasNode.element(outputIndex).toVar('sum');
+
+    Loop(
+      \{ start: uint(0), end: uint(inputSize), type: 'uint', condition: '&lt;' },
+      (\{ i }) =&gt; \{
+        const weightIndex = i.mul(uint(outputSize)).add(outputIndex);
+        sum.addAssign(inputNode.element(i).mul(weightNode.element(weightIndex)));
+      },
+    );
+
+    outputNode.element(outputIndex).assign(sum);
+  });
+})().compute(outputSize, [workgroupSize]);
+</code></pre>
+<h2>Loading Hugging Face checkpoints at runtime</h2>
+<p>Three-LLM reads a Hugging Face <code>config.json</code>, tokenizer files, and SafeTensors weights. The configuration selects a recipe. The recipe describes the graph family, normalization, MLP type, residual layout, position encoding, head counts, and checkpoint layout. Tensor-name aliases map names into the common fields expected by the runners.</p>
+<h2>From GPT-2 to SmolLM2</h2>
+<p>SmolLM2 135M is close to GPT-2 in parameter count, but it uses the newer Llama-style decoder pattern. Four architectural changes matter to the inference implementation: RMSNorm, Rotary Position Embeddings, Grouped-Query Attention, and SwiGLU activation.</p>
+<h2>Phi changes the block layout</h2>
+<p>Phi-1.5 is a 1.3-billion-parameter model. Its inference graph differs from GPT-2 in two ways: it uses partial RoPE, and its attention and MLP branches run in parallel from the same normalized input.</p>
+<h2>Qwen3.5 needs a different kind of memory</h2>
+<p>Qwen3.5 0.8B uses a hybrid stack: three Gated DeltaNet layers for each gated full-attention layer. Full-attention layers retain a KV cache. Gated DeltaNet layers replace that growing history with fixed-size recurrent state.</p>
+<h2>Optimizations that paid off</h2>
+<p>I tested kernel rewrites, command submission, prefill behavior, readback, and model-loading changes while building the library. A few changes accounted for most of the measured gains:</p>
+<ul>
+ <li><strong>Submit a forward pass once:</strong> Recording ordered nodes into one Three.js compute call reduced 427 command submissions to one.</li>
+ <li><strong>Do not compute unused prompt logits:</strong> Only the final prompt token needs vocabulary logits.</li>
+ <li><strong>Reuse prompt prefixes:</strong> Three-LLM compares the new token sequence with the previous one and reuses the matching prefix.</li>
+ <li><strong>Reduce sampling on the GPU:</strong> Three-LLM can run a hierarchical maximum or small top-k reduction on the GPU to avoid synchronization points.</li>
+ <li><strong>Free copies once the GPU owns the weights:</strong> After Three.js creates the GPU bindings, Three-LLM releases static CPU weight arrays.</li>
+</ul>
+<h2>The FP32 cost</h2>
+<p>Three-LLM currently runs every GPU kernel with 32-bit floating-point storage and arithmetic. While this provides a simple baseline, it imposes a large memory and bandwidth cost compared to native FP16 or quantized weights. Future development will focus on adding FP16 support and quantized dot products.</p>
+<h2>Try it</h2>
+<p>You can run the <a href="https://three-llm.ben3d.ca">live Three-LLM chat demo</a>, install <a href="https://www.npmjs.com/package/three-llm"><code>three-llm</code> from npm</a>, or read the <a href="https://github.com/bhouston/three-llm">source on GitHub</a>.</p>
