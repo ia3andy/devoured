@@ -1,0 +1,214 @@
+<h1>DuckFlight DuckDB extension</h1>
+<p>DuckFlight turns any DuckDB database into a PostgreSQL and Arrow Flight SQL server. Query it with <code>psql</code>, PostgreSQL drivers and BI tools, ADBC Flight SQL clients, or another DuckDB instance through Airport. Every client reads and writes the same live database—there is no second service to run and no data to export or copy.</p>
+<h2>Install and load</h2>
+<p>Install the signed extension directly from DuckDB Community Extensions:</p>
+<pre><code>install duckflight from community;
+load duckflight;</code></pre>
+<p>DuckDB downloads the build matching your DuckDB version and platform. DuckFlight currently supports Linux and macOS on amd64 and arm64.</p>
+<p>Download the artifact for your platform from the latest release. Release artifacts are not signed by DuckDB, so start the CLI with unsigned extensions enabled:</p>
+<pre><code>duckdb -unsigned</code></pre>
+<p>Then load the downloaded file by its absolute path:</p>
+<pre><code>load '/absolute/path/to/duckflight-v1.5.5-osx_arm64.duckdb_extension';
+select * from duckflight_core_status();</code></pre>
+<p>Choose the asset matching <code>linux_amd64</code>, <code>linux_arm64</code>, <code>osx_amd64</code>, or <code>osx_arm64</code>. The <code>-unsigned</code> flag weakens DuckDB's extension-signature protection for that process, so use it only with an artifact downloaded from this repository's releases and verify its checksum when moving it through another system.</p>
+<h2>SQL API</h2>
+<p>DuckFlight adds server-control table functions and, when the real core initializes, PostgreSQL compatibility macros and catalog views. This guide covers the basics useful to extension users. The public test mock only implements server lifecycle operations; it does not provide the core's SQL compatibility layer.</p>
+<h3>Start, inspect, and stop servers</h3>
+<p>Run these in the DuckDB instance that loads the extension. Both protocols use that same database, including an in-memory database. Keep the host process running while clients connect.</p>
+<pre><code>load duckflight;
+
+select * from duckflight_core_status();
+select * from duckflight_pg_serve('127.0.0.1:5433', '/path/to/duckflight.toml');
+select * from duckflight_flight_serve('127.0.0.1:31337', '/path/to/duckflight.toml');
+select * from duckflight_servers();
+
+select * from duckflight_stop('pgwire', '127.0.0.1:5433');
+select * from duckflight_stop('flight', '127.0.0.1:31337');</code></pre>
+<table>
+ <thead>
+  <tr>
+   <th>Function</th>
+   <th>Arguments</th>
+   <th>Returned columns</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>duckflight_core_status()</code></td>
+   <td>None</td>
+   <td><code>loaded</code> (boolean), <code>abi_version</code> (unsigned bigint), <code>detail</code> (varchar)</td>
+  </tr>
+  <tr>
+   <td><code>duckflight_pg_serve(address, config_file)</code></td>
+   <td>Two varchar values</td>
+   <td><code>protocol</code>, <code>address</code> (varchar)</td>
+  </tr>
+  <tr>
+   <td><code>duckflight_flight_serve(address, config_file)</code></td>
+   <td>Two varchar values</td>
+   <td><code>protocol</code>, <code>address</code> (varchar)</td>
+  </tr>
+  <tr>
+   <td><code>duckflight_servers()</code></td>
+   <td>None</td>
+   <td><code>protocol</code>, <code>address</code> (varchar), one row per listener</td>
+  </tr>
+  <tr>
+   <td><code>duckflight_stop(protocol, address)</code></td>
+   <td>Two varchar values</td>
+   <td><code>status</code> (varchar)</td>
+  </tr>
+ </tbody>
+</table>
+<p>Start functions return after starting a background listener. Use <code>host:port</code> for the address; port <code>0</code> asks the operating system to choose a free port. The returned address is authoritative: use it when connecting or stopping, including when a hostname resolves to an IP address.</p>
+<h3>Common PostgreSQL compatibility helpers</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Area</th>
+   <th>Useful signatures</th>
+   <th>Purpose</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Strings</td>
+   <td><code>initcap(s)</code>, <code>btrim(s, chars)</code></td>
+   <td>Capitalize space-separated words; trim specified characters</td>
+  </tr>
+  <tr>
+   <td>SQL quoting</td>
+   <td><code>quote_literal(s)</code>, <code>quote_ident(s)</code>, <code>quote_nullable(s)</code></td>
+   <td>Quote SQL values or identifiers; represent a null as SQL text</td>
+  </tr>
+  <tr>
+   <td>Numbers</td>
+   <td><code>div(a, b)</code>, <code>width_bucket(x, minv, maxv, count)</code></td>
+   <td>Truncated division; equal-width numeric buckets</td>
+  </tr>
+  <tr>
+   <td>Aggregates</td>
+   <td><code>every(x)</code></td>
+   <td>Boolean AND across rows</td>
+  </tr>
+  <tr>
+   <td>Arrays</td>
+   <td><code>array_ndims(arr)</code>, <code>array_remove(arr, val)</code>, <code>array_replace(arr, old, new)</code></td>
+   <td>Inspect dimensions or transform array elements</td>
+  </tr>
+  <tr>
+   <td>JSON</td>
+   <td><code>json_typeof(j)</code>, <code>jsonb_array_length(j)</code></td>
+   <td>Inspect a JSON value or array length</td>
+  </tr>
+  <tr>
+   <td>JSON aggregates</td>
+   <td><code>json_agg(x)</code>, <code>json_object_agg(k, v)</code></td>
+   <td>Build JSON arrays or objects from rows</td>
+  </tr>
+  <tr>
+   <td>Date/time</td>
+   <td><code>to_char(val, fmt)</code>, <code>to_date(val, fmt)</code>, <code>to_timestamp(val, fmt)</code></td>
+   <td>Format or parse supported date/time patterns</td>
+  </tr>
+ </tbody>
+</table>
+<h3>DuckFlight session and diagnostic utilities</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Function</th>
+   <th>Result</th>
+   <th>Purpose in a PgWire session</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>duckflight_current_user()</code></td>
+   <td>varchar</td>
+   <td>User associated with the client session</td>
+  </tr>
+  <tr>
+   <td><code>duckflight_current_database()</code></td>
+   <td>varchar</td>
+   <td>Client-facing database name, which can differ from the underlying DuckDB catalog</td>
+  </tr>
+  <tr>
+   <td><code>duckflight_visible_database()</code></td>
+   <td>varchar</td>
+   <td>Underlying DuckDB database selected for catalog visibility</td>
+  </tr>
+  <tr>
+   <td><code>duckflight_session_pid()</code></td>
+   <td>integer</td>
+   <td>PgWire backend/session identifier, not the host operating-system process ID</td>
+  </tr>
+  <tr>
+   <td><code>duckflight_runtime_databases()</code></td>
+   <td>Table with <code>datname</code></td>
+   <td>Distinct database names represented in tracked PgWire sessions, not all attached databases</td>
+  </tr>
+  <tr>
+   <td><code>duckflight_pg_stat_activity()</code></td>
+   <td>Table with session and query metadata</td>
+   <td>Inspect tracked PgWire sessions, including <code>pid</code>, <code>datname</code>, <code>usename</code>, <code>application_name</code>, <code>state</code>, and <code>query</code></td>
+  </tr>
+  <tr>
+   <td><code>duckflight_pg_stat_ssl()</code></td>
+   <td>Table with TLS metadata</td>
+   <td>Inspect <code>pid</code> and <code>ssl</code> for sessions belonging to the current user</td>
+  </tr>
+  <tr>
+   <td><code>duckflight_database_oid(name)</code></td>
+   <td>unsigned integer</td>
+   <td>Generate the database identifier used by the PostgreSQL compatibility catalogs</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Authentication setup</h2>
+<p>Both extension listeners take the path to one <code>duckflight.toml</code> file:</p>
+<pre><code>select * from duckflight_pg_serve('127.0.0.1:5433', '/run/secrets/duckflight.toml');
+select * from duckflight_flight_serve('127.0.0.1:31337', '/run/secrets/duckflight.toml');</code></pre>
+<h3>Secure defaults</h3>
+<p>Every listener requires at least one configured user, bearer token, or mTLS identity. An empty configuration does not start an anonymous server.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Client</th>
+   <th>Authentication on the wire</th>
+   <th>Required config</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>PostgreSQL</td>
+   <td>PostgreSQL SCRAM-SHA-256</td>
+   <td><code>[users.*]</code></td>
+  </tr>
+  <tr>
+   <td>ADBC Flight SQL username/password</td>
+   <td>Basic authorization during the Flight handshake, then a server-issued bearer</td>
+   <td><code>[users.*]</code>; TLS outside loopback</td>
+  </tr>
+  <tr>
+   <td>Airport or direct bearer ADBC</td>
+   <td>Bearer on every Flight RPC; no username/password handshake</td>
+   <td><code>[tokens.*]</code>; TLS outside loopback</td>
+  </tr>
+  <tr>
+   <td>mTLS</td>
+   <td>Verified client certificate mapped by SHA-256 fingerprint</td>
+   <td><code>[tls]</code> with <code>client_ca</code> and <code>identities</code></td>
+  </tr>
+ </tbody>
+</table>
+<h2>Build and test</h2>
+<p>The repository follows DuckDB's Rust Community Extension template and pins <code>extension-ci-tools</code> as a submodule. Clone with submodules, then run:</p>
+<pre><code>git submodule update --init --recursive
+make configure
+make debug
+make test_debug</code></pre>
+<h2>Security</h2>
+<p>The bundled core executes native code in the DuckDB process. Release inputs must be immutable and checksum-verified. SQL callers are trusted to manage DuckFlight listeners, just as they are trusted to operate the DuckDB instance. The core rejects non-loopback listeners without TLS and rejects listeners with no authentication method.</p>
+<h2>License</h2>
+<p>This extension is licensed under the MIT License. Sidequery also licenses the bundled core binaries under MIT; the core source code remains private and is not covered by that license.</p>

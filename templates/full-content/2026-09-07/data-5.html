@@ -1,0 +1,113 @@
+<p>A nightly job loads 100,000 rows from a file into Postgres. It takes 41 minutes. The table has three indexes, the rows are small, the database is on a machine doing almost nothing, and 41 minutes is roughly 40 rows per second, which is a number so bad it does not look like a performance problem. It looks like something is broken.</p>
+<p>Nothing is broken. The job is issuing 100,000 separate statements, each in its own transaction, across a network link with 0.4ms of latency, and the arithmetic on that is exactly what you would predict.</p>
+<p>Rewritten to use <code>COPY</code>, the same load takes 11 seconds.</p>
+<h2>The work is not where you think</h2>
+<p>For a small insert, the row is not the expensive part. The overhead around it is.</p>
+<p>Every statement pays a network round trip out and back. The server parses the SQL text, plans it, and executes it. The transaction machinery opens, records and commits. Then the result comes back and the client moves to the next row.</p>
+<pre><code>per row, roughly:
+  network round trip      0.4ms
+  parse and plan          0.05ms
+  execute                 0.02ms
+  commit and flush        0.5ms</code></pre>
+<p>The row insert is 20 microseconds of a roughly one millisecond operation. Everything else is ceremony, and batching is how you stop paying the ceremony once per row.</p>
+<h2>The batch API that does not batch</h2>
+<p>Here is the part that genuinely annoys me, because the code looks right.</p>
+<pre><code>PreparedStatement ps = conn.prepareStatement(
+        "INSERT INTO events (id, type, payload) VALUES (?, ?, ?)");
+
+for (Event e : events) \{
+    ps.setLong(1, e.getId());
+    ps.setString(2, e.getType());
+    ps.setString(3, e.getPayload());
+    ps.addBatch();
+}
+ps.executeBatch();</code></pre>
+<p>That is textbook JDBC batching. Against MySQL with default connection settings, it sends 100,000 separate INSERT statements. The driver accepts them into a batch, then loops and executes them individually, because rewriting them into a multi-value statement is opt in.</p>
+<pre><code>jdbc:mysql://host/db?rewriteBatchedStatements=true</code></pre>
+<p>Without that parameter, <code>addBatch</code> is a client side convenience with no effect on the wire. With it, the driver combines rows into <code>INSERT INTO events VALUES (...), (...), (...)</code> and the round trip count collapses.</p>
+<p>Postgres has the same shape with a different name:</p>
+<pre><code>jdbc:postgresql://host/db?reWriteBatchedInserts=true</code></pre>
+<p>Both default to off. Both produce code that passes review, passes tests, and performs like it never batched. I have seen this exact flag be the entire content of a performance fix more than once, and there is nothing in the API that hints at it.</p>
+<p>Worth setting a batch size rather than accumulating everything, because the driver builds the whole statement in memory:</p>
+<pre><code>int batchSize = 1_000;
+int count = 0;
+
+conn.setAutoCommit(false);
+for (Event e : events) \{
+    // bind parameters
+    ps.addBatch();
+    if (++count % batchSize == 0) \{
+        ps.executeBatch();
+    }
+}
+ps.executeBatch();
+conn.commit();</code></pre>
+<p>Somewhere around 500 to 5,000 rows per batch is the usual sweet spot. Past that the statement gets large enough that memory and parse time start eating the gain.</p>
+<h2>Autocommit turns every row into a barrier</h2>
+<p>The <code>setAutoCommit(false)</code> line above is doing more work than it appears to.</p>
+<p>With autocommit on, each insert is its own transaction. Each transaction commits. Each commit is a durability barrier, which means waiting for the storage device to confirm the write-ahead log record is safe.</p>
+<p>That barrier is not CPU work you can parallelise away. It is a wait on the device, and it caps throughput at roughly one over the flush latency regardless of everything else. A hundred thousand autocommitted inserts is a hundred thousand flushes.</p>
+<p>Wrapping the load in one transaction means one barrier for the whole thing. The write-ahead log records still get written, they just get flushed together.</p>
+<h2>The ladder, and where COPY sits</h2>
+<p>Each rung removes a different overhead, which is why the gains multiply rather than add.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Approach</th>
+   <th>Round trips</th>
+   <th>Parse cost</th>
+   <th>Transactions</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Single inserts, autocommit</td>
+   <td>one per row</td>
+   <td>one per row</td>
+   <td>one per row</td>
+  </tr>
+  <tr>
+   <td>Single inserts in a transaction</td>
+   <td>one per row</td>
+   <td>one per row</td>
+   <td>one total</td>
+  </tr>
+  <tr>
+   <td>JDBC batch without the flag</td>
+   <td>one per row</td>
+   <td>one per row</td>
+   <td>one total</td>
+  </tr>
+  <tr>
+   <td>JDBC batch with the flag</td>
+   <td>one per batch</td>
+   <td>one per batch</td>
+   <td>one total</td>
+  </tr>
+  <tr>
+   <td><code>COPY</code> / <code>LOAD DATA INFILE</code></td>
+   <td>streamed</td>
+   <td>none</td>
+   <td>one total</td>
+  </tr>
+ </tbody>
+</table>
+<p><code>COPY</code> is a different protocol path rather than a faster statement. There is no SQL to parse per row, no plan, no per-statement bookkeeping. The client streams rows and the server writes them.</p>
+<pre><code>CopyManager copy = new PGConnection(conn).getCopyAPI();
+copy.copyIn("COPY events (id, type, payload) FROM STDIN WITH (FORMAT csv)", reader);</code></pre>
+<p>For genuine bulk loading this is the correct tool and the difference is not subtle.</p>
+<h2>The same principle on the read side</h2>
+<p>Reads have the identical failure and it hides better, because reading in a loop looks like normal code.</p>
+<pre><code>// 500 round trips
+for (Long id : ids) \{
+    orders.add(orderRepository.findById(id));
+}
+
+// One
+List&lt;Order&gt; orders = orderRepository.findAllByIdIn(ids);</code></pre>
+<p>Keep the <code>IN</code> list bounded. A few thousand values is fine; a hundred thousand produces a statement large enough to be slow to parse and, on Postgres, can blow past the bind parameter limit. Chunking the ids into pages of a thousand and issuing a handful of queries is almost always the right shape.</p>
+<h2>What I would check</h2>
+<p>Run the load with <code>rewriteBatchedStatements</code> or <code>reWriteBatchedInserts</code> explicitly set and compare, because if the timing changes then the code was never batching and everything else you tune is noise on top of that.</p>
+<p>Count round trips rather than reasoning about them. Postgres <code>log_statement = 'all'</code> for a single run, or the query count metrics from the connection pool, will tell you in one number whether the batch reached the wire.</p>
+<p>Check autocommit on any code path that writes more than a handful of rows. It is on by default in most drivers and it is the single largest multiplier in the table above.</p>
+<p>The thing that makes this worth writing down is that all four of these controls are invisible at the call site. The loop looks the same whether it issues one round trip or a hundred thousand, the batch API looks identical whether or not the driver honours it, and autocommit is a connection property set somewhere else entirely. The code cannot tell you which version you have. Only the wire can.</p>

@@ -1,0 +1,59 @@
+<h1>Sail 0.7: Stateless Compute, Durable Job State</h1>
+<p>Sail 0.7 delegates shuffle and checkpoint state to object storage, making jobs more resilient and letting them run on smaller clusters.</p>
+<p>The Sail 0.7 release comes with two highly requested features: <strong>blocking shuffle</strong> and <strong>checkpoint</strong>. Both stem from the same philosophy: an engine should treat decoupled storage and compute as its native environment, not an accommodation.</p>
+<p>Cloud data infrastructure has been converging on this shape for over a decade. Data lives in object storage, durable, cheap, and effectively unlimited. Compute appears when a job starts and disappears when it finishes. You store everything, and you pay for compute only while it runs.</p>
+<p>One kind of state still resists the decoupling: the intermediate data inside a running job. Shuffle data and checkpoint data accumulate as a job executes, and in Spark and most other engines they live on the workers themselves. A lost worker loses data. A running job pins its cluster.</p>
+<p>How does Sail leverage this? Sail’s workers are stateless by design, and 0.7 applies that principle to a job’s intermediate data: we delegate state management for shuffle data and checkpoint data to external storage, making the architecture simpler and more scalable, and making Sail a stronger fit for the composable data stack.</p>
+<h2>Blocking Shuffle</h2>
+<p>In Sail, a job is represented as a directed acyclic graph (DAG) of stages, where each stage runs parallel tasks to process partitioned data. The job stages exchange data under different modes, including shuffle, forward, and broadcast. The stage definition also indicates whether the stage output should be pipelined or blocking, which affects how stages are scheduled in the control plane.</p>
+<p>Stages connected by pipelined data exchange form a <strong>task region</strong> whose tasks must be scheduled and retried together. The boundaries between task regions are blocking data exchanges, where data is persisted before downstream task regions are scheduled. Both pipelined and blocking exchanges can coexist in one job graph, providing a flexible blueprint for the job’s control-plane scheduling and data-plane operations.</p>
+<p>The design for data exchange modes and task regions forms Sail’s unified shuffle architecture, which blocking shuffle is built on top of. We implement blocking shuffle by inserting an additional stage at each shuffle boundary. This stage receives shuffle data from mapper tasks in the previous stage and merges it into a single output stream for each reduce partition. This is essentially a “no-op” reducer stage whose output is marked as blocking, so the stream manager writes the output as compressed Arrow data to object storage. The actual reducer stage connects with the auxiliary “no-op” reducer stage with <em>forward</em> mode and <em>blocking</em> data exchange, so that the actual reducer stage belongs to a separate task region and reads the persisted shuffle data from object storage after the previous task region completes.</p>
+<p>A blocking shuffle, planned as ordinary stages: map tasks shuffle into a merge stage within one task region, the merge stage writes one compressed Arrow stream per reduce partition to object storage, and each reduce partition runs as its own task region that reads the persisted data after the first region completes.</p>
+<p>This implementation elegantly achieves a similar effect to the ”push-based” shuffle merging described in the Magnet paper (which is also discussed in the Exoshuffle paper). In doing so, it avoids writing one file per reduce partition for every mapper task, naturally preventing the “small file problem” when naively adopting the “pull-based” shuffle implementation for object storage.</p>
+<p>Blocking shuffle improves resiliency and helps jobs scale. In the default pipelined shuffle mode, a task failure can cause all connected stages to retry because the intermediate data has not been materialized. With blocking shuffle, data is first written to persistent storage. Downstream tasks can retry by reading from that storage again, rather than triggering cascading retries of upstream tasks.</p>
+<p>Although persistence adds write overhead, it can reduce total job runtime when workers are frequently preempted or memory is constrained. It also enables jobs to run on smaller clusters. Pipelined shuffle requires all connected tasks to run concurrently, whereas blocking shuffle requires only one task region to be active at a time. Downstream task regions can be scheduled after the previous task region completes, reusing the same underlying worker resources.</p>
+<p>Getting started with storage-based blocking shuffle is easy. You define the following environment variables for the Sail server to specify <code>storage</code> as the shuffle backend and a base path to store shuffle data.</p>
+<pre><code>export SAIL_CLUSTER__SHUFFLE_BACKEND__TYPE=storage
+export SAIL_CLUSTER__SHUFFLE_BACKEND__STORAGE__PATH="s3://sail/shuffle"</code></pre>
+<h2>Checkpoint</h2>
+<p>The Spark <code>DataFrame.checkpoint()</code> API allows you to store intermediate data for reuse. This is important for iterative processing (typically seen in graph algorithms). Without checkpoint the query plan can grow exponentially large during iterations, and all the computation is done from scratch in every step.</p>
+<p>The example below computes connected components by label propagation: every vertex starts in its own component and repeatedly adopts the smallest component ID among itself and its neighbors. This is a classic use case when checkpointing is a must.</p>
+<pre><code>from pyspark.sql import functions as F
+
+vertices = spark.createDataFrame(
+    [(1,), (2,), (3,), (4,), (5,), (6,)],
+    ["id"],
+)
+edges = spark.createDataFrame(
+    [(1, 2), (2, 1), (2, 3), (3, 2), (4, 5), (5, 4)],
+    ["src", "dst"],
+)
+
+labels = vertices.withColumn("component", F.col("id"))
+
+for _ in range(3):
+    neighbor_min = (
+        labels.join(edges, labels["id"] == edges["src"])
+        .groupBy(F.col("dst").alias("id"))
+        .agg(F.min("component").alias("neighbor_component"))
+    )
+    labels = (
+        labels.join(neighbor_min, "id", "left")
+        .withColumn(
+            "component",
+            F.least("component", F.coalesce("neighbor_component", "component")),
+        )
+        .drop("neighbor_component")
+        .checkpoint(eager=True)
+    )
+
+labels.orderBy("id").show()</code></pre>
+<p>Previously, due to the lack of checkpoint support in Sail, users had to explicitly write their data and then read it back again. Now, with <strong>eager checkpointing</strong>, data materialization happens behind the scenes, allowing users to focus on the business logic in their code. We also plan to support <strong>lazy</strong> <strong>checkpointing,</strong> where data is materialized implicitly upon first use.</p>
+<p>Spark distinguishes between <code>DataFrame.localCheckpoint</code> and <code>Dataframe.checkpoint()</code>, where the former stores data in the executor’s local disk. In Sail, since all workers are stateless, we favor supporting the latter. To store the checkpoint data, you can either use a shared network file system available to all nodes in a cluster, or an object store such as AWS S3. The checkpoint data is scoped to the session and Sail handles data cleanup when the session ends.</p>
+<p>Getting started with checkpoint is also easy. You define the following environment variable for the Sail server to specify a base path to store checkpoint data.</p>
+<pre><code>export SAIL_EXECUTION__CHECKPOINT__PATH="s3://sail/checkpoint"</code></pre>
+<h2>Getting Started with Sail</h2>
+<p>Sail 0.7 works with the latest PySpark 4.2 client. It is available on PyPI. Install or upgrade with <code>pip install pysail==0.7.0</code>, or see the installation guide for standalone binary and Docker options. The documentation covers cluster deployment and configuration in detail.</p>
+<h2>Join the Community</h2>
+<p>Sail 0.7.0 has received a record-breaking 11 community contributors (with 5 being first-time). Sail wouldn’t have its current shape without its community, and we welcome contributions of all kinds: code, feature ideas, and especially bug reports with reproducible examples.</p>
+<p>Stay tuned for more feature announcements. You can follow along on GitHub or by joining our Slack Community.</p>

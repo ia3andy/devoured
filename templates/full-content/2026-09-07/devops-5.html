@@ -1,0 +1,94 @@
+<h1>How to Carry User Identity Across Federated Kubernetes and AI Platforms</h1>
+<p>Modern AI platforms are no longer a single application behind one login screen. A user may start in a central portal, open a governed dataset, launch a notebook where that data resides, and invoke an assistant that calls services in another cluster. The workflow feels unified, but identity crosses control-plane and data-plane boundaries at every step. That is where conventional single sign-on (SSO) stops being enough.</p>
+<p>SSO proves the user at the front door. Platform teams who manage a federated data or AI platform across multiple clusters still need a reliable way to carry that user context into distributed execution environments without handing raw tokens to every application, weakening revocation, or forcing each cluster to reimplement identity-provider logic.</p>
+<p>This challenge is especially important for AI and data platforms, where data and compute often stay close to where they are produced, stored, or governed. Workloads may run in regional clusters, separate cloud accounts, on-premises environments, or specialized execution planes. Users still expect one platform experience across notebooks, catalogs, query tools, dashboards, and AI assistants.</p>
+<p>This post describes a central identity gateway pattern for propagating user identity across those federated data planes. A central gateway owns the platform session. Data-plane gateways validate that session through a shared API and convert it into trusted local identity context for downstream applications. The pattern uses standard OpenID Connect (OIDC), a shared session store, stateless data-plane gateways, and a small identity-validation API that services can trust.</p>
+<p>At NVIDIA, this approach reduced repeated login events by 55% across internal developer platforms spanning Kubernetes clusters in AWS and OCI. More importantly, it created a reusable foundation for unified platform shells, consistent logout, lower upstream identity-provider load, and AI assistants that can act with delegated user identity across data planes.</p>
+<h2>Where SSO ends and data-plane identity begins</h2>
+<p>The implementation details will vary by organization, but the core design is broadly applicable to platform teams running federated Kubernetes environments, multi-cloud data platforms, machine learning workbenches, internal developer portals, or AI application stacks with multiple authenticated tools. SSO gives users one entry point.</p>
+<p>Federated data platforms still need a way to carry identity into the planes where work executes. A notebook in one cluster, a catalog API in another, and an assistant calling a query engine in a third all need the same answer: Who is the user, and what are they allowed to do here?</p>
+<p>Without a shared identity propagation model, several problems appear:</p>
+<ul>
+ <li>Control-plane authentication doesn’t automatically become trusted data-plane identity</li>
+ <li>Raw token forwarding expands credential exposure and makes it harder to reason about who can use which token where</li>
+ <li>Each data-plane gateway may integrate with the identity provider differently, creating inconsistent claims, refresh behavior, and audit records</li>
+ <li>Logout and revocation may not propagate quickly across every cluster or execution plane</li>
+ <li>New applications inherit identity plumbing instead of consuming a standard platform contract</li>
+</ul>
+<p>For users, the symptom may look like repeated login prompts. For platform engineers, the deeper issue is distributed token propagation: identity created at the control plane must be transformed into trusted, scoped, auditable context at each data plane.</p>
+<p>That model works for a small number of applications, but it creates structural problems as the platform expands:</p>
+<ul>
+ <li>Sessions are scoped to where they were created. A token issued by one gateway is unknown to another, so users authenticate per service instead of per platform</li>
+ <li>Logout is local. Signing out of one tool can leave active sessions elsewhere, creating both user confusion and security risk</li>
+ <li>Token refresh is uncoordinated. Every gateway independently negotiates refresh cycles with the upstream identity provider, increasing load and creating divergent session states</li>
+ <li>Identity context is inconsistent. Downstream services often parse tokens differently or duplicate authentication logic</li>
+ <li>New services inherit old complexity. Adding another tool usually means rebuilding the same auth integration again</li>
+</ul>
+<h2>Comparing two identity patterns</h2>
+<p>There are two common ways to structure identity in a federated platform.</p>
+<p>The first pattern is distributed session ownership. Each service gateway owns its own login flow, session store, token refresh logic, and logout behavior. This keeps each cluster independent, but it also means the identity state does not move cleanly across the platform.</p>
+<p>The second pattern is centralized session ownership. A dedicated identity gateway owns login, session state, refresh, and logout. Regional gateways remain in place, but they delegate session validation to the central identity gateway and focus on request enforcement.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Design choice</th>
+   <th>Distributed session ownership</th>
+   <th>Centralized session ownership</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Login experience</td>
+   <td>Users may log in once per tool or gateway</td>
+   <td>Users log in once per platform session</td>
+  </tr>
+  <tr>
+   <td>Logout behavior</td>
+   <td>Local to a service or cluster</td>
+   <td>Platform-wide through one session record</td>
+  </tr>
+  <tr>
+   <td>Token refresh</td>
+   <td>Repeated independently by each gateway</td>
+   <td>Coordinated by the central gateway</td>
+  </tr>
+  <tr>
+   <td>Upstream IdP load</td>
+   <td>Scales with users, tools, and clusters</td>
+   <td>Scales primarily with active users</td>
+  </tr>
+  <tr>
+   <td>Downstream identity</td>
+   <td>Often duplicated or inconsistent</td>
+   <td>Standardized through trusted headers or claims</td>
+  </tr>
+  <tr>
+   <td>Operational model</td>
+   <td>Simple at first, harder at scale</td>
+   <td>Requires central service, simpler for new tools</td>
+  </tr>
+ </tbody>
+</table>
+<h2>The central identity gateway pattern</h2>
+<p>The central identity gateway owns three responsibilities:</p>
+<ul>
+ <li>Session creation: handling the OIDC authorization code flow and creating a platform-wide session</li>
+ <li>Per-request identity validation: answering “who is this user?” for any gateway or trusted service</li>
+ <li>Session lifecycle management: coordinating token refresh and logout across the platform</li>
+</ul>
+<p>Regional authentication gateways remain in place. They still enforce per-cluster policy, protect local services, and inject identity into requests. What changes is where sessions live.</p>
+<p>Instead of storing sessions inside each regional gateway, the central identity gateway writes every authenticated session to a shared store such as Redis. The session is keyed by an opaque session ID and associated with a secure, HTTP-only browser cookie scoped to the platform domain.</p>
+<p>On each request, a regional gateway calls an identity-validation endpoint such as /gateway/userinfo. The central identity gateway checks the session store and returns trusted identity claims. The regional gateway then injects a standardized set of identity headers before forwarding the request to the application.</p>
+<h2>Request flow</h2>
+<h3>Login</h3>
+<p>When a user arrives without a valid platform session, the regional gateway redirects the browser to the central identity gateway. The central gateway runs the OIDC authorization code flow against the organization’s identity provider, exchanges the authorization code server-side, stores the resulting session in Redis with a defined time-to-live, and sets an HTTP-only session cookie.</p>
+<h3>Per-request validation</h3>
+<p>On subsequent requests, the regional gateway sends the session cookie to /gateway/userinfo. The central identity gateway performs a session lookup and returns identity claims such as user ID, email, groups, roles, and session metadata.</p>
+<h3>Token refresh and logout</h3>
+<p>When an access token nears expiry, the central identity gateway refreshes it using the stored refresh token and updates the session record. Because the refreshed state is written to the shared store, every regional gateway observes the same session state.</p>
+<h2>Security and reliability guardrails</h2>
+<p>Use secure service-to-service authentication between regional gateways and the central identity gateway. Mutual TLS, workload identity, or signed internal tokens can prevent untrusted callers from using the validation endpoint. Strip inbound identity headers before injecting trusted ones. Applications should only trust headers added by the gateway layer, not headers provided by a client request.</p>
+<h2>Reducing load on upstream identity systems</h2>
+<p>In a distributed model, each regional gateway can call the identity provider, token secret store, and authorization policy engine independently. With a central identity gateway, the identity provider is called once per login. Regional gateways validate against the shared session instead of repeating the OIDC flow.</p>
+<h2>Getting started</h2>
+<p>Ready to implement a similar identity-aware gateway architecture? Begin with the <a href="https://github.com/oauth2-proxy/oauth2-proxy/tree/master/contrib/local-environment">OAuth2 Proxy local environment</a> to explore OIDC login, cookie handling, and Redis-backed sessions. Next, follow the <a href="https://github.com/istio/istio/tree/master/samples/extauthz">Istio external authorization sample</a> to define the Auth Gateway interface, and add Rego policy evaluation with the <a href="https://github.com/open-policy-agent/opa-envoy-plugin/tree/main/examples/istio">OPA Envoy Istio example</a>. For an integrated reference covering JWT and API-key validation, metadata enrichment, policy decisions, and trusted upstream headers, explore <a href="https://github.com/Kuadrant/authorino">Authorino</a>.</p>

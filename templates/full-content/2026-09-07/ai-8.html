@@ -1,0 +1,146 @@
+<h3>Any modality, Many Applications, One Unified Verification Framework</h3>
+<p>LLM-as-a-Verifier achieves SOTA performance across agentic benchmarks, including Terminal-Bench, SWE-Bench Verified, MedAgentBench, RoboRewardBench and more. We invite the community to contribute more use cases!</p>
+<h2>Installation</h2>
+<pre><code>pip install llm-verifier</code></pre>
+<p>To install the latest from a clone:</p>
+<pre><code>pip install -e .</code></pre>
+<p><strong>What's new in 0.2.0</strong>:</p>
+<ul>
+ <li>Prefix-cache optimization: ~3.4× fewer uncached input tokens on trajectory-heavy benchmarks</li>
+ <li>Terminal-Bench 2.1 self-verification benchmark</li>
+ <li><code>deepseek-v4-flash</code> verifier backend</li>
+ <li>Token accounting (<code>llm_verifier.token_usage()</code>)</li>
+</ul>
+<h2>About</h2>
+<p>LLM-as-a-Verifier is a general-purpose framework that provides <strong>fine-grained feedback</strong> for any agent. The key idea is simple: 1) use fine-grained scoring granularity, 2) take the expectation over the full logprob distribution of LLM score tokens, and 3) scale repeated evaluation and criteria decomposition. The resulting fine-grained feedback can be used for test-time scaling, progress tracking, and reinforcement learning.</p>
+<h2>Quickstart</h2>
+<h3>Simple Best-of-N Selection</h3>
+<p>Run a first end-to-end selection (requires <code>DEEPSEEK_API_KEY</code> or <code>VERTEX_API_KEY</code> in <code>.env</code>, or an OpenAI-compatible server that returns logprobs — e.g. <code>vllm serve Qwen/Qwen3.5-9B</code> with <code>OPENAI_BASE_URL=http://localhost:8000/v1</code>):</p>
+<pre><code>import llm_verifier
+
+problem = "Write a function that reverses a string."
+candidates = [
+    "def rev(s): return s[::-1]", "def rev(s): return s", "def rev(s): return ''.join(sorted(s))",
+]
+
+result = llm_verifier.select(
+    problem=problem,
+    candidates=candidates,
+    criteria=\{"Correctness": "Does the code actually reverse the string?"},
+)
+print(result.index)   # index of the best candidate: 0
+print(result.scores)  # candidate scores: [0.73104, 0.38446, 0.38449]</code></pre>
+<h3>Score a pair of candidates directly</h3>
+<p><code>select</code> is built on a pairwise reward model. For the raw fine-grained rewards of a single comparison, call <code>compare</code>:</p>
+<pre><code>reward_a, reward_b = llm_verifier.compare(
+    problem, candidates[0], candidates[1],
+    criteria=\{"Overall": "Does the code solve the problem?"},
+)
+print(reward_a, reward_b)   # fine-grained rewards in [0, 1]: 0.99994 0</code></pre>
+<h3>Fine-grained Progress Tracking</h3>
+<p>The same fine-grained reward can also score an agent's progress after each step with <code>track</code>:</p>
+<pre><code>steps = [
+    'Read the problem statement',
+    'Wrote def rev(s): return s ',
+    'Tested: rev("abc") returned "abc"',
+    'Changed to def rev(s): return s[::-1]',
+    'Tested: rev("abc") returned "cba"',
+]
+
+result = llm_verifier.track(problem=problem, steps=steps,
+                            checkpoint_steps=[1, 2, 3, 4, 5], n_evaluations=4)
+print(result.scores)  # progress after each step: [0.00106, 0.02417, 0.03143, 0.62004, 0.99978]</code></pre>
+<h2>Self-Verification (Terminal Bench 2.1)</h2>
+<p>Can a model verify its own rollouts? On Terminal-Bench 2.1 we generate 5 mini-swe-agent trajectories per task with <code>deepseek-v4-flash</code> and use the <strong>same model</strong> as the verifier. Selection lands well above Pass@1 even though the verifier is judging its own model's work:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Config</th>
+   <th>Pass@1</th>
+   <th>LLM-as-a-Verifier</th>
+   <th>Oracle</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Best-of-3</td>
+   <td>79.4%</td>
+   <td><strong>86.5% ± 1.1%</strong></td>
+   <td>92.1%</td>
+  </tr>
+  <tr>
+   <td>Best-of-5</td>
+   <td>78.7%</td>
+   <td><strong>88.0% ± 0.6%</strong></td>
+   <td>96.6%</td>
+  </tr>
+ </tbody>
+</table>
+<p>The trajectories ship in <code>data/terminal_bench_2.1_trajs/</code>; scoring only needs <code>DEEPSEEK_API_KEY</code> in <code>.env</code>. Each configuration has its own reproduction script:</p>
+<pre><code>python scripts/run_bo3.py                    # best-of-3
+python scripts/run_bo5.py                    # best-of-5</code></pre>
+<h2>Test-Time Scaling for Agentic Benchmarks</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Benchmark</th>
+   <th>Base Model</th>
+   <th>Harness</th>
+   <th>Pass@1</th>
+   <th>LLM-as-a-Verifier</th>
+   <th>Oracle</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Terminal-Bench V2</td>
+   <td>GPT-5.5 (Best-of-5)</td>
+   <td>Capy</td>
+   <td>83.1%</td>
+   <td><strong>86.5%</strong></td>
+   <td>92.1%</td>
+  </tr>
+  <tr>
+   <td>SWE-Bench Verified</td>
+   <td>Opus 4.5 / Opus 4.6 / Gemini 3 Flash (Best-of-3)</td>
+   <td>mini-swe-agent</td>
+   <td>76.1%</td>
+   <td><strong>78.2%</strong></td>
+   <td>84.4%</td>
+  </tr>
+  <tr>
+   <td>MedAgentBench</td>
+   <td>Claude Opus 4.8 (Best-of-5)</td>
+   <td>AgentBench</td>
+   <td>70.2%</td>
+   <td><strong>73.3%</strong></td>
+   <td>75.0%</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Progress Tracking for Coding Agents</h2>
+<p>The same fine-grained reward can score a trajectory <em>at every step</em>. Below, we track two Terminus-2 runs of the Terminal-Bench task <code>pytorch-model-cli</code>. The successful trajectory exhibits consistently increasing verifier scores, whereas the failed trajectory is characterized by erroneous behaviors, resulting in lower scores throughout the execution. Reproduce it with:</p>
+<pre><code>python scripts/terminal_bench_progress.py    # scores both runs then plots</code></pre>
+<h3>Online progress tracking</h3>
+<p><code>track</code> scores a <strong>finished</strong> trajectory. To monitor an agent <strong>while it runs</strong>, use <code>ProgressTracker</code>: feed it each step as it happens and get a live progress score back — e.g. to stop a hopeless rollout early or decide when to resample. Since the verifier only ever sees the steps so far, it cannot peek at the future.</p>
+<h2>Multi-Modal Support</h2>
+<p>With a multimodal verifier model, every entry point accepts <code>images</code> — a single image or a list of images, each a local file path, an http(s) URL, or raw bytes.</p>
+<h2>Claude Code Plugin</h2>
+<p><a href="https://github.com/llm-as-a-verifier/TurboAgent">TurboAgent</a> brings LLM-as-a-Verifier to Claude Code as a drop-in LLM API proxy. It sits between your client and the model provider, generating multiple candidate responses in parallel and selecting the best one with a Probabilistic Pivot Tournament.</p>
+<pre><code>pip install git+https://github.com/llm-as-a-verifier/TurboAgent</code></pre>
+<h2>How it works</h2>
+<h3>Fine-grained Reward Estimation</h3>
+<p>Rather than reducing each distribution into a single discrete score (as in LLM-as-a-Judge), LLM-as-a-Verifier approximates the reward of a trajectory $\tau$ on task $x$ as:</p>
+<p>$$ R(x, \tau) = \frac\{1}\{CK} \sum_\{c=1}^\{C} \sum_\{k=1}^\{K} \sum_\{g=1}^\{G} p_\{\theta}(v_g \mid x, c, \tau),\phi(v_g) $$</p>
+<h3>Probabilistic Pivot Tournament</h3>
+<p>To pick the best of <code>N</code> candidate trajectories, a round-robin tournament scores all $\binom\{N}\{2}$ pairs. Probabilistic Pivot Tournament (PPT) is a cost efficient ranking algorithm in which every candidate is compared only against a small set of pivots, reducing the budget from $\mathcal\{O}(N^2)$ to $\mathcal\{O}(Nk)$ .</p>
+<h2>Citation</h2>
+<pre><code>@misc\{kwok2026llmasaverifiergeneralpurposeverificationframework,
+      title=\{LLM-as-a-Verifier: A General-Purpose Verification Framework}, 
+      author=\{Jacky Kwok and Shulu Li and Pranav Atreya and Yuejiang Liu and Yixing Jiang and Chelsea Finn and Marco Pavone and Ion Stoica and Azalia Mirhoseini},
+      year=\{2026},
+      eprint=\{2607.05391},
+      archivePrefix=\{arXiv},
+      primaryClass=\{cs.AI},
+      url=\{https://arxiv.org/abs/2607.05391}, 
+}</code></pre>

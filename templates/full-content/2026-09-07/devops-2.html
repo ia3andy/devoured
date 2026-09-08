@@ -1,0 +1,132 @@
+<p>SQL queries aren't always written in the order that we think about them. We might start by choosing a table, filtering its rows, aggregating them, and finally sorting the result, but traditional SQL begins by describing the columns that the query will return.</p>
+<p>Since ClickHouse 22.12, we’ve been able to put the FROM clause before SELECT. ClickHouse 26.8 takes this further with pipelined SQL using a new <code>|&gt;</code> operator that lets us write queries as a sequence of transformations.</p>
+<p>In this post, we'll compare conventional, <code>FROM</code>-first, and pipelined queries using the UK property prices dataset, before using pipelines to build queries that would otherwise require nested subqueries or CTEs.</p>
+<h2>A conventional SQL query</h2>
+<p>Let's start with a query that finds the London districts with the highest median property price since 2024:</p>
+<pre><code>SELECT district, count() AS sales, round(median(price)) AS median_price
+FROM uk_price_paid
+WHERE (town = 'LONDON') AND (date &gt;= '2024-01-01')
+GROUP BY district
+ORDER BY median_price DESC
+LIMIT 10;</code></pre>
+<pre><code>┌─district───────────────┬─sales─┬─median_price─┐
+│ KENSINGTON AND CHELSEA │  2694 │      1125000 │
+│ RICHMOND UPON THAMES   │   708 │       960000 │
+│ CITY OF WESTMINSTER    │  3830 │       900000 │
+│ CITY OF LONDON         │   367 │       842000 │
+│ HARROW                 │     2 │       806750 │
+│ HOUNSLOW               │   660 │       780000 │
+│ CAMDEN                 │  3200 │       760000 │
+│ HAMMERSMITH AND FULHAM │  3312 │       730000 │
+│ ISLINGTON              │  3316 │       650000 │
+│ WANDSWORTH             │  7155 │       625000 │
+└────────────────────────┴───────┴──────────────┘</code></pre>
+<h2>Putting <code>FROM</code> first</h2>
+<p>A lesser-known feature of ClickHouse SQL is that we can place the <code>FROM</code> clause before <code>SELECT</code>, so the following is also a valid query:</p>
+<pre><code>FROM uk_price_paid
+SELECT district, count() AS sales, round(median(price)) AS median_price
+WHERE (town = 'LONDON') AND (date &gt;= '2024-01-01')
+GROUP BY district
+ORDER BY median_price DESC
+LIMIT 10;</code></pre>
+<p>Putting the data source first can make a query easier to visualize. We start by identifying the data we're working with and then describe the columns, filtering, aggregation, ordering, and limit. Apart from moving <code>FROM</code>, this is still a conventional SQL query.</p>
+<h2>Building a pipeline</h2>
+<p>ClickHouse 26.8 takes this top-down style further with pipelined SQL. The <code>|&gt;</code> operator passes the result of one stage into the next, making the sequence of transformations explicit: read a table, filter its rows, aggregate them, sort the result, and finally apply a limit.</p>
+<p>Here's the same query written as a pipeline:</p>
+<pre><code>FROM uk_price_paid
+|&gt; WHERE (town = 'LONDON') AND (date &gt;= '2024-01-01')
+|&gt; AGGREGATE count() AS sales, round(median(price)) AS median_price
+   GROUP BY district
+|&gt; ORDER BY median_price DESC
+|&gt; LIMIT 10;</code></pre>
+<p>The conventional, <code>FROM</code>-first, and pipelined versions all return the same result.</p>
+<p>While we can also simplify ordinary SQL incrementally, each <code>|&gt;</code> provides an explicit checkpoint at which the preceding pipeline is a complete query. This makes it particularly convenient to build and inspect the transformation one stage at a time.</p>
+<h2>How does ClickHouse translate the pipeline?</h2>
+<p>The pipelined query is converted into standard SQL before execution. We can prefix our query with <code>EXPLAIN SYNTAX</code> to see the conventional SQL generated from our pipeline:</p>
+<pre><code>EXPLAIN SYNTAX
+FROM uk_price_paid
+|&gt; WHERE (town = 'LONDON') AND (date &gt;= '2024-01-01')
+|&gt; AGGREGATE count() AS sales, round(median(price)) AS median_price
+   GROUP BY district
+|&gt; ORDER BY median_price DESC
+|&gt; LIMIT 10
+FORMAT LineAsString;</code></pre>
+<pre><code>SELECT * FROM (
+    SELECT * FROM (
+        SELECT district, count() AS sales, round(median(price)) AS median_price
+        FROM (
+            SELECT * FROM (
+                SELECT *
+                FROM uk_price_paid
+            )
+            WHERE and(equals(town, 'LONDON'), greaterOrEquals(date, '2024-01-01'))
+        )
+        GROUP BY district
+    )
+    ORDER BY median_price DESC
+)
+LIMIT 10;</code></pre>
+<p>Although the converted query contains several nested <code>SELECT</code> statements, ClickHouse doesn't materialize each intermediate result, it optimizes the complete query before executing it.</p>
+<h2>Adding columns with EXTEND</h2>
+<p><code>EXTEND</code> adds calculated columns while retaining all the columns already in the pipeline.</p>
+<pre><code>FROM uk_price_paid
+|&gt; WHERE town = 'LONDON' AND date &gt;= '2024-01-01'
+|&gt; EXTEND round(price / 1000000, 2) AS price_millions
+|&gt; SELECT date, district, price, price_millions
+|&gt; ORDER BY price DESC
+|&gt; LIMIT 3;</code></pre>
+<pre><code>┌───────date─┬─district──────┬─────price─┬─price_millions─┐
+│ 2024-03-20 │ TOWER HAMLETS │ 164300000 │          164.3 │
+│ 2024-03-20 │ TOWER HAMLETS │ 164300000 │          164.3 │
+│ 2024-03-20 │ TOWER HAMLETS │ 161890000 │         161.89 │
+└────────────┴───────────────┴───────────┴────────────────┘</code></pre>
+<p>In this example the use of <code>EXTEND</code> is equivalent to <code>SELECT *, round(price / 1000000, 2) AS price_millions</code>.</p>
+<h2>Reusing intermediate results</h2>
+<p>You can also extend an existing aggregation with the pipelined syntax. For example, the following query computes the median property price for each district, grouped by county:</p>
+<p>The <code>district_median</code> alias becomes a column that we can use in the next pipeline stage. This lets us aggregate it again without having to write a nested subquery or CTE ourselves.</p>
+<p>We can therefore extend the query to calculate the average of those district-level medians for each county, then return the ten counties with the highest values:</p>
+<pre><code>SELECT county, district, median(price) AS district_median
+FROM uk_price_paid
+WHERE date &gt;= '2024-01-01'
+GROUP BY county, district
+|&gt; AGGREGATE round(avg(district_median)) AS average_district_median
+   GROUP BY county
+|&gt; ORDER BY average_district_median DESC
+|&gt; LIMIT 10;</code></pre>
+<pre><code>┌─county─────────────────┬─average_district_median─┐
+│ GREATER LONDON         │                  558476 │
+│ WINDSOR AND MAIDENHEAD │                  520000 │
+│ SURREY                 │                  497455 │
+│ WOKINGHAM              │                  478000 │
+│ HERTFORDSHIRE          │                  452250 │
+│ BUCKINGHAMSHIRE        │                  443870 │
+│ ISLES OF SCILLY        │                  430000 │
+│ BRIGHTON AND HOVE      │                  405000 │
+│ OXFORDSHIRE            │                  400451 │
+│ BRACKNELL FOREST       │                  400000 │
+└────────────────────────┴─────────────────────────┘</code></pre>
+<h2>Stage order matters</h2>
+<p>Something to keep in mind is that the order of the pipeline stages matters. If we move <code>LIMIT 10</code> before the second aggregation, it limits the intermediate result to ten district medians. The county averages are then calculated from only those ten rows, rather than from every district:</p>
+<pre><code>SELECT county, district, median(price) AS district_median
+FROM uk_price_paid
+WHERE date &gt;= '2024-01-01'
+GROUP BY county, district
+|&gt; LIMIT 10
+|&gt; AGGREGATE round(avg(district_median)) AS average_district_median
+   GROUP BY county
+|&gt; ORDER BY average_district_median DESC;</code></pre>
+<p>Because there is no <code>ORDER BY</code> before the first <code>LIMIT</code>, the ten district rows selected is not deterministic, so the exact result may vary.</p>
+<h2>Using pipelines in other statements</h2>
+<p>Pipelines aren't limited to queries that start with <code>SELECT</code>, they can be used anywhere that ClickHouse expects a <code>SELECT</code> query, including subqueries, <code>INSERT ... SELECT</code> statements, and views.</p>
+<p>In the following example, we use a pipeline as the query behind a view:</p>
+<pre><code>CREATE VIEW million_pound_london_sales AS
+FROM uk_price_paid
+|&gt; WHERE town = 'LONDON' AND price &gt;= 1000000
+|&gt; SELECT date, price, district, postcode1, postcode2;</code></pre>
+<p>We can also use a pipeline as the source of an <code>INSERT</code>.</p>
+<pre><code>INSERT INTO expensive_london_sales (date, price, district)
+FROM uk_price_paid
+|&gt; WHERE town = 'LONDON' AND price &gt;= 1000000
+|&gt; SELECT date, price, district;</code></pre>
+<h2>Conclusion</h2>
+<p>Pipelined SQL gives us another way to express ClickHouse queries. It won't replace conventional SQL, but writing a query as a sequence of transformations can make multi-stage queries easier to build and follow.</p>
