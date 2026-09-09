@@ -1,0 +1,114 @@
+<h2>Do we need simplicity?</h2>
+<p>Recently, I gave a talk titled "Precise, consistent, and reliable code coverage". It's about a truly gnarly bug that took my company 9 months to debug. At the end, my friend Predrag asks:</p>
+<blockquote>
+ <p>How would you recommend that we think about building tools such that these epic debugging stories aren't as necessary?</p>
+</blockquote>
+<p>and I answer him:</p>
+<blockquote>
+ <p>We need to prioritize simplicity. If you go back to my coverage pipeline, there are a <em>lot</em> of nodes in this diagram. [...] The tooling's complicated. We need to rethink how our computing works.</p>
+</blockquote>
+<p>I'm not satisfied with that answer.</p>
+<h2>Unix pipelines are not simple</h2>
+<p>Consider two programs to calculate the frequency of words of a file. First, a small unix pipeline:</p>
+<pre><code>cat README.md \
+  | tr --complement --squeeze-repeats '[:alpha:]' '\n' \
+  | tr A-Z a-z \
+  | sort \
+  | uniq --count \
+  | sort --reverse --numeric-sort
+</code></pre>
+<p>This says "read README.md, translate each word boundary into a newline, collapsing multiple newlines, convert uppercase to lowercase, count the number of occurrences of each word, then show them in frequency order".</p>
+<p>I think this is what most people think of when they think of "simple": each program is small, they're designed to be joined together ad-hoc in this way, it's concise and somewhat easy to read.</p>
+<p>Next, consider a Clojure program:</p>
+<pre><code>(-&gt;&gt; (slurp "README.md")
+     (re-seq #"[a-zA-Z]+")
+     (map str/lower-case)
+     frequencies
+     (sort-by val &gt;)
+     ; for every (word, count) pair in the sequence, call an anonymous function that prints it.
+     (run! (fn [[word count]] (println count word))))
+</code></pre>
+<p>This does the same thing, with a few more names and higher-order functions thrown in.</p>
+<p>Now, let's say we want to make a small change: show the output in the original file order. In Clojure, this is fairly straightforward: store an ordered sequence of the words in <code>word_seq</code>, store a map from each word to its frequency in <code>freq_map</code>, iterate over the sequence, and look up each word in the map:</p>
+<pre><code>(let [word_seq (-&gt;&gt; (slurp "README.md")
+                 (re-seq #"[a-zA-Z]+")
+                 (map str/lower-case))
+      freq_map (frequencies word_seq)]
+  (-&gt;&gt; (distinct word_seq)
+       ; for every distinct word, in original order, print its frequency (from our `freq` map) and the word itself
+       (run! (fn [w] (println (freq_map w) w)))))
+</code></pre>
+<p>In Bash you need a bunch of temp files and ugly opaque regexes, sorts, and joins:</p>
+<pre><code>tr &lt; README.md --complement --squeeze-repeats '[:alpha:]' '\n' \
+  | grep . &gt; words
+sort words \
+  | uniq --count \
+  | sed --regexp-extended 's/^ *([0-9]+) (.*)/\2 \1/' \
+  | sort &gt; counts
+nl --body-numbering=a words \
+  | sort --key=2,2 --key=1,1n \
+  | uniq --skip-fields=1 \
+  | sort --key=2,2 &gt; firstseen
+join -1 2 -2 1 -o 1.1,2.2,1.2 firstseen counts \
+  | sort --numeric-sort \
+  | cut --delimiter=' ' --field=2,3
+</code></pre>
+<p>That's because our original program was <em>small</em> but not <em>simple</em>.</p>
+<h2>What is simplicity?</h2>
+<p>In Simple Made Easy, Rich Hickey defines "simple" from its root, "sim-plex": having only one braid. He contrasts this to "com-plex": braiding multiple things together. In this post I'll use "coupled" as a synonym for "complex" to avoid ambiguity.</p>
+<p>And that gives us a language to talk about what's going on with our first Unix pipeline: it's <em>small</em> but it's <em>coupled</em>. Let's look at exactly what makes it that way.</p>
+<pre><code>tr &lt; README.md --complement --squeeze-repeats '[:alpha:]' '\n' \
+  | tr A-Z a-z \
+  | sort \
+  | uniq --count \
+  | sort --reverse --numeric-sort
+</code></pre>
+<p>There are a bunch of little things here I could nitpick, but the main thing that's coupled (<em>braided together</em>) is the <code>sort | uniq --count</code>. If we look at <code>uniq</code>'s man page, it says this:</p>
+<blockquote>
+ <p>Repeated lines in the input will not be detected if they are not adjacent, so it may be necessary to sort the files first.</p>
+</blockquote>
+<p>There's no native Unix equivalent to <code>frequencies</code>, this <code>sort | uniq -c</code> is the closest we can get. Not only is it less performant (it has to collect the full input into memory before continuing), but it ties aggregation to ordering. This is exactly the thing that makes "separate ordering from aggregation" so hard; we end up having to do this weird dance with table-joins-through-text-files.</p>
+<p>You might have heard the phrase "Write programs that do one thing and do it well" in reference to Unix systems. Maybe you heard it called the Unix Philosophy. I think "do one thing" is commonly understood to be about simplicity, but in practice it's actually about <em>size</em>. Unix tools are <em>small</em> but they are not <em>simple</em>.</p>
+<h2>Large is not the same as coupled</h2>
+<p>Now, let's consider the opposite end. Say you have Google Drive for Desktop running on your computer. This is a <em>massively</em> large program: it depends on platform-specific file watchers, "all of Google3", a streaming and syncing network client, and conflict resolution logic. But to the <em>user</em> it feels quite simple: Install the program, tell it which folder you want it to watch, tell it whether to keep the files locally or primarily on Google's infra. It does all the rest.</p>
+<h2>Decoupling</h2>
+<p>When I think about complex programs, I think about <em>coupling</em>. Programs are complex when different features are <em>coupled</em> to each other, even when they don't have to be.</p>
+<p>Let's take one small example. In Rust, you can associate names to values with a map, or with a struct:</p>
+<pre><code>struct HttpResponse \{
+  status: u16,
+}
+let strukt = HttpResponse \{ status: 200 };
+
+let mut map = HashMap::new();
+map.insert("status", 200);
+
+println!("map: \{}", map.get("status").unwrap());
+println!("struct: \{}", strukt.status);
+</code></pre>
+<p>It's very clear from this that a struct gets you <em>known present fields</em>. For the map, we have to call <code>unwrap()</code>, because the type checker doesn't know what keys are in a map. For the struct it does, so we can just directly access the value.</p>
+<p>What might not be clear about this is that a struct <em>loses runtime information</em>. If you want to iterate a map, that's easy: call <code>for (key, val) in map \{ ...</code>. If you want to iterate a struct ... get fucked? write a proc-macro?</p>
+<p>The reason for this is that in Rust, a struct <em>couples</em> type-checking to a fixed data representation. You can't get one without the other.</p>
+<p>Contrast this to Clojure, where you <em>can</em>. In Clojure, structs <em>are</em> maps: rather than defining a type, you annotate which fields a map is allowed to have. If we wanted to translate our <code>struct HttpResponse</code>, we could write this:</p>
+<pre><code>; bind the name `http-response` to a list of keywords (interned strings).
+; this is a normal list that is created and manipulated at runtime, it is not special in any way.
+(def http-response [:map [:status :int]])
+; bind the name `print-resp` to a function.
+; `^\{}` is a "metadata" map that will be associated with that name.
+; metadata on bindings can be retrieved at runtime.
+(defn ^\{:malli/schema [:=&gt; [:cat http-response] :nil]}
+  print-resp [map]
+  (println "status:" (:status map)))
+</code></pre>
+<p>Here, we've created a type annotation that's checked at runtime with the function <code>(malli/instrument!)</code>. Notably, this is checked <em>with a library</em> (Malli), not by a compiler; and the annotation is <em>inspectable</em>. You can, for example, write a <code>schema-&gt;md</code> function that acts as your own little mini Rustdoc, without needing to integrate with compiler APIs. And all of this works without giving up type safety, reflection, or iteration over the values of the map.</p>
+<p>This works because Clojure <em>decouples</em> data representations from type checking. Typed Racket does a similar trick, but using macros so that the type checking happens at compile time instead of runtime.</p>
+<h2>When is it useful to be small?</h2>
+<p>Being small makes sense when you as the maintainer don't have a lot of resources to dedicate to your program. Maybe you're Brian Kernighan and your program is running on a literal PDP-11. Maybe you're an open source maintainer with only a couple hours a month to dedicate to your project. Maybe you work in an environment where doing <em>anything</em> is a victory and you can only get support for a small subset of the features you actually want to build. All of these are good reasons to keep your program small.</p>
+<p>But small is not the same as simple. The answer to "when should your program be simple?" is: <strong>always</strong>. There is very little advantage to introducing coupling to parts of your program; it makes it harder for you as a developer to maintain the program, and is less flexible for your users.</p>
+<h2>How do we make simple programs?</h2>
+<p>Ah, now this is the hard part. To write simple programs, you need to have a good mental model of your program. You also need to have <em>good taste</em>, which is something I don't yet know how to teach.</p>
+<p>Sometimes, you also need to Suck It Up And Write The Hard Thing. CSS and SQL are highly decoupled: you write a declarative specification of what you want the program to do, and the browser engine or database runtime figure out how to do it. This is really really hard! SQLite alone has had centuries of person-years put into them making it work reliably. Blink (Chrome's renderer) has probably had tens of thousands of person-years put into it. In some domains, that's what it takes to let you write programs that are decoupled.</p>
+<p>It doesn't always make sense to spend that much time on a program. Crunchy technical work can be a mothlamp problem: it attracts a certain kind of person who loves dreaming about how code <em>might</em>, <em>should</em>, <em>could</em> work. Sometimes it's better to put down your tools and take a nap in the sun instead. But when it does work—</p>
+<p>If we go back to the start of the post, the coverage pipeline I describe actually got <em>larger</em> after I fixed it, not smaller. But at the same time it got <em>simpler</em>, because there were fewer hidden dependencies between parts of the dataflow graph.</p>
+<h2>What next?</h2>
+<p>I hope this post encourages you to write programs that are simple, not small, and to look for tools that you use that are unnecessarily coupled.</p>
+<p>In a future post, I hope to extend these ideas: how to develop your sense of taste; how programs can be vertically integrated while still being decoupled; and how to build large systems without making them complex.</p>

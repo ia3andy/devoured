@@ -1,0 +1,81 @@
+<h1>The Two MMLU Scores: What a Benchmark Name Does Not Fix</h1>
+<h2>TL;DR</h2>
+<ul>
+ <li>Two MMLU accuracies, <code>0.781</code> and <code>0.79</code>, for two builds of one model family under the same benchmark name; for a <code>score-delta</code> query the verifier returns <code>incomparable</code>.</li>
+ <li><code>mmlu</code> fixes a name. The split, the implementation, the prompt format, the grader and the runner’s network access stay open, and where published measurements exist for them the differences are points of accuracy, not thousandths.</li>
+ <li>Comparability is a property of the reference the results are traceable to, not of the number.</li>
+ <li>Under the APL AI-Eval profile the frame is a content-addressed object and the claim carries its hash; the two frames differ, and <code>subset: "all"</code> and an omitted key are different scopes by canonical bytes.</li>
+ <li><code>apl-valid</code> is a statement about structure and says nothing about whether either score is correct.</li>
+</ul>
+<p>Two evaluation records appear in the same table. One reports <code>mmlu</code> accuracy <code>0.781</code> for build 42; the other reports <code>0.79</code> for build 44. The claims declare the same provider, model family, metric identifier, unit and benchmark name. The arithmetic difference is <code>+0.009</code>.</p>
+<p>The records are structurally valid. Their frames declare different runners, graders and dataset splits. The shared <code>mmlu</code> label identifies a dataset family, not a full measurement procedure. For the <code>score-delta</code> query shown below, the verifier returns <code>incomparable</code>.</p>
+<h2>1. What the two numbers say</h2>
+<p>Here is claim A as it exists on the wire, in the <code>metadata.apl</code> position of a log entry:</p>
+<pre><code>\{"apl":\{"version":"0.1","claim":\{"kind":"observation","subject":\{"type":"model-build","id":"model:acme-gpt-7b-build-42","build_id":"42","artifact_digest":"sha256:4242424242424242424242424242424242424242424242424242424242424242","provider":"acme","model_family":"acme-gpt-7b"},"aspect_refs":["accuracy"],"statement":\{"predicate":"score","content":\{"benchmark_id":"mmlu","metric_id":"accuracy","value":0.781,"unit":"fraction"}}},"frame_ref":\{"hash":"sha256:c7b88426f2676f3653db0fad0bdbd689318f16d589d14a315bdd4cc454bca1ab"}}}</code></pre>
+<p>Claim B, two builds later:</p>
+<pre><code>\{"apl":\{"version":"0.1","claim":\{"kind":"observation","subject":\{"type":"model-build","id":"model:acme-gpt-7b-build-44","build_id":"44","artifact_digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","provider":"acme","model_family":"acme-gpt-7b"},"aspect_refs":["accuracy"],"statement":\{"predicate":"score","content":\{"benchmark_id":"mmlu","metric_id":"accuracy","value":0.79,"unit":"fraction"}}},"frame_ref":\{"hash":"sha256:c93a9c55422ddbd2158a5336caa3a251641cf3937f451fb13387a5f54f0d998e"}}}</code></pre>
+<p>The subject differs, which is the point: two builds of one family. Each claim declares an <code>artifact_digest</code>, which the profile treats as the immutable identity anchor of the evaluated artifact. The statement is identical in shape and vocabulary — predicate <code>score</code>, benchmark <code>mmlu</code>, metric <code>accuracy</code>, unit <code>fraction</code>. Claim B writes the value as <code>0.79</code>; a presentation may display that JSON value as <code>0.790</code>, and under RFC 8785 canonical number serialization the trailing zero does not change the value.</p>
+<p>The claim-level pointers differ: <code>frame_ref.hash</code> is <code>c7b88426…</code> in one record and <code>c93a9c55…</code> in the other. Resolving the two frames shows differences in both procedure and scope; the hash is the whole signal at the claim level.</p>
+<h2>2. What “MMLU” does not fix</h2>
+<h3>2.1 The split</h3>
+<p>The MMLU paper reports 15,908 questions split into a few-shot development set of 5 questions per subject across 57 subjects, a validation set of 1,540 and a test set of 14,079. The Hugging Face dataset most runners load, <code>cais/mmlu</code> config <code>all</code>, reports test 14,042, validation 1,531, dev 285. “The MMLU test set” names two objects of different sizes, and no reviewed document explains the difference.</p>
+<h3>2.2 The implementation</h3>
+<p>One published measurement of implementation variance is the June 2023 Hugging Face post on the Open LLM Leaderboard. Three harnesses — HELM, the Eleuther harness, the original code — run the same dataset, all 5-shot, and score llama-65b at 0.637, 0.488 and 0.636. The post concludes that the three results are not comparable despite the shared MMLU label.</p>
+<h3>2.3 The prompt format</h3>
+<p>Anthropic’s 2023 account of evaluation reports that formatting alone — option labels, parentheses, an extra space before the answer — moves MMLU accuracy by about 5%. Answer position moves more. Zheng et al. report that on MMLU, moving the correct answers to position D lowers gpt-3.5-turbo from 67.2 to 60.9, and that moving them to A lifts llama-30b by 15.2 points.</p>
+<h3>2.4 The grader</h3>
+<p>Frame A grades with <code>exact-match-v1</code>. Frame B grades with <code>llm-judge-v3</code>. Zheng et al. found that judge models “exhibit strong position bias”, that only GPT-4 stayed consistent in more than 60% of cases, and describe a judgement that flips when two responses swap positions.</p>
+<h3>2.5 What the runner could reach</h3>
+<p>Another variable is the environment the runner was allowed to touch. CAISI published an account of finding, after the fact, that it had been running SWE-bench Verified with internet access while other evaluators ran without it. Scale’s search-time contamination work found roughly 3% of questions retrievable with labels from Hugging Face, and blocking that source cut accuracy on the contaminated subset by about 15 points.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Variable</th>
+   <th>Effect on the number</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Split</td>
+   <td>Different denominators under one name; <code>dev</code> is a few-shot source by design</td>
+  </tr>
+  <tr>
+   <td>Implementation</td>
+   <td>llama-65b 0.637 / 0.488 / 0.636; rank order flips</td>
+  </tr>
+  <tr>
+   <td>Task variant</td>
+   <td>Different scoring targets under one dataset</td>
+  </tr>
+  <tr>
+   <td>Prompt format</td>
+   <td>~5% from punctuation; up to 76 accuracy points from format</td>
+  </tr>
+  <tr>
+   <td>Answer position</td>
+   <td>gpt-3.5-turbo 67.2 → 60.9; llama-30b +15.2</td>
+  </tr>
+  <tr>
+   <td>Grader</td>
+   <td>Judge self-consistency 65.0% / 46.2% / 23.8% across three judges</td>
+  </tr>
+  <tr>
+   <td>Network access</td>
+   <td>~15 points on a contaminated subset</td>
+  </tr>
+ </tbody>
+</table>
+<h2>3. Comparability is a property of the reference, not of the number</h2>
+<p>VIM §2.46 defines metrological comparability of measurement results through traceability to a common reference. The AI-Eval profile turns that into a narrower operational rule: a bridge is applicable only when the frames meet its exact aspect, scope and procedure constraints, and <code>mmlu</code> alone does not meet them.</p>
+<h2>4. Binding the number to its frame</h2>
+<p>Under APL, the frame is not documentation attached to a claim but a separate content-addressed object, and the claim carries only its hash. The AI-Eval profile — the vocabulary for benchmark observations about a model build — fixes what that object must contain.</p>
+<h2>5. What the verifier says</h2>
+<p><code>apl-ai-eval</code> is a Rust crate, version 0.3.1. Given a receipt or a pair of receipts and a relation query, it decides whether the claims are well-formed under the profile and whether the relation is evaluable. If frames differ and no bridge is supplied to license a comparison, the verifier returns <code>incomparable</code>. It is a subtraction with no defined result, reported as such.</p>
+<h2>6. What this does not prove</h2>
+<ul>
+ <li><strong>That either score is correct.</strong> <code>apl-valid</code> is a statement about structure, not accuracy.</li>
+ <li><strong>That two identical identifiers name the same thing.</strong> It does not know whether the two runs shared a commit, an accelerator, a tokenizer build or sampling defaults.</li>
+ <li><strong>That the dataset was the same dataset.</strong> The frame identifies data by name and split, not by digest.</li>
+ <li><strong>Anything about uncertainty.</strong> Profile v0.1 specifies no uncertainty field.</li>
+</ul>
+<p>What the frame establishes is narrower: it binds a stated procedure to a stated claim by hash. Under AI-Eval v0.1, the supplied frames and this <code>score-delta</code> query do not satisfy the conditions for an applicable bridge, so the verifier returns <code>incomparable</code> rather than a delta.</p>

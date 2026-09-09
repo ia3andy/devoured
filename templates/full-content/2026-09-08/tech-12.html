@@ -1,0 +1,114 @@
+<p>The moment I started caring about this was not a code review. It was watching an agent get lost in its own code.</p>
+<p>It had been working on a project for a while. Every time it needed a helper, it wrote one. Some of them were near-copies of helpers it had written a few sessions earlier, with a slightly different name and one extra parameter. Nothing broke. Ruff was happy, mypy was happy, the tests were green. Then one day I asked it to change how a value was normalized, and it stalled. There were four functions that did roughly that. It read all four, picked one, changed it, ran the tests, found that two other call sites still used a different copy, patched those, and ended up modifying three of the four. It was not sure which one was canonical. Neither was I.</p>
+<p>Duplicated code in an agent-written codebase does not only cost the humans. It costs the agent, on every later turn, because it has to re-read all the copies and guess.</p>
+<h2>What the usual pipeline does and does not check</h2>
+<p>Most Python CI in 2026 looks roughly like this:</p>
+<pre><code>- run: uv run ruff check src tests
+- run: uv run ruff format --check src tests
+- run: uv run mypy src            # strict = true
+- run: uv run pytest -n auto</code></pre>
+<p>Ruff checks conventions: unused imports, shadowed names, bad comprehensions. It can also check function size and complexity if you turn on <code>C901</code> or the <code>PLR09</code> rules, though most projects I see do not, and the one below did not either. mypy checks that values flowing between functions have the shapes the signatures claim. pytest checks that behavior matches whatever tests somebody wrote.</p>
+<p>What none of them do is look across functions. Ruff has no rule for "this block also exists in another file." Nothing in the pipeline knows which modules are allowed to import which. A helper that nobody calls anymore passes lint because it parses and passes mypy because there are no call sites to disagree with it. Before agents, a human reviewer caught these things by reading the diff. Agents produce diffs faster than humans read them, and that part of review quietly stopped happening.</p>
+<h2>Measuring a real repository</h2>
+<p>I ran a structural analysis over one repository at five points in its history. It is a few thousand lines of NumPy and SciPy with a CLI and an MCP server, mostly agent-written, with the CI shown above. The tool was pyscn, which I maintain. For complexity and dead code you can get equivalent numbers from radon and vulture, and import-linter covers dependency rules. Clone detection is the piece that does not have an obvious standalone answer in the Python ecosystem, which is a large part of why pyscn exists.</p>
+<p>pyscn classifies a function's cyclomatic complexity as low at 9 or below, medium from 10 to 19, and high at 20 or above. The <code>check</code> command, the one meant for CI, fails by default on anything above 10.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Commit</th>
+   <th>Date</th>
+   <th>Source lines</th>
+   <th>Health</th>
+   <th>Avg. complexity</th>
+   <th>Functions ≥ 10</th>
+   <th>Duplication</th>
+   <th>Cycles</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Initial</td>
+   <td>Feb 1</td>
+   <td>5,387</td>
+   <td>A (92)</td>
+   <td>6.9</td>
+   <td>—</td>
+   <td>1.6%</td>
+   <td>0</td>
+  </tr>
+  <tr>
+   <td>Phase 2</td>
+   <td>Feb 3</td>
+   <td>6,027</td>
+   <td>B (84)</td>
+   <td>7.7</td>
+   <td>—</td>
+   <td>0.0%</td>
+   <td>0</td>
+  </tr>
+  <tr>
+   <td>Phase 5</td>
+   <td>Feb 12</td>
+   <td>8,861</td>
+   <td>A (90)</td>
+   <td>8.3</td>
+   <td>—</td>
+   <td>0.2%</td>
+   <td>0</td>
+  </tr>
+  <tr>
+   <td>v0.5.0</td>
+   <td>Feb 21</td>
+   <td>9,173</td>
+   <td>A (92)</td>
+   <td>8.5</td>
+   <td>—</td>
+   <td>0.2%</td>
+   <td>0</td>
+  </tr>
+  <tr>
+   <td>HEAD</td>
+   <td>Jun 18</td>
+   <td>~9,200</td>
+   <td>A (91)</td>
+   <td>8.4</td>
+   <td>8 of 32</td>
+   <td>0.4%</td>
+   <td>0</td>
+  </tr>
+ </tbody>
+</table>
+<p>I should be honest about this table. It is not a horror story, and I did not expect one. This repository was developed with pyscn available to the agent as an MCP tool, so it was getting structural feedback while it wrote. An A is roughly what you would hope for under those conditions.</p>
+<p>What the table does show is that the average crept up, from 6.9 to 8.5 across the snapshots, while the grade stayed flat. No function reached the high band, so the summary never changed color. Eight functions at HEAD sit in the medium band, and <code>pyscn check</code> with its default threshold would have failed on all of them, but this project never ran <code>check</code> in CI. It only ever looked at the grade. Five snapshots are not enough to say the code got denser with every merge. They are enough to say that a grade is not a trend line, and that if you only look at the grade you will miss the trend.</p>
+<p>The two most complex functions at HEAD are both at 19. One is a shape-validation ladder:</p>
+<pre><code>def _validate_dimensions(y, T, Z, R, Q, H, a0=None, P0=None) -&gt; None:
+    if y.ndim != 2:
+        raise ValidationError(...)
+    if T.shape != (n_state, n_state):
+        raise ValidationError(...)
+    if Z.shape != (n_obs, n_state):
+        raise ValidationError(...)
+    # ... six more of these</code></pre>
+<p>I looked at it and left it alone. It is flat, the error messages are good, and splitting it would not help anyone. A metric is a reason to look, not a verdict.</p>
+<p>The other one I did not leave alone. In the CSV loader:</p>
+<pre><code>elif obs.transform == "level":
+    if drop_first_row:
+        transformed.append(series[1:])
+    else:
+        transformed.append(series)
+elif obs.transform == "rate":
+    if drop_first_row:
+        transformed.append(series[1:])
+    else:
+        transformed.append(series)</code></pre>
+<p>Two branches, same body. This is the same habit as the four normalization helpers, just smaller: the agent writes the branch it needs right now and does not check whether an identical one is already sitting three lines up. Ruff says nothing, mypy says nothing, the tests pass.</p>
+<p>The dependency check turned up one more. The package that exposes the tool to the AI assistant imports directly from the deepest numerical modules, skipping the layer in between. Whether that is a violation depends on rules I had never written down. I had an architecture in my head and nothing in the repository enforcing it, so the agent drew the graph however was convenient that day.</p>
+<h2>What actually helped</h2>
+<p>In this project the recurring problem was duplication. The agent would add a helper rather than check whether an earlier session had already introduced one, and it would write a branch rather than check whether the branch above it was identical.</p>
+<p>The thing that reduced it was not a CI gate. It was giving the agent the checker as a tool it could call itself, in the same session, before I saw the diff. When clone detection reported a group, the agent could collapse it while it still had the context of why both copies existed. By the time a human reviewer sees a clone, that context is gone and the fix is a chore.</p>
+<p>Beyond that, a few boring things:</p>
+<p>Run <code>pyscn check</code> or your equivalent in CI, but gate on the delta. Fail when a PR introduces a function over the threshold or adds a clone group, not when the whole repository is imperfect. Otherwise the first run reports 200 findings and the check is disabled by lunchtime.</p>
+<p>Track the average complexity over time, not just the maximum. The table above is why.</p>
+<p>Write the dependency rules down, in import-linter contracts or whatever your tool reads. Agents do read prose architecture notes, but a contract that fails their build is harder to drift away from than a paragraph in CLAUDE.md.</p>
+<h2>Why bother</h2>
+<p>Code that is structured well is easier to maintain. Everyone knows that. What I had not appreciated until I watched an agent lose track of its own helpers is that it is also easier for the agent. One way to do each thing, small functions, and a dependency graph that points in one direction is a codebase an agent can read quickly and change safely. That is not a tax on AI-assisted development. It is what keeps the next thousand lines cheap.</p>

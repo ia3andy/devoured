@@ -1,0 +1,106 @@
+<p>Across Vercel, we use coding agents to design and build pages that have to look and feel like Vercel. The typography, color, and composition all need to carry the same judgment that we put into the pages we already ship ourselves.</p>
+<p>We recently wrote about <code>product-design</code>, our skill that teaches agents how we design when they work in our codebases. The skill lives in each repository alongside the code that it governs, explaining how agents can find and understand our design system as well as product guidelines for whatever they are building.</p>
+<p>This works great when agents are working in our codebases, where everything the skill needs is right there. But what about reports, proposals, and the one-off pages that still have to look like Vercel but get made in tools that can't read any of those files? For us, the answer was <a href="https://vercel.com/design.md">design.md</a>, one public file any agent can load.</p>
+<h2>How we approached building <code>design.md</code></h2>
+<p>What made <code>product-design</code> work well was that the design system and product guidelines were sitting right there in the repository for agents to read. We needed a way for agents and tools outside that environment to reach the same knowledge, so that the pages coming out the other end would still look like something we designed ourselves. That set two requirements:</p>
+<ul>
+ <li>A single public URL that anyone can point their agents at, regardless of the environment they run in.</li>
+ <li>Guidance covering everything that made <code>product-design</code> useful in the first place, from brand, layout, and copywriting to the design system, responsiveness, and information architecture.</li>
+</ul>
+<p>The naive approach we tried first was to simply port <code>product-design</code> into a public prompt, collapsing the skill's reference files into one file any agent could read from a URL. The problem we found was that while the prompt described our visual language just fine, every model reading it interpreted that description differently, generating vastly different pages from the same guidance.</p>
+<p>Part of this comes from the fact that design language is subjective. Phrases like "keep the layout clean" can really mean anything. What is "clean"? Beyond that, the bigger problem was everything else the prompt left behind. Inside our codebases, an agent reads <code>product-design</code> surrounded by real components and shipped examples of the things it describes. But a public prompt includes none of that, leaving every model to rebuild our style from just words alone.</p>
+<p>So what we needed to do was distill what that environment provided into a single file, and the only way to know whether we were getting closer was to look at the pages coming out. We set the port aside and started writing a new file from scratch, this time testing every change against a repeatable set of eval prompts.</p>
+<p>We wrote seven of them, pulled from real use cases and paired with mock inputs:</p>
+<ul>
+ <li>Usage and performance report</li>
+ <li>Renewal proposal</li>
+ <li>Benchmark report</li>
+ <li>Interactive planning page</li>
+ <li>Build-versus-buy brief</li>
+ <li>Security governance brief</li>
+ <li>Presentation deck</li>
+</ul>
+<p>The prompts stayed fixed while the file changed, so any difference in the output traced back to the guidance.</p>
+<h2>The first comparison</h2>
+<p>These evals gave us a way to measure both what the file was actually doing and how it was being interpreted by different agents. For our first test, we wanted to know whether <code>design.md</code> would actually change what a model produced at all. We ran the renewal proposal eval twice in the same environment with the same model, once without <code>design.md</code> and once with it loaded, keeping the prompt, data, and viewport identical in both runs.</p>
+<p>Without <code>design.md</code>, the model generated a generic SaaS dashboard. But with it, the page led with the renewal recommendation itself, pulled the commercial evidence into one grid, put peer values on a single scale so they could actually be compared, and kept supporting detail available without letting it compete with the summary. This allowed us to conclude that the file changed the page’s structure and hierarchy as well, not just the styling like we originally found, giving us enough signal to keep building the guidance like this, one rule at a time.</p>
+<h2>The three parts that make the system work</h2>
+<p>As we tested and rebuilt <code>design.md</code>, the scope evolved into a three-part system that made the entire thing work:</p>
+<ul>
+ <li><a href="https://vercel.com/design.md">design.md</a> supplies guidance that shows agents how to frame the reader's job, structure evidence, and choose a composition.</li>
+ <li>A public <a href="https://vercel.com/geist/vercel-brand.css">stylesheet</a> that defines a bounded, documented vocabulary of classes and tokens.</li>
+ <li>An evaluation loop turns repeated human feedback into better guidance and deterministic checks.</li>
+</ul>
+<p>Each of these layers covers a different slice of the work that creates a high-quality, on-brand Vercel page. The judgment that gets encoded in <code>design.md</code> gives agents guidance on:</p>
+<ul>
+ <li>Shaping a page for both a quick executive read and a detailed audit.</li>
+ <li>Writing copy with concrete claims and honest caveats.</li>
+ <li>Composing hierarchy, typography, and color so that evidence and prose support each other.</li>
+ <li>How to publish as Vercel, down to the asset rules for our wordmark and the triangle logo.</li>
+</ul>
+<p><code>design.md</code> also names the recurring generated-design patterns that we never want to see, allowing agents to recognize and avoid them far more reliably by giving the patterns names.</p>
+<p>We created a stylesheet because agents kept inventing their own typography, spacing, and layout, so we took those decisions away from the model entirely. The stylesheet packages our design system's primitives, such as headers, tables, stat strips, and chart styles, as CSS that any page can use via a public URL. Then <code>design.md</code> documents the class names and tokens that the stylesheet provides, allowing the agent to build the page with those names in the HTML instead of reinventing them.</p>
+<p>Another benefit to this is that the agent never actually reads the stylesheet itself. The stylesheet loads when the page renders in your browser, so none of the code enters the model's context, saving more room for design guidance instead.</p>
+<p>Last, the evaluation loop is what helps make the other two pieces work. Deterministic checks are used to help catch mechanical failures, such as a table that ignores the width available to it, while people judge the subjective parts that can't be automated, like hierarchy, composition, and whether the page actually gives the reader what they came for.</p>
+<h2>How guidance made it into the file</h2>
+<p>Every line of guidance in <code>design.md</code> earned its place through the eval loop. We generated pages from fixed scenarios, reviewed what came back, encoded the corrections we accepted, and reran the scenarios to see whether each change stuck, since a change that helped one artifact could quietly hurt another. Nothing got in any other way.</p>
+<h3>Scenarios and rounds</h3>
+<p>Each of the seven prompts becomes a scenario, meaning the prompt is frozen together with its mock inputs and render settings. The renewal proposal, for example, always runs with the same fake customer data with the same viewport settings, keeping <code>design.md</code> as the only thing that changes between runs. A round means generating a fresh page from every scenario against the current version of the file. Full rounds cover all seven scenarios on both Claude Opus 4.8 and Codex with GPT-5.5.</p>
+<p>If we want to investigate something specific, such as a rule change that only affects tables, we can rerun the affected scenarios or a single model, keeping iteration loops tight.</p>
+<p>Generating all seven pages together also made them easy to compare side by side, and what stood out was that <code>design.md</code> wasn't pushing every page toward one template. The interactive planning page put its controls front and center, because someone opens a planning page to change the numbers and see what happens. The renewal proposal instead led with the recommendation and the commercial comparison behind it, because its reader is deciding whether to renew. Every page used the same Vercel typography, color, and spacing, but each one was structured around what its reader came to do.</p>
+<h3>Reviewing every run</h3>
+<p>To review the pages each round produced, we built a local app that displays full-page renders and runs blind A/B comparisons. This app eventually became our eval harness, running each scenario and storing the results. Each stored run keeps the prompt, inputs, model configuration, the version of <code>design.md</code> it used, the screenshots, and whatever feedback the reviewer left about it. Reviewers record every correction against the exact run that produced it.</p>
+<h3>Turning corrections into rules and checks</h3>
+<p>Each correction a reviewer records gets landed in the narrowest place that can consistently enforce it. Judgment changes go into <code>design.md</code> as prose, reusable mechanics go into the stylesheet, and anything that we can check mechanically becomes a deterministic check in code. Problems with the harness itself stay in the harness, and when a single model fails in a way the others don't, we keep it out of the rules until it repeats.</p>
+<p>Take one of the early renewal proposals. Its commercial terms table came back squeezed to the same width as the prose, even though the page had room for the table to be twice as wide.</p>
+<p>During review, we flagged that evidence tables should use the full width available to them. But when looking through previous outputs, we found this same failure everywhere. So this correction ended up going into two places:</p>
+<ul>
+ <li>A rule in <code>design.md</code> stating the intended behavior.</li>
+ <li>A deterministic check in code that catches the same layout failure the next time it appears.</li>
+</ul>
+<p>Once this landed, later renewal proposal prompts resulted in pages with correct full-width tables. To verify changes like this one, we reran the affected scenarios after encoding them. At milestones we went further, running blind A/B rounds that put the updated <code>design.md</code> against an earlier version of the file to decide whether to keep, revise, or revert each change.</p>
+<h2>Measuring whether it worked</h2>
+<p>Building the file had taken well over 200 runs, counting full rounds, targeted checks, dry runs, and all of the dead ends. Alongside the human reviewers, a model judge wrote critiques for each round, and every round's feedback went into improving the next run.</p>
+<p>After all of those runs, we wanted to know whether the corrections we had encoded were actually preventing the failures they were written for. So we picked three desktop scenarios, and for each one we had Codex with GPT-5.5 generate the page twice, once with <code>design.md</code> loaded and once without. We kept the first attempt from every generation, with no re-rolls. Then we ran our deterministic checks over all six pages and counted how many times a known failure, like a table that ignores its available width, showed up in each set. The pages generated with <code>design.md</code> had 39 of those failures. The pages generated without it had 91, which works out to 57% fewer in this test.</p>
+<p>Those numbers come with two caveats. The checks can only catch failures we have already seen and written down, so this test says nothing about whether a page is well designed overall. Six pages is also far too small a sample to make claims about quality or reliability, and every one of them, with or without the file, still had at least one failure serious enough to block shipping. But what the test does well is tell us that once we name a failure and encode it, that failure tends to stay gone.</p>
+<h2>How <code>design.md</code> stays current</h2>
+<p>The eval loop got the file shipped, but what keeps it current is real usage. Inside our Slack, that usage comes through <code>@design-agent</code>, an agent built on <a href="https://eve.dev/">eve</a> that we use for anything from design critiques and copy alternatives to icon recommendations and report sites built from pasted data. Instead of setting up a prompt or hunting down source files, you just mention the agent in a thread. For website requests, it loads the current <code>design.md</code>, builds the page against the published stylesheet, and posts a full-page screenshot and deployment URL back to the thread. Unlike our fixed scenarios, each of these threads captures a real request, a real output, and whatever feedback or steering followed, showing us how the guidance performs out in the wild.</p>
+<p>Every week, we gather all of that feedback in one place, the Slack threads along with comments from GitHub reviews and Figma. Automation groups the comments that keep repeating, and each repeated complaint becomes a proposed change. A person then reviews each proposal, checks whether the system already handles it, and decides where the accepted fix belongs, whether that is <code>@design-agent</code>, the <code>product-design</code> skill, <code>design.md</code>, the stylesheet, or a deterministic check. And if people start asking for a kind of page we have never tested, that request becomes a new eval scenario.</p>
+<p>To know whether any of this is working, we count how often each kind of complaint shows up in similar work over time. Once we encode a fix, that count should start falling. When it does not, something about the fix is wrong. The rule might be unclear, it might not be loading when it is needed, the stylesheet might not have a primitive that can express it, or it might need a deterministic check instead of prose.</p>
+<h2>Build your own</h2>
+<p>You can build the same loop yourself, starting with one recurring artifact and one manual comparison.</p>
+<p><strong>1. Pick one repeated artifact</strong></p>
+<p>Use a recent task with a real reader and real inputs, like a proposal, performance report, benchmark, or microsite. Avoid broad goals such as "make it on-brand." Before generating anything, write down a short rubric. A good one checks that the supplied facts survived, that the reader's decision is clear, and that the correction you keep making by hand actually got resolved.</p>
+<p><strong>2. Save the baseline first</strong></p>
+<p>Generate the page once without any new design context, and save the prompt, inputs, configuration, and a screenshot. Keep that first output even if it looks rough, unless the harness itself failed. You cannot tell whether new context helped without a before.</p>
+<p><strong>3. Start from your last ten corrections</strong></p>
+<p>Collect the feedback you keep giving in design reviews, pull requests, or Slack, and rewrite each correction as something observable. That means writing <code>Let evidence tables use the full available width</code> instead of <code>Make the table feel less cramped</code>, since only one of those can be checked.</p>
+<p>Put the decisions in one file with sections for scope, reader and task, observable decisions, and available primitives. That file is your first <code>design.md</code>.</p>
+<p><strong>4. Constrain repeatable mechanics</strong></p>
+<p>If your outputs keep inventing their own typography, spacing, or layout, publish a stylesheet and document the exact classes and tokens the agent may use. Keep your judgment in prose, and push the repeatable mechanics into CSS or deterministic checks.</p>
+<p><strong>5. Run one matched comparison</strong></p>
+<p>Generate the page one more time with the same input, model, and viewport, but now with your file loaded. Shuffle it with the baseline and score both against your rubric without knowing which is which.</p>
+<p>You do not need a runner or a model judge to start, a single trial can reveal the large, obvious failures. To measure reliability, run multiple independent first-attempt trials (<a href="https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents">Anthropic's guide to evals for agents</a>) and report how often the result holds.</p>
+<p><strong>6. Encode the correction</strong></p>
+<p>Review the output alongside whatever follow-up prompts you have to send, and then ask:</p>
+<ul>
+ <li>What did the user have to repeat or steer manually?</li>
+ <li>Is a rule missing or unclear?</li>
+ <li>Can the stylesheet express the correction?</li>
+ <li>Is the failure mechanical enough to check in code?</li>
+ <li>Does the correction generalize beyond this output?</li>
+</ul>
+<p>Update the guidance instead of hand-tuning the generated page. Your next comparison tells you whether first attempts actually improved.</p>
+<p>Add tooling after the manual loop starts paying off:</p>
+<ul>
+ <li>Include scenarios where the guidance should and should not apply.</li>
+ <li>Keep a small holdout hidden while editing.</li>
+ <li>Record model and guidance versions.</li>
+ <li>Automate mechanical checks.</li>
+ <li>Use multiple blind reviewers.</li>
+</ul>
+<p>However far you take the automation, keep final changes human-reviewed.</p>
+<p>Then keep the loop running. Collect feedback on a cadence, and watch whether each kind of complaint actually becomes less common after you change the guidance. A passing evaluation matters less if people keep correcting the same mistake in production.</p>
+<p>And if you want working examples, ours are public. We load <a href="https://vercel.com/design.md">design.md</a> into tools like <a href="https://v0.app/">v0</a>, Codex, and Claude every day to make artifacts that feel like Vercel, and the <a href="https://github.com/vercel-labs/eve-design-template">eve design agent template</a> will get you a Slack design agent like the one we run.</p>
+<h2>Contributors</h2>
+<p><a href="https://twitter.com/Kev_InDev">Kevin Corbett</a></p>

@@ -1,0 +1,70 @@
+<h2>Motivation</h2>
+<p>There are many coding harnesses (Claude Code, Codex, and many more), but they are all designed to be used by a human.</p>
+<p>They are not designed to be used by an agent. If you ask an agent to use <code>codex exec</code> as a subagent, it might spend a few turns just to figure out the right CLI flags and parse the output. And if you want a more custom loop, an agent might need even more turns to dig into the source code of Codex CLI to learn all the implementation details.</p>
+<h2>Harness In Prompt</h2>
+<p>hip-agent (harness in prompt) is a harness designed for agents. The core loop is about 200 lines of Python, plus one module for the Codex API. Three ideas:</p>
+<ul>
+ <li><strong>The harness fits in the prompt.</strong> The loop is minimal, the model is given only two tools, <code>sh</code> and <code>view_image</code>, and the prompt tells it to read the source to learn exactly what the harness does.</li>
+ <li><strong>The OS is the runtime.</strong> Configuration is environment variables, actions are shell commands, and a subagent is a child process.</li>
+ <li><strong>The rest is handled by existing protocols and formats.</strong> Plugins follow <a href="https://agent-plugins.org/">Agent Plugins</a>, hooks use Claude Code’s hook contract, and the conversation is a Codex CLI session file, so <code>codex resume</code> opens it.</li>
+</ul>
+<p>The whole configuration looks like this:</p>
+<pre><code># ~/.zshrc
+P=~/hip-agent/plugins
+export AGENT_MODEL=gpt-5.6-sol
+export AGENT_PLUGINS=$P/environment:$P/cwd:$P/agentsmd</code></pre>
+<p>And a run:</p>
+<pre><code>codex login
+./agent "inspect this repository and explain it"</code></pre>
+<p>Everything else comes naturally from this design:</p>
+<ul>
+ <li>A subagent is <code>agent</code> run from <code>sh</code>. It inherits the environment and gets its own conversation. The parent configures it with environment variables, <code>AGENT_MODEL=... agent "..."</code>. By default the parent sees only the subagent’s final output, but its state can be read from its session file, and more advanced interactions can be implemented as plugins.</li>
+ <li>The harness is repairable. A sufficiently smart model that has read its harness can work around its limits, or change them.</li>
+ <li>You can put hip-agent in a skill and let your existing agent spawn subagents through it. The code itself is the documentation.</li>
+</ul>
+<h2>Why not native subagents?</h2>
+<p>Why a new harness when current models are already trained with subagents?</p>
+<ol>
+ <li>Models don’t always perform best in a fixed harness, and as models get better a fixed harness can become the limitation. hip-agent is not a fixed harness. It is a reference implementation, deliberately small so that an agent can read, modify, and adapt it.</li>
+ <li>You can train the model to use it. Future models can follow the hip-agent approach, building and editing their own subagent harness depending on the task.</li>
+</ol>
+<h2>Results</h2>
+<p>I did a few iterations of the code on Terminal-Bench 2 with gpt-5.6-luna at effort max: improved the shell design and the prompt a bit, added the view_image tool and command timeouts. Otherwise the code and prompt changes were minimal and not bench-maxxed.</p>
+<p>The final code was then evaluated on <a href="https://github.com/datacurve-ai/deep-swe">DeepSWE</a>, 113 tasks, against a Codex CLI 0.147.0 baseline. The results show hip-agent performs comparably with Codex CLI.</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>hip-agent</th>
+   <th>Codex CLI</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Resolved</td>
+   <td>73/113 (64.6%)</td>
+   <td>72/113 (63.7%)</td>
+  </tr>
+  <tr>
+   <td>Model calls per task</td>
+   <td>187</td>
+   <td>208</td>
+  </tr>
+  <tr>
+   <td>Agent time per task</td>
+   <td>58 min</td>
+   <td>52 min</td>
+  </tr>
+ </tbody>
+</table>
+<p>One run each, no error bars. The two runs ran concurrently on two local machines with the same CPU but otherwise different hardware. Token usage is not compared because hip-agent does not log it.</p>
+<h2>Conclusion</h2>
+<p>Almost every model provider now ships its own TUI harness. But nobody has time to try them all.</p>
+<p>It also makes evals hard. A benchmark run measures the model and the harness together. <a href="https://openai.com/index/how-two-settings-tripled-our-arc-agi-3-scores/">OpenAI found</a> that ARC-AGI-3’s harness dropped the model’s reasoning between moves. Turning on two settings that Codex uses by default tripled the score. On the other hand, a user-facing harness changes every week, and not every change is an improvement: Anthropic’s <a href="https://www.anthropic.com/engineering/april-23-postmortem">April postmortem</a> documented how a harness can silently degrade the result when the model is unchanged. A user-facing harness is therefore a poor instrument for evaluating a model.</p>
+<p>Ideally, every model builder would ship a minimal native reference harness, like hip-agent. A native reference harness is like a tool parser or a chat template: it describes how the model was trained to interact with the world. It should be separate from the model provider’s user-facing product. It also makes trying a new model easy: a user can ask their existing agent to run the new model as a subagent.</p>
+<h2>Related work</h2>
+<ul>
+ <li><a href="https://github.com/swe-agent/mini-swe-agent">mini-swe-agent</a> shares the bash-only principle and has a ~100 line core, but it is designed with abstractions to work with any model and environment. hip-agent commits to one provider and one OS. This keeps the full code smaller and allows vendor-specific features like Codex’s compaction and resumable Codex sessions.</li>
+ <li><a href="https://jonathanc.net/projects/#project-llmproc">llmproc</a> and <a href="https://jonathanc.net/projects/#project-agent-environment-middleware">agent-environment-middleware</a> are my earlier work exploring agent harnesses and abstractions like plugins.</li>
+ <li><a href="https://learn.chatgpt.com/docs/app-server">Codex app server</a> is the low-level interface Codex CLI and the other Codex apps use (the VS Code extension, the desktop apps). It bundles a lot of app-specific logic and is not a lowest-level reference for the model loop. I had an agent dig into it to figure out the correct way to use compaction, the websocket API, etc.</li>
+</ul>
