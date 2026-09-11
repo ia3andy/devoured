@@ -1,0 +1,109 @@
+<h1>Connections: Managed credentials and per-caller identity for Managed Deep Agents</h1>
+<h2>Key Takeaways</h2>
+<ul>
+ <li><strong>Keep credentials out of your project.</strong> A connection lives in your LangSmith workspace, not in <code>.env</code> and not in the build. Rotate or revoke it without touching code or redeploying.</li>
+ <li><strong>Give each caller their own identity.</strong> A user-owned connection resolves to whoever is asking, so the ticket your agent files carries their handle rather than a bot’s.</li>
+ <li><strong>Skip the OAuth plumbing.</strong> Managed Deep Agents runs the authorization round-trip. No callback route, no token store, no refresh logic, no consent screen in your project.</li>
+</ul>
+<p>Connections are available now in Managed Deep Agents v0.7.0+.</p>
+<p>Every agent eventually needs to act on someone's behalf — search the web, file a ticket, open a pull request. Today that usually means one API key hard-coded across every deployment, and every action showing up under a service account. A key in <code>.env</code> answers <em>what</em> the agent may do. It has no way to answer <em>who</em> asked.</p>
+<p>That is what Connections fixes. A connection is a named credential in your LangSmith workspace that your tools read at run time, by slug, through one call.</p>
+<h2>Two axes, not one</h2>
+<p>A connection has an owner and a credential type, and they are independent.</p>
+<p>The <strong>owner</strong> is either the agent or the caller. An agent-owned credential belongs to the deployment, and every caller shares it. A user-owned credential resolves per person, at run time.</p>
+<p>The <strong>credential</strong> is either a static secret or an OAuth grant: an agent can hold an OAuth grant, and a user can hold a secret.</p>
+<p>Ownership is fixed when you create the connection using <code>mda connections create</code>, and <code>connections.get()</code> only selects among credentials that already exist.</p>
+<h2>Agent-owned secret</h2>
+<p>An agent-owned secret is used in situations where you need one credential shared by every caller. This is the right approach for a capability that does not differ per person: web search, a geocoder, a pricing feed.</p>
+<p>In this example, let’s configure a connection to Tavily to add a generic web search tool to an agent:</p>
+<pre><code>uv run mda connections create tavily-agent --secret-from-env TAVILY_API_KEY</code></pre>
+<p><code>tavily-agent</code> is the slug. It is your name for the connection and the name your code uses, and nothing checks it against a provider list. The value came out of <code>TAVILY_API_KEY</code> and went into your LangSmith workspace. It is not part of the build, and <code>mda deploy</code> does not sweep it in the way it sweeps <code>.env</code> into deployment secrets.</p>
+<p>The tool that reads it is an ordinary LangChain tool with one new line leveraging <code>connections.get</code>:</p>
+<pre><code># tools/search_web.py
+import httpx
+from langchain.tools import tool
+from managed_deepagents import connections
+
+@tool(parse_docstring=True)
+async def search_web(query: str) -&gt; str:
+    """
+    Search the web.
+
+    Args:
+        query: Search query.
+    """
+    api_key = await connections.get("tavily-agent", \{"type": "agent"})
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            "https://api.tavily.com/search",
+            json=\{"api_key": api_key, "query": query, "max_results": 5},
+        )
+        response.raise_for_status()
+        return response.text</code></pre>
+<p>If you need to rotate your key, you can update the secret stored at <code>tavily-agent</code>, and any future agent requests will automatically use the new key.</p>
+<h2>User-owned OAuth, with your own app</h2>
+<p>Shared tokens are useful, but allowing your agent to act on behalf of your users means you can securely provide more capabilities to your agent. GitHub ships in the connections catalog alongside 22 other services, so you bring a client ID and a secret and nothing else — no authorization URL, no token URL, no auth method to look up.</p>
+<p>You can quickly reference the catalog connections with <code>mda connections catalog</code>, but you can connect to any provider which offers OAuth if you bring your own metadata.</p>
+<p>For example, to configure a connection to a custom Github OAuth app:</p>
+<pre><code>uv run mda connections create github-issues \
+ --oauth github \
+ --client-id "$GITHUB_CLIENT_ID" \
+ --secret-from-env GITHUB_CLIENT_SECRET \
+ --scope repo</code></pre>
+<p>In this example, <code>github-issues</code> is the slug, which is yours and which your code uses. <code>github</code> is the catalog service, which only decides which endpoints get filled in.</p>
+<ul>
+ <li><code>-scope repo</code> replaces the catalog default rather than adding to it. GitHub's default is <code>read:user</code>, which cannot open an issue, so whatever you pass becomes the whole list.</li>
+</ul>
+<p>The tools read the token through a helper. In this example, the key line is:</p>
+<pre><code>access_token = await connections.get("github-issues", \{"type": "user"})</code></pre>
+<p>With a single call to <code>connections.get</code>, a deployed agent can automatically either invoke an OAuth flow for a new user or fetch a cached OAuth token for a user who has previously authenticated against the OAuth provider.</p>
+<p>We can leverage this access token to make arbitrary API calls to Github:</p>
+<pre><code># tools/github.py
+async def _github(method: str, path: str, **kwargs) -&gt; dict:
+    access_token = await connections.get("github-issues", \{"type": "user"})
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.request(
+            method,
+            f"\{GITHUB_API}\{path}",
+            headers=\{
+                "Authorization": f"Bearer \{access_token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": GITHUB_VERSION,
+            },
+            **kwargs,
+        )
+        response.raise_for_status()
+        return response.json()</code></pre>
+<p>Notice that we set <code>\{"type": "user"}</code>. The agent-owned connection stored a value at create time. This one stored no value at all, only the app registration. The credential arrives per caller, at run time — and if the caller has never authorized GitHub, or their token has expired, <code>connections.get()</code> pauses the run and asks for a grant instead of failing.</p>
+<p>That word appears once, inside <code>_github</code>. A <code>search_issues</code> tool and a <code>create_issue</code> tool both inherit per-caller identity from the helper, and a third GitHub tool would cost no auth code at all.</p>
+<p>The payoff shows up in two places. <code>search_issues</code> already differs per caller before anything is written, because private repositories one person can see and another cannot change the results — same query, same deployment, different answers. And when <code>create_issue</code> runs, the issue lands in GitHub opened by the person who asked. <code>user.login</code> in the response is their handle, not a bot's.</p>
+<h2>User-owned OAuth, with no app to register</h2>
+<p>Some MCP servers register the OAuth client themselves. When they do, the whole setup is a URL.</p>
+<pre><code>uv run mda connections create linear-mcp --mcp https://mcp.linear.app/mcp</code></pre>
+<pre><code># tools/mcp.py
+from managed_deepagents import connections, define_mcp
+
+mcp = define_mcp(
+    servers=\{
+        "linear": \{
+            "transport": "http",
+            "url": "https://mcp.linear.app/mcp",
+            "connection": connections.get("linear-mcp", \{"type": "user"}),
+        },
+    },
+)</code></pre>
+<p>No client ID, no client secret, no app registration. Because the server advertises its OAuth metadata and a client gets registered for you, you don’t need a scope either, and the connection came out with <code>read</code> and <code>write</code> on it, negotiated from the server's own metadata.</p>
+<p>Compare that with the GitHub flow: one needed your own app and one needed nothing, and the line of code reading them is the same. The tool code is the part that disappears here — GitHub took a helper and two functions, this takes a server URL, and the tools arrive from the MCP server.</p>
+<h2>One pause, every missing grant</h2>
+<p>Ask an agent for something that spans both services and the run pauses before the first model turn, with a single interrupt listing every connection the caller has not granted. Authorize them and the run resumes where it stopped.</p>
+<p>There is no callback route in the project, no token store, no refresh logic, no consent screen. The caller never opens LangSmith.</p>
+<p>Do the same thing as a second caller and you get a second issue with a different author, from the same agent, the same slug, and the same workspace entry. Contrast that with the Tavily key, which is the same for everyone by design. You can check the connections you or other developers added to LangSmith with:</p>
+<pre><code>uv run mda connections list</code></pre>
+<h2>Getting started</h2>
+<p>Connections ship in the Managed Deep Agents prerelease, and the OAuth catalog ships inside the binary, so the version you have decides what <code>--oauth</code> accepts:</p>
+<pre><code>uv tool install managed-deepagents
+uv run mda connections catalog</code></pre>
+<p>An agent-owned credential belongs to a deployment, so scaffold and deploy once before creating one. After that, each connection is three steps — create it, read it with <code>connections.get()</code>, redeploy to ship the code that reads it.</p>
+<p>Local development works the same way. Agent-owned connections resolve from <code>MDA_DEV_&lt;SLUG&gt;</code> in <code>.env</code>, uppercased with hyphens as underscores. User-owned connections resolve the signed-in developer to a real principal under <code>mda dev</code>, so the authorization interrupt fires locally and the grant it stores is a real one.</p>
+<p>Beyond the three flows above, <code>--authorize</code> stores one OAuth grant for the deployment, so every caller acts as a single shared account — the fourth cell of the owner-by-credential model, and the right answer when you want a dedicated team account rather than per-person identity. <code>--allowed-scope</code> caps what later authorizations may ask for, and <code>--authorize-url</code> with <code>--token-url</code> covers any provider outside the catalog.</p>
+<p>For more detail and examples, documentation for Connections can be found at <a href="https://docs.langchain.com/langsmith/python/managed-deep-agents-connections">https://docs.langchain.com/langsmith/python/managed-deep-agents-connections</a></p>

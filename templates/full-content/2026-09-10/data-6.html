@@ -1,0 +1,52 @@
+<p>A deploy rolls out to 60 pods. Each one starts, connects to Redis, warms a small cache, and registers with service discovery. The rollout is staged and takes four minutes.</p>
+<p>Nine minutes later, every pod hits the database at the same instant. Nobody scheduled that. The pods were started at different times, they are not coordinated, and there is no shared clock driving them.</p>
+<p>They synchronised themselves, because every one of them set a five minute TTL from a start time that the rolling deploy had already bunched into a narrow window, and after two refresh cycles the small differences had been absorbed by the fixed interval.</p>
+<p>That is the entire failure. Independent things with a fixed period converge, and once they converge nothing pulls them apart again.</p>
+<h2>Fixed intervals are attractors</h2>
+<p>The intuition that trips people up is that clients starting at random times stay at random times. They do not, because most systems have events that reset everyone’s clock at once.</p>
+<p>A deploy restarts every instance within a few minutes. A network partition disconnects every client and they all reconnect when it heals. A cache flush empties everything simultaneously. A leader election completes and every follower re-registers. After any of those, a fixed interval keeps the alignment forever.</p>
+<p>The cache version of this is well known enough that I have written about TTL expiry as a scheduled simultaneous failure. What took me longer to notice is how many other things in a normal service have exactly the same shape and none of the attention.</p>
+<h2>Retries are the worst offender</h2>
+<p>Exponential backoff is standard advice and it is only half the fix.</p>
+<p>Consider a thousand requests failing when a dependency returns 503. Every one of them waits one second, retries, fails, waits two seconds, retries, fails, waits four. The backoff is doing its job in the sense that the total rate decreases. It is doing nothing at all about the fact that all thousand clients are still moving in lockstep.</p>
+<p>The dependency sees a thousand requests, then silence, then a thousand requests, then silence. Those spikes are what prevent it from recovering, because recovery usually requires a period of survivable load rather than a period of zero load followed by a wall.</p>
+<pre><code>import random
+
+def backoff_no_jitter(attempt, base=1.0, cap=30.0):
+    # Every client waits the same amount. Spikes persist.
+    return min(cap, base * (2 ** attempt))
+
+def backoff_full_jitter(attempt, base=1.0, cap=30.0):
+    # Uniform over the whole window. Clients decorrelate immediately.
+    return random.uniform(0, min(cap, base * (2 ** attempt)))
+
+def backoff_equal_jitter(attempt, base=1.0, cap=30.0):
+    # Guarantees a floor while still spreading. Useful when a very fast
+    # retry would itself be a problem.
+    ceiling = min(cap, base * (2 ** attempt))
+    return ceiling / 2 + random.uniform(0, ceiling / 2)</code></pre>
+<p>AWS published measurements comparing these in their architecture blog on backoff and jitter, and full jitter came out ahead on both total work performed and time to completion under contention. The result is slightly counterintuitive, because full jitter sometimes retries almost immediately, and that turns out to matter less than never having a synchronised wave.</p>
+<p>This is the piece that pairs with bounding retries so the resilience layer does not become the outage. Bounding limits how much amplification you get. Jitter limits how concentrated it is. Both are needed and the second one is usually missing.</p>
+<h2>The places nobody thinks to look</h2>
+<p>Retries and cache TTLs get discussed. These generally do not.</p>
+<p>Cron jobs default to the top of the minute, the hour, or midnight. A fleet of services each running a nightly reconciliation at 0 0 * * * produces a thundering herd against whatever they all read, at the exact hour when nobody is watching. Spreading them by a random offset within the window costs nothing, because almost no nightly job actually cares whether it starts at 00:00 or 00:17.</p>
+<p>Health checks and heartbeats fire on a fixed period from process start, so a rolling restart aligns the entire fleet. Sixty pods checking a dependency every 30 seconds is fine when spread and is a burst of sixty when aligned.</p>
+<p>Reconnect logic after a dropped connection is the sharpest one, because the disconnect event itself is what synchronises everyone. A load balancer restart drops every connection at once, and every client reconnects after its fixed delay, at once, to a service that has just restarted and is at its least able to absorb a spike.</p>
+<p>Token refresh is a quiet version. Credentials issued during a deploy expire together and get refreshed together, which puts a synchronised burst on the identity provider rather than on your own service, so it shows up as somebody else’s incident.</p>
+<p>Scheduled cache warming, metrics flushes, and log shipping intervals all belong on this list for the same reason.</p>
+<h2>The fix is genuinely one line</h2>
+<pre><code>def jittered(interval, spread=0.15):
+    # Plus or minus 15 percent. Average rate unchanged.
+    return interval * random.uniform(1 - spread, 1 + spread)</code></pre>
+<p>What I like about this is the cost profile. The average rate does not change, so capacity planning is unaffected. There is no coordination, no new dependency, no state to keep. The p99 of the interval moves by 15 percent, which for a health check or a cache refresh is not a number anybody cares about.</p>
+<p>For a fleet of size N with an interval T, going from aligned to spread turns a peak of N requests into roughly N divided by the number of distinct slots in the jitter window. At 60 pods, a 30 second check, and 15 percent jitter, the peak drops from 60 concurrent to a handful.</p>
+<p>The one place to be careful is that jitter on the first interval matters more than jitter on subsequent ones, because the first is the one anchored to the synchronising event. Some libraries only jitter after the initial delay, which leaves the worst spike intact.</p>
+<h2>Where it does not help</h2>
+<p>Jitter spreads load that was already going to happen. It does nothing about load that should not happen.</p>
+<p>A retry storm caused by an unbounded retry policy is still a retry storm with jitter, just a smoother one. If every client retries forever, jitter converts a series of spikes into a sustained overload, which is arguably harder to diagnose because the graph looks like a traffic increase rather than an obvious wave pattern.</p>
+<p>Jitter also does not help a genuinely single hot key, where there is one value and one expiry and no population to spread. That needs coalescing.</p>
+<p>And it does not fix cold start. Restarting a cache tier gives you a 100 percent miss rate with nothing to jitter, because no key has a TTL yet.</p>
+<h2>What I would do</h2>
+<p>Grep for fixed intervals. Every <code>setInterval</code>, every <code>scheduleAtFixedRate</code>, every cron expression ending in <code>0 * * * *</code>, every <code>Thread.sleep</code> inside a reconnect loop. Most of them will be fine. The ones that are not are the ones where the fleet is large or the target is shared.</p>
+<p>Set the default in whatever wrapper your services use for scheduling and retrying, so it is applied by construction rather than remembered. A retry helper that jitters by default and a scheduler that offsets by a hash of the instance id will cover most of this without anyone thinking about it again.</p>
+<p>The framing that made this click for me is that a distributed system does not need a coordinator to behave like one. Give a thousand independent processes the same constant and they will find each other, and the thing that finds them is arithmetic rather than anything you designed.</p>

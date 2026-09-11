@@ -1,0 +1,150 @@
+<h1>TPC-H Query 15 - Scalar Constants and Materialisation</h1>
+<p>Today's TPC-H query is the first one to use a <code>WITH</code> clause.</p>
+<p>The same expression is used twice, and the query quietly tests for a simple, yet powerful, optimisation: materialisation.</p>
+<p>As we shall see, Databricks, Trino and DataFusion all fail the test and scan 6M more rows than the databases that implement the optimisation.</p>
+<h2>Query 15</h2>
+<p>Here is Query 15, which is the first query featuring a Common Table Expression (aka: a CTE, it's that thing after <code>WITH</code>).</p>
+<p>Notice that the same CTE is referenced twice in this query.</p>
+<pre><code>WITH revenue AS (
+    SELECT 
+      l_suppkey AS supplier_no,
+      SUM(l_extendedprice * (1 - l_discount)) AS total_revenue
+    FROM lineitem
+    WHERE l_shipdate &gt;= '1997-09-01'
+      AND l_shipdate &lt; '1997-12-01'
+    GROUP BY l_suppkey)
+SELECT 
+  s_suppkey,
+  s_name,
+  s_address,
+  s_phone,
+  total_revenue
+FROM supplier
+INNER JOIN revenue
+  ON s_suppkey = supplier_no
+WHERE total_revenue = (SELECT MAX(total_revenue) FROM revenue)
+ORDER BY s_suppkey</code></pre>
+<h2>Estimation and Join Order</h2>
+<p>There is only one filter in the query, on <code>l_shipdate</code>.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Filter</th>
+   <th>Selectivity</th>
+   <th>Cardinality</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>l_shipdate &gt;= '1997-09-01' AND l_shipdate &lt; '1997-12-01'</code></td>
+   <td>3.7%</td>
+   <td>226K</td>
+  </tr>
+ </tbody>
+</table>
+<p>Even with the filter, the output of <code>lineitem</code> is still much larger than <code>supplier</code> (which has no filter and emits 10K rows).</p>
+<p>The join order of the outer query is trivial: <code>lineitem</code> ⨝ <code>supplier</code>.</p>
+<h2>Scalar Constants and Cross Joining</h2>
+<p>Notice this expression: <code>(SELECT MAX(total_revenue) FROM revenue)</code>. This value can be calculated before running the join between <code>supplier</code> and <code>lineitem</code> in the outer query.</p>
+<p>How do we then recombine the constant value with the query to evaluate the <code>WHERE total_revenue</code> filter?</p>
+<p>There are two general approaches:</p>
+<ol>
+ <li>Run the <code>MAX(total_revenue)</code> subquery first and store the value as a parameter - then run the outer query</li>
+ <li>Run the <code>MAX(total_revenue)</code> as part of the outer query, and just do a cross join to evaluate the filter</li>
+</ol>
+<p>If your join implementation is solid - then option 2 saves you a lot of trouble because it allows you to stay in a space that looks like relational algebra. You will be running this join:</p>
+<pre><code>FROM supplier
+INNER JOIN revenue
+CROSS JOIN (SELECT MAX(total_revenue) AS the_max FROM revenue) AS F
+WHERE total_revenue = F.the_max</code></pre>
+<p>This is elegant and avoids duplication of code in the Execution Engine of the database. For example, here is DataFusion doing exactly that (Trino does the same thing):</p>
+<pre><code>Operator
+SORT s_suppkey
+SORT s_suppkey
+INNER JOIN HASH ON MAX(revenue.total_revenue) = total_revenue &lt;--- Here is the cross join!
+│└INNER JOIN HASH ON s_suppkey = supplier_no
+│ │└PROJECT supplier_no, total_revenue
+│ │ AGGREGATE SUM(l_extendedprice * (1 - l_discount)) GROUP BY HASH l_suppkey
+│ │ DISTRIBUTE HASH ON l_suppkey
+│ │ AGGREGATE SUM(l_extendedprice * (1 - l_discount)) GROUP BY HASH l_suppkey
+│ │ FILTER (l_shipdate &gt;= DATE'1997-09-01') AND (l_shipdate &lt; DATE'1997-12-01')
+│ │ TABLE SCAN lineitem WHERE ((l_shipdate &gt;= DATE'1997-09-01') AND (l_shipdate &lt; DATE'1997-12-01')) 
+| |   AND (l_suppkey &lt;= 10000))
+│ TABLE SCAN supplier
+AGGREGATE MAX(total_revenue)
+DISTRIBUTE GATHER
+AGGREGATE MAX(total_revenue)
+PROJECT total_revenue
+AGGREGATE SUM(l_extendedprice * (1 - l_discount)) GROUP BY HASH l_suppkey
+DISTRIBUTE HASH ON l_suppkey
+AGGREGATE SUM(l_extendedprice * (1 - l_discount)) GROUP BY HASH l_suppkey
+FILTER (l_shipdate &gt;= DATE'1997-09-01') AND (l_shipdate &lt; DATE'1997-12-01')
+TABLE SCAN lineitem WHERE (l_shipdate &gt;= DATE'1997-09-01') AND (l_shipdate &lt; DATE'1997-12-01')</code></pre>
+<p>But, if you fail to realise that this scalar value is really a cross join in disguise, you end up with special, scalar handling code in your Execution Engine.</p>
+<p>For example, here is Databricks scanning <code>lineitem</code>, storing it as a scalar, and then using it again on the second scan of <code>lineitem</code>:</p>
+<pre><code>Operator
+SEQUENCE
+├─DISTRIBUTE HASH ON s_suppkey
+│ INNER JOIN HASH ON s_suppkey = revenue.supplier_no
+│ │└DISTRIBUTE GATHER
+│ │ TABLE SCAN supplier
+│ FILTER 
+│ AGGREGATE SUM(l_extendedprice * (1BD - l_discount)) GROUP BY HASH l_suppkey
+│ DISTRIBUTE HASH ON l_suppkey
+│ AGGREGATE SUM(l_extendedprice * (1BD - l_discount)) GROUP BY HASH l_suppkey
+│ TABLE SCAN lineitem WHERE (l_shipdate &gt;= DATE'1997-09-01') AND (l_shipdate &lt; DATE'1997-12-01')
+└─AGGREGATE MAX(revenue.total_revenue)
+  DISTRIBUTE GATHER
+  AGGREGATE MAX(revenue.total_revenue)
+  AGGREGATE SUM(l_extendedprice * (1BD - l_discount)) GROUP BY HASH l_suppkey
+  DISTRIBUTE HASH
+  TABLE SCAN lineitem WHERE (l_shipdate &gt;= DATE'1997-09-01') AND (l_shipdate &lt; DATE'1997-12-01')</code></pre>
+<h2>Materialisation</h2>
+<p>Remember that TPC-H is cleverly designed - and this query is no exception. It is fishing for a special optimisation.</p>
+<p>First, realise that the 6M row <code>lineitem</code> table (with a filter bringing it to 226K rows) is mentioned twice in this query.</p>
+<p>The outer query accesses it with a <code>GROUP BY</code> and this aggregate:</p>
+<pre><code>FROM lineitem
+WHERE l_shipdate &gt;= '1997-09-01'
+  AND l_shipdate &lt; '1997-12-01'
+GROUP BY l_suppkey</code></pre>
+<p>This aggregate can easily be estimated; it can't possibly be larger than the size of <code>supplier</code> - which is 10K rows. This is <em>much</em> smaller than the rowcount of <code>lineitem</code> (by 22x).</p>
+<p>The subquery makes use of the same construct, like this:</p>
+<pre><code>SELECT MAX(total_revenue)
+FROM (
+  SELECT SUM(...) AS total_revenue
+  FROM lineitem
+  WHERE l_shipdate &gt;= '1997-09-01'
+    AND l_shipdate &lt; '1997-12-01'
+) as subquery</code></pre>
+<p><strong>Note:</strong> I specifically didn't represent the subquery by its CTE alias. What the optimiser is about to do often fine without that help from the user specifying a CTE.</p>
+<p>Here is the realisation that a query optimiser might have:</p>
+<ul>
+ <li>The <em>same</em> query is used in two places</li>
+ <li>The output size of that query is small</li>
+ <li>If I save the results of this query - I can eliminate one of the two 6M row scans of <code>lineitem</code></li>
+</ul>
+<p>This insight is sometimes called "materialisation".</p>
+<p>DuckDB can do it, and so can Postgres and SQL Server. Here is the DuckDB query plan:</p>
+<pre><code>Operator
+SEQUENCE
+├─MATERIALISE AS m_revenue &lt;--- Construct the aggregate
+│ AGGREGATE sum_no_overflow #1 GROUP BY HASH #0
+│ PROJECT l_suppkey, l_extendedprice * (1.00 - l_discount)
+│ TABLE SCAN lineitem WHERE l_shipdate &gt;= '1997-09-01' AND l_shipdate &lt; '1997-12-01'
+└─SORT s_suppkey
+  INNER JOIN HASH ON s_suppkey = supplier_no
+  │└INNER JOIN HASH ON total_revenue = SUBQUERY
+  │ │└PROJECT CASE WHEN (#1 &gt; 1) THEN ...
+  │ │ AGGREGATE "first" #0, count_star() &lt;--- Calculate the max from the cached
+  │ │ AGGREGATE MAX(#0)
+  │ │ PROJECT total_revenue
+  │ │ SCAN MATERIALISED revenue
+  │ SCAN MATERIALISED revenue &lt;--- Scan from the cached
+  TABLE SCAN supplier</code></pre>
+<p>Notice how the aggregate is materialised - then reused twice by the code.</p>
+<p>In the case of TPC-H Q15 - this small optimisation saves a 6M row scan.</p>
+<h2>Summary</h2>
+<p>In today's analysis of Query 15, you saw how storing an intermediate result that is referenced more than once can greatly reduce the work needed to run the query.</p>
+<p>In a way, this type of materialisation is almost like the automatic creation of a temp table.</p>
+<p>Some databases, like DuckDB, SQL Server and Postgres, handle this gracefully and pass the test Q15 sets up before us.</p>
+<p>We also saw that even though this optimisation is straightforward - Databricks, DataFusion and Trino all fail to make it.</p>

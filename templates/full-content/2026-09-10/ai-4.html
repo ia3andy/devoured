@@ -1,0 +1,79 @@
+<h1>Run <em>any</em> model, on any backend</h1>
+<p>100+ model families ported to pure Keras 3, with weights converted from the original checkpoints. The same code runs on JAX, PyTorch and TensorFlow, and nothing from <code>transformers</code> or <code>torch</code> is needed at run time.</p>
+<h2>Two calls to a prediction</h2>
+<p>Build the model with <code>from_weights</code>, then feed it whatever its processor produces. Every model in the library follows this shape, so moving between a detector, a depth estimator and an LLM costs you nothing.</p>
+<pre><code>pip install -U zeromodels
+</code></pre>
+<p>Weights come from the <code>zeromodels</code> org on the Hub, and the same identifier builds both the model and its processor, so the resolution and normalization always match the checkpoint.</p>
+<pre><code>import os
+
+os.environ["KERAS_BACKEND"] = "torch"  # or "jax" / "tensorflow"
+
+from PIL import Image
+from zeromodels.models.detr import DETRDetect, DETRImageProcessor
+
+model = DETRDetect.from_weights("zeromodels/detr-resnet-50")
+processor = DETRImageProcessor.from_weights("zeromodels/detr-resnet-50")
+
+image = Image.open("photo.jpg").convert("RGB")
+output = model(processor(image)["pixel_values"], training=False)
+
+results = processor.post_process_object_detection(
+    output, threshold=0.9, target_sizes=[(image.height, image.width)]
+)[0]
+</code></pre>
+<h3>One call, three sources</h3>
+<p><code>from_weights</code> dispatches on what you hand it: a preconverted Keras repo on the Hub, a bare variant name that converts an upstream checkpoint on the fly, or any compatible Hugging Face repo behind the <code>hf:</code> prefix. Architecture details, including the class count of a fine-tune, are read from the repo config.</p>
+<pre><code>from zeromodels.models.qwen3 import Qwen3TextGenerate
+from zeromodels.models.segformer import SegFormerSemanticSegment
+
+# Preconverted Keras weights (zm_config.json)
+SegFormerSemanticSegment.from_weights("zeromodels/segformer_b0_ade_512")
+
+# Bare variant: converted from upstream on the fly
+Qwen3TextGenerate.from_weights("qwen3-8b")
+
+# Any Hub repo with a matching model_type
+SegFormerSemanticSegment.from_weights("hf:nvidia/segformer-b0-finetuned-ade-512-512")
+
+# Architecture only, randomly initialized
+SegFormerSemanticSegment.from_weights(
+    "zeromodels/segformer_b0_ade_512", load_weights=False
+)
+</code></pre>
+<h3>Measured outputs, not illustrative ones</h3>
+<p>Every figure and every printed result on a model page comes from actually running the snippet beside it on the image or audio clip shown. Nothing is hand-written to look plausible, so what you read is what you get when you run it yourself.</p>
+<h3>Any backend, either data format</h3>
+<p>Set <code>KERAS_BACKEND</code> before importing Keras and the rest is unchanged. Models read <code>keras.config.image_data_format()</code> when they are <strong>constructed</strong>, so set that first too if you want <code>channels_first</code>; processors take a per-instance <code>data_format</code> argument.</p>
+<pre><code>import os
+
+os.environ["KERAS_BACKEND"] = "jax"  # or "torch" / "tensorflow"
+
+import keras
+
+keras.config.set_image_data_format("channels_first")
+</code></pre>
+<h3>Large checkpoints, as they ship</h3>
+<ul>
+ <li>GPT-OSS 120B loads at bfloat16 with its MoE experts left packed in MXFP4 and dequantized on the fly, so it stays near 66 GB instead of the ~130 GB an fp32 expansion would cost.</li>
+ <li>Weight-only int8, int4, fp8 and mxfp4 are arguments to the same <code>from_weights</code> call, on any model.</li>
+</ul>
+<pre><code>from zeromodels.models.gpt_oss import GptOssTextGenerate
+
+# Experts stay packed in MXFP4, dequantized in the expert layer's call
+model = GptOssTextGenerate.from_weights("zeromodels/gpt-oss-120b")
+
+# Quantize weight-only on the way in, for a smaller footprint again
+model = GptOssTextGenerate.from_weights("zeromodels/gpt-oss-120b", quantization="int8")
+</code></pre>
+<h2>Where to start</h2>
+<h3>Vision</h3>
+<p>Detection, segmentation, depth, and self-supervised backbones.</p>
+<h3>Text</h3>
+<p>Encoders and decoder LLMs, dense and mixture-of-experts.</p>
+<h3>Multimodal</h3>
+<p>Vision-language generation and grounding.</p>
+<h3>Speech</h3>
+<p>Transcription and speech-aware language models.</p>
+<h2>Ready to use ZeroModels?</h2>
+<p>One install, 118 model families, three backends.</p>

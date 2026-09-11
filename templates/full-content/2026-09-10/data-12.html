@@ -1,0 +1,85 @@
+<h1>xlDuckDb</h1>
+<p>Use DuckDB within Excel with the xlDuckDb addin.</p>
+<p>DuckDB is an amazing tool with deep integration with Python and R, but sometimes you just need data in Excel. xlDuckDb allows DuckDB SQL to be run within Excel. Query results are returned as regular Excel cells.</p><img src="https://github.com/RusselWebber/xlDuckDb/raw/main/images/duckdb_http_parquet.gif?raw=true" alt="Run remote Parquet">
+<h2>Installation</h2>
+<p>Download the xlduckdb.zip file from the latest release on the right.</p>
+<p>Use the "Extract All" option on the right-click menu in Windows Explorer to extract contents of the zip file on your local PC.</p>
+<p>Right-click on the xlDuckDb64.xll file and unblock it:</p><img src="https://github.com/RusselWebber/xlDuckDb/raw/main/images/xlduckdb_unblock.gif?raw=true" alt="Unblock xlDuckDb">
+<p>Double click on the xlDuckDb64.xll file to open the addin in Excel. The function <em>DuckDbQuery</em> will be registered automatically.</p>
+<h3>Requirements</h3>
+<p>xlDuckDb only runs on 64-bit Excel 365 released after Sept 2018. The dynamic array resizing functionality is required.</p>
+<p>xlDuckDb v0.6.0 and above require the .Net 8.0 or later runtime. Usually a compatible version of .Net will already be installed, however the RunTime can also be downloaded from <a href="https://dotnet.microsoft.com/en-us/download/dotnet/8.0">.Net RunTime</a></p>
+<h2>Usage</h2>
+<p>Any DuckDB SQL can be run and the results will be returned to Excel.</p>
+<h3>A note on copying queries into Excel</h3>
+<p>When copying text such as SQL commands into Excel cells, add a <strong>'</strong> at the start so that Excel treats the input as a string.</p>
+<h2>Querying Excel Ranges</h2>
+<p>Excel ranges can be queried as if the range was a regular DuckDb table. The keyword <strong>xlRange</strong> is used in queries, internally xlDuckDb substitutes the Excel range data.</p>
+<blockquote>
+ SELECT * FROM <strong>xlRange</strong>
+</blockquote>
+<p>The range is passed as the third argument to the DuckDbQuery() function.</p>
+<p>Here we copy in the 2024 F1 Drivers Points and query the range:</p>
+<p>The data is in the range A1:E25</p>
+<p>The range is passed as the third argument:</p>
+<blockquote>
+ =DuckDbQuery(A27,,A1:E25)
+</blockquote>
+<p>And the query is run against the Excel range:</p>
+<h3>Named Ranges</h3>
+<p>Queries can be run against named ranges.</p>
+<p>Here we pass the named range DriverPoints:</p>
+<blockquote>
+ =DuckDbQuery(A27,,DriverPoints)
+</blockquote>
+<h3>Table Data</h3>
+<p>Queries can be run against Excel table data.</p>
+<p>Here we pass the table name PointsTable[All]:</p>
+<blockquote>
+ =DuckDbQuery(A27,,PointsTable[All])
+</blockquote>
+<p><em>Note:</em> Multiple Excel ranges can be passed to the DuckDbQuery() function. Any number of ranges can be passed as the 3rd, 4th, 5th..nth argument. These ranges can then be referenced in the SQL query as xlRange[1], xlRange[2]..xlRange[n].</p>
+<h2>Querying JSON files</h2>
+<p>Reading data from JSON files can be difficult, particularly if the data is nested. DuckDB allows the JSON file to be treated just like a regular database table.</p>
+<blockquote>
+ SELECT firstname, surname, bornCountry FROM 'laureate.json' LIMIT 5
+</blockquote>
+<p>We can now easily find the countries with the most Nobel prize winners:</p>
+<blockquote>
+ SELECT bornCountry AS Country, COUNT(*) AS Number FROM 'laureate.json' GROUP BY bornCountry ORDER BY COUNT(*) DESC LIMIT 5
+</blockquote>
+<p>DuckDB supports the use of JSONPath to extract values from nested JSON fields. This allows us to extract the category and motivation of the first prize awarded to each person:</p>
+<blockquote>
+ SELECT firstname, surname, prizes-&gt;&gt;'$[0].category' AS Category, prizes-&gt;&gt;'$[0].motivation'AS Motivation FROM 'laureate.json' LIMIT 5
+</blockquote>
+<h2>Querying CSV files</h2>
+<p>DuckDB is able to handle most CSV files automatically, detecting the column delimiters, data types, and so on. DuckDB allows the CSV file to be treated as a regular database table:</p>
+<blockquote>
+ SELECT Region, "Item Type", "Total Revenue" FROM '10000SalesRecords.csv' LIMIT 5
+</blockquote>
+<p>DuckDB has a user-friendly PIVOT statement that allows us to view the revenues in Asia and Europe broken down by item type:</p>
+<blockquote>
+ PIVOT '10000SalesRecords.csv' ON Region IN ("Europe", "Asia") USING sum("Total Revenue") GROUP BY "Item Type" ORDER BY "Item Type"
+</blockquote>
+<p>Data from multiple sources can be combined in a single SQL query. We can combine the JSON and CSV data to show the total sales in the countries with the most Nobel laureates:</p>
+<blockquote>
+ WITH CountrySales AS (SELECT CASE WHEN Country='United States of America' THEN 'USA' ELSE Country END AS Country, Sum("Total Revenue") AS Sales FROM '10000SalesRecords.csv' GROUP BY Country) SELECT cs.Country, SUM(cs.Sales) AS Sales, COUNT(*) AS "Nobel Laureates" FROM CountrySales cs INNER JOIN 'laureate.json' l ON cs.Country = l.bornCountry GROUP BY cs.Country ORDER BY "Nobel Laureates" DESC LIMIT 5
+</blockquote>
+<h2>Querying Parquet files</h2>
+<p>Apache Parquet is an open source, column-oriented data file format designed for efficient data storage and retrieval. DuckDB has extensive support for efficient querying of Parquet files.</p>
+<blockquote>
+ SELECT Survived, Pclass, Sex, Age FROM 'titanic.parquet' LIMIT 5
+</blockquote>
+<p>We can now contrast the ages across cabin classes for survivors versus non-survivors:</p>
+<blockquote>
+ WITH Survivors AS (SELECT Pclass, Age, Sex FROM 'titanic.parquet' WHERE Survived=1) PIVOT Survivors ON Pclass USING AVG(Age) GROUP BY Sex
+</blockquote>
+<h2>Querying from remote locations</h2>
+<p>DuckDB has functionality to directly query data located on https and in AWS S3.</p>
+<blockquote>
+ SELECT * FROM 'https://duckdb.org/data/holdings.parquet';
+</blockquote>
+<p>Similarly we can attach to the DuckDB stations database in S3 and query the number of stations in each country.</p>
+<h2>Thanks</h2>
+<p>xlDuckDb would not have been possible without the <a href="https://github.com/excel-dna">ExcelDNA</a> and <a href="https://github.com/Giorgi/DuckDB.NET">DuckDB.NET</a> projects.</p>
+<p>The DuckDB query in Excel functionality was extracted from the commercial product <a href="https://www.xlslim.com">xlSlim</a>. If you need the same DuckDB functionality within a Digicert EV certificate signed addin then xlSlim is what you are looking for.</p>
