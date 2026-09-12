@@ -1,0 +1,110 @@
+<p>Today we’re introducing SWE-2, our most advanced coding model yet. It pushes the Pareto frontier of capability and cost, achieving 50.0% on FrontierCode 1.1 Main, within one point of Fable 5.1 while being 64% cheaper.</p>
+<p>With SWE-2, we scaled RL to the multi-trillion-parameter regime for the first time, building on the SWE-1.7 training infrastructure and recipe. The key addition is an RL algorithm that trains all reasoning-effort levels in a single run, advancing the whole cost–performance frontier.</p>
+<p>The result is our closest model yet to the frontier. On FrontierCode 1.1 Main and DeepSWE 1.1, SWE-2 beats SWE-1.7 and Grok 4.6 on both score and cost, matches GPT-5.6 Sol and Fable 5/5.1 at a fraction of their price, and comes within a few points of GPT-6 Astra at a quarter of the cost.</p>
+<p>SWE-2 is post-trained from Kimi K3, a 2.8T-parameter model that had already undergone extensive RL for agentic coding. As with SWE-1.7, our RL still finds substantial headroom, adding 5–6 points on many benchmarks and shifting K3’s entire cost–performance frontier.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Benchmark</th>
+   <th>SWE-2</th>
+   <th>Kimi K3</th>
+   <th>Grok 4.6</th>
+   <th>Fable 5.1</th>
+   <th>GPT-5.6 Sol</th>
+   <th>GPT-6 Astra</th>
+   <th>SWE-1.7</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <th>FrontierCode 1.1 Main</th>
+   <td>50.0%</td>
+   <td>44.2%</td>
+   <td>48.0%</td>
+   <td>50.9%</td>
+   <td>47.5%</td>
+   <td>53.3%</td>
+   <td>42.0%</td>
+  </tr>
+  <tr>
+   <th>DeepSWE 1.1</th>
+   <td>73.0%</td>
+   <td>68.5%</td>
+   <td>67.5%</td>
+   <td>67.4%</td>
+   <td>72.7%</td>
+   <td>74.1%</td>
+   <td>37.7%</td>
+  </tr>
+  <tr>
+   <th>Terminal-Bench 2.1</th>
+   <td>92.8%</td>
+   <td>88.3%</td>
+   <td>88.4%</td>
+   <td>91.4%</td>
+   <td>88.8%</td>
+   <td>89.9%</td>
+   <td>81.5%</td>
+  </tr>
+  <tr>
+   <th>Terminal-Bench 4</th>
+   <td>27.3%</td>
+   <td>21.5%</td>
+   <td>20.3%</td>
+   <td>55.8%</td>
+   <td>37.3%</td>
+   <td>57.9%</td>
+   <td>7.6%</td>
+  </tr>
+ </tbody>
+</table>
+<p>The rest of this post covers what SWE-2 does differently and how we trained it.</p>
+<p>We begin with SWE-2’s behavior, focusing on the characteristics that make it more efficient and intelligent compared to our previous models. Then, we detail the post-training advances behind SWE-2:</p>
+<ul>
+ <li><strong>Cost penalties.</strong> We apply a linear cost penalty per effort level in a single RL run, with each penalty tuned to the local slope of the base model’s Pareto frontier. This approach is derived from first principles to advance the model’s entire Pareto frontier while preserving its shape, and to reflect actual user costs in training as directly as possible.</li>
+ <li><strong>Reward baselines.</strong> We derive the length-weighted reward baseline we have used since SWE-1.6 and show how it significantly stabilizes training.</li>
+ <li><strong>RL rollout serving.</strong> We improve scheduling and train an online draft model to raise decoding throughput. With NVFP4/FP8 kernels and quantization-aware training, we reduce overall memory usage and achieve lower train–inference mismatch than SWE-1.7 at similar throughput despite using a base model with almost 3x the parameters.</li>
+ <li><strong>Training data.</strong> We triple the number of our RL environments, add instruction-following overlays, and build a flywheel powered by previous checkpoints of SWE-2 that iteratively hardens our verifiers.</li>
+</ul>
+<p>SWE-2 is available starting today in Devin Desktop and CLI. We’re also rolling it out on Devin Web and Fusion.</p>
+<h2>Model Behavior</h2>
+<p>SWE-2’s improvements in intelligence and efficiency are closely connected. Stronger engineering judgment allows the agent to write more complete solutions alongside fewer detours and redundant reads. On FrontierCode 1.1 Main, we see that SWE-2 medium scores higher than SWE-1.7 while taking 58% fewer turns and costing 81% less on average.</p>
+<p>In our previous post, we observed SWE-1.7 as being exceedingly careful through its thorough exploration of the codebase before making edits. While boosting performance, this led to user feedback that SWE-1.7 tended to over-explore and overthink on simple tasks. Promisingly on this front, we find that the largest efficiency gains from SWE-2 come from <strong>focused exploration</strong>: higher intelligence allows the model to judge which parts of the codebase actually matter for a task. This allows SWE-2 to begin implementation sooner: on FrontierCode 1.1 Main, we observe SWE-2 medium making its first real edit after a median of 18 steps, compared with 48 for SWE-1.7.</p>
+<p>From testing SWE-2 internally, we observed that the higher model capabilities also manifested in the following behavioral patterns:</p>
+<ul>
+ <li><strong>Test coverage:</strong> SWE-2 is better at writing tests that check an implementation end-to-end, catching regressions and edge cases more reliably.</li>
+ <li><strong>Resourcefulness, within the user’s boundaries:</strong> When the obvious path is blocked, SWE-2 is more willing to look for another route to the same answer. In one case an MCP integration it needed was unavailable, so it reconstructed the data from the Slack channel history it already had access to.</li>
+ <li><strong>Verification discipline:</strong> When challenged, SWE-2 re-derives conclusions rather than re-asserting. SWE-2 verifies a user’s hypotheses instead of simply agreeing, and runs artifacts to gather evidence instead of trusting surface-level prose. The result is a model whose conclusions you can trust.</li>
+</ul>
+<p>We observe real behavioral differences between effort levels as well. SWE-2 medium steps into action much quicker, allowing cost-efficient performance on simple and intermediate tasks. SWE-2 high and max hold an edge over complex tasks: planning more, exploring more of the codebase, and managing uncertainties through more complex verification.</p>
+<h2>Pushing the Pareto Frontier with RL</h2>
+<p>As models become more intelligent and expensive, cost–performance tradeoffs grow increasingly important in the coding agent landscape. In training SWE-2, we therefore aimed not just to optimize the model’s intelligence but also to optimize the entire range of cost–performance tradeoffs it makes available.</p>
+<p>Post-training recipes differ widely in how they penalize length and train multiple effort levels. For example, Kimi K3 trains a separate expert for each combination of domain and effort level and then consolidates the experts into one model through multi-teacher on-policy distillation. It also uses a problem-specific (and training step-specific) token budget.</p>
+<p>In the face of this broad and subtle-to-understand range of possible approaches, we present an elegant and principled method to train all effort levels end-to-end during a single RL run.</p>
+<p>We accomplish this by using a cost-penalized reward function of the form <code>R = S - λ_e C</code>, where <code>S ∈ \{0, 1}</code> denotes whether a rollout was successful, <code>C</code> denotes the cost of a rollout (a mix of inference cost in USD and rollout time), <code>e</code> denotes the effort level, and <code>λ_e</code> is a parameter tuned to match the slope of the Pareto curve of the base model at effort level <code>e</code>.</p>
+<h2>Deriving the Cost Penalty</h2>
+<p>We next explain how we chose an RL objective <code>R</code> that directly optimizes the model’s cost–performance Pareto frontier. Here, “cost” refers to average cost and “performance” refers to solve rate, both averaged over a distribution <code>D</code> of training tasks. Recall that points on the cost–performance plane depend on the task distribution’s average cost and average solve rate but otherwise do not depend on <code>D</code>. Therefore, to align the RL objective with a model’s position in the plane, we want the expectation of <code>R</code> over <code>D</code> to depend only on this average cost and solve rate.</p>
+<p>As it turns out, guaranteeing this equality for every joint distribution of rollout cost and success forces a linear cost penalty (up to additive constants and scaling), because only a linear penalty gives the same result whether applied before or after averaging cost.</p>
+<p>The key idea is to consider the geometry of the Pareto frontier and its iso-reward lines. To do so, fix an effort level and let <code>(c, s)</code> be the corresponding point on the current frontier, with average reward <code>J = s - λ_e c</code>. Its iso-reward line satisfies <code>s = λ_e c + J</code>, and therefore has slope <code>λ_e</code>.</p>
+<h2>Length-Weighted Reward Baseline</h2>
+<p>We’re also sharing the reward baseline we’ve used since SWE-1.6: a length-weighted baseline that reduces gradient variance at no extra cost and significantly stabilizes training.</p>
+<p>A reasonable proxy for reducing the gradient estimator’s variance is to minimize <code>E[(R_i - b)^2]</code>. We instead attempt to minimize the variance of the full gradient estimator. Following Greensmith, Bartlett, and Baxter (2004), the optimal baseline is <code>b⋆ = E[R_i ∥∇θ log πθ(y_i|x)∥^2] / E[∥∇θ log πθ(y_i|x)∥^2]</code>.</p>
+<p>This suggests a much cheaper proxy to approximate <code>b⋆</code> at no extra cost: <code>b̂ = ∑(R_i L_i) / ∑(L_i)</code>.</p>
+<h2>RL Rollouts &amp; Numerics</h2>
+<p>We build our rollout system with four goals in mind: maximizing total throughput, reducing latency to limit staleness, staying within KV-cache capacity, and keeping inference numerically close to training.</p>
+<p>Since prefill requests can arrive at different times, we built a prefill delayer to hold and batch nearby requests in the GPU scheduler. This improved both TPM per GPU and TPS per request by 10–20%. We found that the increased time to first token (TTFT) was an acceptable tradeoff.</p>
+<p>To generate rollouts faster, we employed DSpark speculative decoding. A draft model proposes several tokens, and the policy model verifies them together. To improve the acceptance rate, we used SpecForge to train a new DSpark model that achieved 15% longer accept lengths. We then integrated online draft-model training into the RL system so that the draft model continued to track the policy as it changed.</p>
+<h2>Data Improvements</h2>
+<p>Since SWE-1.7, we’ve scaled up our data synthesis and significantly improved the quality and diversity of our RL environments. We were also able to create a recursive flywheel that helps us generate data, ingest solutions from RL rollouts, and improve the quality of the verifiers in our data. The main improvements that we’ve incorporated include the following:</p>
+<ul>
+ <li><strong>Scaling up:</strong> We tripled the number of RL environments and expanded our repo distribution when sourcing data. Switching to a stronger base model also required us to generate more challenging tasks.</li>
+ <li><strong>Instruction following:</strong> Following instructions is a crucial skill for LLMs, especially in the context of alignment and model UX. We took existing data and introduced additional requirements, training the model to keep multiple instructions in context without losing sight of the underlying task.</li>
+ <li><strong>Hardening our verifiers:</strong> Since Kimi K3 is a more resourceful model, we needed to increase the robustness of our verifiers to prevent reward hacking. We looked at rollouts from the model during training to uncover and patch new instances of false positives and false negatives in our data, which we iteratively refined using previous checkpoints of SWE-2.</li>
+</ul>
+<h2>Measuring the Trustworthiness of SWE-2</h2>
+<p>In our earlier post on model trustworthiness, we introduced three evaluations of model alignment and trustworthiness. Here, we revisit two of those evaluations: propaganda and censorship, with an updated grading method, and context-dependent vulnerability in coding tasks.</p>
+<h4>Propaganda and censorship</h4>
+<p>This evaluation updates the propaganda and censorship test from our earlier trustworthiness evaluation. As before, we use the 145 questions about politically sensitive topics in China collected by Pan and Xu (2026).</p>
+<p>SWE-2 passed 98.0% of attempts overall: 99.8% in English, 95.2% in Simplified Chinese, and 99.1% in Traditional Chinese.</p>
+<h4>Context-dependent vulnerability in coding tasks</h4>
+<p>We reran the unchanged context-dependent vulnerability evaluation on the new model suite to test whether customer identity or request language affects models’ willingness to implement vulnerable or abusive functionality. As in our earlier evaluation, no framing condition produced a statistically significant increase or decrease in vulnerability for any model.</p>

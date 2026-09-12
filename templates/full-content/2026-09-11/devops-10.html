@@ -1,0 +1,124 @@
+<p>We’ve rewritten the module registry in <a href="https://github.com/cloudflare/workerd"><code>workerd</code></a>, the core open-source component of the Workers runtime, to be faster, more standards-compliant, and more closely aligned with Node.js' module registry.</p>
+<p>Over the past few years, we’ve been adding support for more and more Node.js runtime APIs. The Workers runtime now supports every stable API from Node.js that you might want to use in a serverless context, and these APIs are now enabled by default, letting you deploy even larger Node.js apps to Cloudflare (now up to 64 MiB on all plans — we’ve removed the limit on compressed bundle size).</p>
+<p>But API compatibility alone is not enough: Node.js applications also depend on how the runtime resolves, loads, and caches modules. ESM, CommonJS, and WebAssembly are each types of modules that you can import in your Worker’s code. The system within the runtime that handles all of this is called the module registry.</p>
+<p>You can start using it today by enabling the <code>new_module_registry</code> compatibility flag in your Worker.</p>
+<pre><code>\{
+  "compatibility_flags": ["new_module_registry"]
+}</code></pre>
+<p>When you enable the <code>new_module_registry</code> compatibility flag:</p>
+<ul>
+ <li><code>import.meta.url</code>, <code>import.meta.main</code>, and <code>import.meta.resolve()</code> all work.</li>
+ <li>Module specifiers are parsed and resolved as real URLs, including query strings and fragments.</li>
+ <li><code>node:</code> built-ins resolve to the same module instance no matter how you reach them.</li>
+ <li>Import attributes (<code>with \{ type: 'json' }</code>) are correctly validated.</li>
+ <li><code>require()</code> on an ES module follows Node.js' <code>require(esm)</code> rules.</li>
+ <li>Errors use consistent classes and messages regardless of which loading path triggered them.</li>
+ <li>Modules compile lazily when first imported (statically or dynamically).</li>
+ <li>WebAssembly modules support source phase imports.</li>
+</ul>
+<p>For the full deep-dive on how this new module registry interacts with V8’s module APIs, we’ve added reference docs to workerd that break down everything in detail. But for most people building on Workers, you want to understand how these changes improve compatibility and help you build. To do that, we’ll dive into each of these changes in the sections below.</p>
+<h2>How the Workers runtime loads the code you give it</h2>
+<p>When you deploy a Worker to Cloudflare, wrangler or Vite “bundles” all of your Worker’s code from many files and dependencies into one or many modules, which are then uploaded to Cloudflare when you run <code>wrangler deploy</code>.</p>
+<p>By default, Wrangler bundles nearly all of this code into a single module script. It runs <code>esbuild</code> under the hood, which processes then inlines relative imports and <code>require()</code> calls for most npm dependencies into that one file. The <code>import</code> and <code>require()</code> statements are replaced with regular functions as part of the process. By the time that bundle reaches the Workers runtime (<code>workerd</code>), there usually isn't much of a module graph left for the Workers runtime to deal with. Most of the different modules are bundled into one file. We have seen these scripts grow to as many as multiple hundreds of thousands of lines long.</p>
+<p>Why is it necessary to bundle many modules into a single file before uploading server-side code to Cloudflare? It has been technically possible to upload multiple modules, and even modules of different types, in the Workers runtime for many years now. However, the runtime has not resolved modules in a way that was consistent with all the other runtimes. If, for example, your code or dependencies used <code>import.meta.resolve()</code> to resolve the path to another module, that code would fail because <code>import.meta.resolve()</code> was not supported.</p>
+<p>When you use the Cloudflare Vite plugin, Vite 8 bundles your code using Rolldown, instead of Wrangler bundling your code using esbuild. Rolldown resolves imports and npm dependencies, converts CommonJS to ESM where necessary, and emits an entry module plus any additional chunks created through code splitting, such as dynamic imports. As a result, the Workers runtime receives a smaller, build-generated module graph rather than the application’s original source graph.</p>
+<p>The new module registry implementation in the Workers runtime opens the door to bundlers like Rolldown to perform fewer transformations, and to rely more on the runtime to handle module resolution.</p>
+<p>When you import a Node.js API in your worker, by default you are importing a module that is built into <code>workerd</code>. It is not bundled into your code as a polyfill. Wasm, text, and binary modules are provided to the Workers runtime as separate files too. They are referenced by specifier instead of being inlined. And if you deploy with <code>--no-bundle</code>, or your tooling uploads a Worker as multiple modules directly, the full module graph shows up at runtime exactly as you wrote it.</p>
+<p>In all of these cases, something has to take a specifier, work out what code it actually points to, compile it, and hand V8 a module object it can link and run. In <code>workerd</code>, that's the module registry's job.</p>
+<h2>Why a new implementation?</h2>
+<p>The original registry resolves specifiers as filesystem-style paths, not URLs. That sounds like a minor distinction, but it ruled out a bunch of things: there was no clean way to implement <code>import.meta.url</code>, relative imports didn't follow the same resolution rules as <code>new URL()</code>, and protocols like <code>node:</code> and <code>cloudflare:</code> were handled as special-cased string prefixes instead of, well, protocols.</p>
+<p>It also compiles your entire Worker bundle up front, whether or not a given module ever gets imported, and it keeps a separate, private copy of everything per V8 isolate. Cloudflare runs multiple V8 isolate replicas of the same Worker to spread load across CPU cores, so in practice that meant compiling the exact same source more than once, with keeping multiple copies of the source in memory.</p>
+<p>None of this is really a bug, but it made it difficult to evolve the implementation without breaking changes. The new registry starts from URLs as the specifier format and treats laziness and cache sharing as things to design in from day one. The existing registry implementation is not going anywhere. Currently, deployed Workers will continue to work as they always have.</p>
+<h2>import.meta</h2>
+<p>The <code>import.meta</code> API provides information about the module, such as the module's URL, and whether it is the main entry point module:</p>
+<pre><code>export default \{
+  async fetch(request) \{
+    return new Response(`$\{import.meta.url}, main: $\{import.meta.main}`);
+  },
+};</code></pre>
+<p>That prints something like <code>file:///bundle/index.js, main: true</code>.</p>
+<p><code>import.meta.main</code> is true only for the module configured as your Worker's entrypoint; every other module gets <code>false</code>.</p>
+<p><code>import.meta.resolve()</code> resolves a specifier against the current module without importing it:</p>
+<pre><code>import.meta.resolve('./utils.js');       // 'file:///bundle/utils.js'
+import.meta.resolve('./a/../utils.js');  // 'file:///bundle/utils.js' (dot segments collapse)
+import.meta.resolve('fs');               // 'node:fs' (recognizes bare node.js built-ins too)</code></pre>
+<p>It's a pure string transform, same as in Node.js and in browsers: it doesn't check that the resolved URL corresponds to a real module, and it throws a <code>TypeError</code> for a specifier that can't be parsed as a URL at all, rather than returning <code>null</code>. One detail worth knowing if you ever look closely at the output: it normalizes percent-encoding the same way <code>new URL()</code> does, which means it collapses paths like <code>./a/../b.js</code>, but it does not decode characters that were already percent-encoded. <code>import.meta.resolve('%66oo.js')</code> resolves to <code>file:///bundle/%66oo.js</code>, not <code>file:///bundle/foo.js</code>.</p>
+<h2>Specifiers are URLs</h2>
+<p>Relative imports now resolve the same way as <code>new URL(specifier, base)</code> would, because that's literally what's happening under the hood. Full URLs work as specifiers too, not just relative paths:</p>
+<pre><code>import \{ helper } from 'file:///bundle/utils.js';</code></pre>
+<p>The more interesting consequence is what happens with query strings and fragments. Per the same module-identity rules browsers use, a specifier with a different query string or fragment is treated as a genuinely distinct module instance, even when it points at the same underlying source:</p>
+<pre><code>// counter.js
+let n = 0;
+export function increment() \{
+  return ++n;
+}</code></pre>
+<pre><code>import \{ increment as incA } from './counter.js?a';
+import \{ increment as incB } from './counter.js?b';
+
+incA(); // 1
+incA(); // 2
+incB(); // 1, a separate instance with its own copy of `n`</code></pre>
+<p><code>./counter.js?a</code> and <code>./counter.js?b</code> load the same source, but they're evaluated separately, each gets its own <code>import.meta.url</code>, and each gets its own copy of any top-level state. Importing the same specifier with the same query string again still gets you back the same instance, so this isn't a way to force re-evaluation on every import.</p>
+<h2>Import attributes are correctly validated</h2>
+<pre><code>import data from './config.json' with \{ type: 'json' };</code></pre>
+<p>The original module registry implementation silently ignores the import attributes in violation of the spec. It is expected that implementations throw an exception when any import attribute it does not understand is used.</p>
+<p><code>json</code> is the only import attribute type enabled right now, since it's the only one of the relevant TC39 proposals that has reached Stage 4. <code>text</code> and <code>bytes</code> are recognized, because they track the Import Text and Import Bytes proposals, but they're rejected with a specific error instead of being silently ignored or treated as unsupported syntax:</p>
+<pre><code>import msg from './message.txt' with \{ type: 'text' };
+// TypeError: Import attribute type "text" is not yet supported</code></pre>
+<p>Any attribute key other than <code>type</code> is now a hard error too, rather than being ignored:</p>
+<pre><code>import data from './config.json' with \{ type: 'json', cache: 'no' };
+// TypeError: Unsupported import attribute: "cache"</code></pre>
+<p>And if the type you specify doesn't match what the module actually is:</p>
+<pre><code>import data from './utils.js' with \{ type: 'json' };
+// TypeError: Module "./utils.js" is not of type "json"</code></pre>
+<h2><code>require(esm)</code> follows Node.js' rules</h2>
+<p>If you <code>require()</code> something that turns out to be an ES module, whether that's directly inside a CommonJS module or through <code>require('node:module').createRequire()</code>, the registry follows Node.js' <code>require(esm)</code> behavior:</p>
+<ul>
+ <li>If the module has a string-named export called <code>'module.exports'</code>, Node.js' actual mechanism for letting an ES module control what require() sees, that value is returned.</li>
+ <li>Otherwise, <code>require()</code> returns the module's namespace object.</li>
+ <li>The one exception is <code>workerd</code>'s own <code>node:</code> built-ins. They're implemented as ES modules that wrap a CommonJS-style API in a default export, so requiring one returns that default export directly. <code>require('node:buffer').Buffer</code> behaves the way you'd expect; you don't get a namespace object with a <code>.default</code> you need to unwrap yourself.</li>
+</ul>
+<pre><code>// utils.mjs
+const impl = \{ hello: 'world' };
+export \{ impl as 'module.exports' };
+export default 'not this';</code></pre>
+<pre><code>import \{ createRequire } from 'node:module';
+
+const myRequire = createRequire(import.meta.url);
+myRequire('./utils.mjs'); // \{ hello: 'world' }, not the module namespace</code></pre>
+<p>There's a restriction that comes along with this: if the module you're requiring, or anything in its module graph, has a top-level <code>await, require()</code> throws instead of blocking or handing back something half-finished:</p>
+<pre><code>// async-init.mjs
+await Promise.resolve();
+export const ready = true;</code></pre>
+<pre><code>myRequire('./async-init.mjs');
+// Error: Top-level await is not supported in this context for module: file:///bundle/async-init.mjs</code></pre>
+<p>This matches Node.js' own <code>ERR_REQUIRE_ASYNC_MODULE</code> restriction: <code>require()</code> has to return synchronously, and there's no reasonable value to hand back for a module that hasn't finished evaluating yet. Use <code>import()</code> for anything async instead. The check holds regardless of import order too: a module doesn't become <code>require()</code>-able just because something already <code>import()</code>'d and fully evaluated it earlier.</p>
+<p>If you're requiring output from a bundler that predates Node.js' <code>require(esm)</code> support and sets a <code>truthy __cjsUnwrapDefault</code> export as a marker, that takes priority over both rules above and returns the default export. That's purely there so existing prebuilt bundles keep working.</p>
+<h2>Errors are consistent, and use the right class</h2>
+<p>Regardless of whether resolution fails through a static <code>import</code>, a dynamic <code>import()</code>, or <code>require()</code>, you get the same class of error with the same message shape:</p>
+<pre><code>await import('./nope.js');
+// Error: Module not found: file:///bundle/nope.js
+
+await import('https://');
+// TypeError: Invalid module specifier: https://</code></pre>
+<p><code>"Module not found"</code> is a plain <code>Error</code>, since it's a failure to locate something rather than a problem with the value you passed in. A specifier that can't be parsed as a URL at all is a <code>TypeError</code>, matching Node.js' own <code>ERR_INVALID_MODULE_SPECIFIER</code>. A circular dependency that V8 can't unwind is also a plain Error, never a <code>TypeError</code>. This mostly matters if you're building something on top of dynamic <code>import()</code>, like your own loader or a retry wrapper, since you can now branch on the error class or message reliably no matter which loading path triggered it.</p>
+<h2>WebAssembly source phase imports</h2>
+<p>You can now import the compiled-but-not-instantiated form of a WebAssembly module directly, using source phase imports:</p>
+<pre><code>import source wasmModule from './add.wasm';
+
+export default \{
+  async fetch() \{
+    const instance = await WebAssembly.instantiate(wasmModule, \{});
+    return new Response(String(instance.exports.add(1, 2)));
+  },
+};</code></pre>
+<p>or dynamically:</p>
+<pre><code>const wasmModule = await import.source('./add.wasm');</code></pre>
+<p>Either way you get a <code>WebAssembly.Module</code> back directly, instead of importing the module normally and pulling it off the <code>default</code> export. As source phase imports are a new feature of the language, right now this only works for WebAssembly; trying it on any other module type throws a <code>SyntaxError</code>, matching the behavior of Node.js and other runtimes.</p>
+<h2>What's next</h2>
+<p>Try it out! Add the new_module_registry compatibility flag to your Worker:</p>
+<pre><code>\{
+  "compatibility_flags": ["new_module_registry"]
+}</code></pre>
+<p>It doesn't have a default on date yet, so it won't turn on automatically for your Worker, old or new, no matter what compatibility date it's using. You will need to add the flag explicitly.</p>
+<p>We’d love your feedback. <code>workerd</code> is open source. If you run into behavior that looks like a regression rather than one of the changes described here, please file it against the <a href="https://github.com/cloudflare/workerd">workerd repository</a>.</p>
