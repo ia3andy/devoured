@@ -1,0 +1,72 @@
+<h1>Catch AI Regressions Before They Ship with AI Evals in CI/CD | Harness Blog</h1>
+<p>Traditional software fails loudly: a test breaks, an API error, a container crashes. AI applications do not. An agent can return 200 OK, respond fast, pass every infrastructure check, and still hand a customer a wrong answer.</p>
+<p>A support agent telling customers the wrong billing terms or return rules at scale is not a bug ticket. It is a brand, support-cost, and compliance problem that a traditional pipeline waves straight through to production. So the question for CI/CD becomes:</p>
+<p><em>How do you decide whether an AI application is actually good enough to ship?</em></p>
+<p>To test this, Harness AI Evals ran inside the deployment pipeline of a simple e-commerce support agent as a blocking quality gate:</p>
+<h2><strong>The setup</strong></h2>
+<ul>
+ <li><strong>Dataset:</strong> 32 golden support scenarios (payments, orders, shipping, returns, cancellations, support, promotions, security).</li>
+ <li><strong>Metrics:</strong> Answer Relevancy, Task Completion, and Toxicity. Each scores a different part of the response.</li>
+ <li><strong>Gate:</strong> blocking, 70% pass threshold. Below the bar, no production deploy.</li>
+</ul>
+<h2><strong>The first version failed the gate</strong></h2>
+<p>An early run passed only ~65% of cases. Nothing was broken in the traditional sense: the build succeeded, the service deployed to QA, and the endpoint was live. But the behavior was not good enough, so the blocking step stopped the deploy. A 65% → FAIL number is only useful if you can see <em>why</em>, and the failed cases showed the pattern immediately:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Customer question</th>
+   <th>Relevancy</th>
+   <th>Task Completion</th>
+   <th>What went wrong</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>"When am I charged for my order?"</td>
+   <td>1.0</td>
+   <td>0.3</td>
+   <td>Relevant, but wrong fact: said "at purchase" instead of "at shipment"</td>
+  </tr>
+  <tr>
+   <td>"How long does order processing take?"</td>
+   <td>1.0</td>
+   <td>0.6</td>
+   <td>Incomplete: gave the timeframe but skipped the shipping and tracking details</td>
+  </tr>
+  <tr>
+   <td>"Can I return an item without the original packaging?"</td>
+   <td>0.5</td>
+   <td>0.5</td>
+   <td>Buried the answer: described the policy but never said "No"</td>
+  </tr>
+  <tr>
+   <td>"How do I cancel my order?"</td>
+   <td>0.4</td>
+   <td>0.4</td>
+   <td>Answered the wrong thing: explained returns, not cancellation</td>
+  </tr>
+ </tbody>
+</table>
+<p>The first row is the dangerous kind. Relevancy is 1.0, yet Task Completion is 0.3 because the fact was wrong. This is the regression that survives traditional testing: the API works, the reply reads naturally, and the customer gets bad information. The other rows are communication failures. The agent often had the right information but buried it, skipped part of it, or answered a nearby question instead.</p>
+<h2><strong>From a vague complaint to an action list</strong></h2>
+<p>Without evaluation, feedback is just "the agent needs improvement." The failed cases made it concrete, and five of the eight recurring failures were traced to incorrect, missing, or incomplete knowledge:</p>
+<ul>
+ <li>Wrong payment and billing facts</li>
+ <li>Missing cancellation and customer-service details</li>
+ <li>Incomplete shipping information</li>
+ <li>Inconsistent gift-card answers</li>
+ <li>Indirect responses to yes/no questions</li>
+</ul>
+<p>The tempting shortcut is to lower the bar until the gate turns green. That defeats the purpose. The honest path is to fix the application: correct the knowledge, and tune prompts so the agent leads with a direct answer and refuses to reveal its instructions. After iterating, later runs reached 75% and 78% against the same 70% bar, held it across repeated runs, and the production deploy continued.</p>
+<h2><strong>AI is non-deterministic, so design for it</strong></h2>
+<p>The same target, dataset, and config did not always produce identical results, with one comparison showing 24 passing cases versus 22. Sometimes the agent itself varied. Asked <em>"Do you sell gift cards?"</em>, it scored Task Completion 1.0 in one run and 0.2 in another, answering "yes" once and "no" the next time. That is a real consistency problem, not noise.</p>
+<p>Two rules follow:</p>
+<ul>
+ <li><strong>Trust repetition, not luck.</strong> An improvement counts only once it holds across repeated runs.</li>
+ <li><strong>Read a red gate before reacting.</strong> A failure can mean a genuinely bad answer (block it) or a broken judge or target (an infrastructure issue, not quality).</li>
+</ul>
+<h2><strong>Why it belongs in the pipeline</strong></h2>
+<p>Running the eval inside the delivery pipeline, rather than a separate tool, is the point. The eval and the deployment gate are one blocking step next to build and deploy, completing end to end in roughly seven to eight minutes. No glue code shuttling scores from an external dashboard, no second system deciding whether the build ships. The quality signal and the delivery decision are the same decision, made in the same place.</p>
+<p>Traditional pipelines ask whether the app compiled, tests passed, and the service is healthy. AI applications add one more: is it behaving well enough to put in front of users? Because the most dangerous AI regression does not crash anything. It looks healthy while confidently giving your customer the wrong answer, and that is exactly what to catch before it ships.</p>
+<h2><strong>Try it in your own pipeline</strong></h2>
+<p>Harness AI Evals lets teams define golden datasets, pick the metrics that matter, and turn results into a blocking quality gate inside the pipeline, so a build only ships if the AI behaviour clears the bar. The fastest way to see it work is to watch the AI Evals demo and try it against your own agent.</p>

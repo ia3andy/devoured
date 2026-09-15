@@ -1,0 +1,122 @@
+<h1><strong>The question that stopped the meeting</strong></h1>
+<p>It was a routine cost review. The slide showed the month’s GPU spend, the biggest line on the whole infrastructure bill, and someone asked a five-word question: “Are we using these things?” Nobody could answer. The most expensive hardware we owned was also the hardest to see.</p>
+<p>The frustrating part is that the answer already existed. Every GPU’s utilization had been recorded, every second, for months, all of it flowing into one central, infrastructure-owned Prometheus that held every metric for every team across thousands of namespaces. The data was right there. It just sat somewhere no tenant was allowed to look, because a store that sees everyone’s metrics can’t safely be opened to any one of them. So visibility split in two:</p>
+<p>When we finally went looking, we found a GPU that had sat at zero percent utilization for eleven straight days: allocated, powered on, doing nothing, and invisible to the team that owned it. You can’t fix what you’re not allowed to see. Multiply that one idle card across a fleet, all of it drawing power behind green health checks, and “we’re not sure” becomes real money every month.</p>
+<p>This post is how we closed that gap: how we gave every team a safe, self-service view into their own metrics without handing them the keys to everyone else’s. No new metrics stack, no vendor platform, just CNCF-native pieces arranged so the people spending the GPU budget can finally see it.</p>
+<h1><strong>Why “just share Prometheus” doesn’t work</strong></h1>
+<p>The obvious fix is to give every team read access to the central Prometheus. We ran into two walls, each built from an individually correct decision.</p>
+<p>The first is security. A Prometheus query endpoint isn’t namespace-aware: if a tenant can run one PromQL query, they can run any query, including one that reads another tenant’s request rates or capacity plans. “Everyone can read everything” isn’t a posture you can defend across thousands of namespaces.</p>
+<p>The second is scale, and it has a name every platform engineer knows: the noisy neighbor. The central Prometheus is already scraping and storing series for the whole fleet. Point a few hundred engineers and ad-hoc queries at it and the store everyone depends on starts to buckle. One team’s expensive range query becomes everyone’s latency spike.</p>
+<p>Both are reasonable on their own. Together they leave the data tenants need locked in a store you can’t safely open to them. We needed to give each tenant their own curated, isolated slice, served directly.</p>
+<h2><strong>A metaphor that made it click</strong></h2>
+<p>Picture the central Prometheus as one enormous reading room where every team’s private notebooks sit on open shelves. Hand out a room key and you break confidentiality in the same motion, and the moment a crowd arrives the shared room grinds to a halt. What you want is a librarian who takes your card and brings a copy of only your box. That librarian is the multi-tenant proxy.</p>
+<h1><strong>The insight: a proxy in front, a contract in YAML</strong></h1>
+<p>We didn’t need a new metrics stack. We needed a thin, tenant-aware layer in front of the one we already had. The design came down to three moves:</p>
+<ul>
+ <li><strong>Identify:</strong> Authenticate the caller and establish which tenant they are.</li>
+ <li><strong>Isolate:</strong> Restrict every query to that tenant’s namespace, enforced below the query language so it can’t be bypassed.</li>
+ <li><strong>Deliver:</strong> Optionally copy a curated slice of each tenant’s metrics into their own small Prometheus, so their dashboards and alerts run against a store they own.</li>
+</ul>
+<p>The other half is self-service. Platform teams can’t hand-curate metric lists for thousands of namespaces, so the contract is a small Kubernetes custom resource, a MetricAccess object, where a team declares which metrics it wants. The platform owns the mechanism; the tenant owns the policy. All of it sits on CNCF-native, open source pieces.</p>
+<h1><strong>How the pieces fit</strong></h1>
+<p>The infrastructure Prometheus keeps doing its job; everything tenant-facing sits behind the proxy:</p>
+<p>On the read path, a tenant’s request enters through Nginx (load-balancing across proxy replicas), passes through kube-rbac-proxy for authentication and authorization, and reaches the proxy. The proxy discovers backend Prometheus instances via the Kubernetes API, fans the query across healthy backends, filters results to what the tenant may see, and returns the aggregate.</p>
+<p>On the write path, the proxy periodically collects each tenant’s curated metrics and remote-writes them into that tenant’s own Prometheus. For HA tenants it resolves each replica’s pod DNS and writes to all of them, so every instance holds identical data. None of this is exotic: Prometheus, service discovery, and remote-write with a tenancy model on top.</p>
+<h1><strong>The part that has to be airtight: isolation</strong></h1>
+<p>Self-service is only safe if isolation isn’t optional. Two open source components do the work here.</p>
+<p>kube-rbac-proxy handles authentication and authorization. It answers “who is this, and are they allowed?” using Kubernetes-native identity and RBAC, the same model you already trust for the API server, and carries the tenant’s identity through as a namespace assertion that anchors everything downstream.</p>
+<p>Query-time isolation is handled by prom-label-proxy . It’s the piece that makes “everyone can read everything” impossible rather than merely discouraged: it rewrites every incoming query to inject a namespace matcher, so any query becomes query\{namespace=”your-namespace”} before it reaches Prometheus. Enforcement happens below the query language, so no PromQL can escape it.</p>
+<p>The proxy itself runs hardened: non-root (UID 65534), read-only root filesystem, all capabilities dropped, no privilege escalation, least-privilege service account. Defense in depth on the path that matters most.</p>
+<h1><strong>Isolation that also cuts the bill</strong></h1>
+<p>There’s a second, quieter isolation, where the cost story lives. Read-time filtering stops tenants seeing each other’s data, but a tenant’s own Prometheus can still store far more than it needs. The <code>metricIsolation</code> setting pushes the boundary to collection time: metrics are gathered through prom-label-proxy with the namespace filter already applied, so a tenant only ever ingests its own series.</p>
+<p>The difference is not subtle:</p>
+<table>
+ <tbody>
+  <tr>
+   <td><strong>Configuration</strong></td>
+   <td><strong>Series stored</strong></td>
+   <td><strong>Query speed</strong></td>
+   <td><strong>Isolation</strong></td>
+  </tr>
+  <tr>
+   <td><strong>metricIsolation: false</strong></td>
+   <td>~10,000+ (all namespaces)</td>
+   <td>Slower (large dataset)</td>
+   <td>Query-time only</td>
+  </tr>
+  <tr>
+   <td><strong>metricIsolation: true</strong></td>
+   <td>~300 (this namespace)</td>
+   <td>Faster (focused dataset)</td>
+   <td>Collection + query time</td>
+  </tr>
+ </tbody>
+</table>
+<p>For a typical tenant that’s roughly a 97% cut in stored series, from ten-thousand-plus down to a few hundred. A smaller store queries faster, costs less, and can’t leak data it never collected. The noisy-neighbor problem shrinks too, since the fleet-wide store leaves the critical path for everyday dashboards. Our original team went from empty dashboards to a Prometheus of its own.</p>
+<h1><strong>What a tenant actually does</strong></h1>
+<p>A tenant onboards with a single YAML file that declares the metrics and where to deliver them:</p>
+<pre><code>apiVersion: observability.ethos.io/v1alpha1
+kind: MetricAccess
+metadata:
+  name: gpu-team-metrics
+  namespace: gpu-team
+spec:
+  source: gpu-team
+  metricIsolation: true         # only collect this namespace's series
+  metrics:
+    - "DCGM_FI_DEV_GPU_UTIL"                                     # exact match
+    - "container_(cpu|memory)_.*"                # regex
+    - '\{__name__=~"nginx_ingress_controller_.*"}'  # PromQL selector
+  remoteWrite:
+    enabled: true
+    interval: "30s"
+    target:
+      type: "prometheus"
+    prometheus:
+      serviceName: "prometheus-operated"
+      servicePort: 9090
+      replicas: 2                # write to both HA replicas
+      statefulSetName: "prometheus-gpu-team"
+    extraLabels:
+      tenant: "gpu-team"
+      managed_by: "multi-tenant-proxy"</code></pre>
+<p>The metrics list mixes three styles freely: exact names, regexes, and PromQL selectors. Apply the file and the proxy starts collecting and delivering. Querying is a normal Prometheus API call with a tenant header:</p>
+<pre><code>curl -H "X-Tenant-Namespace: gpu-team" \
+  "http://prometheus-multi-tenant-proxy:8080/api/v1/query?query=DCGM_FI_DEV_GPU_UTIL"</code></pre>
+<p>One requirement: the tenant’s Prometheus must accept remote-write (start it with –web.enable-remote-write-receiver). Everything else is defaults.</p>
+<h1><strong>Six PromQL queries that make idle GPUs visible</strong></h1>
+<p>Once a team can see GPU metrics, a few queries do most of the work. These assume a DCGM-style exporter; adjust the names to yours. Queries 5 and 6 also use an ingress request-rate metric, so swap nginx_ingress_controller_requests for whatever your ingress exposes.</p>
+<p><strong>1. Average GPU utilization per namespace — the headline number the team was missing:</strong></p>
+<p><code>avg by (namespace) (DCGM_FI_DEV_GPU_UTIL)</code></p>
+<p><strong>2. Count GPUs that are effectively idle — under 5% utilization for the last hour (this one finds the money):</strong></p>
+<p><code>count by (namespace) (avg_over_time(DCGM_FI_DEV_GPU_UTIL[1h]) &lt; 5)</code></p>
+<p><strong>3. GPU memory used vs. total per namespace — separates “busy and memory-bound” from “reserved but empty”:</strong></p>
+<p><code>sum by (namespace) (DCGM_FI_DEV_FB_USED)</code></p>
+<p><code> / sum by (namespace) (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE)</code></p>
+<p><strong>4. Power draw per namespace — a rough real-time proxy for cost:</strong></p>
+<p><code>sum by (namespace) (DCGM_FI_DEV_POWER_USAGE)</code></p>
+<p><strong>5. Hot cards, no traffic — GPUs busy while ingress is silent, often a stuck job:</strong></p>
+<p><code>avg by (namespace) (DCGM_FI_DEV_GPU_UTIL) &gt; 70</code></p>
+<p><code> and sum by (namespace) (rate(nginx_ingress_controller_requests[5m])) &lt; 1</code></p>
+<p><strong>6. Traffic, no GPUs — requests arriving while GPUs sit idle points at a scheduling gap, not capacity:</strong></p>
+<p><code>sum by (namespace) (rate(nginx_ingress_controller_requests[5m])) &gt; 10</code></p>
+<p><code> and avg by (namespace) (DCGM_FI_DEV_GPU_UTIL) &lt; 5</code></p>
+<p>Query 2 closed the loop for our original team: it surfaced GPUs idle for hours, the invisible spend we opened with, capacity they could finally see and give back.</p>
+<h1><strong>Holding up at fleet scale</strong></h1>
+<p>Self-service without limits just moves the noisy-neighbor problem downstream. Two levers keep load bounded. Curated metric sets mean the proxy handles a fraction of the fleet’s cardinality, not all of it. And per-tenant collection intervals act as a quota: one team can run at 5-second resolution, a batch workload at five minutes, and neither pays for the other’s cadence.</p>
+<p>Across many clusters it leans on the same primitives: dynamic backend discovery, independent per-tenant remote-write, and writes to all HA replicas so failover is a non-event. It’s still a system you operate, but its moving parts are ones a platform team already knows.</p>
+<h1><strong>What we’d tell our past selves</strong></h1>
+<ul>
+ <li><strong>Self-service still needs guardrails.</strong> A team asking for “all metrics” usually means “I don’t know which ones I need yet.” Curation is a conversation, and good defaults beat a big allowlist.</li>
+ <li><strong>Cardinality is a cost decision.</strong> metricIsolation is the difference between a 300-series store and a 10,000-series one. Turn it on unless a team has a concrete cross-namespace reason not to.</li>
+ <li><strong>Delivery is where the sharp edges are.</strong> Retries, backoff, and HA multi-replica writes aren’t optional extras. Budget for the failure modes up front.</li>
+ <li><strong>Isolation can be overkill.</strong> Small teams do fine on filtered query access alone; reserve remote-write for teams that own real dashboards and alerts.</li>
+ <li><strong>Names drift across clusters.</strong> Half our early “no data” tickets were a query naming a metric the exporter didn’t emit. Pin exporter versions and document the exact series names.</li>
+</ul>
+<h1><strong>The portable idea</strong></h1>
+<p>Strip away the specifics and the pattern fits any multi-tenant cluster: an authn/authz proxy, label-enforced isolation below the query language, and optional per-tenant remote-write, all CNCF-native and open source. No proprietary lock-in, no bespoke stack; if you already run Prometheus, you have the foundation. Other approaches exist and are worth a look. This is just the one that let us give thousands of namespaces their own view without opening the shared store to everyone.</p>
+<p>The team that couldn’t see its own GPUs now runs its own dashboards and catches idle capacity within the hour. The reading room is quiet again, and everyone has their own desk.</p>
+<h1><strong>Try it yourself</strong></h1>
+<p>The proxy is open source under Apache 2.0; the MetricAccess CRD, manifests, and examples are in the repo. The KubeCon + CloudNativeCon India 2025 talk walks through a live demo.</p>
+<p><strong>Repository:</strong> https://github.com/adobe/prometheus-multi-tenant-proxy</p>
+<p><strong>Talk recording:</strong> https://www.youtube.com/watch?v=gI40zpbES5w</p>

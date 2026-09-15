@@ -1,0 +1,85 @@
+<p>Today, we’re making Cloudflare CASB more powerful than ever by introducing automatic remediation policies. This means security teams can now design event-driven logic to revoke risky file shares and dispatch custom webhooks, without manual intervention.</p>
+<p>When we launched Cloudflare CASB, a cloud access security broker, we wanted to provide security teams complete visibility into the posture of their SaaS applications before misconfigurations became incidents. With a quick, clientless integration, CASB surfaces risks like overshared files, dormant admin keys and tokens, OAuth apps with excessive permissions — continuously, across users in the organization.</p>
+<p>For years, SaaS Security Posture Management (SSPM) tools such as Cloudflare CASB have functioned as a passive alarm system. Most SSPM tools tell you what’s wrong but do not help you fix the issue, placing the burden on administrators to manage an ever-growing to-do list. A single misconfigured file-sharing policy across a Google Workspace tenant can generate thousands of findings in seconds, and even a disciplined team faces a window between detection and remediation measured in hours or days — more than enough time for a sensitive file to be downloaded, forwarded, or indexed.</p>
+<p>With automatic remediation policies, CASB customers can now configure the actions that should be invoked immediately after a new finding is identified.</p>
+<h2>Shifting from reactive to proactive</h2>
+<p>When we launched manual remediation actions earlier this year, we gave security teams the ability to resolve misconfigurations directly from the Cloudflare dashboard. This removed the need for customers to log in to multiple SaaS portals to take action on the security and content findings detected by Cloudflare CASB. Still, this required a human to confirm and initiate each individual remediation — even if they’d seen this exact finding type before.</p>
+<p>CASB policies are a native automation engine built directly into Cloudflare One that takes action the moment a finding is detected. Security teams define their response logic once, whether that is revoking access to a file share, dispatching a webhook to your security operations center (SOC), or forwarding the event to a security orchestration, automation and response platform (SOAR). The engine handles matches automatically by executing the customer-configured action.</p>
+<p>As an example, many organizations implement controls that prohibit files from being shared publicly. However, they may apply an exception to users and groups in their marketing department who are frequently required to collaborate with external parties. SSPMs allow their customers to be alerted of any files that are shared publicly in violation of their policy. With many solutions, this permitted behavior lands in a queue with hundreds of possible violations, forcing administrators to take action on each individual instance.</p>
+<p>CASB policies are designed for exactly this scenario. Rather than waiting for a human to see and act on a finding, automation fires the moment detection happens. The public share is revoked within minutes, keeping the backlog of findings clean and clear.</p>
+<h2>How CASB policies work</h2>
+<p>At their core, CASB policies are automated workflows that tell our scanning service what action to take when a new finding is detected. From there, the configured policy will tell CASB to either trigger a remediation action, send a webhook, or both. This gives organizations the flexibility to rely on native CASB remediation capabilities or their own internal automation services and communication channels — without having to take action in disparate platforms or create their own event processing system.</p>
+<h2>How we built it</h2>
+<p>The architecture behind CASB policies is built entirely on the Cloudflare developer platform — the same platform available to every Cloudflare customer.</p>
+<p>When a finding is detected, the findings engine enqueues an orchestration message to a Cloudflare Queue. A Worker consumer then checks whether a policy configuration matches the incoming finding. If a match exists, it creates the corresponding job and hands it to the remediations pipeline, which runs on Cloudflare Workflows for durable, fault-tolerant execution. That means jobs survive process restarts and retries are handled automatically.</p>
+<p>Cloudflare Workflows also handle third-party API rate limits gracefully. If a vendor returns a rate limit error, the Workflow pauses for the appropriate backoff window and retries without dropping the job. Our target from detection to completed remediation is five minutes or less.</p>
+<h2>How to create policies</h2>
+<p>To get started, navigate to the Cloudflare dashboard and create your first policy. Policies can include both a remediation and a webhook action, but at a minimum:</p>
+<ul>
+ <li><strong>Select the vendor. </strong>Select the vendor and integration or tenant this policy should apply to.</li>
+ <li><strong>Select the integration.</strong> You can hand-select specific integrations or set it to apply to all integrations for the selected vendor.</li>
+ <li><strong>Choose a finding type.</strong> Select the CASB finding type that should fire the policy.</li>
+ <li><strong>Choose an action.</strong> Once a trigger is selected, the available actions for that finding type are shown. There are two categories: 
+  <ul>
+   <li><strong>Run remediations.</strong> First-party actions Cloudflare performs directly against the SaaS integration API. CASB currently supports remediation actions for Microsoft and Google Workspace file/folder finding types. Note that this may require upgrading permissions on integrations to read/write.</li>
+   <li><strong>Send webhooks.</strong> Send finding details to configured webhook destinations such as Slack, Microsoft Teams, Jira, ServiceNow, Tines, or any custom HTTP endpoint your team uses.</li>
+  </ul></li>
+</ul>
+<h3>Example webhook format</h3>
+<pre><code>\{
+  "id": "019f1755-23d0-7097-a9b5-fb2f82edbfc9",
+  "type": "casb.finding_instance.policy_dispatch",
+  "metadata": \{
+    "actor": "",
+    "time_sent": "2026-06-30T07:01:34.066Z",
+    "destination": "&lt;example web hook reciver url&gt;",
+    "version": 1
+  },
+  "data": \{
+    "object": "finding_instance",
+    "action": "policy_dispatch",
+    "finding": \{
+      "id": "865184c0-9e17-411a-aa5a-a54995d70cb0",
+      "severity": "High",
+      "dashboard_url": "...",
+      "type_name": "File publicly accessible with view access"
+    },
+    "asset": \{
+      "id": "019f1754-cff8-74f8-bbe7-ed0e8b8ffb73",
+      "name": "q3_financial_report_preview.xlsx",
+      "vendor": "&lt;example vendor name&gt;",
+      "type": "File",
+      "vendor_url": "&lt;example vendor URL&gt;"
+    },
+    "dlp": \{
+      "profiles": []
+    },
+    "metadata": \{
+      "access": "open",
+      "download_count": 0,
+      "download_url": "&lt;example vendor file URL&gt;",
+      "effective_access": "open",
+      "effective_permission": "",
+      "file_name": "q3_financial_report_preview.xlsx",
+      "full_path": "All Files/q3_financial_report_preview.xlsx",
+      "is_password_enabled": false,
+      "owned_by_created_at": "2022-11-01T09:24:17-07:00",
+      "owned_by_enterprise_name": "Cloudflare CASB",
+      "owned_by_id": "21665592646",
+      "owned_by_role": "admin",
+      "owned_by_user_name": "Cloudflare CASB",
+      "preview_count": 0,
+      "size": 42,
+      "url": "&lt;example vendor URL"
+    }
+  }
+}</code></pre>
+<h2>Maintaining visibility and compliance</h2>
+<p>Each policy action produces two categories of logs, visible under Insights in Cloudflare One.</p>
+<p><strong>Admin Activity logs.</strong> These capture changes to a policy definition: who created it, who edited it, who disabled it, and when. If a policy was turned off and a risk slipped through, this audit trail surfaces a timeline of the event.</p>
+<p><strong>Cloud &amp; SaaS Security policies logs.</strong> This new class of logs captures the runtime outcome of policy invocations. This includes details like which finding triggered the policy, which file was acted on, whether it succeeded or failed, and the specific error if it did not — for example, a 401 Unauthorized or an API rate limit response from the vendor.</p>
+<p>For compliance use cases, the execution log is the proof of fix. It ties a specific finding, like an overshared file (e.g. Q4_Financials.pdf), to a specific automated action and event timestamp.</p>
+<h2>Get started</h2>
+<p>Customers can find CASB Policies in the <strong>Cloud &amp; SaaS findings</strong> section of the dashboard today. Connect or update your Microsoft 365 or Google Workspace integration to Read-Write permissions, and create your first remediation policy.</p>
+<p>In the coming weeks, we’ll also be adding support for Custom Findings to CASB. Different organizations have unique needs when it comes to detection, and we want to give customers the ability to augment or define finding logic to fit those needs.</p>
+<p>New to Cloudflare One? Sign up for 50 free seats to get started with CASB, or talk to our team about a deployment at scale. For full setup instructions, visit our developer documentation.</p>

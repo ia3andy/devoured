@@ -1,0 +1,141 @@
+<p>An exact duplicate reused <strong>8 of 9 tokens</strong> and required <strong>1 token of prompt work</strong>.</p>
+<p>One interior mutation cut safe reuse to <strong>3 of 9 tokens</strong>. Namespace isolation forced <strong>0 reuse</strong>. A capacity revisit ended as the typed verdict <strong><code>evicted</code></strong>. Across all ten cases, cached and no-cache outputs stayed token-identical and every evaluator passed.</p>
+<p>That is the shipped result.</p>
+<blockquote>
+ <p><strong>Evidence boundary:</strong> this is a deterministic synthetic token-level control. It validates the auditor, oracle, attestation path, evaluator, schemas, privacy rules, hashes, and standalone verifier. It does not establish MLX or vLLM speedup, production cache correctness, provider identity, GPU performance, latency savings, or runtime-memory savings.</p>
+</blockquote>
+<p>A runtime can report a cache hit without proving that the intended prefix matched. It can report eight cached tokens while the prompt path still recomputes them. It can reuse state and return a different answer. It can label an isolated namespace as a miss without telling you whether the result came from isolation, eviction, or a cold cache.</p>
+<p>The cache event is one statement from one part of the system.</p>
+<p>The engine attestation is the statement under test. LLMTraceFX checks it against five independent checks: the token oracle, observed prompt work, output-token identity, evaluator correctness, and the checksum-bound evidence bundle. The claim survives only when the chain agrees.</p>
+<h2>What the ten cases prove</h2>
+<p>The reference control runs a fixed request sequence through a token-granular cache. For each request, an oracle calculates the reusable prefix from exact token identity and the pinned cache policy. The engine reports its reuse. The prompt path records the work it processed. A no-cache control supplies the output identity and correctness checks.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Case</th>
+   <th>Input</th>
+   <th>Expected</th>
+   <th>Attested</th>
+   <th>Work</th>
+   <th>Verdict</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>capacity-seed</td>
+   <td>4</td>
+   <td>0</td>
+   <td>0</td>
+   <td>4</td>
+   <td>verified miss</td>
+  </tr>
+  <tr>
+   <td>cold</td>
+   <td>9</td>
+   <td>0</td>
+   <td>0</td>
+   <td>9</td>
+   <td>verified miss</td>
+  </tr>
+  <tr>
+   <td>exact-duplicate</td>
+   <td>9</td>
+   <td>8</td>
+   <td>8</td>
+   <td>1</td>
+   <td>verified hit</td>
+  </tr>
+  <tr>
+   <td>interior-mutation</td>
+   <td>9</td>
+   <td>3</td>
+   <td>3</td>
+   <td>6</td>
+   <td>partial reuse</td>
+  </tr>
+  <tr>
+   <td>boundary-mutation</td>
+   <td>9</td>
+   <td>4</td>
+   <td>4</td>
+   <td>5</td>
+   <td>partial reuse</td>
+  </tr>
+  <tr>
+   <td>same-length-different-ids</td>
+   <td>9</td>
+   <td>0</td>
+   <td>0</td>
+   <td>9</td>
+   <td>verified miss</td>
+  </tr>
+  <tr>
+   <td>suffix-change</td>
+   <td>9</td>
+   <td>8</td>
+   <td>8</td>
+   <td>1</td>
+   <td>partial reuse</td>
+  </tr>
+  <tr>
+   <td>namespace-isolation</td>
+   <td>9</td>
+   <td>0</td>
+   <td>0</td>
+   <td>9</td>
+   <td>verified miss</td>
+  </tr>
+  <tr>
+   <td>capacity-pressure</td>
+   <td>4</td>
+   <td>0</td>
+   <td>0</td>
+   <td>4</td>
+   <td>verified miss</td>
+  </tr>
+  <tr>
+   <td>capacity-revisit</td>
+   <td>4</td>
+   <td>0</td>
+   <td>0</td>
+   <td>4</td>
+   <td>evicted</td>
+  </tr>
+ </tbody>
+</table>
+<p>The first two rows establish cold state. <code>capacity-seed</code> inserts a four-token candidate. <code>cold</code> then submits a nine-token request with no reusable prefix. Both are <code>verified_miss</code>.</p>
+<p>The exact duplicate is the clean positive control. The oracle expects eight reusable tokens, the engine attests eight, and the prompt path processes one. The verdict is <code>verified_hit</code>.</p>
+<p>The interior and boundary mutations change where the exact token prefix stops. The interior mutation reuses three tokens and processes six. The boundary mutation reuses four and processes five. Both are <code>partial_reuse</code>.</p>
+<p>The same-length case is the trap. Its request still contains nine tokens, but the token IDs differ. The oracle expects zero reuse. The engine attests zero. The prompt path processes all nine. Equal length creates no identity.</p>
+<p>The suffix-change case keeps an eight-token prefix. It processes the changed final token and returns <code>partial_reuse</code>, not a full hit.</p>
+<p>Namespace isolation also forces zero reuse. Capacity pressure fills the controlled cache. The later capacity revisit has zero reuse and four tokens of prompt work, but its verdict is not a generic miss. The retained predecessor proof and controlled residency observations show that the earlier candidate left the cache, so the verifier returns <code>evicted</code>.</p>
+<p>Every row preserves <code>output identity: yes</code> and <code>evaluator: yes</code>. Those checks do not change the cache verdict. They answer separate questions: did reuse alter the output, and did the result remain correct?</p>
+<h2>A hit needs an evidence chain</h2>
+<p>The independent oracle matters because the engine cannot verify itself. It derives the safe prefix from the exact request, cache state, namespace, and policy. That expected count then has to match both the engine's attestation and the amount of prompt work observed.</p>
+<p>Output identity adds another boundary. A correct reuse count does not prove that the response stayed the same. The evaluator adds one more. Token-different output can still be correct, and token-identical output can still fail a task if the control itself is wrong.</p>
+<h2>Three lessons from nine tokens</h2>
+<h3>Equal token count is not equal token identity</h3>
+<p><code>cold</code>, <code>same-length-different-ids</code>, and <code>namespace-isolation</code> all contain nine input tokens and all process nine tokens. The reasons differ.</p>
+<h3>Mutation position defines the reusable prefix</h3>
+<p>Similarity is not the rule. Prefix identity is.</p>
+<h3>Eviction and isolation are not the same operational case</h3>
+<p>Zero reuse describes an amount. It does not describe a cause.</p>
+<h2>Reproduce the public proof</h2>
+<p>From the merged LLMTraceFX repository:</p>
+<pre><code>make kv-cache-demo</code></pre>
+<h2>What this result does not prove</h2>
+<ul>
+ <li>MLX or vLLM speedup;</li>
+ <li>production cache correctness;</li>
+ <li>provider or hardware identity;</li>
+ <li>GPU performance;</li>
+ <li>latency reduction;</li>
+ <li>runtime-memory savings;</li>
+ <li>block-level cache behavior; or</li>
+ <li>that a runtime integration has enough evidence merely because it emits cache events.</li>
+</ul>
+<p>It proves a narrower and more useful thing: for a deterministic synthetic token-level control, the auditor records full reuse, partial reuse, verified misses, and eviction while the case evidence preserves namespace isolation. Output identity, evaluator correctness, privacy rules, and hash-bound verification remain intact.</p>
+<h2>The result</h2>
+<p>A cache hit can be true and still fail to prove that work was skipped.</p>
+<p>The useful claim is stricter: the independent oracle expected the prefix, the engine attested it, the prompt path skipped it, the output stayed identical, the evaluator passed, and the verifier bound those facts to the exact public bundle.</p>
+<p>That is when a cache event becomes evidence.</p>

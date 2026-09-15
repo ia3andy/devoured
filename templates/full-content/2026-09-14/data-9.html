@@ -1,0 +1,170 @@
+<p>Somewhere in your company there is a slide that says something like this: <strong>customers who enabled the AI assistant retain 15 points better than customers who did not.</strong> It has a bar chart. It has been in three executive reviews. It is driving next quarter's roadmap.</p>
+<p>Nobody randomized the AI assistant. It shipped to eligible accounts, some of them turned it on, and the analytics team compared the ones that did against the ones that did not.</p>
+<p>That comparison is not an effect. It is a description of who opts in. The feature did not make those accounts engaged. Being engaged made them adopt the feature.</p>
+<p>AI features make this worse than the average opt-in feature, and it is worth being specific about why. To adopt an AI assistant, someone at the account has to notice the release, enable it, trust it enough to put it in front of their team, train people on it, fold it into a workflow, and keep using it after the novelty fades. Every one of those steps reveals something about the account: administrator engagement, executive sponsorship, technical sophistication, product maturity, organizational appetite for change. By the time an account shows up as an "adopter," the flag is close to a proxy for organizational readiness. Readiness predicts retention on its own. The feature is riding on top of it.</p>
+<p>The instinct at this point is to model the customer's choice harder. Add covariates. Match on usage. Build a propensity score. This article argues for a different move, and it is the one sentence I would keep if everything else were cut:</p>
+<p><strong>Don't model the customers' choice harder. Find variation the customers didn't choose.</strong></p>
+<p>The rest of this article is about doing that with the one piece of an AI rollout that no customer picked: the eligibility rule.</p>
+<h2><strong>Define the question before the method</strong></h2>
+<p>There are three different quantities hiding inside "the effect of the AI assistant," and the slide conflates all of them.</p>
+<p><strong>The effect on adopters.</strong> If the accounts that turned the feature on had not adopted, how much worse would their retention have been? This is what the naive comparison is <em>trying</em> to estimate. It is the number the product team wants, because it describes the customers who actually experienced the feature.</p>
+<p><strong>The effect on everyone.</strong> If every eligible account adopted rather than nobody adopting, how much would retention change? This is the number finance wants, because it is what a forced rollout or a default-on change would produce. It is not the same number as the effect on adopters. Whether it is larger or smaller is an empirical question about effect heterogeneity; in opt-in product settings it is often reasonable to expect adopters to benefit more, but that is an assumption, not a theorem.</p>
+<p><strong>The effect at the margin.</strong> For accounts right at the edge of eligibility, what does becoming eligible do to retention, and what does adopting do for the accounts that adopt because they became eligible? Those are two numbers, not one, and the distinction matters later. These are the quantities nobody asks for and the ones you can usually identify most cleanly. They are also the ones that speak to the decision most often on the table: whether to move the eligibility rule.</p>
+<p>The naive comparison does not estimate any of them. It estimates the difference between ready organizations and unready ones, with a feature flag attached.</p>
+<h2><strong>The setup</strong></h2>
+<p>The synthetic dataset has 40,000 B2B accounts. The AI assistant is available only to accounts with <strong>25 or more seats</strong>, a seat-count eligibility rule of the kind common in SaaS products. Among eligible accounts, adoption is voluntary.</p>
+<p>The thing that makes this hard is a latent variable I will call <strong>engagement</strong>: how invested the account is in the product. Engaged accounts are more likely to turn on new features and more likely to renew regardless. The analyst never observes it. What the analyst observes is seats, tenure, whether the account adopted, and whether it retained six months later.</p>
+<p>The true effect baked into the simulation is <strong>+4 percentage points</strong> of 6-month retention from adopting the assistant. Retention also trends smoothly upward with account size: bigger accounts retain a little better, feature or no feature. So the observed adopter gap will mix three things: the feature effect, selection on engagement, and the fact that adopters are drawn from larger, eligible accounts.</p>
+<pre><code>RNG = np.random.default_rng(2026)N = 40_000TRUE_EFFECT = 0.04&nbsp;&nbsp; # +4 pp retention from adopting the AI assistantCUTOFF = 25&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; # assistant only available at &gt;= 25 seats&nbsp;engagement = np.clip(RNG.normal(0, 1, N), -2.5, 2.5)&nbsp;&nbsp; # latent; never observedseats = ...&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; # skewed, integer, 3 to 300eligible = (seats &gt;= CUTOFF).astype(int)&nbsp;# Adoption is voluntary among eligible accounts; engaged accounts opt in more.p_adopt = 1 / (1 + np.exp(-(-0.6 + 1.4 * engagement)))adopted = ((eligible == 1) &amp; (RNG.uniform(size=N) &lt; p_adopt)).astype(int)&nbsp;# Retention: baseline + engagement + smooth seat trend + the true effect.p_retain = (0.55 + 0.10 * engagement&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + 0.03 * (np.log(seats) - np.log(CUTOFF))&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + TRUE_EFFECT * adopted)retained = (RNG.uniform(size=N) &lt; p_retain).astype(int)</code></pre>
+<p>The full data-generating process is in the notebook. The part that matters is above: adoption and retention share a cause the analyst cannot see.</p>
+<h2><strong>Method 1: The slide</strong></h2>
+<p><strong>Business question:</strong> Do accounts that use the AI assistant retain better?</p>
+<p><strong>What it estimates:</strong> The difference in retention between adopters and non-adopters.</p>
+<p><strong>Identifying assumption:</strong> Adopters and non-adopters would have retained identically absent the feature. Adoption is as good as random.</p>
+<pre><code>df.groupby('adopted')['retained'].mean()# adopted=0: 0.531# adopted=1: 0.685&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; gap: +15.4 pp</code></pre>
+<p>Fifteen points. The true effect is four. The rest is selection: mostly engagement, plus the fact that adopters come from larger, eligible accounts that already retain somewhat better.</p>
+<p>It does not help much to restrict the comparison to eligible accounts, which is the usual first fix. Among accounts with 25 or more seats, the adopter gap is +13.9 pp. Restricting to eligible accounts removes the mechanical size difference created by the 25-seat gate, and it shrinks the gap by only about a point and a half. Nearly ten points of excess lift remain. The selection is not happening at the eligibility line. It is happening inside the eligible population, at the moment each admin decides whether to click the toggle.</p>
+<p><strong>Reading the result.</strong> This is not a lie, exactly. Adopters really do retain 15 points better. The slide's mistake is the caption, which says the feature caused it.</p>
+<h2><strong>Method 2: Regression adjustment on what you can see</strong></h2>
+<p><strong>Business question:</strong> After accounting for account size and tenure, do adopters still retain better?</p>
+<p><strong>What it estimates:</strong> The adopter gap, holding observed covariates fixed.</p>
+<p><strong>Identifying assumption:</strong> Conditional exchangeability. Everything that drives both adoption and retention is in the model.</p>
+<pre><code>elig = df[df.eligible == 1]adj = smf.ols('retained ~ adopted + np.log(seats) + tenure',&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; data=elig).fit(cov_type='HC3')adj.params['adopted']# +0.138&nbsp; (95% CI roughly ±0.013)</code></pre>
+<p>The adjusted estimate is +13.8 pp, with a tight confidence interval. It is precise and it is wrong, and the precision is what makes it dangerous. A standard error of 0.7 points looks like rigor. It is rigor about the wrong quantity.</p>
+<p>If you had the engagement column, this would work:</p>
+<pre><code>oracle = smf.ols('retained ~ adopted + np.log(seats) + tenure + engagement',&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; data=elig).fit(cov_type='HC3')oracle.params['adopted']# +0.041</code></pre>
+<p>You do not have the engagement column. Pre-launch product usage is the closest proxy most teams have, and it helps. But the confounder here is not "how much they used the product," it is "how ready they were to keep using it," and no pre-period covariate fully captures that.</p>
+<p><strong>Failure mode: proxies that are too good.</strong> The temptation is to control for post-launch usage, since engaged accounts use the product more. Post-launch usage is downstream of the feature. Conditioning on it removes part of the effect you are trying to measure. Every covariate in this regression has to be measured before the feature existed.</p>
+<p><strong>Reading the result.</strong> Regression adjustment moved the estimate from 15.4 to 13.8. When observed covariates barely move the number, that tells you those covariates, in that specification, are not explaining much of the gap. It tells you nothing reassuring about the confounders you cannot see. The identification argument is still there; it just is not credible.</p>
+<h2><strong>Method 3: Regression discontinuity at the eligibility threshold</strong></h2>
+<p>Here is the thing the slide ignored. The feature is gated at 25 seats. An account with 24 seats cannot turn it on. An account with 25 seats can. Nothing else about those two accounts is systematically different: same tier of customer, same kind of admin, same distribution of readiness. The gate is arbitrary, and arbitrary is exactly what you want. It is the one part of the rollout that no customer chose.</p>
+<p><strong>Business question:</strong> For accounts near the eligibility threshold, what does becoming eligible for the AI assistant do to retention, and what does adopting it do for the accounts that adopt because they became eligible?</p>
+<p><strong>What it estimates:</strong> Two local quantities at the 25-seat margin: the reduced-form effect of eligibility on retention, and the effect of adoption for accounts whose adoption is induced by eligibility. This is a fuzzy regression discontinuity (RD), because eligibility does not force adoption; it only makes adoption possible.</p>
+<p><strong>Identifying assumption:</strong> Everything that affects retention, other than access to the feature, varies smoothly across the 25-seat line. The only thing that jumps at 25 is eligibility.</p>
+<pre><code>from linearmodels.iv import IV2SLS&nbsp;def fuzzy_rd(df, cutoff=CUTOFF, bw=10):&nbsp;&nbsp;&nbsp; # Keep accounts within bw seats of the cutoff on either side.&nbsp;&nbsp;&nbsp; w = df[(df.seats &gt;= cutoff - bw) &amp; (df.seats &lt; cutoff + bw)].copy()&nbsp;&nbsp;&nbsp; w['x'] = w.seats - cutoff&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; # running variable, centred at 0&nbsp;&nbsp;&nbsp; w['above'] = (w.x &gt;= 0).astype(int)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; # eligibility: the instrument&nbsp;&nbsp;&nbsp; w['above_x'] = w.above * w.x&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; # lets the slope differ by side&nbsp;&nbsp;&nbsp;&nbsp; # Second stage: retention on adoption, with local linear trend each side.&nbsp;&nbsp;&nbsp; # First stage (in brackets): adoption instrumented by eligibility.&nbsp;&nbsp;&nbsp; model = IV2SLS.from_formula(&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 'retained ~ 1 + x + above_x + [adopted ~ above]', data=w&nbsp;&nbsp;&nbsp; ).fit(cov_type='robust')&nbsp;&nbsp;&nbsp; return model&nbsp;m = fuzzy_rd(df, bw=10)m.params['adopted'], m.std_errors['adopted']# +0.049, se 0.037&nbsp;&nbsp;&nbsp;&nbsp; 95% CI: -0.024 to +0.121</code></pre>
+<p>Adoption jumps from 0% to 37% at the threshold. Retention jumps by 1.8 points. Per adopter at the margin: <strong>+4.9 pp, with a 95% interval from −2.4 to +12.1.</strong> The truth is +4.</p>
+<p>Two estimands came out of that, and they answer different business questions:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Quantity</th>
+   <th>Estimate</th>
+   <th>Question it answers</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Reduced form (effect of eligibility)</strong></td>
+   <td>+1.8 pp (−0.9 to +4.5)</td>
+   <td>What happens to retention if we offer access at this margin, given that only about 37% take it up?</td>
+  </tr>
+  <tr>
+   <td><strong>2SLS (effect of adoption)</strong></td>
+   <td>+4.9 pp (−2.4 to +12.1)</td>
+   <td>Among accounts whose adoption was induced by eligibility, what did adopting do?</td>
+  </tr>
+ </tbody>
+</table>
+<p>If the decision is about changing the eligibility rule, the first row is the intervention you are actually contemplating. If the decision is about the value of the feature to a customer who uses it, the second row is the one you want. Bringing the wrong row to the meeting is the same estimand-drift mistake as the original slide, just one level more sophisticated.</p>
+<p><strong>Reading the result.</strong> The interval is wide. That is not a flaw in the method. That is the method telling you the truth about how much information a threshold contains. A 4-point effect diluted through a 37% first stage is a 1.5-point jump in the raw outcome, and detecting a 1.5-point jump takes a lot of accounts near the cutoff. The naive number had a half-point standard error because it was measuring something easy. The RD has a 4-point standard error because the identifying variation is much thinner. That is the price of throwing away the variation created by customer choice.</p>
+<h2><strong>The diagnostics that make RD credible</strong></h2>
+<p>An RD estimate without diagnostics is a number. With diagnostics it is an argument. Six checks, in the order I run them.</p>
+<p><strong>1. Bandwidth sensitivity.</strong> The bandwidth is how many seats on either side of the cutoff you include. Narrow is more credible and noisier. Wide is more precise and starts picking up curvature the linear fit cannot handle.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Bandwidth</th>
+   <th>N</th>
+   <th>First stage</th>
+   <th>2SLS estimate</th>
+   <th>95% CI</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>±5 seats</strong></td>
+   <td>10,556</td>
+   <td>0.385</td>
+   <td>−0.002</td>
+   <td>−0.102 to +0.097</td>
+  </tr>
+  <tr>
+   <td><strong>±10 seats</strong></td>
+   <td>20,691</td>
+   <td>0.370</td>
+   <td>+0.049</td>
+   <td>−0.024 to +0.121</td>
+  </tr>
+  <tr>
+   <td><strong>±15 seats</strong></td>
+   <td>28,913</td>
+   <td>0.381</td>
+   <td>+0.049</td>
+   <td>−0.009 to +0.108</td>
+  </tr>
+  <tr>
+   <td><strong>±20 seats</strong></td>
+   <td>33,325</td>
+   <td>0.391</td>
+   <td>+0.057</td>
+   <td>+0.005 to +0.108</td>
+  </tr>
+ </tbody>
+</table>
+<p>At ±5 the estimate is basically zero with an interval of ten points either way. That is not evidence of no effect; it is evidence that you have run out of data. Between ±10 and ±20 the estimate is stable. Report the range, not the best-looking row.</p>
+<p><strong>2. The running variable is discrete, and that matters.</strong> Seats are integers. At a ±5 bandwidth there are exactly ten distinct values of the running variable, and the untreated-side fit has to extrapolate from 24 seats to the cutoff at 25 because there is no untreated observation arbitrarily close to the threshold. Conventional RD inference assumes you can zoom in as close as you like. With a discrete running variable you cannot, so the fit's functional form is doing real work and specification error is part of the uncertainty. This is the normal situation in SaaS, where the gating variable is seats, licenses, or a tier. Two practical consequences. Treat the bandwidth and specification sensitivity table as part of the primary result, not a robustness appendix. And be careful with the common advice to cluster standard errors by the running variable's values: it is not a free fix; Kolesár and Rothe (2018) showed it can understate uncertainty, and in this simulation it shrinks the standard error from 0.037 to 0.021. I keep the heteroskedasticity-robust interval as a measure of sampling uncertainty, but I do not treat it as resolving the discreteness problem. That is exactly why the bandwidth and specification sensitivity results belong in the primary analysis.</p>
+<p><strong>3. Placebo cutoffs.</strong> Run the same reduced-form regression at seat counts where nothing happens. If retention "jumps" at 15 seats or 35 seats, your design is finding structure that is not there. One rule when choosing placebos: the window around each fake cutoff has to stay on one side of the real one. A placebo at 20 seats with a ±10 window would span 10 to 29 and contain the actual discontinuity, which is not a test of anything.</p>
+<pre><code>for placebo in [15, 35, 45, 55]:&nbsp;&nbsp;&nbsp; ...&nbsp; # same local linear fit on retention, ±10 window, different cutoff# cutoff 15: jump = -0.016 (se 0.014)# cutoff 35: jump = +0.004 (se 0.017)# cutoff 45: jump = -0.004 (se 0.023)# cutoff 55: jump = +0.008 (se 0.031)</code></pre>
+<p>All noise. The only place retention jumps is the place eligibility jumps.</p>
+<p><strong>4. Nothing else changes at the threshold.</strong> Before using the cutoff, inventory everything else that changes there. If pricing, support entitlement, onboarding, an account-management tier, or contract terms also jump at 25 seats, the reduced form is the effect of the bundle, not the AI feature alone, and the exclusion argument for the instrument collapses. Seat-count thresholds in SaaS often do double duty. Check the price book before you check the data.</p>
+<p><strong>5. Covariate smoothness.</strong> Pre-treatment covariates should not jump at the threshold either. Tenure does not (jump = 0.06 months, se 0.24). In the simulation I can also check engagement itself, which is the point of the exercise: it is smooth across the cutoff (jump = 0.01, se 0.03). In real data you cannot check the unobserved confounder, which is why you check every observed one and reason about whether the unobserved ones would behave differently.</p>
+<p><strong>6. Manipulation of the running variable.</strong> This is the one that breaks RD in practice, and it is specific to how SaaS companies operate. If the sales team knows the AI assistant unlocks at 25 seats, they will upsell 22-seat accounts to 25 to close the deal. Now the accounts just above the threshold are not comparable to the ones just below; they are the ones a rep decided were worth pushing. Check the histogram of seats around the cutoff. A pile-up at exactly 25 is the tell.</p>
+<pre><code>df.seats.value_counts().sort_index().loc[20:30]# 20:1247&nbsp; 21:1120&nbsp; 22:1190&nbsp; 23:1080&nbsp; 24:1136# 25:1060&nbsp; 26:1008&nbsp; 27: 929&nbsp; 28: 914&nbsp; 29: 872&nbsp; 30: 821</code></pre>
+<p>Smooth in the simulation. In your data, look. If you see bunching, the threshold is not arbitrary anymore and the design is compromised. The clean fix is available only if eligibility was actually determined from a seat count snapshot taken before the feature was announced; in that case the snapshot is the running variable and the rep could not have gamed it. If eligibility was evaluated on live seat counts, switching to a historical snapshot changes the running variable without preserving the discontinuity in access, the first stage weakens, and you are back to arguing about whether the snapshot is a valid instrument. Sometimes it is. It is not automatic.</p>
+<h2><strong>Which number goes on the slide</strong></h2>
+<p>Four numbers came out of this analysis and they answer four different questions.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Estimate</th>
+   <th>Value</th>
+   <th>What it is</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Naive adopter gap</strong></td>
+   <td>+15.4 pp</td>
+   <td>Ready vs. unready organizations, with a feature flag</td>
+  </tr>
+  <tr>
+   <td><strong>Regression-adjusted</strong></td>
+   <td>+13.8 pp</td>
+   <td>Same thing, holding seats and tenure fixed</td>
+  </tr>
+  <tr>
+   <td><strong>RD reduced form at 25 seats</strong></td>
+   <td>+1.8 pp (−0.9 to +4.5)</td>
+   <td>Effect of offering access at the eligibility margin</td>
+  </tr>
+  <tr>
+   <td><strong>RD 2SLS at 25 seats</strong></td>
+   <td>+4.9 pp (−2.4 to +12.1)</td>
+   <td>Effect of adoption for accounts induced to adopt by eligibility</td>
+  </tr>
+ </tbody>
+</table>
+<p>The two RD estimates are the only ones here whose identifying variation comes from the rollout rule rather than from customer choice, and they come with two honest caveats that belong on the slide.</p>
+<p>First, it is local. It describes accounts around 25 seats. If the decision is "should we expand eligibility to accounts just below 25," the reduced form above is directly relevant. If the decision is "should we lower the threshold all the way to 15," you are already asking the estimate to travel beyond the population that identified it. And if the decision is "should we make it default-on for enterprise," neither number speaks to a 500-seat account at all.</p>
+<p>Second, the two RD estimates apply to different populations. The reduced form describes what happens to all accounts near the threshold when access is offered, including the ones that never adopt. The 2SLS estimate is narrower: because nobody below the threshold could adopt, the accounts whose behavior the instrument moves are precisely the ones that adopt once eligible, and the estimate describes the effect of adoption for them. It says nothing about what would happen if the 63% of eligible accounts near the cutoff that never turned the feature on were forced or persuaded to use it. If the roadmap decision is a default-on rollout, that is the population that matters, and a fuzzy RD cannot reach it.</p>
+<p>Those caveats sound like weaknesses. They are the opposite. The naive number has no caveats because its identifying variation is entirely the customer's choice. It is confidently wrong about everyone. The RD numbers are carefully right about a specific group, and they tell you who that group is.</p>
+<h2><strong>If you do not have a threshold</strong></h2>
+<p>Not every feature is gated by a clean cutoff. If yours was released with no eligibility rule at all, the discontinuity design is not available and you are looking for a different source of variation the customer did not choose. Staggered rollout by region or account cohort gives you timing variation. An in-product nudge shown to a random subset gives you an instrument for adoption. Neither is this article. The principle carries over unchanged: find the part of adoption that was decided by something other than the customer, and estimate from that part only.</p>
+<h2><strong>A few closing pitfalls</strong></h2>
+<p><strong>1. The precision trap.</strong> The naive and adjusted estimates had confidence intervals under two points. The RD interval was fourteen points wide. Stakeholders will prefer the tight one. Tight intervals around biased estimates are the most expensive output a data team can produce, because they get acted on.</p>
+<p><strong>2. Post-launch covariates.</strong> Anything measured after the feature shipped is a candidate outcome, not a candidate control. Usage, support tickets, NPS, seat expansion: if the feature could have moved it, it does not go on the right-hand side.</p>
+<p><strong>3. Gaming the gate.</strong> If sales, CS, or the customer can push an account across the threshold on purpose, the threshold is not arbitrary. Check the density before you check anything else.</p>
+<p><strong>4. Treating the running variable as continuous.</strong> Seats are integers. The bandwidth table is not a robustness check you run at the end; it is where the specification uncertainty lives.</p>
+<p><strong>5. Extrapolating the local effect, or the wrong one.</strong> A +5 point effect at 25 seats is not a +5 point effect at 250 seats, and the effect of adoption is not the effect of offering access. If the business decision is about a different part of the customer base than the threshold sits in, say so, and say what additional assumption would be required to carry the number over.</p>
+<p><strong>6. Calling the naive gap a lower bound.</strong> I hear this one a lot: "even if it is confounded, the feature clearly does <em>something</em>." The naive gap in this simulation is nearly four times the true effect. It is not a bound on anything.</p>
+<p>The adoption slide was never measuring the feature. It was measuring the customers who chose it. The threshold that gated the feature is the only part of the rollout that was not chosen by anyone, and that is exactly why it is the part of this rollout you can learn from.</p>

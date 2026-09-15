@@ -1,0 +1,92 @@
+<h1>Kubernetes v1.37: Native Histograms Graduates to Beta</h1>
+<p>I'm excited to announce that native histogram support for Kubernetes metrics is graduating to Beta and is enabled by default in Kubernetes v1.37!</p>
+<p><em>Native histograms</em> (previously introduced as Alpha in Kubernetes v1.36 under <a href="https://www.kubernetes.dev/resources/keps/5808/">KEP-5808</a>) bring high-resolution, low-cardinality observability to Kubernetes metrics. By adopting <a href="https://prometheus.io/docs/specs/native_histograms/">Prometheus Native Histograms</a>, Kubernetes components now expose latency and duration metrics with far greater accuracy while significantly reducing telemetry storage and scraping overhead.</p>
+<h2>Why move beyond classic histograms?</h2>
+<p>Since the early days of Kubernetes observability, duration and latency metrics (such as API server request latencies or scheduling durations) have relied on <strong>classic Prometheus histograms</strong>.</p>
+<p>Classic histograms require metric authors to define a static list of cumulative bucket boundaries (<code>le</code> labels), such as <code>0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10</code>. While familiar, this approach introduces three major challenges:</p>
+<ol>
+ <li><strong>The Bucket Guessing Game</strong>: If a workload's latency profile changes, for example, shifting into microsecond ranges or experiencing long-tail tail latencies beyond the highest bucket, the histogram loses visibility. Specifying bucket boundaries upfront requires knowing the distribution before observing it</li>
+ <li><strong>High Cardinality &amp; Storage Cost</strong>: With classic histograms, each bucket boundary is exported as a separate time series (<code>_bucket\{le="..."}</code>). A histogram with 10 buckets across multiple labels multiplies the number of time series by 10, increasing memory consumption in Prometheus and inflating time series database (TSDB) storage costs</li>
+ <li><strong>Interpolation Error in Quantiles</strong>: Calculating percentiles using <code>histogram_quantile()</code> relies on linear interpolation between static bucket boundaries. When bucket spans are coarse, quantile calculations can suffer from significant estimation error</li>
+</ol>
+<h2>What are Prometheus native histograms?</h2>
+<p><a href="https://prometheus.io/docs/specs/native_histograms/">Prometheus Native Histograms</a> replace static user-defined buckets with <strong>dynamic, exponential buckets</strong>.</p>
+<p>Instead of emitting a separate time series for every single bucket boundary, a <em>native histogram</em> is stored as a single time series containing a rich schema of positive and negative spans, zero thresholds, and exponential scaling factors.</p>
+<ul>
+ <li><strong>High Resolution Automatically</strong>: Exponential buckets dynamically adjust to any value range — from nanoseconds to hours — without requiring pre-configured bucket boundaries</li>
+ <li><strong>Up to 90% Fewer Time Series</strong>: By consolidating buckets into structured spans within a single time series, scraping and storage overhead are dramatically reduced</li>
+ <li><strong>Accurate Quantile Calculation</strong>: Quantiles can be calculated with mathematical bounds on error (≃5% worst-case relative error under default settings) across the entire spectrum of observations</li>
+</ul>
+<h2>How native histograms work in Kubernetes</h2>
+<p>In Kubernetes, native histogram support is implemented directly inside the shared metrics subsystem (<code>k8s.io/component-base/metrics</code>).</p>
+<h3>1. Dual exposition for zero breaking changes</h3>
+<p>A primary design requirement for KEP-5808 was <strong>zero disruption</strong> for existing observability stacks. When the <code>NativeHistograms</code> feature gate is enabled, Kubernetes components use <strong>dual exposition</strong>:</p>
+<ul>
+ <li><strong>Classic buckets (<code>h.Bucket</code>)</strong> are still emitted alongside native spans. Existing Prometheus servers, dashboards, and alerting rules that rely on traditional text scraping or classic bucket labels continue to work unmodified</li>
+ <li><strong>Native spans (<code>h.Schema</code>, <code>h.PositiveSpan</code>)</strong> are included in the same Protobuf payload for collectors that understand native histograms</li>
+</ul>
+<h3>2. Tuned default exponential configuration</h3>
+<p>When <code>NativeHistograms</code> is enabled, the <code>k8s.io/component-base/metrics</code> package automatically applies standardized exponential options to all histogram metrics:</p>
+<ul>
+ <li><strong><code>BucketFactor: 1.1</code></strong>: Configures exponential buckets where each bucket is at most 10% wider than the preceding one. This guarantees a mathematically bounded worst-case relative error of at most ~5% for quantile calculations regardless of whether an operation takes 1 millisecond or 10 seconds.</li>
+ <li><strong><code>MaxBucketNumber: 160</code></strong>: Caps the maximum number of buckets per histogram to 160. Following OpenTelemetry SDK recommendations for base-2 exponential histogram aggregation, this limit protects component memory usage even under extreme outlier distributions.</li>
+</ul>
+<h3>3. Broad component support</h3>
+<p>Because native histograms are integrated into <code>component-base/metrics</code>, all major Kubernetes control plane and node components inherit support automatically, including:</p>
+<ul>
+ <li><strong><code>kube-apiserver</code></strong> (e.g., <code>apiserver_request_duration_seconds</code>, authentication/authorization metrics, validation latencies)</li>
+ <li><strong><code>kube-scheduler</code></strong> (e.g., <code>scheduler_plugin_execution_duration_seconds</code>, <code>scheduler_scheduling_algorithm_duration_seconds</code>)</li>
+ <li><strong><code>kubelet</code></strong> (node-level container runtime and pod lifecycle metrics)</li>
+ <li><strong><code>kube-controller-manager</code></strong> and <strong><code>kube-proxy</code></strong></li>
+</ul>
+<h2>How to scrape native histograms</h2>
+<p>The simple answer: upgrade to Kubernetes v1.37, and it works.</p>
+<h3>1. Prometheus scrape configuration by version</h3>
+<ul>
+ <li>
+  <p><strong>Prometheus 3.0+ (Recommended)</strong>: Use explicit per-job configuration in your <code>scrape_configs</code> rather than global flags (the global <code>--enable-feature=native-histograms</code> flag is deprecated in Prometheus 3.9+):</p>
+  <pre><code>scrape_configs:
+  - job_name: 'kubernetes-apiservers'
+    scrape_native_histograms: true
+    always_scrape_classic_histograms: true  # Recommended during transition
+</code></pre>
+  <p>In summary: always set <code>always_scrape_classic_histograms: true</code> during your transition period. Without this setting, Prometheus will only ingest the native format and stop ingesting classic <code>_bucket</code>, <code>_count</code>, and <code>_sum</code> series. Setting <code>always_scrape_classic_histograms: true</code> ensures existing dashboards (<code>histogram_quantile(..._bucket...)</code>) and alerts continue to work while you migrate them to native histograms.</p></li>
+ <li>
+  <p><strong>Prometheus 2.40 – 2.x</strong>: Enable Native Histograms globally by starting Prometheus with the feature flag:</p>
+  <pre><code>prometheus --enable-feature=native-histograms
+</code></pre>
+  <p>Note that in Prometheus 2.x, this is an all-or-nothing setting for all scrape targets.</p></li>
+</ul>
+<h3>2. Verify Protobuf dual exposition</h3>
+<p>Standard Prometheus text scraping (<code>application/openmetrics-text</code> or plain text format) only transfers classic buckets. When <code>scrape_native_histograms</code> is enabled, Prometheus automatically negotiates <strong>Protobuf format</strong> with Kubernetes endpoints.</p>
+<h2>Querying native histograms in PromQL</h2>
+<p>Once native histograms are ingested into Prometheus, you can query them using standard PromQL histogram functions without needing static <code>le</code> bucket labels or <code>_bucket</code> suffixes:</p>
+<pre><code># 1. Calculating P99 latency for a single target:
+# Native histogram (operates directly on the metric name):
+histogram_quantile(0.99, rate(apiserver_request_duration_seconds[5m]))
+
+# 2. Aggregating across multiple instances (e.g., all API servers):
+# Native histogram (no grouping by le required!):
+histogram_quantile(0.99, sum(rate(apiserver_request_duration_seconds[5m])))
+</code></pre>
+<p>With native histograms, functions like <code>histogram_quantile()</code> operate directly on the dynamic exponential spans inside the time series, producing highly accurate quantiles without static bucket interpolation error.</p>
+<h2>Dashboard migration &amp; rollback strategy</h2>
+<h3>Recommended migration workflow</h3>
+<ol>
+ <li><strong>Enable Both Formats</strong>: In your Prometheus 3.x scrape config, set <code>scrape_native_histograms: true</code> AND <code>always_scrape_classic_histograms: true</code> so both formats are collected safely during transition</li>
+ <li><strong>Migrate Queries</strong>: Update your Grafana dashboards and Prometheus alerting rules from classic quantile queries (<code>histogram_quantile(..._bucket...)</code>) to native histogram queries (<code>histogram_quantile(...)</code>), and replace references to classic <code>_count</code> and <code>_sum</code> series with <code>histogram_count(...)</code> and <code>histogram_sum(...)</code></li>
+ <li><strong>Verify in Staging/Production</strong>: Validate that all dashboards and SLO alerts fire and graph correctly using the new native histogram queries</li>
+ <li><strong>Unlock ~10x Storage Savings</strong>: Once migration is complete, set <code>always_scrape_classic_histograms: false</code>. Prometheus will stop ingesting the static <code>_bucket</code>, <code>_count</code>, and <code>_sum</code> time series, reducing your histogram time series count by up to 90%!</li>
+</ol>
+<h3>Opt-out and rollback flexibility</h3>
+<ul>
+ <li><strong>Instant Collector Rollback</strong>: If you need to stop ingesting native histograms, simply set <code>scrape_native_histograms: false</code> in your Prometheus job configuration. No Kubernetes restart is required, and Prometheus will immediately resume scraping only the classic format without data loss</li>
+ <li><strong>Component Feature Gate Rollback</strong>: Administrators can also disable the feature gate on Kubernetes components using <code>--feature-gates=NativeHistograms=false</code> (requires component restart)</li>
+</ul>
+<h2>What's next &amp; how to get involved</h2>
+<p>As native histograms progress toward General Availability (GA) in future Kubernetes releases, SIG Instrumentation will continue evaluating ecosystem readiness, performance characteristics, and long-term plans for eventually deprecating static classic buckets once native histogram adoption becomes ubiquitous across the monitoring community.</p>
+<ul>
+ <li>Read the <a href="https://www.kubernetes.dev/resources/keps/5808/">KEP-5808 page</a></li>
+ <li>Read the <a href="https://prometheus.io/docs/specs/native_histograms/">Prometheus Native Histograms specification</a></li>
+ <li>Get involved with <a href="https://github.com/kubernetes/community/tree/main/sig-instrumentation">SIG Instrumentation</a></li>
+</ul>

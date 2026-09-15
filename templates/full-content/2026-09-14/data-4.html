@@ -1,0 +1,186 @@
+<p>Being "the database guy" comes with a lot of questions, and over the last eight months those questions changed. The repetitive ones disappeared, nobody asks how to avoid putting things in the database any more, and the code arriving for review got noticeably more polished. Then this summer a schema landed in front of me with twelve proposed index drops on a single table, which is when I started assuming coding agents over-index. The next schema I looked at had the same shape.</p>
+<p>Passing this off as AI slop would be too easy, because most of those changes were competent. So I built a harness and measured it.</p>
+<p>I loaded 30 model-generated schemas into PostgreSQL and audited 838 indexes across twelve of them. The competence caught me off guard. Only ten served no requirement I could find; the rest showed solid craft. All four models handled GIN and GiST indexes cleanly, built partial indexes with sensible predicates, and got multi-tenant composite keys in the right order. The baseline SQL quality is much better than what agents wrote a year ago.</p>
+<h2>The cost of an extra index</h2>
+<p>Indexes are great, until you pile them onto the single table taking all your writes. On quiet tables you will never notice the difference. On hot tables, every index is extra work on every write.</p>
+<p>In one support-tool schema, a model created sixteen indexes on <code>tickets</code> alone. Six of them indexed <code>last_activity_at</code>, a column that updates every time an agent touches a ticket. Compared to my hand-written baseline with seven indexes, the generated schema wrote 1.8× the WAL, took 1.9× longer per update, and pushed up VACUUM time just as much.</p>
+<p>Those sixteen indexes were not dumb mistakes. For read queries, they run fast. The problem is that coding agents write indexes query by query, without thinking about write traffic.</p>
+<p>What actually happens on disk when you touch that row:</p>
+<ul>
+ <li><strong>No more HOT updates.</strong> If any index touches the modified column, Heap-Only Tuples is out the window. Postgres can't keep the new row version confined to the original 8 KB data block without updating index pointers.</li>
+ <li>Every index on the table whose <code>WHERE</code> predicate matches the new tuple gets a new entry written into it—not just the index covering the column you changed.</li>
+ <li>Extra WAL records for every single one of those index inserts.</li>
+ <li>Dead tuple cleanup: the old row version sits in the heap until VACUUM cleans it up, but VACUUM has to cycle through every secondary index to prune the pointers pointing at it. More indexes, slower vacuum sweeps, even if only three rows changed.</li>
+</ul>
+<p>I never got the vacuum cost isolated from the WAL volume; the two kept confounding. Treat the vacuum numbers below as direction, not measurement.</p>
+<h2>The setup</h2>
+<p>I created six fictional SaaS products for the review.</p>
+<ul>
+ <li>Shared inbox support tool</li>
+ <li>Class booking system for gyms</li>
+ <li>Product analytics tool</li>
+ <li>Marketplace app</li>
+ <li>Veterinary practice system</li>
+ <li>Freight management board</li>
+</ul>
+<p>No table names, no column hints, and no database constraints, except that Postgres will be used. Also, there's no mention of anyone counting indexes later. I wrote the first four specifications myself (only polished them with an LLM). The last two were written by an independent model from a short description of what I wanted. One of the six specs is thinner than the others and it shows in the output. I left it in place rather than change it. The revisit would contaminate the run with all the bias of things I learned reviewing it.</p>
+<p>Each specification went to new model instances without schema templates or index hints. Design the PostgreSQL schema, write SQL queries, and don't ask questions. Four models from three vendors created the schemas. To focus on the database instead of a model leaderboard, I label them <strong>Model A</strong> to <strong>Model D</strong>. This way, there are no names and no ways to identify the models.</p>
+<p>Twenty-six of the thirty runs carried one extra line at the end of the prompt: <em>make it production-ready</em>. That is what people actually type into a coding agent, so I left it in, and later re-ran Models B and D without it as a separate condition.</p>
+<p>Thirty runs in total were loaded into PostgreSQL 18.6. All metrics come from <code>pg_index</code> and <code>pg_stat_*</code> on a live database. Schemas, specifications, harnesses, raw CSVs and the pre-registration file are at github.com/boringSQL/vibe-coded-indexes.</p>
+<h2>Indexes pile onto one table</h2>
+<p>Average index density looks fine on a summary slide. The catch is where those indexes land. Every agent dumps its indexes onto the single table with the most writes: helpdesk runs hit <code>tickets</code>, fitness hits <code>class_occurrence</code>, freight hits <code>loads</code>.</p>
+<table>
+ <thead>
+  <tr>
+   <th>app</th>
+   <th>most-indexed table</th>
+   <th>indexes created</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>helpdesk (7 runs)</td>
+   <td><code>tickets</code></td>
+   <td>10–16</td>
+  </tr>
+  <tr>
+   <td>fitness (3 runs)</td>
+   <td><code>class_occurrence</code></td>
+   <td>6–10</td>
+  </tr>
+  <tr>
+   <td>analytics (3 runs)</td>
+   <td><code>events</code></td>
+   <td>5–8</td>
+  </tr>
+  <tr>
+   <td>marketplace (7 runs)</td>
+   <td><code>products</code></td>
+   <td>8–11</td>
+  </tr>
+  <tr>
+   <td>vet (6 runs)</td>
+   <td><code>appointment</code>(s)</td>
+   <td>5–11</td>
+  </tr>
+  <tr>
+   <td>freight (4 runs)</td>
+   <td><code>loads</code></td>
+   <td>7–15</td>
+  </tr>
+ </tbody>
+</table>
+<p>Each app keeps its core data in those tables. The models read requirements feature by feature: every filter or sort rule prompts another index, and no agent checks what is already there. Interestingly, no model indexed foreign keys by reflex; if anything, they under-indexed them. Partial, expression, GIN, GiST, INCLUDE, tenant-prefixed composites: all syntactically fine.</p>
+<h2>What sixteen indexes cost</h2>
+<p>I ran a synthetic benchmark on a million-row <code>tickets</code> table with a realistic support mix: roughly 60% customer replies, 25% status updates, and 15% ticket reassignments. This was on PostgreSQL 18.6 with <code>fillfactor=90</code>. Autovacuum was disabled to keep row layout predictable, capturing WAL with <code>EXPLAIN (ANALYZE, BUFFERS, WAL)</code> averaged over three runs.</p>
+<table>
+ <thead>
+  <tr>
+   <th>index set</th>
+   <th>secondary indexes</th>
+   <th>index size before</th>
+   <th>WAL written</th>
+   <th>update time</th>
+   <th>index size after</th>
+   <th>VACUUM</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>hand baseline</td>
+   <td>7</td>
+   <td>176 MiB</td>
+   <td>436.0 MiB</td>
+   <td>4,850 ms</td>
+   <td>230 MiB</td>
+   <td>264 ms</td>
+  </tr>
+  <tr>
+   <td>helpdesk-run3</td>
+   <td>9</td>
+   <td>173 MiB</td>
+   <td>426.2 MiB</td>
+   <td>4,377 ms</td>
+   <td>227 MiB</td>
+   <td>236 ms</td>
+  </tr>
+  <tr>
+   <td>helpdesk-run2</td>
+   <td>15</td>
+   <td>221 MiB</td>
+   <td>647.8 MiB</td>
+   <td>8,599 ms</td>
+   <td>324 MiB</td>
+   <td>394 ms</td>
+  </tr>
+  <tr>
+   <td>helpdesk-run1</td>
+   <td>15</td>
+   <td>259 MiB</td>
+   <td>776.8 MiB</td>
+   <td>9,013 ms</td>
+   <td>361 MiB</td>
+   <td>436 ms</td>
+  </tr>
+ </tbody>
+</table>
+<p>Notice run 3: nine indexes, yet it generated slightly <em>less</em> WAL than my 7-index baseline and beat it on update time. Why? Strict partial predicates: three of its indexes had restrictive <code>WHERE</code> clauses that touched almost none of the updated rows:</p>
+<pre><code>CREATE INDEX tickets_unassigned_urgent_idx ON tickets (workspace_id, priority, created_at)
+  WHERE assignee_kind IS NULL
+    AND status &lt;&gt; ALL (ARRAY['solved','closed']);</code></pre>
+<p>My hand-crafted baseline had wider, unconditional indexes that forced more full-page writes. In other words, WAL volume tracks index footprint and page dirtiness, not raw index count. Still, when models go up to fifteen indexes (run 1 and run 2), the cumulative penalty adds up: <strong>1.8× the WAL, double the latency, 1.6× the on-disk footprint, and an extra 65% on VACUUM</strong>, all for the exact same 200,000 updates.</p>
+<h2>Those indexes work</h2>
+<p><strong>helpdesk-run1</strong> is 23 to 46 times faster on four of the nine queries I measured. Eight of the nine queries perform as expected. The ninth is the SLA sweep, and it runs 111 times slower on the generated schema. The index meant to serve it looks right:</p>
+<pre><code>CREATE INDEX tickets_first_response_due_idx ON tickets (workspace_id, first_response_due_at)
+  WHERE first_response_at IS NULL
+    AND first_response_due_at IS NOT NULL
+    AND status &lt;&gt; ALL (ARRAY['solved','closed']);</code></pre>
+<p>An SLA sweep is inherently cross-tenant, and the leading <code>workspace_id</code> that is right everywhere else on this table is wrong here.</p>
+<h3>Where it breaks even</h3>
+<p>Leaving out that SLA query, helpdesk-run1 saves <strong>0.554 ms</strong> per execution on average across the other eight queries. Planning overhead takes back <strong>0.146 ms</strong>: more indexes give the planner more choices to evaluate on unprepared queries. Net gain: <strong>0.408 ms saved per read</strong>.</p>
+<p>Comparing read savings against write penalties, the fifteen-index schema wins on CPU time as long as you do fewer than twenty updates for each read. Measured on CPU time alone there is nothing here to argue with.</p>
+<h2>Which column the index sits on</h2>
+<p><code>last_activity_at</code> is a key column in six of the sixteen indexes, and that placement costs more than the count does. I built a small table to test it: six secondary indexes either way, the same <code>UPDATE ... SET last_seen_at = now()</code> over 300,000 rows, and the only difference is whether one of those six sits on the column being written.</p>
+<table>
+ <thead>
+  <tr>
+   <th>the updated column is</th>
+   <th>HOT updates</th>
+   <th>HOT %</th>
+   <th>update time</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>not indexed</td>
+   <td>138,468</td>
+   <td><strong>46.2%</strong></td>
+   <td>2,743 ms</td>
+  </tr>
+  <tr>
+   <td>indexed</td>
+   <td>0</td>
+   <td><strong>0.0%</strong></td>
+   <td>3,979 ms</td>
+  </tr>
+ </tbody>
+</table>
+<p>Moving an index onto the touched column costs every HOT update and adds 45% to the time. A low <code>hot_pct</code> on a hot table is the real cue: which index is on the column your <code>UPDATE</code> touches?</p>
+<h2>What the indexes evict</h2>
+<p>Once HOT is disqualified, every secondary index you add costs about <strong>26 MiB of extra WAL</strong> across the same 200,000 updates, averaged over twelve of them. It is not a flat rate: the per-index cost ran from 18 to 46 MiB depending on how many full-page images that step happened to trigger, and you pay it on every write from then on.</p>
+<p>The cache impact was worse. When I throttled <code>shared_buffers</code> to 128MB with a cold cache, physical reads jumped by <strong>6.7×</strong>, and the cached heap fell from 35 MiB to 9 MiB while the cached index went the other way.</p>
+<h2>Nobody drops the twelfth index</h2>
+<p>The other half of the problem is the next commit. I gave the sixteen-index <code>tickets</code> table and an ordinary feature request to six fresh instances. Not a single run removed the twelfth index. Five of the six added a new one, every time on a mutable column together with a mutable predicate.</p>
+<h2>"Make it production-ready" is a database decision</h2>
+<p>I ran two models again with the phrase "make it production-ready" removed, leaving nothing but "read this file, write the schema". That one phrase is worth about a fifth of the index count. Three words at the end of a prompt, which nobody thinks of as a schema decision, move the write cost of the busiest table in the application.</p>
+<h2>Checking the write path in production</h2>
+<p>On a live database, check <code>pg_stat_user_indexes</code> before touching anything:</p>
+<pre><code>SELECT s.relname, s.indexrelname,
+  pg_size_pretty(pg_relation_size(s.indexrelid)) AS size,
+  i.indisunique AS uniq,
+  s.idx_scan, s.last_idx_scan
+FROM pg_stat_user_indexes s
+JOIN pg_index i ON i.indexrelid = s.indexrelid
+WHERE NOT i.indisprimary AND s.idx_scan = 0
+ORDER BY pg_relation_size(s.indexrelid) DESC;</code></pre>
+<p>Read the output before dropping anything: counters reset on restarts, replicas might use indexes the primary ignores, and unique indexes exist for data integrity.</p>
