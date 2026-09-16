@@ -1,0 +1,82 @@
+<p>I saw a post on LinkedIn by Craig Abbott on an article using math to define typography. Having presented on this very idea a few times earlier this year, I was interested to see what he had written about it. I noticed that he was using a verbose method of making the scale and recommended another way. Though in doing so I noticed I didn’t have my own article about making a scale. So, here’s that article.</p>
+<h2>Modular type</h2>
+<p>If you’ve been working with typography on the web, you know that you’ll typically have different sizes of text which are used to help with hierarchy of information. The larger the text, the more generic the content. This meant to help the reader know what they are about to read as the text gets more detailed.</p>
+<p>The problem many folks have is choosing sizes of the text. This is why we’ve created systems that help create sizes that LooksGood™. One of the more popular ways of doing this is with the modular scale. To make the scale, you’ll need a base size and a ratio. For each size you use the ratio to make the next size. In Craig’s article, this is performed by setting up the following:</p>
+<pre><code>body \{
+  /* --ratio is obviously our ratio */
+  --ratio: 1.5;
+
+  /* --s0 is our base, or fundamental */
+  --s0: 1.2rem;
+
+  /* Positive numbers are larger */
+  --s1: calc(var(--s0) * var(--ratio));
+  --s2: calc(var(--s1) * var(--ratio));
+  --s3: calc(var(--s2) * var(--ratio));
+
+  /* Negative numbers are smaller */
+  --s-1: calc(var(--s0) / var(--ratio));
+  --s-2: calc(var(--s-1) / var(--ratio));
+  --s-3: calc(var(--s-2) / var(--ratio));
+
+  /* Our body copy is set to the base size */
+  font-size: var(--s0);
+}</code></pre>
+<p>This is very clear. For larger sizes, we need to multiply the ratio. And for smaller sizes, we need to divide. I had also done it this way at first, but there was something that annoyed me. I didn’t like that I needed to use a previous size to calculate the next size. As you can see above, so get <code>--s3</code>, I need to first calculate <code>--s2</code>. I wanted to only use the base size and ratio for all of the sizes.</p>
+<p>What I recognized in the formula is that we keep multiplying the same ratio over and over. That is the same as raising the ratio to a power. In fact, the number we raise it to is the step. And even in the case where we divide the number, a negative number as a power does the same thing so we can put in any step (positive or negative) in to get the expected size.</p>
+<p>size = base × ratio^step</p>
+<p>In CSS, using the <code>pow()</code> function and using Craig’s naming from earlier, we can get the sizes like this:</p>
+<pre><code>body \{
+  --ratio: 1.5;
+  --s0: 1.2rem;
+  --s3: calc(var(--s0) * pow(var(--ratio), 3));
+  --s2: calc(var(--s0) * pow(var(--ratio), 2));
+  --s1: calc(var(--s0) * pow(var(--ratio), 1));
+  --s-1: calc(var(--s0) * pow(var(--ratio), -1));
+  --s-2: calc(var(--s0) * pow(var(--ratio), -2));
+  --s-3: calc(var(--s0) * pow(var(--ratio), -3));
+}</code></pre>
+<p>Now let’s understand why I don’t recommend this. 😈</p>
+<h2>To infinity and beyond</h2>
+<p>The issue here being able to generate sizes that are too small. For example, in the scale above the <code>--s-3</code> size would result in <code>0.36rem</code> or about <code>5.6px</code> which is really too small for anyone to read properly. Here’s what the full list above renders in pixels:</p>
+<pre><code>body \{
+  --ratio: 1.5;
+  --s0: 1.2rem;
+  --s3: calc(var(--s0) * pow(var(--ratio), 3)); /* 64.8px */
+  --s2: calc(var(--s0) * pow(var(--ratio), 2)); /* 43.2px */
+  --s1: calc(var(--s0) * pow(var(--ratio), 1)); /* 28.8px */
+  --s-1: calc(var(--s0) * pow(var(--ratio), -1)); /* 12.8px */
+  --s-2: calc(var(--s0) * pow(var(--ratio), -2)); /* 8.5px */
+  --s-3: calc(var(--s0) * pow(var(--ratio), -3)); /* 5.6px */
+}</code></pre>
+<p>Of course, you could improve the resulting sizes by putting new numbers in but it’s still possible to accidentally introduce inaccessible sizes when the wrong numbers are entered. Instead I recommend thinking in categories of text and only allowing positive numbers.</p>
+<p>In the system I use, I have 3 categories of text. This was largely influenced by the categories described at Adobe Spectrum: Heading, Body, and Detail.</p>
+<ul>
+ <li><strong>Heading</strong> describes the body of text you’re about to read.</li>
+ <li><strong>Body</strong> describes the main content the person needs to know.</li>
+ <li><strong>Detail</strong> describes additional information that might be helpful but isn’t necessary to continue.</li>
+</ul>
+<p>In the Heading category, we want to set the base as the <em>minimum</em> font size. This means that there is no font size that gets smaller than what we set here. This helps ensure that the heading will always be larger than the body and it also ensure that the text will always be readable (as long as the base size is chosen accessibly). It’s much easier to curate the smallest base size in an accessible way then to try fiddling with the numbers to hopefully make it accessible. Again, one wrong number and it becomes a problem.</p>
+<p>From here, you can use the scale in the headings however you like. If your lowest heading is <code>h3</code> (which is normal if you aren’t working with a writing experience), then all you’d need is the following:</p>
+<pre><code>h3 \{
+    font-size: calc(var(--heading-min-size) * pow(var(--ratio), 0));
+}
+
+h2 \{
+    font-size: calc(var(--heading-min-size) * pow(var(--ratio), 1));
+}
+
+h1 \{
+    font-size: calc(var(--heading-min-size) * pow(var(--ratio), 2));
+}</code></pre>
+<p>You could also be cute and generate the steps and font size from the heading tag name if you have a <code>&lt;Heading/&gt;</code> component.</p>
+<pre><code>const MAX_LEVEL = 3;
+function Heading(\{ level, ...props }) \{
+    // If there's no level, render a div.
+    const clamp = Math.min(Math.max(MAX_LEVEL, level), 1);
+    const Tag = `h$\{clamp}`;
+    const step = (MAX_LEVEL - 1) - clamp; // 0, 1, 2
+    const fontSize = `calc(var(--heading-min-size) * pow(var(--ratio), $\{step}))`;
+    return &lt;Tag \{...props} style=\{\{ fontSize }}/&gt;
+}</code></pre>
+<p>In my world, introducing values that we shouldn’t be using makes maintaining the values harder in the future. I like to be deliberate the values that exist, and can back them up about why and what to use them for. It’s all about intention and reducing decisions making for a consistent and thoughtful experience.</p>
