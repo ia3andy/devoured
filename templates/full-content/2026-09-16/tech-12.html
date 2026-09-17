@@ -1,0 +1,236 @@
+<h1>I Stopped Letting the Image Model Decide Everything</h1>
+<p>Logo placement, output dimensions, and mandatory text became deterministic constraints instead of prompts in an AI image generation pipeline.</p>
+<p>The first version of my image generation pipeline was mostly what you would expect.</p>
+<p>Give the model a source image, a logo, some text, brand context, and instructions describing the final composition. Let it generate the image.</p>
+<p>It worked surprisingly well.</p>
+<p>Until I needed it to work repeatedly.</p>
+<p>That difference became much more obvious once I started using the pipeline behind KeepPost, where the goal isn't to generate one impressive image. The same pipeline has to produce content for different brands, different source photos, different formats, and different campaigns.</p>
+<p>At that point, a visually good result is not enough.</p>
+<p>The logo has to be where it is supposed to be. The product in the source image shouldn't suddenly change. Required text needs to survive generation. Brand rules need to stay consistent across posts.</p>
+<p>And if I run a similar request tomorrow, I don't want the entire composition strategy to change because the model found another interpretation equally reasonable.</p>
+<p>I initially tried solving most of this through prompting.</p>
+<p>Eventually I stopped.</p>
+<p>The problem wasn't that the prompts weren't detailed enough. I was asking a probabilistic model to make decisions that didn't need to be probabilistic in the first place.</p>
+<h2>The model is not my layout engine</h2>
+<p>This became the most useful distinction in the pipeline.</p>
+<p>There are decisions where I want the model to be creative.</p>
+<p>Lighting is a good example. So is adapting a restaurant photo into a more polished scene, extending the background, integrating an object naturally, or deciding how the generated environment should feel.</p>
+<p>Those are exactly the things I want from an image model.</p>
+<p>But there are other decisions where creativity adds almost no value.</p>
+<p>If the brand logo belongs at a specific position and size, I don't need the model to reinterpret that requirement on every generation.</p>
+<p>The same applies to things like output dimensions, protected areas, mandatory assets, exact text, and some composition constraints.</p>
+<p>So the pipeline gradually moved away from:</p>
+<pre><code>Assets + Prompt
+      │
+      ▼
+ Image Model
+      │
+      ▼
+ Final Image
+</code></pre>
+<p>toward something closer to:</p>
+<p><em>The shape the pipeline settled into — deterministic constraints and generative decisions feeding the same image model, gated by validation before anything ships.</em></p>
+<p>The important part isn't the number of stages.</p>
+<p>It's deciding who owns each decision.</p>
+<h2>What I stopped delegating to the model</h2>
+<p>Logo placement is probably the clearest example.</p>
+<p>If the rule for a brand says the logo belongs in a known region with a known relative size, letting the image model decide its placement again adds uncertainty without adding much value.</p>
+<p>So that becomes structured configuration instead.</p>
+<p>Conceptually, it can be as simple as:</p>
+<pre><code>\{
+  "logo": \{
+    "x": 0.065,
+    "y": 0.055,
+    "width": 0.22,
+    "alignment": "left"
+  }
+}
+</code></pre>
+<p>Now the position isn't something the prompt has to persuade the model to remember.</p>
+<p>It's a constraint.</p>
+<p>The same idea applies to other parts of the system. Once I sorted every decision the pipeline makes into "the model shouldn't be guessing here" versus "this is where I want the model's judgment," it looked like this:</p>
+<p><strong>Fixed by configuration, not left to the model:</strong></p>
+<table>
+ <thead>
+  <tr>
+   <th>Decision</th>
+   <th>Why it's fixed</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Output aspect ratio</td>
+   <td>The format is dictated by where the image will be used, not by taste</td>
+  </tr>
+  <tr>
+   <td>Required assets</td>
+   <td>Either the asset is in the image or it isn't — no room for interpretation</td>
+  </tr>
+  <tr>
+   <td>Logo placement</td>
+   <td>The brand already specifies exact position and size</td>
+  </tr>
+  <tr>
+   <td>Protected regions</td>
+   <td>Some areas of the canvas simply can't be touched</td>
+  </tr>
+  <tr>
+   <td>Mandatory text</td>
+   <td>Must survive generation exactly as written (checked afterward if it can't be fixed)</td>
+  </tr>
+ </tbody>
+</table>
+<p><strong>Left to the model's judgment:</strong></p>
+<table>
+ <thead>
+  <tr>
+   <th>Decision</th>
+   <th>Why it's generative</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Scene adaptation</td>
+   <td>Turning a raw source photo into a polished scene needs visual judgment</td>
+  </tr>
+  <tr>
+   <td>Lighting</td>
+   <td>There's no single "correct" lighting — this is where creativity pays off</td>
+  </tr>
+  <tr>
+   <td>Background</td>
+   <td>Extending or building out a background is a genuinely creative task</td>
+  </tr>
+  <tr>
+   <td>Object integration</td>
+   <td>Making something look naturally placed isn't a coordinate problem</td>
+  </tr>
+  <tr>
+   <td>Creative direction</td>
+   <td>The overall mood/feel of the shot is exactly what I want the model deciding</td>
+  </tr>
+ </tbody>
+</table>
+<p>This looks obvious when written down.</p>
+<p>It wasn't as obvious when I started building it.</p>
+<p>When image models become better at following instructions, the natural reaction is to give them more responsibility. In some parts of the pipeline I ended up doing the opposite.</p>
+<p>Better generation made the creative parts better.</p>
+<p>It didn't make deterministic requirements any less deterministic.</p>
+<h2>Some decisions sit in the middle</h2>
+<p>The interesting cases aren't always purely deterministic or purely generative.</p>
+<p>Composition is one of them.</p>
+<p>A model can be useful for understanding that the main subject occupies the right side of an image and that placing text there would cover the product.</p>
+<p>That's a semantic decision. Hard-coded coordinates alone aren't particularly good at it.</p>
+<p>But I also don't necessarily want the model to have unrestricted control over what happens next.</p>
+<p>One approach is to let the model propose a composition plan as structured data:</p>
+<pre><code>\{
+  "subject_region": \{
+    "x": 0.36,
+    "y": 0.16,
+    "width": 0.52,
+    "height": 0.70
+  },
+  "preferred_text_region": "upper_left",
+  "background_extension": true,
+  "creative_direction": "fine_dining"
+}
+</code></pre>
+<p>That output can be validated before it reaches the generation stage.</p>
+<p>This gives me a useful third category: the model proposes, code decides whether the proposal is valid.</p>
+<p>I've found this pattern useful beyond image generation as well.</p>
+<p>It is often a better boundary than either extreme: encoding every decision manually or giving an agent/model complete control.</p>
+<h2>Prompting wasn't the right fix for every failure</h2>
+<p>One of the traps with generative systems is treating every bad output as a prompt problem.</p>
+<p><strong>Logo moved?</strong> Improve the prompt.</p>
+<p><strong>Product changed?</strong> Add stronger instructions.</p>
+<p><strong>Text came back wrong?</strong> Make the requirement more explicit.</p>
+<p><strong>Composition changed too much?</strong> Add another paragraph describing the layout.</p>
+<p>Sometimes that works.</p>
+<p>But the prompt also gets longer, different constraints start interacting, and you're still relying on the model to reproduce behavior that your application could enforce directly.</p>
+<p>I started asking a different question when something failed:</p>
+<blockquote>
+ <p>Does the model actually need to decide this?</p>
+</blockquote>
+<p>If the answer is no, I would rather move that responsibility out of the prompt.</p>
+<p>That turned out to be a much more useful debugging question than continuously rewriting instructions.</p>
+<h2>The source image is another boundary</h2>
+<p>For KeepPost, the source image often represents something real: a dish, product, venue, bottle, or other customer asset.</p>
+<p>That changes how I think about generation.</p>
+<p>The source isn't just inspiration.</p>
+<p>It's input data that needs to preserve some truth.</p>
+<p>If a restaurant sends a photo of a particular dish, generating a more attractive image while changing the dish itself can produce a technically impressive result that is useless for the customer.</p>
+<p>So I treat source preservation differently from creative direction.</p>
+<p>The model can have significant freedom around the subject while having much less freedom over the subject itself.</p>
+<p>This distinction matters because prompts such as "keep the product unchanged" sound precise to us, but they're still instructions interpreted by a generative model.</p>
+<p>When preservation really matters, the architecture should reflect that instead of assuming a stronger sentence in the prompt will solve everything.</p>
+<h2>Brand context is not the same as layout</h2>
+<p>Another thing I separated over time was brand understanding from deterministic brand rules.</p>
+<p>Brand context can describe things like:</p>
+<ul>
+ <li>visual mood</li>
+ <li>typography preferences</li>
+ <li>lighting</li>
+ <li>palette</li>
+ <li>composition tendencies</li>
+ <li>use of negative space</li>
+ <li>photography style</li>
+</ul>
+<p>Those are useful signals for generation.</p>
+<p>But "the logo goes here" is not really brand context.</p>
+<p>It's a rule.</p>
+<p>Mixing both into one large prompt technically works, but it hides two very different types of information inside natural language.</p>
+<p>I prefer to let retrieved brand context influence creative decisions while keeping strict requirements represented explicitly wherever possible.</p>
+<p>This makes the system easier to reason about when something goes wrong.</p>
+<p>If an image has the wrong mood, I look at the generative context.</p>
+<p>If the logo is in the wrong place, I shouldn't need to debug the model's interpretation of the brand guide.</p>
+<h2>Validation matters more once generation becomes automated</h2>
+<p>When you're manually generating an image, validation is easy.</p>
+<p>You look at it.</p>
+<p>If it's bad, you regenerate it.</p>
+<p>That doesn't scale particularly well once image generation sits inside a larger automated workflow.</p>
+<p>Now the pipeline needs to care about things such as:</p>
+<ul>
+ <li>Did generation succeed?</li>
+ <li>Is the expected output format correct?</li>
+ <li>Are required elements present?</li>
+ <li>Were protected assets preserved?</li>
+ <li>Does the result satisfy composition constraints?</li>
+ <li>Should this output be accepted, repaired, or regenerated?</li>
+</ul>
+<p>Not every one of these checks can be perfectly deterministic, especially when you're evaluating visual semantics.</p>
+<p>But that doesn't mean there shouldn't be a validation layer.</p>
+<p>Generation and acceptance are separate problems.</p>
+<p>I think this distinction becomes increasingly important as AI pipelines move from interactive tools into background automation.</p>
+<p>The model saying "done" is not the same thing as the application deciding that the result is acceptable.</p>
+<h2>This is really a control problem</h2>
+<p>I originally thought most of the engineering work would be about getting better images from the model.</p>
+<p>Some of it is.</p>
+<p>But once the quality became good enough, another problem became more important: controlling variance.</p>
+<p>There are places where variance is valuable.</p>
+<p>I want the model to find a better way to light a dish. I want it to integrate an object naturally. I want it to understand the scene rather than follow a fixed Photoshop template.</p>
+<p>There are also places where variance is simply another failure mode.</p>
+<p>I don't want a creative interpretation of a logo coordinate.</p>
+<p>The architecture became easier to reason about when I stopped treating "AI image generation" as one operation and started treating it as a pipeline containing different kinds of decisions.</p>
+<p>Some belong to the model.</p>
+<p>Some belong to code.</p>
+<p>Some can be proposed by the model and verified by code.</p>
+<p>And a few still need human judgment.</p>
+<h2>The same pattern shows up outside image generation</h2>
+<p>This lesson has changed how I look at other LLM systems too.</p>
+<p>An agent doesn't need to decide something simply because it can.</p>
+<p>A RAG pipeline doesn't need an LLM for a transformation that deterministic code handles more reliably.</p>
+<p>A structured output schema shouldn't be replaced by instructions asking the model to "please always return these fields."</p>
+<p>And business rules shouldn't quietly migrate into prompts just because adding another sentence is faster than changing the application.</p>
+<p>The useful question isn't:</p>
+<blockquote>
+ <p>How much can I make the model do?</p>
+</blockquote>
+<p>It's:</p>
+<blockquote>
+ <p>Where does probabilistic reasoning actually improve the system?</p>
+</blockquote>
+<p>That's a very different architecture question.</p>
+<p>For my image pipeline, the answer wasn't "everywhere."</p>
+<p>The more I worked on it, the more I ended up giving the model freedom exactly where its uncertainty was useful, and removing freedom where the application already knew the correct answer.</p>
+<p>The resulting pipeline is less magical than the original one.</p>
+<p>That's probably why I trust it more.</p>

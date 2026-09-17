@@ -1,0 +1,67 @@
+<h1>Kubernetes v1.37: Memory QoS Graduates to Beta</h1>
+<p>Memory QoS has graduated to Beta in Kubernetes v1.37 and is now enabled by default. On Linux nodes running cgroup v2, the feature uses the memory controller to give the kernel better guidance on how to treat container memory. It was first introduced as Alpha in v1.22, and expanded in v1.36 with tiered memory reservation.</p>
+<p>This post covers what changed in v1.37, what the Beta promotion means for cluster operators, and how to configure the feature.</p>
+<h2>What changed in v1.37</h2>
+<h3>Memory QoS is Beta and enabled by default</h3>
+<p>The <code>MemoryQoS</code> feature gate is now Beta in v1.37. This means every v1.37 <code>kubelet</code> has the feature gate turned on without any configuration change. Turning on the feature by default is safe because the default <code>kubelet</code> configuration does not enable memory throttling or memory reservation. No <code>memory.high</code>, <code>memory.min</code>, or <code>memory.low</code> values are written to cgroups unless you explicitly configure them.</p>
+<p>You can opt into specific behaviors through <code>kubelet</code> configuration fields:</p>
+<ol>
+ <li>Set <code>memoryThrottlingFactor</code> (for example, <code>0.9</code>) to enable <code>memory.high</code> throttling on Burstable and BestEffort containers. The default is <code>null</code>, which means no throttling.</li>
+ <li>Set <code>memoryReservationPolicy</code> to <code>TieredReservation</code> to enable tiered memory protection via <code>memory.min</code> and <code>memory.low</code>. The default is <code>None</code>, which means no memory reservation.</li>
+</ol>
+<h3>Default <code>memoryThrottlingFactor</code> changed to null</h3>
+<p>In earlier Alpha releases, <code>memoryThrottlingFactor</code> defaulted to <code>0.9</code>, which meant enabling the feature gate caused the <code>kubelet</code> to set <code>memory.high</code> on containers. In v1.37, the default is <code>null</code>, so the <code>kubelet</code> does not set <code>memory.high</code> unless you configure a value.</p>
+<p>This change was made because, with the feature gate now on by default, an automatic <code>memory.high</code> could throttle workloads that were previously running without throttling. Making it <code>null</code> ensures that upgrading to v1.37 does not change runtime behavior for existing clusters.</p>
+<p>If your <code>kubelet</code> configuration file already contains an explicit <code>memoryThrottlingFactor</code> value, that value is preserved during the upgrade and throttling continues to work as before. If your configuration file does not include <code>memoryThrottlingFactor</code>, the <code>kubelet</code> uses the new <code>null</code> default and stops setting <code>memory.high</code>. To keep throttling in that case, add <code>memoryThrottlingFactor</code> explicitly:</p>
+<pre><code>apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+memoryThrottlingFactor: 0.9
+</code></pre>
+<h2>How to configure MemoryQoS in v1.37</h2>
+<h3>Enable memory throttling only</h3>
+<p>Set <code>memoryThrottlingFactor</code> to a value between 0 and 1. The <code>kubelet</code> uses this factor to calculate <code>memory.high</code> for Burstable and BestEffort containers.</p>
+<pre><code>apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+memoryThrottlingFactor: 0.9
+</code></pre>
+<h3>Enable memory throttling and tiered reservation</h3>
+<pre><code>apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+memoryThrottlingFactor: 0.9
+memoryReservationPolicy: TieredReservation
+</code></pre>
+<h3>Enable tiered reservation without throttling</h3>
+<pre><code>apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+memoryReservationPolicy: TieredReservation
+</code></pre>
+<h3>Disable Memory QoS entirely</h3>
+<p>To disable the feature after upgrading, set the feature gate to <code>false</code> and ensure a compatible kubelet configuration. The <code>kubelet</code> rejects the configuration if <code>memoryThrottlingFactor</code> is set to anything other than the former default of <code>0.9</code>, or if <code>memoryReservationPolicy</code> is <code>TieredReservation</code>, so remove or adjust those fields if you set them.</p>
+<pre><code>apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+featureGates:
+  MemoryQoS: false
+</code></pre>
+<p>When the feature gate is off, or <code>memoryReservationPolicy</code> is not <code>TieredReservation</code>, the <code>kubelet</code> resets stale protection at startup on cgroup v2 nodes: <code>memory.min=0</code> and <code>memory.low=0</code> on the root kubepods cgroup, and <code>memory.low=0</code> on the Burstable QoS cgroup. For containers, stale <code>memory.high</code> values are reset to <code>max</code> on reconciliation paths such as restart or resize.</p>
+<h2>Known limitation: memory reservation is node-wide</h2>
+<p><code>memoryReservationPolicy</code> applies to every pod on the node. With <code>TieredReservation</code>, every Guaranteed pod gets <code>memory.min</code> and every Burstable pod gets <code>memory.low</code>; there is no way to opt individual pods in or out. A node that mixes workloads needing hard reservation with workloads that should stay reclaimable has to choose one policy for all of them.</p>
+<p>Hard reservation also covers everything charged to the container's cgroup, including page cache, so a pod that reads large files can hold memory the kernel would otherwise reclaim to serve its neighbors.</p>
+<p>SIG Node is tracking both in <a href="https://github.com/kubernetes/kubernetes/issues/140246">kubernetes/kubernetes#140246</a>. If this affects you, that issue is the best place to describe your workload.</p>
+<h2>What to expect next</h2>
+<p>The next milestone for Memory QoS is graduation to GA. Feedback from Beta users will shape any remaining adjustments before that step. If you run into issues, please file bugs at <a href="https://github.com/kubernetes/kubernetes/issues">kubernetes/kubernetes</a>.</p>
+<h2>How can I learn more?</h2>
+<ul>
+ <li><a href="https://www.kubernetes.dev/resources/keps/2570/">KEP-2570: Memory QoS</a></li>
+ <li>Pod Quality of Service Classes</li>
+ <li>Memory QoS with cgroup v2</li>
+ <li>Managing Resources for Containers</li>
+ <li>Kubernetes cgroups v2 support</li>
+ <li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html">Linux kernel cgroups v2 documentation</a></li>
+</ul>
+<h2>Getting involved</h2>
+<p>This feature is driven by <a href="https://www.kubernetes.dev/community/community-groups/sigs/node/">SIG Node</a>. If you are interested in contributing or have feedback, you can reach out through:</p>
+<ul>
+ <li>Slack: <a href="https://kubernetes.slack.com/messages/sig-node">#sig-node</a></li>
+ <li><a href="https://groups.google.com/forum/#!forum/kubernetes-sig-node">Mailing list</a></li>
+ <li><a href="https://www.kubernetes.dev/community/community-groups/sigs/node/#meetings">SIG Node meetings</a></li>
+</ul>

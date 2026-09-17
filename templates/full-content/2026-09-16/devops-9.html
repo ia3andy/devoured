@@ -1,0 +1,59 @@
+<ul>
+ <li>What changed: You can now resize a stateful streaming query's partitions without rebuilding the checkpoint or losing state.</li>
+ <li>How it works: Set spark.sql.streaming.stateStore.partitions and restart your query on DBR 18+ with RocksDB state store provider. The query redistributes state to the new partition count.</li>
+ <li>Why it matters: Tune and scale long-running streams to fit the workload, and track each resize via query progress metrics.</li>
+</ul>
+<p>Anyone running stateful Apache Spark™ Structured Streaming queries in production eventually hits the same uncomfortable wall.</p>
+<p>You started the query months ago. Back then, the data volume was modest, so you accepted the default of 200 shuffle partitions and moved on. The pipeline ran smoothly. Then the business grew, traffic tripled, and the state store ballooned. Suddenly, those 200 partitions are no longer the right size. Some partitions are skewed and run hot, the cluster is straining, and every microbatch takes longer than it should.</p>
+<p>So you do the natural thing: you bump up <code>spark.sql.shuffle.partitions</code> and restart the query. Nothing changes.</p>
+<p>The query quietly ignores your new value because the partition count was baked into the checkpoint when you first started the stream. Historically, the only way to apply a new number has been to abandon the existing checkpoint and start over, which, for a stateful query, means losing all the accumulated state you've been carefully maintaining. For a fraud model tracking millions of accounts, or a sessionization job holding days of windows, "start over" is not a phrase anyone wants to say in a production incident review.</p>
+<p>On-demand state repartitioning (Public Preview), available in Databricks Runtime 18 and above, removes that wall. You can now resize the number of partitions for a stateful streaming query and keep your checkpoint state intact.</p>
+<p>This applies to any stateful streaming query, whether you run aggregations, stream-stream joins, deduplication, sessionization, or transformWithState, and to any workload, from fraud detection to real-time monitoring.</p>
+<p>For early adopters like Coveo, the ability to right-size their streaming infrastructure on demand immediately translated into significant operational savings.</p>
+<blockquote>
+ At Coveo, we run large-scale stateful streaming pipelines where data volumes fluctuate significantly over time. With Databricks and the State Repartitioning capability, we’ve cut our related Amazon S3 API costs by 40%. Before, every scaling decision forced a trade-off: either overprovision or rebuild from new checkpoints, which drove storage API costs nearly the same as compute costs. Now we scale freely as demand shifts, without disrupting the existing state or triggering costly checkpoint migrations.” —Alexis Chicoine, Senior Software Developer, Coveo
+</blockquote>
+<h2>Under the hood: Why were state partitions locked?</h2>
+<p>To understand why Coveo’s results represent a meaningful leap forward for Structured Streaming, we have to look at why the partition count was ever frozen in the first place.</p>
+<p>A stateful streaming query keeps its state in a state store, and that state is physically partitioned. Each key in your stream, a user ID, an account number, a window, is hashed to a specific partition, and the data for each partition is stored in its own separate RocksDB instance within the checkpoint. The number of partitions defines the layout of the entire state store on disk.</p>
+<p>If you simply changed the partition count between restarts, the hashing would no longer line up. A key that previously lived in one partition (say, partition 47) might now hash to a different one (partition 12), but its accumulated state is still sitting in the original partition's files. The query would, in effect, lose track of its own memory. To prevent exactly this kind of silent corruption, Structured Streaming locked the partition count at checkpoint creation and ignored any later changes to <code>spark.sql.shuffle.partitions</code>.</p>
+<p>Safe, but inflexible. The two costs you paid were:</p>
+<ol>
+ <li><strong>You couldn't tune.</strong> If 200 partitions turned out to be the wrong choice, you were stuck with it for the life of the checkpoint.</li>
+ <li><strong>You couldn't scale with the workload.</strong> As data volume grew or shrank, your partition count couldn't keep pace.</li>
+</ol>
+<p>On-demand state repartitioning addresses both by doing the one thing the old design refused to do, but doing it safely, by physically redistributing the state to match the new partition count.</p>
+<h2>What you need to get started</h2>
+<p>The requirements are short:</p>
+<ul>
+ <li><strong>Databricks Runtime 18 or above.</strong></li>
+ <li><strong>The RocksDB state store provider.</strong> In DBR 17.3 and above, RocksDB is the default, and new queries created in those versions will use it unless explicitly changed. If you want to confirm or explicitly set it, see Configure RocksDB state store on Databricks.</li>
+</ul>
+<p>That's the entire prerequisite list. If you're on DBR 18 with the default state store, you already have everything you need.</p>
+<h2>Changing the number of partitions</h2>
+<p>The mechanism is simple, and it reuses a pattern every streaming developer already knows: stop, reconfigure, restart.</p>
+<p>Instead of <code>spark.sql.shuffle.partitions</code>, you set a dedicated configuration, <code>spark.sql.streaming.stateStore.partitions</code>, and restart the query:</p>
+<p>The key detail is the new config itself. For stateful queries, <code>spark.sql.streaming.stateStore.partitions</code> <strong>takes precedence</strong> over <code>spark.sql.shuffle.partitions</code>. This is what makes the change "stick" where the old approach didn't.</p>
+<p>When the query restarts, it doesn't resume normal processing immediately. First, it finishes the last planned microbatch, if there's one still pending. Then it performs a one-time repartition operation: it physically redistributes the state data across the new number of partitions, re-hashing keys into their correct new homes so that nothing is lost or misplaced. Once that redistribution completes, the query resumes processing as usual, now using the partition count you requested.</p>
+<p>That repartition step is the heart of the feature. It's the difference between "we changed a number" and "we safely moved your state to a new layout."</p>
+<h2>Monitoring the repartition operation</h2>
+<p>Because repartitioning is an actual operation whose runtime is proportional to the amount of state, you'll want visibility into it. Structured Streaming surfaces this through its standard progress reporting.</p>
+<p>After the next microbatch completes, the <code>StreamingQueryProgress</code> events include the duration of the repartition operation. Look in the event's durationMs metrics for the <code>controlBatch.REPARTITION</code> field, which reports the repartition duration in milliseconds.</p>
+<p>A larger state footprint means a longer repartition, but we expect it to take only a few seconds for most workloads. So, on big jobs, it's worth capturing this metric to understand the duration.</p>
+<h2>Example: scaling a query down</h2>
+<p>Let's make this concrete with a simple aggregation, a tumbling-window count of events by id. We'll start it with the default of 200 partitions, decide that's more than this workload needs, and scale it down to 100.</p>
+<p>First, the query as it runs today, with the default partition count:</p>
+<p>Now, we've watched this stream for a while and concluded that 200 partitions is overkill. We're paying coordination overhead for parallelism we don't need. We stop the query, set the new partition count, and restart it with the same options and the same checkpoint:</p>
+<p>When the restarted query comes up, it wraps up the last planned microbatch, if there's one still pending, runs the repartition to redistribute state from 200 partitions down to 100, and then carries on counting with every window and every running total fully preserved. The same procedure works in reverse: to scale up under a heavier load, you'd simply set a larger number.</p>
+<h2>When to use state repartitioning</h2>
+<p>On-demand state repartitioning is a tuning and scaling tool rather than a routine operation. It proves valuable in a few key situations:</p>
+<ul>
+ <li><strong>Right-sizing after launch.</strong> You started the pipeline with the default 200 partitions on day one because the stream was small and fine-tuning wasn't worth it. Six months later, that number is baked into a checkpoint you can't afford to lose, and it's not enough. Ex: a fraud-scoring stream that launched in a single pilot region now covers every market, and 200 partitions leave each one holding far too much state. With on-demand repartitioning, you can increase the partition count to match what you now carry without losing your existing checkpoint.</li>
+ <li><strong>Changing workloads.</strong> You sized the stream for the peak traffic. Ex: An ad-bidding pipeline runs hot through the day and goes quiet overnight, so a value tuned for the daytime peak leaves most partitions idle at 3 am. With on-demand repartitioning, you scale up going into the busy stretch and back down once it passes, so partitioning follows actual load rather than the worst case.</li>
+ <li><strong>Backfilling historical data:</strong> Backfill and steady-state processing need different partition counts, and previously, you had to choose one for the checkpoint's life. Ex: reprocessing two years of history needs a high count to spread the work and finish fast, but that same count is wasteful once you're back to steady-state traffic. On-demand repartitioning lets you scale up for backfilling and down to steady-state size after catching up, all without losing the checkpoint and state.</li>
+ <li><strong>Performance tuning.</strong> Partition count affects parallelism, state size, and shuffle overhead, and the optimal value is hard to predict. Ex: you might think 200 is too small and that 400 would reduce microbatch latency, but testing used to require rebuilding state and reprocessing data, wasting resources. On-demand repartitioning lets you adjust the count against your live checkpoint and monitor controlBatch.REPARTITION and microbatch durations, and decide based on measurements rather than guessing.</li>
+</ul>
+<p>Because each change requires a stop and restart with a one-time repartition pause, treat it as a deliberate maintenance action. Plan the resize for a window where a brief processing pause is acceptable, and watch <code>controlBatch.REPARTITION</code> to confirm how long it took, and let the query settle back into its normal rhythm.</p>
+<h2>Conclusion</h2>
+<p>For years, the partition count of a stateful streaming query was a decision you made once, at the very beginning, and then never revisited, or paid dearly to rebuild the state from scratch. On-demand state repartitioning removes these constraints. Safely redistributing state across a new partition count turns a start-time-only decision into one you can revisit whenever your workload calls for it.</p>
+<p>The result is exactly what operators of long-running streams have wanted: the freedom to right-size a query based on its scaling needs, with nothing more than a stop, a config change, and a restart, without losing its state.</p>

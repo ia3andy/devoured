@@ -1,0 +1,60 @@
+<h1>Learning to Solve Hard Problems in RL for LLMs by Never Giving Up</h1>
+<p>This is a blog post for my recent paper on RL post-training of LLMs: introducing the Matthew Effect and proposing to solve it with Never Give Up. It is presented interactively and less formally, more like how I give the talk. For a deeper, more technical dive, check out the paper on arxiv and code on github.</p>
+<h2>What is your eval actually measuring?</h2>
+<p>Every good RL practitioner has no doubt seen an eval curve go up. Here is the AIME 2025 eval during our RL training of Olmo 3.1 RL-Zero Math.</p>
+<p>What does this curve really mean?</p>
+<p>Our eval is an average over 30 AIME questions. Let’s break those 30 questions down into 3 levels of difficulty. Every question that our initial, pre-RL model gets 0 for pass@32 will be labelled “hard”. The other questions we’ll divide evenly by into “medium” and “easy” based on their pass-rates. So our initial pass@1 averages will be 0%, 3.8%, 22.7% for our subsets. How do you think performance on each subset will evolve?</p>
+<p>Averaging our AIME eval was hiding something important: the majority of our improvements are coming from the easiest problems going from somewhat solved to mostly solved. The hardest problems are barely improving. This is clearly visible if you look at how each example’s solve rate changes over time. The hardest examples barely improve over training. The model mainly learns to better solve easy and medium-difficulty examples that were already reasonably-well solved. We call this discrepancy the <strong>Matthew Effect</strong>. But this is for math RL on LLMs. What about other domains?</p>
+<p>We evaluate code RL and agentic RL using Deepcoder and DeepSWE, two nice open-source projects that released models and logs. We can use the initial model to split each benchmark into difficulty buckets (Deepseek-R1-Distilled-Qwen-14B on LCBv6) or we can use existing task length/difficulty labels (SWEBench).</p>
+<p>The gains from RL are proportional to how easy the problems are. We connect this bias to a similar phenomenon in network science and economics, the <em>Matthew Effect</em>, generally summarized as “the rich get richer”.</p>
+<p>We therefore propose <strong>The Matthew Effect in RL for LLMs</strong></p>
+<blockquote>
+ <p>RL improves performance on a task in proportion to a model’s initial competence—making easy tasks easier while hard tasks often remain difficult.</p>
+</blockquote>
+<h2>What causes the Matthew Effect?</h2>
+<p>You might assume the issue has to do with GRPO. If we just don’t get a correct answer to our problem in our <code>k</code> sampled completions, then we don’t get any gradient and can’t improve on this problem. One possible answer is to sample more completions i.e. larger <code>k</code>.</p>
+<p>To test this out, we train Qwen 2.5 0.5B Instruct with GRPO on GSM8k platinum and test on the same. We split our dataset into difficulty levels using initial pass@1: easy (25%), medium (10%), hard (5%), and extra-hard (0%) problems. We vary <code>k \in \\{4, 8, 16, 32\}</code> but keep batch size fixed.</p>
+<p>It turns out that smaller <code>k=4</code> is actually best! Why is this happening?</p>
+<p>Lets look at what our training batch is actually composed of. Since we filter any prompt whose completions are all correct or incorrect, our training batch must always be composed of problems with some completions right, some wrong. We plot what percentage of our batch is our easy subset and our extra hard subset and how this changes over time.</p>
+<p>Larger <code>k</code> increases the chance of finding a rare correct solution to a very hard problem. So, naively, we expect it to have more hard problems in the batch. The issue is that larger <code>k</code> also increases the chances of finding a rare <em>incorrect</em> solution to an <em>easy</em> problem.</p>
+<p>Early in training, <code>k=32</code> finds rare solutions to hard problems. But after the inflection point around step 200, <code>k=4</code> does better. <code>k=4</code> filters any problem that is solved in <code>4/4</code> completions. In contrast, for <code>k=32</code> to filter the same problem, it must be solved much more: <code>32/32</code>. <code>k=4</code> ends up spending much less compute on easy problem, especially when they get a rare incorrect solution. The inflection point is when the benefit of finding rare correct answers to hard questions is outweighted by wasting compute training on rare incorrect answers to easy questions.</p>
+<p>Because of our asynchronous RL for LLMs setup, all the compute we save filtering easy problems is used to train on harder problems. We argue the issue behind the Matthew Effect isn’t just undersampling for hard problems, but spending too much compute on easy problems.</p>
+<h2>Never Give Up on hard problems</h2>
+<p>Our goal is therefore to only use small <code>k</code> for easy problems but have large <code>k</code> for hard problems. We propose a simple, but effective method of adapting asynchronous RL sampling: <strong>Never Give Up</strong>. We start sampling some small amount <code>k</code>. If a prompt is solved within the first <code>k</code> completions, train on it! If a prompt is fully solved in <code>k/k</code> completions, then we can easily and quickly filter it.</p>
+<p>The tricky part is if all completions are wrong. With probability <code>p</code>, we <em>never give up</em> and add the prompt back to our generator in order to sample <code>k</code> more completions. We keep track of our old completions and when we do solve the problem, train on our whole <code>k * \text\{rounds of NGU}</code> completions. This creates a geometric distribution for the number of samples we take: if we never solve the prompt, we expect to take <code>\frac\{k}\{1-p}</code> samples, in expectation.</p>
+<p>This method is implicitly adaptive. Whereas curriculum learning pre-sets the difficulty of a problem, we find that online, adaptive methods do better as easy problems can become more difficulty over training and vice-versa. On GSM8k, <code>k=4</code> with NGU <code>p=0.9</code> outperforms all values of standard GRPO with varied <code>k</code>. This is especially evident on the hardest subset.</p>
+<p>It does this by achieving the best of large <code>k</code> early in training and small <code>k</code> late in training.</p>
+<h2>Async RL staleness and tricks for NGU</h2>
+<p>Astute readers might already see a downside to the method: stale completions. This section introduces two tricks for dealing with staleness, but its not necessary to the main message so feel free to skip it.</p>
+<p>If we take multiple rounds of NGU to get one correct completion, our initial <code>k</code> completions will be pretty stale by the time we train on them. Stale negatives are known to be bad for LLMs and RL so its important to filter completions to be below some age threshold.</p>
+<p>Overall, it makes sense to use all the samples you have for your GRPO baseline, even if you’re not training on them.</p>
+<h2>NGU at a bigger scale: Math</h2>
+<p>We scale up to a bigger math RL setup: DeepScaler with Qwen 3 4B base. On top of a strong GRPO <code>k=16</code> baseline, NGU further improves performance, especially on the hardest subsets of our AIME + BRUMO 2025 eval.</p>
+<p>The Matthew Effect still persists, but we can mitigate it; NGU helps solve harder questions without really degrading on easier ones.</p>
+<h2>NGU on a different scale: Code</h2>
+<p>Code RL is fundamentally different from math because math usually has binary verifier: right or wrong. A coding problem has many <em>tests</em> and the tests can vary from easy and difficult within a single coding problem. Math problems are either easy or hard. Solving a single coding problem means solving <em>both</em> easy and hard tests.</p>
+<p>We look at a particularly tough setup: Manufactoria. Standard GRPO improves performance but eventually stagnates: improving on some tests but failing to pass <em>all</em> tests. Splitting the tests by difficulty, we see a clear Matthew Effect.</p>
+<p>Easy tests are nearly fully solved and improvement on hard tests stagnates. GRPO dedicates the majority of training signal to repeatedly revisiting partially-solved medium tests and oscillates between solving them slightly more or less.</p>
+<p>If our first <code>k</code> completions all pass <code>\frac\{7}\{12}</code> tests, then Never Give Up won’t accept the next <code>k</code> completions unless they pass <em>more</em> than <code>\frac\{7}\{12}</code>, pushing the model to iteratively do better. Where standard GRPO stalls, GRPO + NGU keeps solving harder and harder tests until it starts to fully pass all tests for a given problem.</p>
+<h2>The Matthew Effect is a Primacy Bias, sort of</h2>
+<p>Some <em>very</em> astute readers may have noticed that the Matthew Effect resembles a primacy bias where LLMs are predisposed to solve certain problems according to their initial state. This intuitively connects the Matthew Effect to the Primacy Bias in Deep RL where deep RL training runs could be derailed due to bad early samples. This was due, in part, to issues of plasticity in neural networks trained with RL.</p>
+<p>Could it be that the Matthew Effect in RL for LLMs caused by plasticity? In short, no.</p>
+<p>We start from a post-GRPO checkpoint at 6000 steps that has been stagnant for at least 3000 of those steps. We can then either train with a single reward for passing all tests (<em>all-tests</em>) or keep our per-test reward and just add NGU (<em>per-test NGU</em>).</p>
+<p>Both methods recover strong performance, even after spending a while on suboptimal data. This demonstrates that plasticity is not a major issue and LLMs can generally recover from early bad samples.</p>
+<h2>Limitations</h2>
+<p>The intuition behind Never Give Up is that our RL training can reallocate compute by quickly filtering easy problems. So if a task leans heavily towards very difficult problems, Never Give Up will likely not be effective. NGU’s sample, wait, sample more process can take longer to finish a whole group of completions as compared to sampling <code>\frac\{k}\{1-p}</code> from the start. This means your early samples will be more off-policy than necessary, which means a worse learning signal and slower learning speed. But if you already know a decent <code>k</code> for your data distribution, NGU can likely be effective!</p>
+<h2>Conclusion</h2>
+<p>We have highlighted <em>the Matthew Effect</em> in RL for LLMs, and shown that standard RL results in disproportionately poor performance on the hardest problems. This demonstrates how simple scalar values may not be sufficient for accurate evaluations of LLMs. Hopefully, it inspires you to dig into your evals and look at more dense evaluation signals.</p>
+<p>Our proposed solution, <em>Never Give Up</em>, represents a simple method for better allocating compute. The trick is really just reducing the compute spent on easy problems, which reallocates it towards harder problems. But it does seem to show substantial improvements on difficult tasks. Future work should examine more complex multi-step, agentic environments and try to gain a deeper understanding of how RL actually changes our model’s distribution, in practice.</p>
+<h3>Acknowledgements</h3>
+<p>Thanks so much to my coauthors: Hamish, Nathan, and Aaron! And all my friends who I annoyed for advice during the project: Costa, Sam, Finbarr, Dima, and Adrien. Hamish, Nathan, and Adrien kindly gave me feedback on this blog post. Thanks to Ai2 for giving me compute, some really nice stickers, and great colleagues.</p>
+<p>All graphs here made with plotly thanks to my robot friends Sonnet and Sol.</p>
+<h3>Citation</h3>
+<pre><code>@misc\{noukhovitch_ngu_2026,
+	title = \{Learning to Solve Hard Problems in RL for LLMs by Never Giving Up},
+	url = \{https://arxiv.org/abs/2609.13443},
+	author = \{Noukhovitch, Michael and Ivison, Hamish and Lambert, Nathan and Courville, Aaron},
+	month = sep,
+	year = \{2026},
+}
+</code></pre>
