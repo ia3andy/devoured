@@ -2186,7 +2186,7 @@ public class DigestHelper implements Runnable {
     static void writeHtmlFile(Path dir, String id, String html) {
         try {
             html = Jsoup.clean(html, PROSE_SAFELIST);
-            html = html.replace("{", "\\{");
+            html = html.replace("\\{", "{").replace("{", "\\{");
             Files.writeString(dir.resolve(id + ".html"), html);
         } catch (IOException e) {
             System.err.println("      -> write error for " + id + ": " + e.getMessage());
