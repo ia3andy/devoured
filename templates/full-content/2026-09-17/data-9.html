@@ -1,0 +1,93 @@
+<h1>DuckDB Skills for Claude Code</h1>
+<p><em>TL;DR: The duckdb-skills plugin gives Claude Code a growing number of skills that use the DuckDB CLI to read data files, run queries, convert formats, explore object storage, work with spatial data, search the documentation and recall earlier sessions.</em></p>
+<p>More likely than not, you've been using AI tools such as Claude Code for day-to-day work. You may have noticed that when AI needs to look at a data file, it makes use of Python, writes a small script, runs it, and then reads the output. This works, although it is slow, and the agent guesses column names and types and doesn't really check them.</p>
+<p>Since DuckDB can read pretty much any file directly, the DuckDB team has written a set of skills that can tell your AI to use the DuckDB CLI instead. Whether the data is a file on your machine, a file on the internet or an Iceberg table behind a login, to DuckDB it is still a table or a catalog that it can query and process efficiently.</p>
+<p>This post describes what is in the plugin and how it works.</p>
+<h2>Installation</h2>
+<p>In Claude Code, install <code>duckdb-skills</code> from the official plugins:</p>
+<pre><code>/plugin install duckdb-skills@claude-plugins-official
+</code></pre>
+<p>The skills are then available as <code>/duckdb-skills:skill-name</code> in all subsequent sessions. You need the DuckDB CLI installed; if it is not found, the skills will offer to install it.</p>
+<p>Alternatively, you can add our repository as a plugin marketplace and install the plugin from there:</p>
+<pre><code>/plugin marketplace add duckdb/duckdb-skills
+/plugin install duckdb-skills@duckdb-skills
+</code></pre>
+<h2>An Example Interaction</h2>
+<p>Here is what a short exchange looks like when you ask a question about a data file:</p>
+<pre><code>You: How many taxi trips in that Parquet file were longer than 10 miles?
+
+Claude runs:
+    SELECT count(*) FROM 'trips.parquet' WHERE distance &gt; 10;
+
+DuckDB:
+    Binder Error: Referenced column "distance" not found
+    Candidate bindings: "trip_distance"
+
+Claude reads the error, checks the columns and retries:
+    SELECT count(*) FROM 'trips.parquet' WHERE trip_distance &gt; 10;
+
+DuckDB:
+    ┌──────────────┐
+    │ count_star() │
+    ├──────────────┤
+    │       184362 │
+    └──────────────┘
+
+Claude: 184,362 of the trips were longer than 10 miles.
+</code></pre>
+<p>What you see in the chat is a conversation in natural language between you and Claude. Underneath it runs a second conversation in SQL between Claude and DuckDB. People and Claude are both at home in natural language, and Claude and DuckDB are both at home in SQL, so each step uses the language that fits it. When a query fails, Claude reads the error, adjusts the SQL and tries again, as in the retry above.</p>
+<p>The two tools cover different work. DuckDB gives exact answers to exact questions, and those exact answers give Claude a firm base to reason from and to turn back into a short, readable reply for you.</p>
+<h2>What's in the Plugin</h2>
+<p>Each skill wraps a common data task behind a <code>/duckdb-skills:skill-name</code> slash command, grouped here by what they do.</p>
+<p>You do not have to type the slash command, though: each skill also has a description that tells Claude Code when it applies, so you can simply ask in plain language (for example, “convert this CSV to Parquet” or “how far is the nearest station?”) and the agent will pick the right skill on its own.</p>
+<h3>Reading, Querying and Converting Data</h3>
+<p><strong><code>attach-db</code></strong> attaches a DuckDB database and records it in the session state, so the other skills can use it:</p>
+<ul>
+ <li>“Attach my_analytics.duckdb and show me its tables.”</li>
+</ul>
+<p><strong><code>query</code></strong> runs SQL or a plain-English question against attached databases or a file:</p>
+<ul>
+ <li>“Show me the first 10 rows of the sales table.”</li>
+ <li>“What are the top 5 customers by revenue?”</li>
+</ul>
+<p><strong><code>read-file</code></strong> reads and profiles any data file (CSV, JSON, Parquet, Avro, Excel, spatial, SQLite, Jupyter) on local disk or in S3, GCS, Azure or HTTPS:</p>
+<ul>
+ <li>“What columns does variants.parquet have?”</li>
+ <li>“How many rows are in the CSV file at that URL?”</li>
+</ul>
+<p><strong><code>convert-file</code></strong> converts a file from one format to another:</p>
+<ul>
+ <li>“Convert sales.csv to Parquet.”</li>
+ <li>“Save data.json as an Excel file.”</li>
+</ul>
+<h3>Remote and Spatial Data</h3>
+<p><strong><code>s3-explore</code></strong> lists and queries data on S3, R2, GCS, MinIO or any S3-compatible storage without downloading it:</p>
+<ul>
+ <li>“What's in s3://my-bucket/?”</li>
+ <li>“How many rows are in s3://my-bucket/data.parquet?”</li>
+</ul>
+<p><strong><code>spatial</code></strong> answers spatial questions: distances, nearest neighbors, spatial joins and geographic lookups, including free Overture Maps data:</p>
+<ul>
+ <li>“What are the 5 closest cafes to this point?”</li>
+ <li>“Which districts in districts.geojson overlap?”</li>
+</ul>
+<h3>Documentation and Session Context</h3>
+<p><strong><code>duckdb-docs</code></strong> searches the DuckDB and DuckLake documentation and blog posts:</p>
+<ul>
+ <li>“How do window functions work in DuckDB?”</li>
+ <li>“How do I read a CSV with custom delimiters?”</li>
+</ul>
+<p><strong><code>read-memories</code></strong> searches past Claude Code session logs for earlier decisions, conventions and open TODOs:</p>
+<ul>
+ <li>“What did we decide about the DuckDB schema in earlier sessions?”</li>
+</ul>
+<h3>Setup</h3>
+<p><strong><code>install-duckdb</code></strong> installs or updates extensions, including community extensions:</p>
+<ul>
+ <li>“Install the spatial and httpfs extensions.”</li>
+ <li>“Update my DuckDB extensions.”</li>
+</ul>
+<p>The skills share a single per-project <code>state.sql</code> file, a plain SQL script of <code>ATTACH</code>, <code>USE</code> and <code>LOAD</code> statements, secrets and macros, so a session can be restored with <code>duckdb -init state.sql</code>.</p>
+<p>For session-state details and local development instructions, see the README.</p>
+<h2>Conclusion</h2>
+<p>The duckdb-skills plugin is available at github.com/duckdb/duckdb-skills. If you run into problems or have suggestions, please open an issue. For DuckDB-related errors, it helps to include the output of <code>duckdb --version</code> and the full error message.</p>

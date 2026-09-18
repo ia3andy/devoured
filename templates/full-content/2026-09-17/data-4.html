@@ -1,0 +1,92 @@
+<p>Redis p99 goes from 0.4ms to 900ms. Every operation is affected, including plain <code>GET</code> calls against small string values. CPU on the Redis host is at 30 percent, memory is fine, the network is not saturated, and <code>INFO</code> shows no evictions.</p>
+<p>Then it clears, and forty seconds later it happens again.</p>
+<p>Somebody added an admin endpoint that lists cache keys matching a pattern. It runs every minute. It calls <code>KEYS</code>.</p>
+<h2>One thread, one command at a time</h2>
+<p>Redis executes commands on a single thread. That is a design decision rather than an oversight, and it is why every Redis operation is atomic without any locking: nothing else can be running while your command runs.</p>
+<p>The consequence is head-of-line blocking with no escape. A command that takes 200 milliseconds does not slow down your request. It makes every other client wait 200 milliseconds, including clients whose request would have taken 30 microseconds.</p>
+<p>Client B asked for one small string. It waited 340 milliseconds because of a command it has no relationship to. From B’s perspective Redis was slow, and every metric B has will say so.</p>
+<p>Redis 6 added threaded I/O, and it is worth knowing exactly what that changed. Reading from and writing to sockets can now happen on multiple threads, which helps when a large number of connections saturates the network handling. Command execution is still single threaded, deliberately, because that is what keeps operations atomic. Threaded I/O does nothing for this problem.</p>
+<h2>The commands that are linear and do not look it</h2>
+<p><code>KEYS</code> is the famous one and it is not the only one. Anything whose cost scales with the size of the data it touches will block for proportionally long.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Command</th>
+   <th>Cost</th>
+   <th>Why it surprises people</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>KEYS pattern</code></td>
+   <td>whole keyspace</td>
+   <td>the pattern does not narrow the scan</td>
+  </tr>
+  <tr>
+   <td><code>SMEMBERS key</code></td>
+   <td>size of the set</td>
+   <td>fine at 100 members, not at 2 million</td>
+  </tr>
+  <tr>
+   <td><code>HGETALL key</code></td>
+   <td>size of the hash</td>
+   <td>same shape, same trap</td>
+  </tr>
+  <tr>
+   <td><code>LRANGE key 0 -1</code></td>
+   <td>length of the list</td>
+   <td>the <code>0 -1</code> is the problem</td>
+  </tr>
+  <tr>
+   <td><code>DEL key</code></td>
+   <td>elements in the collection</td>
+   <td>deleting feels like it should be free</td>
+  </tr>
+  <tr>
+   <td><code>FLUSHALL</code></td>
+   <td>whole keyspace</td>
+   <td>blocks until every key is freed</td>
+  </tr>
+  <tr>
+   <td><code>SORT</code></td>
+   <td>size plus sort cost</td>
+   <td>rarely used, always expensive</td>
+  </tr>
+ </tbody>
+</table>
+<p>The <code>DEL</code> row is the one that catches people, because deletion intuitively feels cheap. Removing a set with two million members means freeing two million objects, and that happens synchronously on the same thread everything else is waiting on. <code>UNLINK</code> exists precisely for this: it removes the key from the keyspace immediately and reclaims the memory in a background thread, so the blocking portion is constant.</p>
+<p><code>LRANGE key 0 -1</code> deserves a mention because it appears in code that looks careful. Somebody wrote a helper that fetches a whole list, the list had 40 elements in development, and it now has 900,000 in production.</p>
+<h2>Finding the offender</h2>
+<p><code>SLOWLOG</code> is where to look and it is the first thing I check when Redis latency moves without a corresponding change in traffic.</p>
+<pre><code>redis-cli SLOWLOG GET 10</code></pre>
+<p>It records commands exceeding <code>slowlog-log-slower-than</code>, which defaults to 10,000 microseconds. On a server where normal commands take tens of microseconds, 10ms is an enormous threshold and will only catch the extremes. Lowering it to 1,000 makes the log genuinely useful.</p>
+<p><code>LATENCY DOCTOR</code> and <code>LATENCY HISTORY</code> cover a broader set of causes, including fork pauses during persistence, which is the other common source of multi-hundred-millisecond stalls that look like nothing in the application logs.</p>
+<p>The signature worth memorising: <strong>every operation slows at once, CPU is not saturated, and the slowdown clears without intervention.</strong> That combination almost always means one command is holding the thread. If instead one particular key or operation is slow and others are fine, the problem is elsewhere.</p>
+<h2>SCAN and the cursor contract</h2>
+<p><code>SCAN</code> replaces <code>KEYS</code> and the difference is that it returns after a bounded amount of work.</p>
+<pre><code>def scan_keys(redis, pattern, count=500):
+    cursor = 0
+    while True:
+        cursor, batch = redis.scan(cursor=cursor, match=pattern, count=count)
+        for key in batch:
+            yield key
+        if cursor == 0:
+            break</code></pre>
+<p>Each call examines roughly <code>count</code> slots and yields, so other clients get served between iterations. The whole scan takes longer in wall clock terms and blocks nobody.</p>
+<p>Two properties of the guarantee are worth knowing before relying on it. Keys present for the entire scan are returned at least once, so you may see duplicates and must handle them. Keys added or removed during the scan may or may not appear, so <code>SCAN</code> gives you a fuzzy snapshot rather than an exact one. For finding keys to expire or clean up that is fine. For anything requiring exactness it is the wrong tool, and the right answer is usually to maintain an explicit index in a set rather than scanning the keyspace at all.</p>
+<p>The same cursor pattern exists for collections: <code>HSCAN</code>, <code>SSCAN</code> and <code>ZSCAN</code> do for large hashes, sets and sorted sets what <code>SCAN</code> does for the keyspace.</p>
+<h2>Big keys are a latency problem before they are a memory problem</h2>
+<p>A single key holding a large collection is a latency risk on every operation that touches it, including its eventual deletion and its serialisation during persistence.</p>
+<pre><code>redis-cli --bigkeys
+redis-cli --memkeys</code></pre>
+<p><code>--bigkeys</code> samples the keyspace and reports the largest key per type. Running it during a quiet period is one of the higher value ten second investigations available, because a single 4 million element set is a stall waiting for whichever unlucky request touches it.</p>
+<p>The structural fix is sharding the key. A set of 4 million members becomes 64 sets of 60,000 members addressed by a hash of the member, and every operation touches one shard. That also spreads the key across a cluster rather than pinning it to one node, which no amount of ring based key distribution will do for you, because the hash of a given key is fixed.</p>
+<h2>What I would put in place</h2>
+<p>Set <code>slowlog-log-slower-than</code> to 1,000 microseconds so the log records things that matter on a server where normal is measured in tens of microseconds.</p>
+<p>Disable the dangerous commands outright in production rather than relying on nobody calling them:</p>
+<pre><code>rename-command KEYS ""
+rename-command FLUSHALL ""
+rename-command FLUSHDB ""</code></pre>
+<p>This is the rare case where I favour removing a capability over documenting it, because the cost of one accidental <code>KEYS</code> against a large keyspace is an outage and the benefit of having it available in production is close to zero.</p>
+<p>Run <code>--bigkeys</code> on a schedule and alert when the largest key crosses whatever threshold your latency budget tolerates.</p>
+<p>And treat the documented complexity of every command as a latency budget rather than trivia. On a single threaded server, O(N) is not a note about that command. It is a statement about what every other client will experience while it runs.</p>

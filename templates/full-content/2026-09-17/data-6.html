@@ -1,0 +1,181 @@
+<p>There is a conversation that happens in every PostgreSQL shop eventually. A query that has been fine for a year gets slow overnight. Nothing was deployed. The data grew a little, <code>ANALYZE</code> ran, and the planner — entirely reasonably, on the numbers it had — picked a different plan. The old plan was better. You would like it back.</p>
+<p>PostgreSQL 19 ships two new modules for exactly this: <code>pg_plan_advice</code>, which can read a plan back out as a string and enforce it later, and <code>pg_stash_advice</code>, which keeps those strings keyed by query id and applies them automatically.</p>
+<h2>Reading a plan back out</h2>
+<p>Start with a query that joins three F1 tables. A freshly restored Lab image has never been analyzed, so the setup below includes the <code>ANALYZE</code> from the opening paragraph before running the query — the last thing a comparison needs is statistics that do not reflect the data yet:</p>
+<pre><code>analyze f1db.results, f1db.races, f1db.drivers;
+
+  select drivers.surname, count(*) as races
+    from f1db.results
+    join f1db.races using(raceid)
+    join f1db.drivers using(driverid)
+   where races.year = 2017
+group by drivers.surname
+order by races desc, drivers.surname
+   limit 5;
+</code></pre>
+<pre><code>ANALYZE
+  surname   | races 
+------------+-------
+ Bottas     |    11
+ Ericsson   |    11
+ Grosjean   |    11
+ Hamilton   |    11
+ Hülkenberg |    11
+</code></pre>
+<p>Nothing remarkable about the query itself. Now ask the planner not just what it did, but to describe what it did in a form it can read back:</p>
+<pre><code> explain (costs off, plan_advice)
+  select drivers.surname, count(*) as races
+    from f1db.results
+    join f1db.races using(raceid)
+    join f1db.drivers using(driverid)
+   where races.year = 2017
+group by drivers.surname;
+</code></pre>
+<pre><code>                        QUERY PLAN                        
+----------------------------------------------------------
+ HashAggregate
+   Group Key: drivers.surname
+   -&gt;  Hash Join
+         Hash Cond: (results.driverid = drivers.driverid)
+         -&gt;  Hash Join
+               Hash Cond: (results.raceid = races.raceid)
+               -&gt;  Seq Scan on results
+               -&gt;  Hash
+                     -&gt;  Seq Scan on races
+                           Filter: (year = 2017)
+         -&gt;  Hash
+               -&gt;  Seq Scan on drivers
+ Generated Plan Advice:
+   JOIN_ORDER(results races drivers)
+   HASH_JOIN(races drivers)
+   SEQ_SCAN(results races drivers)
+   NO_GATHER(results races drivers)
+</code></pre>
+<p>Indented <code>EXPLAIN</code> output is a tree written sideways, and it is worth seeing as one before going further — the plan below is what those four lines of advice are describing:</p>
+<p>That trailing block under the plan is the whole idea. Four lines, describing four decisions the planner made: which table drives the join and in what order, which join method to use, how to reach each relation, and whether to go parallel.</p>
+<p><code>JOIN_ORDER(results races drivers)</code> says <code>results</code> is the driving table, joined first to <code>races</code> and then to <code>drivers</code>. <code>HASH_JOIN(races drivers)</code> says each of those belongs on the <em>inner</em> side of a hash join. <code>SEQ_SCAN(...)</code> and <code>NO_GATHER(...)</code> say how to read each table and that none of it should run in parallel.</p>
+<p>Note what is <em>not</em> here. There is no cost, no row estimate, no timing — advice describes outcomes, not the reasoning that produced them. That is a deliberate design choice, and it is the reason advice survives a change in statistics: it does not mention any.</p>
+<h2>You do not need PostgreSQL 19 for this part</h2>
+<p>There is an obvious problem with everything above: <code>pg_plan_advice</code> is a PostgreSQL 19 contrib module, and you are probably not running PostgreSQL 19. Most people will not be for years.</p>
+<p>The useful half of that four-line block does not actually depend on the server, though. It is a <em>description of a plan</em> — and the plan text is something every version has been printing all along. So it can be reconstructed. <code>sqlfmt</code> does that, from ordinary <code>EXPLAIN</code> output, on any version:</p>
+<pre><code>$ sqlfmt explain advice plans/default.txt
+</code></pre>
+<pre><code>JOIN_ORDER(results races drivers)
+HASH_JOIN(races drivers)
+SEQ_SCAN(results races drivers)
+NO_GATHER(results races drivers)
+</code></pre>
+<p>That is the same four lines PostgreSQL 19 printed above, from a plan captured on a server that has never heard of <code>pg_plan_advice</code>.</p>
+<h3>Why this is the right way to compare two plans</h3>
+<p>Putting two plans side by side works fine at the size of the ones in this article. It stops working at twenty nodes, and twenty-node plans are the ones you actually need to compare. The mechanical answer — run <code>diff</code> over two <code>EXPLAIN</code> outputs — does not help either: every line carries a cost or a timing, so <em>every line differs</em>, and the one change that matters drowns in the noise.</p>
+<p>Leaving the numbers out is what makes the comparison tractable. Because no cost or timing appears, two runs of the same plan produce identical output, and any difference is a real difference. Here is the planner’s own plan against one with a different join order forced onto it — the same forced plan the next section walks through in full:</p>
+<pre><code>$ sqlfmt explain diff plans/default.txt plans/forced.txt
+</code></pre>
+<pre><code>--- plans/default.txt
++++ plans/forced.txt
+@@ plan structure @@
+-JOIN_ORDER(results races drivers)
++JOIN_ORDER(drivers results races)
+-HASH_JOIN(races drivers)
++HASH_JOIN(results races)
+-SEQ_SCAN(results races drivers)
++SEQ_SCAN(drivers results races)
+-NO_GATHER(results races drivers)
++NO_GATHER(drivers results races)
+</code></pre>
+<p>The driving table moved and both join methods stayed hash joins — the <code>HASH_JOIN</code> line just names a different pair, because forcing <code>drivers</code> to drive puts a different relation on the inner side. With <code>EXPLAIN (ANALYZE)</code> plans the timings are reported too, as context lines under the structural hunk, so you can see whether the shape change actually bought anything. It exits non-zero when the plans differ, which makes it usable as a check in CI.</p>
+<h3>Comparing across versions</h3>
+<p>The comparison worth making most is the one you make before an upgrade. You have the plan your PostgreSQL 16 server produces for a query you care about, and you have what a PostgreSQL 19 server says about the same query, printed by <code>pg_plan_advice</code> itself. Did the planner change its mind?</p>
+<p>One plan from each side, and the two write the same decisions down slightly differently — 19 orders a set of relations by its own internal numbering and schema-qualifies index names, neither of which is in plain <code>EXPLAIN</code> text. <code>-canonical</code> puts both into one normal form:</p>
+<pre><code>$ diff &lt;(sqlfmt explain advice -canonical pg16-plan.txt) \
+       &lt;(sqlfmt explain canonical pg19-plan.txt)
+</code></pre>
+<p>It sorts what is a set, leaves <code>JOIN_ORDER</code> alone because there the order <em>is</em> the meaning, keeps index pairs together as pairs, and drops schema qualifiers. <code>explain canonical</code> is the counterpart for the other side: it reads an advice block a server already printed, finding it inside a whole <code>EXPLAIN (PLAN_ADVICE)</code> capture.</p>
+<h2>Making the planner take it</h2>
+<p>Feed a string back through <code>pg_plan_advice.advice</code> and the planner is obliged to follow it. Here is the same query, told to drive from <code>drivers</code> instead:</p>
+<pre><code>set pg_plan_advice.advice = 'JOIN_ORDER(drivers results races)';
+
+ explain (costs off, plan_advice)
+  select drivers.surname, count(*) as races
+    from f1db.results
+    join f1db.races using(raceid)
+    join f1db.drivers using(driverid)
+   where races.year = 2017
+group by drivers.surname;
+</code></pre>
+<pre><code>SET
+                                 QUERY PLAN                                  
+-----------------------------------------------------------------------------
+ Finalize GroupAggregate
+   Group Key: drivers.surname
+   -&gt;  Sort
+         Sort Key: drivers.surname
+         -&gt;  Hash Join
+               Hash Cond: (results.raceid = races.raceid)
+               -&gt;  Hash Join
+                     Hash Cond: (drivers.driverid = results.driverid)
+                     -&gt;  Seq Scan on drivers
+                     -&gt;  Hash
+                           -&gt;  Partial HashAggregate
+                                 Group Key: results.raceid, results.driverid
+                                 -&gt;  Seq Scan on results
+               -&gt;  Hash
+                     -&gt;  Seq Scan on races
+                           Filter: (year = 2017)
+ Supplied Plan Advice:
+   JOIN_ORDER(drivers results races) /* matched */
+ Generated Plan Advice:
+   JOIN_ORDER(drivers results races)
+   HASH_JOIN(results races)
+   SEQ_SCAN(drivers results races)
+   NO_GATHER(drivers results races)
+</code></pre>
+<p>Two things to notice. The plan really did change — <code>drivers</code> is now the driving table — and the shape of the change is a PostgreSQL 19 feature in its own right: <code>Partial HashAggregate</code> moved <em>below</em> the join, on <code>results</code> alone, with <code>Finalize GroupAggregate</code> combining the partial groups once every relation is joined.</p>
+<h2>When advice does not win</h2>
+<p>Advice constrains the planner’s choice <em>among plans it would consider</em>. It does not resurrect plans that have been taken off the table. Turn off hash joins and ask for one anyway:</p>
+<pre><code>reset pg_plan_advice.advice;
+
+set enable_hashjoin = off;
+
+set pg_plan_advice.advice = 'JOIN_ORDER(results races drivers) HASH_JOIN(races)';
+
+ explain (costs off)
+  select drivers.surname, count(*) as races
+    from f1db.results
+    join f1db.races using(raceid)
+    join f1db.drivers using(driverid)
+   where races.year = 2017
+group by drivers.surname;
+</code></pre>
+<pre><code>RESET
+SET
+SET
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Finalize GroupAggregate
+   Group Key: drivers.surname
+   -&gt;  Sort
+         Sort Key: drivers.surname
+         -&gt;  Nested Loop
+               -&gt;  Nested Loop
+                     Disabled: true
+                     -&gt;  Partial HashAggregate
+                           Group Key: results.raceid, results.driverid
+                           -&gt;  Seq Scan on results
+                     -&gt;  Index Scan using idx_49556_primary on races
+                           Index Cond: (raceid = results.raceid)
+                           Filter: (year = 2017)
+               -&gt;  Index Scan using idx_49514_primary on drivers
+                     Index Cond: (driverid = results.driverid)
+ Supplied Plan Advice:
+   JOIN_ORDER(results races drivers) /* matched */
+   HASH_JOIN(races) /* matched, failed */
+</code></pre>
+<p><code>JOIN_ORDER</code> matched. <code>HASH_JOIN(races)</code> reports <code>matched, failed</code> — the advice was understood, it applied to the right part of the query, and the planner still could not honour it.</p>
+<h2>Stashing advice by query id</h2>
+<p>Setting <code>pg_plan_advice.advice</code> by hand works for experimenting, but you cannot ask an application to do it. <code>pg_stash_advice</code> closes that gap: it maps query ids to advice strings in shared memory, and applies them to any query whose id matches.</p>
+<h2>The part the documentation says twice</h2>
+<p>Both modules’ documentation carries the same warning, and it is worth repeating rather than paraphrasing: the planner’s ability to change its mind as the data changes is a feature. Advice takes that away. If the distribution shifts under a pinned plan, you get the old plan applied to new data, which is exactly the failure the planner exists to prevent. The README is blunter still — bad advice producing a bad plan is “user error, not a defect in this module”.</p>
+<h2>What this replaces</h2>
+<p>You have met the alternatives if you have run PostgreSQL at scale: <code>pg_hint_plan</code>’s out-of-tree hints in query comments, the blunt per-session <code>enable_*</code> family, or rewriting the query until the planner agrees with you — which is not available when the query comes out of an ORM you do not control.</p>
+<p>What is new is the round trip: a plan can be <em>read out</em>, and the same string put back. You are not writing hints from first principles and hoping they describe the plan you remember; you are keeping a plan you measured. That is a smaller feature than a hint language, and a much more useful one.</p>

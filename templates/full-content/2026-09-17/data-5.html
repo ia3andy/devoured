@@ -1,0 +1,76 @@
+<h2>The question teams skip</h2>
+<p>"Just use an LLM for it" has become the default answer to almost any text classification problem — routing support tickets, tagging feedback, sorting incoming requests. Zero-shot classification with a modern LLM needs no training data at all, which makes it an easy default when a project starts.</p>
+<p>But that convenience has a cost most teams never actually measure: LLM classification means a network call and a per-request charge on every single item, forever. A classical baseline like TF-IDF plus a linear classifier costs nothing to run once trained — no API, no network round-trip, sub-millisecond inference. The question worth answering before defaulting to an LLM isn't "which method is better" in the abstract. It's: <strong>how much labeled data do I actually have, and how good does the free, instant option get with it?</strong></p>
+<p>I ran a small, concrete experiment to answer that for a common case — routing support tickets into categories — and measured exactly how accuracy scales as labeled examples increase from barely-any to modest.</p>
+<h2>The Setup</h2>
+<p><strong>Task:</strong> classify support tickets into one of five categories — <code>billing</code>, <code>technical_bug</code>, <code>feature_request</code>, <code>account_access</code>, <code>general_question</code>.</p>
+<p><strong>Dataset:</strong> 70 tickets, 14 per category, that I wrote myself as synthetic examples — no scraped or real customer data anywhere in this experiment. I deliberately mixed clear-cut examples ("I was charged twice for my subscription") with ambiguous ones that could plausibly land in two buckets ("Is there a student discount available?" — billing, or general policy question?). Real support queues look like this; a benchmark built only from unambiguous examples tells you nothing useful about production performance.</p>
+<p><strong>Fixed test set:</strong> 20 tickets (4 per category), held out and never used for training, so every configuration is judged on the same unseen examples.</p>
+<p><strong>Method:</strong> TF-IDF vectorization (unigrams + bigrams) feeding a logistic regression classifier, trained at three different data volumes — 2, 5, and 10 labeled examples per category — to isolate the one variable that actually changes over a project's lifetime: how much labeled data you've accumulated.</p>
+<pre><code>vec = TfidfVectorizer(ngram_range=(1, 2), min_df=1)
+X_train = vec.fit_transform(train_texts)
+X_test = vec.transform(test_texts)
+clf = LogisticRegression(max_iter=1000)
+clf.fit(X_train, train_labels)
+preds = clf.predict(X_test)</code></pre>
+<p>(Full runnable script — dataset, train/test split, and evaluation loop in one file — is linked at the end.)</p>
+<h2>The Results</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Training examples per category</th>
+   <th>Accuracy</th>
+   <th>Macro-F1</th>
+   <th>Inference time/ticket</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>2 (10 Total)</td>
+   <td>40.00%</td>
+   <td>32.9%</td>
+   <td>~0.008ms</td>
+  </tr>
+  <tr>
+   <td>5 (25 Total)</td>
+   <td>55.00%</td>
+   <td>52.2%</td>
+   <td>~0.005ms</td>
+  </tr>
+  <tr>
+   <td>10 (50 Total)</td>
+   <td>60.00%</td>
+   <td>59.00%</td>
+   <td>~0.005ms</td>
+  </tr>
+ </tbody>
+</table>
+<p>Three things stand out.</p>
+<p><strong>Accuracy climbs steeply at first, then flattens.</strong> Going from 2 to 5 examples per category bought +15 points of accuracy — the single highest-leverage move in this whole experiment. Going from 5 to 10 bought only +5 more. That's the classic diminishing-returns curve of a linear classifier on a small vocabulary, and it's worth knowing <em>before</em> committing budget to labeling hundreds more tickets: the first handful of examples per category matters far more than the next handful.</p>
+<p><strong>Inference is effectively instant and free.</strong> Sub-millisecond, on-device, no API call, no per-request line item. At any meaningful ticket volume, that's not a rounding error — it's the difference between a routing step with zero recurring cost and one that scales linearly with every request you ever process.</p>
+<p><strong>Even at 60% accuracy, this is not "deploy it and walk away" territory.</strong> A router misclassifying 2 in 5 tickets is a real product problem. The interesting part isn't that TF-IDF "wins" or "loses" — it's <em>where the curve sits</em> relative to what your product can tolerate.</p>
+<h2>Where the ambiguous cases actually broke</h2>
+<p>Aggregate accuracy hides the more useful diagnostic: <em>which</em> tickets the classifier got wrong, and whether more data actually fixes it. I logged every misclassification at each training size, and two distinct failure patterns showed up.</p>
+<p><strong>Some errors are pure data-starvation — more labels fix them.</strong> At 2 examples/category, tickets like <em>"Can you reset my password, the reset email never arrives"</em> (true: <code>account_access</code>, predicted: <code>billing</code>) and <em>"How do I delete my account and all associated data?"</em> (true: <code>account_access</code>, predicted: <code>general_question</code>) were both wrong. By 10 examples/category, both were classified correctly. The model simply hadn't seen enough <code>account_access</code> vocabulary yet at low data volumes.</p>
+<p><strong>Other errors are structural — they never went away, no matter how much data I added.</strong> Two tickets were misclassified at <em>every</em> training size, 2 through 10 examples/category:</p>
+<ul>
+ <li><em>"Is there a student discount available on the pro plan?"</em> — true <code>billing</code>, predicted <code>technical_bug</code> at n=2, then <code>general_question</code> at both n=5 and n=10. The model never settled on the right answer; it just moved between wrong ones. "Discount" and "plan" don't disambiguate a pricing-policy question from an actual charge dispute — that requires understanding <em>intent</em>, not just vocabulary.</li>
+ <li><em>"The mobile app logs me out every few minutes."</em> — true <code>technical_bug</code>, predicted <code>feature_request</code> at every single training size. Nothing in the surface wording ("mobile app," "logs me out") points TF-IDF toward "bug" over "feature request"; that distinction lives entirely in tone and implied urgency, which a bag-of-words model has no access to.</li>
+</ul>
+<p>That's the real finding, not just the accuracy number: <strong>more labeled data reliably fixes data-starvation errors, but does nothing for errors rooted in intent the vectorizer literally can't see.</strong> Those two categories of failure call for different fixes — one calls for more labels, the other calls for a fundamentally different approach to the text (or a human review step, or a model that reasons about intent rather than word frequency).</p>
+<h2>Where this approach falls short</h2>
+<ul>
+ <li><strong>Synthetic data</strong>: I wrote all 70 tickets myself, real tickets have typos, uneven phrasing, and skewed category volumes that tend to hurt a bag-of-words model more than an LLM. Worth validating against a small sample of real tickets before trusting this curve.</li>
+ <li><strong>Single split</strong>: these numbers come from one random train/test split, which would shift with a reshuffle — especially at 2 examples/category. Averaging over a few seeds would be more rigorous.</li>
+ <li><strong>Small test set</strong>: 20 examples means one flipped prediction swings accuracy by 5 points. Read the table as showing the <em>shape</em> of the curve, not a precise benchmark.</li>
+</ul>
+<h2>The actual decision framework</h2>
+<p>The right choice isn't "TF-IDF vs. LLM" as a fixed architectural decision — it's a function of three things any team can answer for their own case:</p>
+<ol>
+ <li><strong>How much labeled data do you have right now?</strong> Near zero, and a classical model isn't usable yet — 2 examples per category only gets you 40% here. A few dozen examples per category, and the picture changes considerably; this experiment only tested up to 10.</li>
+ <li><strong>What's your volume, and what does that do to the cost line?</strong> A classical model's cost is fixed once trained. Anything charged per request scales linearly with every ticket you ever process — worth modeling explicitly at your actual volume, not judged by a single per-call number.</li>
+ <li><strong>What's your latency budget?</strong> Sub-millisecond local inference versus a network round-trip is a real product constraint for anything user-facing or real-time, and largely irrelevant for a background batch job.</li>
+</ol>
+<p>A pattern worth considering directly: <strong>use zero-shot classification to generate labels when you have none, then train a classical model on those labels once you've accumulated enough of them.</strong> You get a working system on day one with no cold-start problem, and near-zero marginal cost once you have data — which, per this experiment, might arrive faster than expected, since even 5–10 examples per category bought a real accuracy jump.</p>
+<h2>The takeaway</h2>
+<p>The number that should drive a classification architecture decision isn't "which method scores higher in the abstract." It's how much labeled data you have today, how fast that number is growing, and what a misclassification actually costs your product. The diminishing-returns curve above is specific to this dataset and this task — but the shape of the question, "how much does my next batch of labels actually buy me," is one every team building a classifier should be measuring on their own data before defaulting to either answer.</p>

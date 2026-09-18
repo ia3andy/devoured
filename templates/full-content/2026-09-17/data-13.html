@@ -1,0 +1,84 @@
+<p>PostgreSQL <strong>row-level security</strong> (RLS) adds a database check behind EF Core query filters. It covers reads and writes, as long as the application connects as a non-owner role and sets the tenant every time a connection opens.</p>
+<p>I've recommended a <strong>global query filter</strong> for <strong>shared-schema multi-tenancy</strong> for years, and I still would. EF Core adds <code>WHERE tenant_id = @tenant</code> to every query it generates, so nobody has to remember the predicate. It also stops there: SQL you send through <code>ExecuteSql</code>, an entity you attach and save, and anything behind <code>IgnoreQueryFilters()</code> never get it.</p>
+<p>I wanted a second check that doesn't depend on every developer remembering the first one. Postgres has one built in with <strong>row-level security</strong> (RLS). So I set it up with EF Core 10, <strong>Npgsql</strong>, and Postgres 18 on a table with 1,000,000 invoices across 50 tenants, and tried to get past it.</p>
+<h2>Put the Rule in Postgres</h2>
+<p>Row-level security is a predicate that Postgres attaches to every statement against a table, for every role that isn't exempt. The application can't forget it, because it never sees it.</p>
+<p>Superusers, roles with <code>BYPASSRLS</code>, and the table's owner all skip it, and in a lot of apps the one database user that runs migrations also serves requests and owns the tables. So the sample connects as <code>app_user</code>, a role that owns nothing and has only the DML grants it needs, and migrations run as a separate owner role. That split also keeps <code>DROP POLICY</code> out of the application's reach.</p>
+<p>I consider it a general best practice to have a dedicated database user for executing queries against the database.</p>
+<p>Here's an example <strong>policy</strong> on the <code>invoices</code> table:</p>
+<pre><code>ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invoices FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON invoices
+  USING      (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+</code></pre>
+<p><code>USING</code> decides which rows a read, update, or delete can reach, and <code>WITH CHECK</code> rejects an insert or update whose new <code>tenant_id</code> doesn't match the session setting. <code>NULLIF</code> makes a missing or empty setting match nothing instead of everything, which is the failure I'd rather have. <code>FORCE</code> puts the owner under the policy too, so a migration script can't touch every tenant's rows by accident.</p>
+<p>The <code>current_setting</code> function returns the current value of a configuration parameter.</p>
+<h2>Set the Tenant on Every Connection</h2>
+<p>The policy reads a session variable, so the application has to set it, and the obvious place is the start of the request. But you'll quickly run into problems with this approach.</p>
+<p>EF Core opens the connection for a command and closes it afterwards, and <strong>Npgsql resets pooled session state</strong>, so the query after my <code>SET</code> ran on a connection that had never heard of the tenant. Turning the reset off with <code>No Reset On Close=true</code> is worse: the next request picked up the previous tenant's setting and saw rows it shouldn't have.</p>
+<p>The fix is to set the tenant every time a connection opens, on whichever physical connection Npgsql hands out. A <strong>connection interceptor</strong> does that, with <code>TenantContext</code> holding the tenant authorized for the current request:</p>
+<pre><code>public sealed class TenantConnectionInterceptor(TenantContext tenant)
+    : DbConnectionInterceptor
+\{
+    public override void ConnectionOpened(
+        DbConnection connection, ConnectionEndEventData eventData)
+    \{
+        using var command = Build(connection);
+        command.ExecuteNonQuery();
+    }
+
+    public override async Task ConnectionOpenedAsync(
+        DbConnection connection, ConnectionEndEventData eventData,
+        CancellationToken cancellationToken = default)
+    \{
+        await using var command = Build(connection);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private DbCommand Build(DbConnection connection)
+    \{
+        var command = connection.CreateCommand();
+        command.CommandText = "SELECT set_config('app.tenant_id', @tenant, false)";
+
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = "tenant";
+        parameter.Value = tenant.TenantId?.ToString() ?? "";
+        command.Parameters.Add(parameter);
+        return command;
+    }
+}
+</code></pre>
+<p><code>set_config</code> takes the tenant as a bind parameter, and <code>false</code> means session scope. The <code>?? ""</code> is what makes a request without a tenant fail closed.</p>
+<p>Register the scoped services in <code>Program.cs</code>:</p>
+<pre><code>builder.Services.AddScoped&lt;TenantContext&gt;();
+builder.Services.AddScoped&lt;TenantConnectionInterceptor&gt;();
+builder.Services.AddDbContext&lt;AppDbContext&gt;((sp, options) =&gt; options
+    .UseNpgsql(connectionString)
+    .AddInterceptors(sp.GetRequiredService&lt;TenantConnectionInterceptor&gt;()));
+</code></pre>
+<p>This is <code>AddDbContext</code>, not <code>AddDbContextPool</code>, because a pooled context would keep the first request's <code>TenantContext</code>. Behind <strong>PgBouncer</strong> in transaction pooling mode, the tenant has to be set with <code>set_config(..., true)</code> inside an explicit transaction instead.</p>
+<p>The cost is one extra round trip per connection open, about 0.4 ms per request in my testing.</p>
+<h2>Try to Bypass It</h2>
+<p>With the policy in place, I went back to the list from the top of the issue, starting with the filter switched off by hand:</p>
+<pre><code>var affected = await db.Invoices
+    .IgnoreQueryFilters()
+    .Where(i =&gt; i.Id == otherTenantInvoiceId)
+    .ExecuteUpdateAsync(
+        setters =&gt; setters.SetProperty(i =&gt; i.Status, "Cancelled"),
+        cancellationToken);
+// affected == 0
+</code></pre>
+<p><code>ExecuteUpdateAsync</code> sends the SQL straight away, without change tracking or <code>SaveChanges</code>, and the filter is gone. The row belongs to another tenant, so the policy hides it, and the update affects nothing.</p>
+<p>The attached entity fails the same way. EF Core builds <code>UPDATE invoices SET ... WHERE id = @p0</code> from the primary key, the policy adds its own predicate, and zero rows match. EF reports that as <code>DbUpdateConcurrencyException</code>, which looks like a lost <strong>optimistic concurrency</strong> race, but the row was never visible to this session.</p>
+<p>An unfiltered read still returns only the current tenant's invoices, and an insert carrying another tenant's ID fails with SQLSTATE <code>42501</code>.</p>
+<p>What the policy can't do is decide which tenant is right. If the application resolves the wrong tenant, the policy enforces that one instead.</p>
+<h2>Summary</h2>
+<p>I'd keep the EF query filter for multi-tenant applications and add the policy under it. The filter puts the tenant into the SQL, so query plans stay simple and the intent is visible in the code, and it costs nothing at runtime. The policy covers the code that never goes through it, including the <code>IgnoreQueryFilters()</code> someone adds for an admin report.</p>
+<p>Backups and cross-tenant jobs need a role that bypasses the policy, so take that into account.</p>
+<p>The <strong>row-level security lab</strong> has the full setup, the bypass attempts, and the measured plans. With Docker and the .NET 10 SDK installed, extract the download and run:</p>
+<pre><code>docker compose up -d
+dotnet run -- setup
+dotnet run
+</code></pre>

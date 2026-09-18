@@ -1,0 +1,164 @@
+<h1>Apache Iceberg Python 0.12.0 Release</h1>
+<p>The Apache Iceberg community is pleased to announce the 0.12.0 release of Apache Iceberg Python.</p>
+<p>The 0.12.0 release covers development work from early February through late August 2026 and is the result of merging over 470 pull requests from 58 contributors, including more than 40 first-time contributors.</p>
+<p>These notes cover the highlights. For the full list, see the changelog.</p>
+<h2>Release Highlights</h2>
+<h3>REST Catalog View Support</h3>
+<p>This release adds read support for Iceberg views. Views can be created, loaded, listed, registered, and dropped through the REST catalog, and are exposed through a <code>View</code> object.</p>
+<pre><code>view = catalog.create_view(
+    identifier=("default", "recent_orders"),
+    schema=schema,
+    view_version=view_version,
+)
+
+view = catalog.load_view("default.recent_orders")
+view.sql_for("spark")</code></pre>
+<ul>
+ <li>ViewMetadata read support and <code>create_view</code> for the REST catalog</li>
+ <li><code>load_view</code> and the <code>View</code> object API</li>
+ <li>Registering existing views via <code>register_view</code></li>
+ <li>Pagination support for <code>list_views</code></li>
+ <li>More examples for working with views and a REST integration test suite</li>
+</ul>
+<p>For older REST servers that support the view endpoints but do not advertise them in the <code>ConfigResponse</code>, set the <code>view-endpoints-supported</code> catalog property.</p>
+<h3>Commit Retry and Concurrency Validation</h3>
+<p>Writes now retry on concurrent commits and validate for conflicts. When a catalog commit fails with <code>CommitFailedException</code>, <code>Transaction.commit_transaction()</code> refreshes the table, checks for conflicts, and retries the commit.</p>
+<h3>Incremental Append Scan</h3>
+<p><code>Table.incremental_append_scan()</code> (#3512) reads the rows added by append snapshots within a snapshot range, projected onto the table's current schema.</p>
+<pre><code>scan = table.incremental_append_scan(
+    from_snapshot_id_exclusive=last_processed_snapshot_id,
+    to_snapshot_id_inclusive=table.current_snapshot().snapshot_id,
+)
+new_rows = scan.to_arrow()</code></pre>
+<h3>Geometry and Geography Types</h3>
+<p>The v3 <code>geometry</code> and <code>geography</code> primitive types are now supported: schema parsing and serialization, Avro mapping via WKB bytes, and PyArrow/Parquet integration.</p>
+<h3>File Format Writer API</h3>
+<p>PyIceberg has begun using the File Format API for handling Parquet files.</p>
+<h3>Catalog and REST Improvements</h3>
+<ul>
+ <li>REST <code>loadCredentials</code> support with longest-prefix resolution for a target location, and storage credentials in <code>LoadTableResult</code></li>
+ <li>Pagination support for <code>list_namespaces</code> and <code>list_tables</code>, with a shared <code>rest-page-size</code> option</li>
+ <li><code>overwrite</code> option for <code>register_table</code></li>
+ <li>SigV4 retry configuration defaults for REST</li>
+ <li>S3 server-side encryption configs for <code>FsspecFileIO</code></li>
+ <li>Glue <code>create_table</code> support for S3 Tables federated databases</li>
+ <li>An <code>iceberg_type</code> column for <code>SqlCatalog</code>, so Iceberg tables can be distinguished from other entries, with filtering fixed for existing catalogs</li>
+ <li>Catalog properties for the shared catalog test suite and coverage for nonexistent tables and namespaces</li>
+ <li>Renamed <code>rest-scan-planning-enabled</code> to <code>scan-planning-mode</code></li>
+</ul>
+<h3>CLI</h3>
+<ul>
+ <li><code>--warehouse</code> flag for the REST catalog</li>
+ <li><code>--version</code> flag, deprecating the <code>version</code> subcommand, which now also skips catalog loading</li>
+ <li><code>--purge</code> option for <code>drop table</code>, to request that the catalog purge the underlying table files</li>
+</ul>
+<h2>Bug Fixes</h2>
+<p>Notable correctness fixes in this release:</p>
+<ul>
+ <li>Fixed strict <code>NotEqualTo</code>/<code>NotIn</code> pruning for files with partial nulls or NaNs</li>
+ <li>Corrected <code>NOT STARTS WITH</code> projection for truncated partitions, along with residual evaluation and the string-based <code>starts_with</code>/<code>not_starts_with</code> methods</li>
+ <li>Fixed the <code>ManifestEntry.snapshot_id</code> setter writing to the wrong index</li>
+ <li>Fixed the <code>DELETED</code> manifest entry <code>snapshot_id</code> in <code>OverwriteFiles</code></li>
+ <li>Preserved a manifest min sequence number of 0 rather than dropping it</li>
+ <li>Stripped the spec-mandated deletion vector blob framing before deserializing, with a Spark interop test covering the read path</li>
+ <li>Fixed <code>deepcopy</code> for <code>And</code>, <code>Or</code>, and <code>Not</code> expressions</li>
+ <li>Fixed precision loss in large integral string conversions, with Long bounds returned for decimal conversion, bounds sentinels for long date literals, and an overflow sentinel in <code>LongLiteral.to(FloatType)</code></li>
+ <li>Padded sub-microsecond digits when parsing nanosecond timestamps, and handled non-UTC nanosecond timestamps</li>
+ <li>Used minimal byte length when encoding decimals for negative powers of two</li>
+ <li>Preserved dictionary encoding in <code>to_arrow_batch_reader</code></li>
+ <li>Fixed <code>delete_data_file</code> on partitioned tables and residual <code>NotNaN</code> for null partition values</li>
+ <li>Avoided committing update builders after exceptions</li>
+ <li>Preserved <code>write_default</code> when applying a name mapping</li>
+ <li>Handled zero-byte files in fsspec <code>__len__</code>, extracted the ADLS <code>account_name</code> from the URI hostname, and parsed S3 virtual addressing as a boolean</li>
+ <li>Stopped reusing <code>TSaslClientTransport</code> to eliminate server-side SASL noise</li>
+ <li>Rejected unsupported identity transform types, empty <code>source-ids</code>, and decimal precision outside the valid range</li>
+</ul>
+<h2>Breaking Changes</h2>
+<ul>
+ <li>Raised <code>pyarrow</code> minimum from 17.0.0 to 18.0.0 for native UUID type support</li>
+ <li>Bumped <code>pyiceberg-core</code> from <code>&gt;=0.5.1,&lt;0.9.0</code> to <code>&gt;=0.10.1,&lt;0.11.0</code>, which bundles DataFusion 53.x behind a new <code>datafusion</code> extra</li>
+ <li><code>NoopCatalog.table_exists</code> now returns <code>False</code> instead of raising</li>
+ <li>Explicitly deleting a data file that's already missing now raises instead of failing silently</li>
+</ul>
+<h2>Infrastructure Improvements</h2>
+<ul>
+ <li>Python 3.14 support</li>
+ <li>Windows unit test job added to CI</li>
+ <li>CodeQL security scanning for GitHub Actions, and a documented Iceberg security model</li>
+ <li>Migrated lockfile management to <code>uv-pre-commit</code> with <code>uv.lock</code> freshness enforced in CI</li>
+ <li>Third-party GitHub Actions pinned to Apache-approved SHAs, with an allowlist check on every PR and least-privilege workflow permissions</li>
+ <li>Papermill-based tests that execute the documentation examples, and a release verification script</li>
+ <li>PR auto-merge enabled</li>
+</ul>
+<h2>Contributors</h2>
+<pre><code>$ git shortlog --perl-regexp --author='^((?!dependabot\[bot\]).*)$' -sn pyiceberg-0.11.0..pyiceberg-0.12.0
+    44  Kevin Liu
+    36  Yuya Ebihara
+    12  Anas Khan
+    11  Alex Stephen
+     7  geruh
+     5  Minh Vu
+     5  Neelesh Salian
+     4  Gabriel Igliozzi
+     3  Fokko Driesprong
+     3  GayathriSrividya
+     3  Junwang Zhao
+     3  Sotaro Hikita
+     3  jj.lee
+     3  vishnu prakash
+     2  Aaron Niskode-Dossett
+     2  ChangHyeon Im
+     2  David
+     2  David Dallakyan
+     2  Jared Yu (余启正)
+     2  Mrutunjay Kinagi
+     2  Paul Mathew
+     2  Sreesh Maheshwar
+     2  Tanmay Rauth
+     2  Yingjian Wu
+     1  Adam
+     1  Antonio
+     1  Ben Lai
+     1  BharatDeva
+     1  CalebWeisgerber
+     1  Chris Qiu
+     1  David Zhao
+     1  Federico
+     1  James Bornholt
+     1  Jared Yu
+     1  Koen Denecker
+     1  Kristofer Gaudel
+     1  Marcin Szymański
+     1  Ménélik Vero
+     1  Noritaka Sekiyama
+     1  Platon G. Gimp
+     1  Pucheng Yang
+     1  R. Conner Howell
+     1  Rob Reeves
+     1  Ruiyang Wang
+     1  Sam Verhasselt
+     1  Sidra
+     1  Sumanth
+     1  Sung Yun
+     1  Thomas Pfeiffer
+     1  Vova Kot
+     1  Yong Zheng
+     1  abnobdoss
+     1  achasnovskiy
+     1  antonlin1
+     1  barking-code
+     1  committobetter
+     1  rcjverhoef
+     1  shiwk
+     1  spr0els</code></pre>
+<p>We thank all contributors for their efforts in making this release possible!</p>
+<h2>Getting Involved</h2>
+<p>The PyIceberg project welcomes contributions! We use GitHub issues for tracking work and the Apache Iceberg Community Slack for discussions.</p>
+<p>The easiest way to get started is to:</p>
+<ol>
+ <li>Try PyIceberg with your workloads and report any issues you encounter</li>
+ <li>Review the contributor guide</li>
+ <li>Look for good first issues</li>
+</ol>
+<p>Code review is also a very welcome contribution - please provide feedback on pull requests where you feel comfortable to do so!</p>
+<p>For more information, visit the PyIceberg repository or the documentation.</p>
