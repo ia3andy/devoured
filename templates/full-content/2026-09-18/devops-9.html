@@ -1,0 +1,153 @@
+<h1>Getting started with runtime security and Falco</h1>
+<h2>Falco Feeds extends the power of Falco by giving open source-focused companies access to expert-written rules that are continuously updated as new threats are discovered.</h2>
+<p>Runtime security serves as a last line of defense to cover posture gaps.</p>
+<p>Imagine a public-facing web application. An attacker could use a software bug to gain initial access, then move laterally and escalate privileges to access the rest of your cloud infrastructure. Or, think about stolen credentials. One of your developers used their work laptop to download a Minecraft mod for his son. However, he instead downloaded malware that stole cloud credentials. Now the attacker has access through the main door.</p>
+<p>Although posture helps enforce best practices, it is blind to ongoing threats. That’s where runtime security chips in.</p>
+<p>Let's briefly introduce you to runtime security, uncovering how Falco works its magic and how easy it is to get started with Falco.</p>
+<h2>What is runtime security?</h2>
+<p>Runtime security is the protection of workloads once they are in execution. It acts as a safety net, covering for security risks that posture cannot detect. This includes:</p>
+<ul>
+ <li>Zero-day vulnerabilities, or issues previously unknown to a software creator.</li>
+ <li>Privilege escalation attempts.</li>
+ <li>Bugs that cause erratic behavior or resource leaking.</li>
+</ul>
+<p>Runtime security software acts similarly to an antivirus, observing everything that is happening in the system and triggering alarms when suspicious activity occurs.</p>
+<p>An attacker can exploit a software vulnerability not yet known to the public to gain initial access to a container. Then, they can use misconfigurations to move laterally and escalate privileges. If you rely only on mitigating known vulnerabilities and on compliance, you are blind to these attacks.</p>
+<p>A runtime security tool like Falco will detect suspicious network connections on the container and suspicious behaviour in the cloud account, triggering an alarm that gives you a chance to contain the attack. Falco will also include cloud-native context in each alert to help you identify the source of the alert and correlate multiple alerts to understand the scope of the attack.</p>
+<p>We’ve observed the use of AI to assist, speed up, and customize attacks. Runtime is more unpredictable than ever, so posture and best practices alone are not enough; you need solid runtime security as a safety net.</p>
+<h3>Runtime security for cloud and containers</h3>
+<p>Cloud-native workloads are a mix of moving pieces, and it’s challenging to gain visibility into all of them.</p>
+<p>Let’s cover the main elements and how to implement runtime security on them.</p>
+<p><strong>Container</strong> workloads are made of:</p>
+<ul>
+ <li><strong>Containers:</strong> Your workloads, running in sandboxes.</li>
+ <li><strong>Container runtime:</strong> The process on a server executing the containers and interfacing with the host resources.</li>
+ <li><strong>Orchestrators:</strong> A combination of tools that deploys and manages containers across a cluster of servers.</li>
+ <li><strong>Nodes:</strong> Each of the servers that comprises the cluster and hosts its components.</li>
+</ul>
+<p><strong>Cloud workloads</strong> may contain containers, but also include:</p>
+<ul>
+ <li><strong>Servers:</strong> Good old virtual machines where you can run whatever software you want.</li>
+ <li><strong>Serverless workloads:</strong> Services where you can run software without managing the server underneath.</li>
+ <li><strong>Managed services:</strong> Databases, storage, firewalls, networking, message queues, and other services you configure and use, but don’t manage at a low level.</li>
+</ul>
+<p>With a special mention to the <strong>configuration and access management</strong> of all these services, which are often two entities in themselves.</p>
+<p>To implement <strong>runtime security for cloud-native</strong> environments, you can use a combination of:</p>
+<ul>
+ <li><strong>Agents</strong> on cluster nodes and compute units. They keep track of everything happening in the system through a mix of strategies, such as kernel instrumentation to read system calls or using the orchestrator API to tap into logs.</li>
+ <li><strong>Sidecars</strong> on serverless workloads where kernel instrumentalization is not available, but alternatives like ptrace or LD_PRELOAD are.</li>
+ <li><strong>Agentless services</strong> that use the cloud provider’s API to tap into the audit log. They can also use the API to perform response actions, such as quarantining an account or stopping a workload.</li>
+</ul>
+<p>Falco is the most popular OSS cloud and container runtime security tool. As such, its ecosystem has tools to implement all the above.</p>
+<h2>How does Falco work?</h2>
+<p>Falco is a <strong>cloud-native security tool that provides runtime security</strong> across hosts, containers, Kubernetes, and cloud environments.</p>
+<p>Falco provides deep visibility by <strong>analyzing events</strong> from multiple sources. On one side, it fetches kernel system calls from the host system; on the other, it receives events via Falco plugins that can tap into audit logs from Kubernetes, cloud providers, and even SaaS services like GitLab, Box, or Salesforce.</p>
+<p>Equally important, <strong>Falco adds context</strong> to its findings, helping DevOps, security, and cloud teams understand exactly who did what and where. This context is key when trying to understand the scope of a security event.</p>
+<p>You can complement Falco’s detection skills with other tools in the ecosystem:</p>
+<p>By default, Falco can send alerts to a limited number of channels. <strong>Falcosidekick</strong> expands Falco’s alert channels to known chat services like Slack, observability tools like Prometheus, alerting systems like Pagerduty, and more.</p>
+<p>Also, <strong>Stratoshark</strong> lets you explore events from the desktop using a Wireshark-based interface.</p>
+<h3>Falco architecture</h3>
+<p>Internally, Falco works at several levels:</p>
+<ul>
+ <li>The <strong>Falco binary</strong> runs in userspace, parsing information from drivers and plugins, evaluating rules, and outputting alerts.</li>
+ <li>The <strong>drivers</strong> gather system calls from the host. The Kernel module (default) and the eBPF probe run at the kernel level and can see everything that’s happening, while the userspace instrumentation can run with fewer privileges with limited visibility.</li>
+ <li>Finally, the <strong>configuration</strong> defines how Falco runs, which rules to assert, and when to trigger alerts.</li>
+</ul>
+<h3>Falco rules</h3>
+<p>Falco evaluates events against <strong>rules</strong> and considers them suspicious if the <code>condition</code> is met.</p>
+<p>For example, a bash spawn inside a container is unusual. The following rule would flag such events, focusing on how the <code>condition</code> looks for processes where <code>proc.name</code> is <code>bash</code>:</p>
+<pre><code>- rule: Detect bash in a container
+  desc: You shouldn't have a shell run in a container
+  condition: container.id != host and proc.name = bash
+  output: Bash ran inside a container (user=%user.name command=%proc.cmdline %container.info)
+  priority: INFO</code></pre>
+<p>When this rule detects an event, we will receive the message defined on the <code>output</code> property:</p>
+<pre><code>20:07:06.837415779: Notice A shell was spawned in a container with an attached terminal (user=root container=1dab04047700 shell=bash parent=runc cmdline=bash terminal=34816 container_id=1dab04047700 image=docker.io/falcosecurity/falco) container=1dab04047700</code></pre>
+<p>And that's it! Using simple language, we can see runtime container activity and detect potential security events.</p>
+<h3>Falco is a solid project</h3>
+<p>"Ok, ok, Falco is great," I hear you say. "But how solid is this project?"</p>
+<p>And this is a reasonable question. After all, no one wants to commit to a solution only to migrate to something else a short time later. So here are some interesting facts to put things in perspective.</p>
+<p>Falco adoption continues to grow, and its graduation from the Cloud Native Computing Foundation® (CNCF) in 2024 has only accelerated this trend. For example, the number of users following Falco's GitHub repo has quadrupled since incubation, keeping a constant pace.</p>
+<p>Adoption is so ubiquitous that Falco is now part of the curriculum for the official CKS exam.</p>
+<p>And for us, the icing on the cake is being recognized by Gartner. Among the reasons for using Falco, Gartner analysts note that "Falco enables detection of anomalous behavior in application deployments with Kubernetes context awareness." [1]</p>
+<p>Falco is a strong project with a thriving community, and you should consider it a serious contender for your runtime container security needs.</p>
+<h2>First steps with Falco</h2>
+<p>Installing Falco on your Linux machine is fairly easy. In summary: Install the kernel modules, set up the repository, and then install the binaries with apt-get (on debian-based hosts).</p>
+<p>However, in a cloud-native world, chances are that you don’t do bare metal installations and you use containers instead.</p>
+<p>Let's cover how to install Falco in a Kubernetes cluster using Helm, Kubernetes' package manager, and how to customize the available rules.</p>
+<h3>Wait, I don't have a Kubernetes cluster to test this on!</h3>
+<p>Worry not! We have you covered.</p>
+<p>Follow the instructions to install Minikube, and you'll get a single-node Kubernetes cluster in a matter of minutes.</p>
+<p>Remember to start Minikube with:</p>
+<pre><code>$ minikube start</code></pre>
+<p>And perform a quick test to confirm that it's up and running:</p>
+<pre><code>$ minikube kubectl -- get nodes
+NAME       STATUS   ROLES                  AGE     VERSION
+minikube   Ready    control-plane,master   6m18s   v1.22.2</code></pre>
+<h3>Let's deploy Falco on Kubernetes with Helm</h3>
+<p>For this, make sure you have Helm installed.</p>
+<p>We will use the community-supported chart to install Falco.</p>
+<p>First, add the falcosecurity charts repository and update:</p>
+<pre><code>helm repo add falcosecurity https://falcosecurity.github.io/charts
+helm repo update</code></pre>
+<p>Now, it's time to install Falco using the helm install command:</p>
+<pre><code>helm install --set tty=true falco falcosecurity/falco</code></pre>
+<p><strong>Warning:</strong> Don’t use <code>--set tty=false</code> in production. We are using it to simplify the example and get an instant output later, but it overrides stdout buffering and causes serious performance issues. In production, you would use other output channels or Falcosidekick, which don’t buffer and output alerts instantly.</p>
+<p>Wait a few seconds for the containers to start, identify the Falco Pod, and have a look at the container logs:</p>
+<pre><code>$ kubectl get pods
+`NAME READY STATUS RESTARTS AGE
+`falco-467d7 1/1 Running 0 4m13s
+$ kubectl logs falco-467d7
+…
+Wed Nov 3 15:05:17 2021: Falco initialized with configuration file /etc/falco/falco.yaml
+Wed Nov 3 15:05:17 2021: Loading rules from file /etc/falco/falco_rules.yaml:
+Wed Nov 3 15:05:17 2021: Loading rules from file /etc/falco/falco_rules.local.yaml:
+Wed Nov 3 15:05:17 2021: Starting internal webserver, listening on port 8765
+…</code></pre>
+<h3>Putting Falco to the test.</h3>
+<p>Now that Falco is deployed and running, let's see if it can detect some suspicious activity.</p>
+<p>Since containers are not meant to be accessed interactively, one of the biggest red flags of a compromised container is the spawning of a terminal shell. There are legitimate reasons for this to happen, but they are usually limited to troubleshooting tasks.</p>
+<p>Falco ships with rules enabled by default to detect such scenarios.</p>
+<p>Let's take the same <code>falco</code> Pod we deployed earlier, and let's run some commands inside it:</p>
+<pre><code>$ kubectl exec -it falco-4gsbr -- /bin/sh
+root@falco-4gsbr:/#</code></pre>
+<p>If we now check the Falco logs, we'll see a warning:</p>
+<pre><code>$ kubectl logs falco-4gsbr
+…
+Triggered rules by rule name:
+16:37:58.199209616: Notice A shell was spawned in a container with an attached terminal (user=root user_loginuid=-1 k8s.ns=default k8s.pod=falco-4gsbr container=b1cfe2fbfcdd shell=bash parent=runc cmdline=bash terminal=34816 container_id=b1cfe2fbfcdd image=falcosecurity/falco) k8s.ns=default k8s.pod=falco-4gsbr container=b1cfe2fbfcdd
+…</code></pre>
+<p>Notice how Falco provides contextual information about the pod and namespace where the event was triggered.</p>
+<h2>Next steps</h2>
+<p>Now that Falco is working, there's a lot of fun to be had.</p>
+<p>Continue your journey with:</p>
+<ul>
+ <li>This webinar: Getting started with container runtime security using Falco.</li>
+ <li>The Falco community maintained hands-on labs.</li>
+ <li>The Runtime Security and Falco 101 course by Sysdig.</li>
+ <li>This Falco workshop, and these too.</li>
+</ul>
+<p>You can also try integrating some <strong>Falco plugins</strong>:</p>
+<ul>
+ <li>SaaS services like Gitlab, Box, or Salesforce.</li>
+ <li>Track Bitcoin activity.</li>
+ <li>Implement pet surveillance.</li>
+ <li>Or, check the list of registered plugins.</li>
+</ul>
+<p>You can also get familiar with <strong>other Falco projects</strong>:</p>
+<ul>
+ <li>Set up Falcosidekick to forward events.</li>
+ <li>Get started with Stratoshark in 5 minutes.</li>
+</ul>
+<p>And, if you want to <strong>get involved</strong> with the Falco project:</p>
+<ul>
+ <li>Get started at Falco.org.</li>
+ <li>Check out the Falco project on GitHub.</li>
+ <li>Get involved with the Falco community.</li>
+ <li>Meet the maintainers on the Falco Slack.</li>
+ <li>Follow @falco_org on Twitter.</li>
+</ul>
+<h2>Conclusion</h2>
+<p>Falco is a solid open source solution for implementing runtime security in containers, Kubernetes, and the cloud.</p>
+<p>Falco's cloud-native design enables it to provide the context you need to quickly and effectively resolve the security events in your modern application environments.</p>
+<p>[1] Gartner, "Open-Source Options for Threat Detection and Incident Response", Anna Belak and Eric Ahlm, 1 December 2020.</p>
