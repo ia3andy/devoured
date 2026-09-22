@@ -1,0 +1,71 @@
+<h1>Jev for 10-K Data Extraction: Fast &amp; Calibrated</h1>
+<p><strong>TL;DR:</strong> Jev for 10-K data extraction works best as a fast, calibrated decision layer: pre-extract candidate values with regex or a generative model, then let Jev’s Choice and Noul primitives select the correct field, confirm presence, and score confidence. Teams process sections of Form 10-K filings (revenue recognition notes, risk factors, MD&amp;A) at $0.042 per million input tokens and 70–500 ms latency, routing only low-confidence fields to heavier models or humans. The pattern eliminates parse-retry loops and keeps arithmetic and assembly in deterministic code.</p>
+<p>Jev for 10-K data extraction is not another generative model that invents numbers from a financial report. TypeSafe AI’s System One model (released 15 September 2026) accepts unstructured state—chunks of a Form 10-K—and returns typed decisions with calibrated probabilities. You still need a lightweight extractor to surface candidate revenue figures, accounting policies, or risk-factor language; Jev then picks the right candidate, decides whether a required disclosure is present, and tells you how confident it is. This post shows the exact architecture, worked examples from Item 8 notes, and the one place the pattern fails. By the end you will have a production-ready cascade that auto-routes clean extractions and flags only the ambiguous residue.</p>
+<h2>Why Jev for 10-K data extraction beats pure LLM pipelines</h2>
+<p><strong>Jev for 10-K data extraction turns the expensive “generate then parse and retry” loop into a cheap select-and-gate step.</strong> A typical 10-K contains dozens of tables, notes, and narrative blocks. Asking a frontier model to extract every revenue line, every ASC 606 policy phrase, and every material risk produces variable JSON, occasional hallucinations, and repeated validation cycles. Jev never generates free text; it only chooses among options you supply and returns a probability distribution plus confidence.</p>
+<p>Public companies file Form 10-K under SEC rules that still require the familiar Item structure (Business, Risk Factors, MD&amp;A, Financial Statements). Large accelerated filers must file within 60 days of fiscal year-end; accelerated filers have 75 days; all others have 90 days. Those deadlines create predictable seasonal volume that rewards low-latency, low-cost decision layers.</p>
+<p><strong>Key takeaway: Jev does not replace the extractor; it replaces the unreliable post-processing and routing layer.</strong></p>
+<h2>The correct architecture: candidates first, then Jev</h2>
+<p>The single most important rule for structured extraction with Jev is simple: never ask it to invent a value. Ask it to pick from candidates you already found.</p>
+<ol>
+ <li>Chunk the 10-K (by Item or by note) and run a fast candidate generator—regex, table parser, or a small generative model.</li>
+ <li>Pass the raw text (or the candidate list) as <code>state</code> and a set of Choice / Noul / Score questions.</li>
+ <li>Jev evaluates every question in parallel and returns typed answers with probabilities.</li>
+ <li>Code owns arithmetic, date assembly, currency normalization, and final validation.</li>
+</ol>
+<p><strong>Key takeaway: candidates → Choice/Noul → deterministic code.</strong></p>
+<h2>Worked example: revenue recognition from Item 8</h2>
+<p>Item 8 of a 10-K contains the audited financial statements and the accompanying notes. Revenue-recognition language under ASC 606 is usually concentrated in a single note. Suppose a pre-processor has already extracted three candidate policy paragraphs and three candidate total-revenue figures from the consolidated statements.</p>
+<pre><code>\{
+  "note_text": "Revenue is recognized when control of the promised goods is transferred... five-step process under ASC 606...",
+  "candidates_revenue": ["$10,140 million", "$9,631 million", "$8,722 million"],
+  "candidates_policy": ["paragraph_A", "paragraph_B", "paragraph_C"]
+}</code></pre>
+<p>Questions sent to Jev in one call:</p>
+<ul>
+ <li><code>revenue_2025</code> (Choice): Which candidate is total Merchant Solutions revenue for the year ended 31 December 2025?</li>
+ <li><code>policy_is_asc606</code> (Noul): Does the supplied note describe the five-step ASC 606 model?</li>
+ <li><code>control_transfer</code> (Noul): Does the policy state that revenue is recognized upon transfer of control?</li>
+ <li><code>confidence_needed</code> (Score 0–2): How complete is the disclosure relative to typical large-accelerated-filer notes?</li>
+</ul>
+<p>Jev returns the selected revenue figure, two high-probability Noul scores, and a calibrated confidence. Code then stores the number, flags any Noul below 0.85 for human review, and never has to parse free-form JSON.</p>
+<p><strong>Key takeaway: one parallel request replaces multiple generative calls and validation retries.</strong></p>
+<h2>Scoring risk factors and MD&amp;A language</h2>
+<p>Item 1A (Risk Factors) and Item 7 (MD&amp;A) are narrative-heavy. Jev excels at classification and severity scoring rather than free-text summarization.</p>
+<ul>
+ <li>Choice: Which category best describes this risk paragraph? (liquidity / litigation / cybersecurity / supply-chain / regulatory / other / not_stated)</li>
+ <li>Score: Severity of the described risk on a 0–4 rubric (none → material and unresolved)</li>
+ <li>Noul: Does the paragraph contain forward-looking language that requires safe-harbor consideration?</li>
+ <li>Noul: Is a quantitative impact disclosed?</li>
+</ul>
+<p><strong>Key takeaway: treat risk-factor extraction as multi-label classification plus severity scoring, not generation.</strong></p>
+<h2>Full pipeline with confidence gating</h2>
+<p>A production cascade for 10-K processing looks like this:</p>
+<ol>
+ <li>Ingest the EDGAR HTML or iXBRL filing and split by Item / note.</li>
+ <li>Run a cheap candidate extractor (regex + table parser + optional small LLM).</li>
+ <li>Batch every field as a Jev question set; keep state under the 32 k token budget for the longest question.</li>
+ <li>Gate on confidence: 
+  <ul>
+   <li>confidence ≥ 0.90 and Noul ≥ 0.85 → auto-store</li>
+   <li>0.70–0.90 → second-stage generative model or senior analyst</li>
+   <li>&lt; 0.70 → human review queue</li>
+  </ul></li>
+ <li>Log every probability for later calibration monitoring.</li>
+</ol>
+<p><strong>Key takeaway: confidence thresholds turn probabilistic outputs into deterministic routing rules.</strong></p>
+<h2>Key numbers and cost reality</h2>
+<p>Current Jev 1.13 economics:</p>
+<ul>
+ <li>Input price: $0.042 per million tokens ($42 per billion)</li>
+ <li>Output: free</li>
+ <li>Latency: 70–500 ms end-to-end</li>
+ <li>Context: 64 k tokens total; 32 k for state + longest question</li>
+ <li>Rate limits: 250 000 tokens per second / 1 200 requests per minute</li>
+</ul>
+<p>A 50-page 10-K chunked into 40 state blocks of ~1 500 tokens each, with eight questions per block, costs a few cents and finishes in seconds rather than minutes.</p>
+<h2>Who this does not apply to</h2>
+<p>Teams that need free-form narrative summaries, full MD&amp;A rewriting, or open-ended question answering over the entire filing should keep a generative model in the loop. Jev also cannot yet ingest images or native PDF layouts; text or iXBRL must be supplied. If your extraction volume is a handful of filings per quarter, the engineering cost of the candidate-generation stage may outweigh the savings.</p>
+<p><strong>Key takeaway: Jev is a decision and verification layer, not a general-purpose 10-K reader.</strong></p>
+<h2>Conclusion</h2>
+<p>Jev for 10-K data extraction succeeds when it is treated as a high-speed, calibrated decision engine sitting on top of ordinary candidate generation. The economics and the inability to hallucinate outside the supplied schema make it a natural fit for the seasonal flood of annual reports. Keep generation and arithmetic where they belong—outside Jev—and the remaining work becomes a clean, auditable pipeline of typed choices and confidence scores.</p>

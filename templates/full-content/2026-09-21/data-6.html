@@ -1,0 +1,125 @@
+<h1>jev — ask your Postgres tables questions in plain language</h1>
+<p>Write the condition the way you would say it. Postgres does the rest.</p>
+<p><code>jev</code> lets you filter, rank and classify rows with plain-language conditions. Every row is judged by TypeSafe's Jev, a System One model that returns calibrated probabilities instead of generated text. No index, no embeddings, no vector column.</p>
+<p>Website: <a href="https://pgjev.com">pgjev.com</a></p>
+<pre><code>CREATE EXTENSION jev CASCADE;
+
+SELECT * FROM people WHERE jev(people, 'the name is European');
+
+SELECT subject, jev_prob(tickets, 'the customer is angry') AS p
+FROM tickets ORDER BY p DESC LIMIT 20;
+
+SELECT jev_choice(tickets, 'which team should handle this?',
+                  ARRAY['billing', 'technical', 'security', 'sales']) AS team, count(*)
+FROM tickets GROUP BY 1;
+
+SELECT name, jev_score(products, 'how luxurious is this product?',
+                       ARRAY['budget', 'mid-range', 'premium', 'luxury']) AS luxury
+FROM products ORDER BY luxury DESC;</code></pre>
+<p><code>jev()</code> is an ordinary boolean function, so it composes with everything else in SQL: <code>AND age &gt; 40</code>, joins, <code>GROUP BY</code>, <code>LIMIT</code>, <code>ORDER BY jev_prob(...)</code>.</p>
+<h2>How it works</h2>
+<ol>
+ <li><code>jev(table, 'condition')</code> receives the row as a composite value. The first call for a table + condition starts a read-ahead that streams the table in physical order (TID range scans; <code>OFFSET</code> pages for views), so memory stays constant whatever the table size.</li>
+ <li>Rows are packed <code>jev.batch_size</code> (20) per request into one shared <em>state</em> (<code>\{"condition": ..., "rows": [...]}</code>) with one yes/no Noul question per row. Jev evaluates all questions over one state in parallel, which amortises the ~270-token request overhead.</li>
+ <li>Up to 2 × <code>jev.concurrency</code> requests are in flight over persistent HTTPS connections, and every row is answered as soon as its batch returns, so a <code>LIMIT</code> stops the read-ahead after the in-flight window, and rows that cheaper predicates filter out before <code>jev()</code> runs are skipped rather than judged.</li>
+ <li>Answers are cached per row content for the session, so re-running, changing the threshold or sorting by probability is free. Rows from a subquery or CTE (anonymous <code>record</code> type) can't be read ahead and are judged one request at a time; put <code>jev()</code> on base tables or views when you can.</li>
+</ol>
+<h3>Why 20 rows per request</h3>
+<p>Jev has to find <code>rows[i]</code> by position in the array, and that gets unreliable in long arrays. Against ground truth from structured columns (job title, EU membership, a phrase in a free-text field; 400 rows each), batches of 1–20 rows were 100 % correct, batches of 40 were 92–98 % and batches of 80 were 77–94 %. Wider rows (1,000 characters) made no difference at 20.</p>
+<h2>Install</h2>
+<p>Requirements: PostgreSQL 14–17 with <code>plpython3u</code>, a superuser, and a TypeSafe API key from <a href="https://console.typesafe.ai">https://console.typesafe.ai</a>.</p>
+<h3>With an AI agent (easiest)</h3>
+<pre><code>npx skills add realZachi/pg-jev</code></pre>
+<blockquote>
+ <p>Install pgjev on this server and set it up.</p>
+</blockquote>
+<h3>From PGXN</h3>
+<pre><code>pip install pgxnclient
+pgxn install jev
+psql -c "CREATE EXTENSION jev CASCADE"</code></pre>
+<h3>From source (PGXS)</h3>
+<pre><code>git clone https://github.com/realZachi/pg-jev.git &amp;&amp; cd pg-jev
+make install
+psql -c "CREATE EXTENSION jev CASCADE"</code></pre>
+<h3>Docker</h3>
+<pre><code>docker build -t pg-jev .
+docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=pw -e TYPESAFE_API_KEY=your-key pg-jev
+psql postgres://postgres:pw@localhost/postgres -c "CREATE EXTENSION jev CASCADE"</code></pre>
+<h3>API key</h3>
+<pre><code>SET jev.api_key = 'your-key';
+ALTER ROLE analyst SET jev.api_key = 'your-key';</code></pre>
+<h2>Functions</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Function</th>
+   <th>Returns</th>
+   <th>Purpose</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>jev(row, condition [, threshold])</code></td>
+   <td>boolean</td>
+   <td><code>WHERE</code> predicate.</td>
+  </tr>
+  <tr>
+   <td><code>jev_prob(row, condition)</code></td>
+   <td>float8</td>
+   <td>Probability 0..1 that the row satisfies the condition</td>
+  </tr>
+  <tr>
+   <td><code>jev_score(row, question, levels text[])</code></td>
+   <td>float8</td>
+   <td>Probability-weighted position on ordered levels</td>
+  </tr>
+  <tr>
+   <td><code>jev_choice(row, question, options text[])</code></td>
+   <td>text</td>
+   <td>The most likely option for the row</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Settings</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Setting</th>
+   <th>Default</th>
+   <th>Meaning</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>jev.api_key</code></td>
+   <td>env <code>TYPESAFE_API_KEY</code></td>
+   <td>TypeSafe API key</td>
+  </tr>
+  <tr>
+   <td><code>jev.threshold</code></td>
+   <td><code>0.5</code></td>
+   <td>Probability at which <code>jev()</code> returns true</td>
+  </tr>
+  <tr>
+   <td><code>jev.batch_size</code></td>
+   <td><code>20</code></td>
+   <td>Rows per API request.</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Writing good conditions</h2>
+<ul>
+ <li>State the exact condition: <code>'the customer threatens to leave, dispute a charge, or take legal action'</code> beats <code>'churn risk'</code>.</li>
+ <li>Keep arithmetic, dates and exact matches in SQL; let the model judge meaning.</li>
+ <li>Look at the distribution with <code>jev_prob()</code> before picking a threshold.</li>
+ <li>Send only the columns the judgment needs: create a view with the relevant columns and call <code>jev(view_alias, ...)</code> on the view.</li>
+</ul>
+<h2>Caveats</h2>
+<ul>
+ <li>This is a full scan by design: every row the executor asks about goes to the API.</li>
+ <li>Row contents are sent to a third-party API. Do not use it on data you may not share.</li>
+ <li>The cache lives in the backend session.</li>
+ <li><code>plpython3u</code> is an untrusted language: only superusers can create the extension.</li>
+</ul>
+<h2>License</h2>
+<p>PostgreSQL License.</p>

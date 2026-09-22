@@ -1,0 +1,73 @@
+<ul>
+ <li>Gray failures slip past green dashboards, quietly costing you customers and revenue before anyone notices.</li>
+ <li>RADAR is a four-stage, metric-agnostic pattern — reliability metrics, anomaly detection, alerting, and root-cause analysis — that Databricks runs on itself to catch these failures in minutes, at over 90% precision and 95% faster discovery.</li>
+ <li>You can build the same system on Databricks for any metric — billing, conversion, or model performance — using native components and an AI-agent scaffold.</li>
+</ul>
+<p>Some of the most damaging outages are the ones your monitoring never flags: a slice of your customers quietly fails while every health check still reads normal. These "gray failures" leak users and revenue for hours before anyone connects the dots. This post is about catching them early with anomaly detection — how we do it at Databricks with a system called RADAR, and how you can build the same thing for whatever metric matters most to your business. It's written for the people who own service reliability: SREs, platform and data engineers, on-call responders, and the engineering leaders they answer to.</p>
+<h2>When everything is green but nothing is fine</h2>
+<p>Picture a normal Wednesday. Keeping a customer-facing service reliable is your job, and every dashboard on your wall is green — CPU healthy, latency fine, servers up, database connected. By every signal your team watches, the system looks perfect.</p>
+<p>It isn’t.</p>
+<ul>
+ <li><strong>9:30</strong> — A routine deploy slips a subtle bug into your checkout flow.</li>
+ <li><strong>9:35</strong> — One in twenty customers paying by credit card silently fails. After a couple of retries, they give up and leave.</li>
+ <li><strong>12:40</strong> — The first support ticket lands. It looks like just another mistyped card number, so nobody blinks.</li>
+ <li><strong>14:20</strong> — Two more tickets arrive on the same issue.</li>
+ <li><strong>14:25</strong> — Your support lead spots the pattern and escalates.</li>
+ <li><strong>16:00</strong> — Engineers track down the bug and ship a fix.</li>
+</ul>
+<p>For nearly seven hours, your monitoring insisted everything was fine while customers walked and revenue leaked.</p>
+<h2>What is a gray failure?</h2>
+<p>That Wednesday is a textbook gray failure. On the surface everything looks healthy; underneath, one specific piece has quietly stopped working — and it hurts customers without ever tripping an alert.</p>
+<p>Two things make gray failures so sneaky:</p>
+<ul>
+ <li><strong>They’re partial.</strong> It’s not everyone — just one slice, like a single type of credit card. There’s no server crash you’d catch instantly, just a messy middle where most users are fine and one group fails the whole time.</li>
+ <li><strong>They grow.</strong> What starts as a handful of affected customers spreads. Left alone, more and more people hit the same wall.</li>
+</ul>
+<p>Think of it as smoke behind the wall. From the outside the house looks fine, but inside the damage is spreading — and the longer you wait, the bigger the blast radius. Researchers have a name for the underlying problem, too: Microsoft’s Gray Failure: The Achilles’ Heel of Cloud-Scale Systems calls it differential observability — your failure detectors don’t notice a problem even while your users clearly do.</p>
+<h2>Why waiting for customer reports fails</h2>
+<p>Most teams handle gray failures exactly the way that Wednesday played out: they wait for customers to tell them. Customer reports matter — they’re real human pain — but your customers shouldn’t be your monitoring system. Leaning on reports alone has three problems:</p>
+<ul>
+ <li><strong>It’s manual.</strong> Someone has to notice the same complaint across a pile of tickets. That’s easy to miss.</li>
+ <li><strong>It’s delayed.</strong> By the time enough people complain for anyone to connect the dots, hours or days have passed.</li>
+ <li><strong>It’s silent.</strong> Most affected customers never file a ticket at all. They just leave.</li>
+</ul>
+<h2>Meet RADAR</h2>
+<p>That’s the idea behind <strong>RADAR</strong> — Reliability Anomaly Detection, Alerting, and Root-cause analysis. We built it at Databricks to catch gray failures in minutes instead of hours. The name fits: when visibility is low, you don’t wait until something hits you — you scan for weak signals early.</p>
+<p>Here’s how we point it at one especially useful signal: user errors.</p>
+<p>A gray failure often shows up as a sudden spike in errors that look like the user’s fault. Picture a bunch of users in one region who suddenly can’t spin up a certain type of cluster. Each request fails with INVALID_ARGUMENT - an error that is politely saying, “this one’s on you.”</p>
+<p>But when many users hit the same “your fault” error at the same moment, it stops being their fault. It’s <strong>ours.</strong> That spike is exactly the pattern RADAR is built to catch.</p>
+<h2>The four stages of RADAR</h2>
+<p>RADAR turns that instinct into a pipeline with four stages:</p>
+<ol>
+ <li><strong>Reliability metrics.</strong> At every point in time, record two things: how many errors are happening, and how many separate users hit each one. Break it down by error code and region. Now you have a rich set of time series describing the health of your service.</li>
+ <li><strong>Anomaly detection.</strong> Run anomaly detection on each of those series so the system flags anything that looks off — without you hand-tuning a pile of thresholds. We use an unsupervised, streaming model called SPOT, which learns what “normal” looks like from the past 14 days and needs only a single risk parameter instead of manual cutoffs.</li>
+ <li><strong>Alerting.</strong> When something fires, the alerting layer takes over. It <strong>enriches</strong> the alert with context, <strong>filters</strong> out what isn’t significant, and <strong>dedupes</strong> so on-call isn’t buried under copies of the same thing. Then it files a ticket routed to the right engineering team for that error.</li>
+ <li><strong>Root-cause analysis.</strong> Every ticket arrives with anomaly deep-dive details and a link to a dashboard backed by an AI assistant, AI/BI Genie. Whoever’s on call can go straight to figuring out what actually broke, in the least time possible.</li>
+</ol>
+<h2>What we achieved</h2>
+<p>Running RADAR on ourselves changed the shape of these incidents. Before, we waited on customer tickets to discover such incidents, leading to days of delay. With RADAR, we achieved a <strong>95% reduction in incident-discovery time</strong>, at <strong>over 90% precision</strong>, with no human needed to spot the pattern. As a result, we are able to keep the blast radius of gray failures contained.</p>
+<h2>Point RADAR at any metric</h2>
+<p>Here’s the part that matters most for you: <strong>RADAR doesn’t care what the metric is.</strong> We happen to point it at user errors, but the same pattern works anywhere a number can quietly go wrong:</p>
+<ul>
+ <li><strong>Financial services</strong> — payment and transaction failures, billing anomalies, fraud signals</li>
+ <li><strong>Retail and e-commerce</strong> — checkout conversion, cart errors, delivery times</li>
+ <li><strong>Healthcare and life sciences</strong> — patient throughput, claims processing</li>
+ <li><strong>Any AI product</strong> — model performance and data-distribution drift that shows up before a model visibly breaks</li>
+</ul>
+<h2>Build it yourself on Databricks</h2>
+<p>The best news: every piece you need is already on Databricks. Map the four stages to the platform and it looks like this:</p>
+<ul>
+ <li><strong>Reliability metrics</strong> — Zerobus for low-latency ingest, Unity Catalog and Metric View for governance, Delta Lake for storage</li>
+ <li><strong>Anomaly detection</strong> — MLflow for model training, Model Serving to deliver the model endpoint, and Workflows to orchestrate the recurrent jobs</li>
+ <li><strong>Alerting</strong> — Databricks SQL Alerts to fire alerts</li>
+ <li><strong>Root-cause analysis</strong> — AI/BI Genie and AI/BI Dashboards</li>
+</ul>
+<p>And the whole thing deploys as a single unit through a Declarative Asset Bundle (DAB).</p>
+<p>Wiring all those parts together by hand is the annoying bit — so we removed it. We distilled the entire internal RADAR system into a single scaffold: one markdown file that works like a recipe, mapping each part of RADAR to a specific Databricks component (collect and store → a Delta table; detect the anomaly → a job; alert and dedupe → a ticket; visualize → a dashboard).</p>
+<p>Then comes the payoff. You bring your own metric — wherever your signal lives — and hand the metric, the scaffold, and a short prompt to an AI agent. It builds the whole RADAR system for you, live on Databricks.</p>
+<h2>Takeaways</h2>
+<ol>
+ <li><strong>Catch gray failures before they escalate.</strong> Green dashboards aren’t proof that customers are okay. Add real-time anomaly detection so a partial, silent failure surfaces in minutes, not days.</li>
+ <li><strong>Build RADAR on Databricks for whatever metric matters to you.</strong> The scaffold, the demo, and the prompt are all public — start from them.</li>
+</ol>
+<p>Because the best outcome isn’t a faster response to angry customers — it’s that your customers never have to discover your incidents for you.</p>

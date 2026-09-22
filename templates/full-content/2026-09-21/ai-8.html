@@ -1,0 +1,212 @@
+<h1>AX</h1>
+<p>Warning</p>
+<p>We are still actively refining our core concepts, protocols, and specifications. We will likely to introduce major breaking changes prior to a stable release.</p>
+<p><strong>Declare an agentic task with workspaces and gateway specifications. AX sandboxes it, wires up its workspace, fences its network, and helps running it at scale.</strong></p>
+<p>AX is a high-throughput, declarative orchestrator to run billions of autonomous agent workloads in a cluster. It runs on top of Agent Substrate for sandboxed execution and is built to run billions of tasks per cluster. If you have used Kubernetes, <code>ax</code> will feel similar.</p>
+<pre><code># task.yaml
+apiVersion: ax.io/v1alpha1
+kind: Workspace
+metadata:
+  name: golang
+spec:
+  git:
+    - repo: https://github.com/golang/go.git
+      branch: "my-fix"
+---
+apiVersion: ax.io/v1alpha1
+kind: Task
+metadata:
+  name: test
+spec:
+  workspaces:
+    - name: golang
+      goal: "Ensure that Go tool chain is available and is built from source"
+  debug: true   # lets you `ax ssh` into the sandbox</code></pre>
+<p>Then apply it, watch it come up, and look over the agent's shoulder:</p>
+<pre><code>ax apply -f task.yaml
+ax watch task test
+ax ssh test -- ls -al /workspace</code></pre>
+<h2>Why?</h2>
+<p>Agents are a new kind of workload. They are neither stateless microservices nor run-to-completion batch jobs. They accumulate state, need strict isolation, call out to model APIs and tool servers, and can burn money in a loop if nobody is watching. AX gives you four small primitives that handle all of that declaratively:</p>
+<table>
+ <thead>
+  <tr>
+   <th>You want to...</th>
+   <th>AX gives you</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Run untrusted agent code in an isolated sandbox with CPU/memory limits</td>
+   <td><strong><code>Task</code></strong></td>
+  </tr>
+  <tr>
+   <td>Pre-wire Git repos, MCP servers, and skill packages so every agent starts warm</td>
+   <td><strong><code>Workspace</code></strong></td>
+  </tr>
+  <tr>
+   <td>Lock outbound traffic down to an explicit host allowlist</td>
+   <td><strong><code>Gateway</code></strong></td>
+  </tr>
+  <tr>
+   <td>Configure which LLM the platform itself uses, with credentials from a Kubernetes secret</td>
+   <td><strong><code>Model</code></strong></td>
+  </tr>
+  <tr>
+   <td>Pause an idle agent and pick up exactly where it left off</td>
+   <td><code>ax suspend</code> / <code>ax resume</code></td>
+  </tr>
+  <tr>
+   <td>Shell into a running agent to see what it is doing</td>
+   <td><code>ax ssh</code></td>
+  </tr>
+ </tbody>
+</table>
+<p>Everything is expressed as <code>ax.io/v1alpha1</code> manifests and applied with a single command.</p>
+<h2>Quick start</h2>
+<h3>1. Install the CLI</h3>
+<pre><code>go install github.com/google/ax/cmd/ax@latest</code></pre>
+<p>This puts the <code>ax</code> binary in <code>$(go env GOPATH)/bin</code>. Make sure that directory is on your <code>PATH</code>.</p>
+<h3>2. Deploy the control plane</h3>
+<p>You need a Kubernetes cluster, <code>ko</code> (<code>brew install ko</code>), a container registry your cluster can pull from, and a reachable Agent Substrate Control API (in-cluster default: <code>api.ate-system.svc.cluster.local:443</code>).</p>
+<pre><code>make deploy AX_IMAGE_REPO=&lt;your-registry&gt;</code></pre>
+<p>This deploys Redis, then builds and deploys the control plane images with <code>ko</code>. Everything lands in the <code>ax-system</code> namespace.</p>
+<h3>3. Run your first task</h3>
+<pre><code>ax apply -f examples/task.yaml       # Task + Workspace + Gateway + Model in one file
+ax get tasks
+# NAME      ATESPACE   PHASE     ACTOR           WORKER-IP    AGE
+# task123   default    Running   task123         10.20.3.67   1m
+
+ax watch task task123                # stream phase and condition changes live
+ax ssh task123 -- ls -la /workspace  # poke around inside the sandbox
+ax suspend task task123              # checkpoint and pause
+ax resume task task123               # pick up where it left off</code></pre>
+<p>Want to see the whole lifecycle end to end? Run <code>./demo.sh</code>. It applies a custom workspace, waits for readiness, runs commands over <code>ax ssh</code>, and suspends the task.</p>
+<h2>Documentation</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Guide</th>
+   <th>Read it to...</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Concepts</td>
+   <td>Learn what a <code>Task</code>, <code>Workspace</code>, <code>Gateway</code>, and <code>Model</code> each do, and how a task moves through phases and conditions.</td>
+  </tr>
+  <tr>
+   <td>Manifests</td>
+   <td>Write your own YAML, with an annotated example of every kind.</td>
+  </tr>
+  <tr>
+   <td>Sandbox</td>
+   <td>See what the runner does on boot and what your command can rely on: metadata server, guest services, environment.</td>
+  </tr>
+  <tr>
+   <td>Runners</td>
+   <td>Understand the contract between the control plane and the task container, and build your own runner image to replace the default.</td>
+  </tr>
+  <tr>
+   <td>Networking</td>
+   <td>Reach a running task through the atenet router from the cluster, your laptop, or a gRPC client.</td>
+  </tr>
+  <tr>
+   <td>Architecture</td>
+   <td>Understand how the control plane fits together, plus the API reference.</td>
+  </tr>
+  <tr>
+   <td>Development</td>
+   <td>Build, test, and ship changes to AX itself.</td>
+  </tr>
+ </tbody>
+</table>
+<h2>CLI usage</h2>
+<p><code>ax</code> talks to the control plane over gRPC. It is deliberately <code>kubectl</code>-shaped: <code>apply</code>, <code>get</code>, <code>describe</code>, <code>watch</code>, <code>delete</code>, plus a few agent-specific verbs.</p>
+<h3>Everyday commands</h3>
+<pre><code># Apply anything (multi-document YAML, file or stdin)
+ax apply -f examples/task.yaml
+
+# Tasks
+ax get tasks                          # list
+ax get tasks -a my-atespace           # list in another atespace
+ax get task task123                   # full spec + live status as YAML
+ax describe task task123              # human-readable detail
+ax watch task task123                 # stream status and condition transitions
+ax suspend task task123               # checkpoint actor state and pause
+ax resume task task123                # resume a suspended task
+ax delete task task123
+
+# Shell into the running sandbox
+ax ssh task123                        # interactive shell (task needs spec.debug: true)
+ax ssh task123 -- ls -la /workspace   # one-off command
+ax ssh task123 -- python3 main.py
+
+# Gateways, workspaces, models follow the same pattern
+ax get gateways
+# NAME              ATESPACE   LISTENERS             EGRESS-HOSTS
+# default-gateway   default    8494/gRPC,8080/HTTP   *
+ax describe gateway default-gateway
+ax delete gateway default-gateway
+
+ax get workspaces
+# NAME                ATESPACE   GIT-REPOS   MCP-SERVERS
+# default-workspace   default    1           1
+ax describe workspace default-workspace
+ax delete workspace default-workspace
+
+ax get models
+# NAME            ATESPACE   PROVIDER   MODEL
+# default-model   default    google     gemini-3.8-flash
+ax describe model default-model
+ax delete model default-model
+
+# Connection plumbing
+ax ctx                                # active kube context and how ax is reaching the control plane
+ax tunnel list                        # background tunnels (state lives in ~/.ax/tunnels)
+ax tunnel stop
+ax version</code></pre>
+<h3>Works with <code>kubectx</code></h3>
+<p><code>ax</code> follows your active Kubernetes context. Switch clusters and <code>ax</code> resolves and tunnels to that cluster's control plane in the background.</p>
+<pre><code>kubectx staging-cluster
+ax get tasks
+
+kubectx prod-cluster
+ax get tasks
+
+# Or target a context without switching
+ax --context=dev-cluster get tasks</code></pre>
+<h3>Global flags</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Flag</th>
+   <th>Description</th>
+   <th>Default</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>-a</code>, <code>--atespace</code></td>
+   <td>Atespace scope for the command</td>
+   <td><code>default</code></td>
+  </tr>
+  <tr>
+   <td><code>-n</code>, <code>--namespace</code></td>
+   <td>Kubernetes namespace where AX is installed</td>
+   <td><code>ax-system</code></td>
+  </tr>
+  <tr>
+   <td><code>--context</code></td>
+   <td>Kubernetes context to target</td>
+   <td>active <code>kubectx</code> / <code>current-context</code></td>
+  </tr>
+  <tr>
+   <td><code>--server</code></td>
+   <td>Control plane address, bypassing auto-detection</td>
+   <td>derived from kube context, or <code>$AX_SERVER</code></td>
+  </tr>
+ </tbody>
+</table>
+<h2>License</h2>
+<p>Apache License 2.0. See LICENSE for details.</p>

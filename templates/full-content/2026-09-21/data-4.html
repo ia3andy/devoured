@@ -1,0 +1,86 @@
+<p>Finance wants to know why observability went up forty percent month over month, and you check span volume first because that is the number everyone reaches for. Flat. Bytes into the trace backend: flat. Head sampling rate: unchanged at one percent. Nothing shipped that emits more spans.</p>
+<p>What shipped was one line in a Collector config three weeks ago, adding <code>tenant.id</code> to the span metrics connector’s dimension list. Somebody wanted per-tenant latency on a dashboard, and they got it. They also got a new metric time series for every combination of tenant and operation that has appeared recently, and <em>that</em> is the number that moved.</p>
+<p>The instinct to look at span volume is the problem. Your traces and your span-derived metrics are billed on two different axes, and sampling — the one lever everybody reaches for — only moves one of them.</p>
+<h2>Traces are priced by the byte; metrics are priced by the series</h2>
+<p>Trace storage is a volume problem and behaves like one. Tempo “stores all trace data in object storage” and “backend workers enforce retention by expiring data in object storage after the configured retention period.” Your bill is roughly bytes per day times retention days. Halve the spans, halve the bytes, halve the bill. The relationship is linear and the knob is sampling.</p>
+<p>Metrics are not a volume problem. Grafana Cloud’s definition is blunt: “an active series is a time series that has received new data points within the previous 20 minutes.” Data points per minute is tracked as a <em>separate</em> axis — “DPM is the number of data points sent to Grafana Cloud Metrics per minute per series.” So a series receiving one sample a minute and a series receiving sixty are both exactly one active series. The count of distinct series and the count of samples are priced independently.</p>
+<p>That distinction is the whole post. A span attribute that becomes a metric dimension stops being a volume question and becomes a <em>distinctness</em> question, and distinctness does not respond to the lever you have.</p>
+<h2>Sampling is a volume knob, and cardinality is not a volume</h2>
+<p>Here is the arithmetic that surprises people.</p>
+<p>A dimension’s contribution to your series count is the number of distinct values that appear <strong>at least once</strong> in the active window. Not how often each appears — whether it appears. Sampling divides how often. It barely touches whether.</p>
+<p>Take head sampling at one percent. The decision there “is made based on the trace ID and the desired percentage of traces to sample,” which “ensures that whole traces are sampled — no missing spans — at a consistent rate.” So the coin is flipped once per trace, not once per span: a tenant making <code>k</code> requests inside a 20-minute window gets <code>k</code> independent flips. The probability that tenant shows up in the sampled stream at all is <code>1 - 0.99^k</code>. At <code>k = 100</code>, that is about 63 percent. At <code>k = 500</code>, it is 99.3 percent.</p>
+<p>Read that as a ratio. You cut ingested bytes by 100×. You cut the tenant dimension’s contribution to series count by about 1.6× — and once your busier tenants cross a few hundred requests per window, by nothing at all. A hundredfold reduction on one axis buys you roughly a third off the other, and only on your quietest tenants.</p>
+<p>Tail sampling is worse, not better, because of where it sits.</p>
+<h2>The fork in the pipeline is where the two bills separate</h2>
+<p>A Collector running span metrics has two paths out of one receiver. The connector consumes the trace stream and emits a metrics stream; the sampler sits on the trace path and decides what reaches storage. You almost always want the connector <em>upstream</em> of the sampler, because “tail sampling is where the decision to sample a trace takes place by considering all or most of the spans within the trace” — and a sampler that deliberately keeps errors and slow traces hands the connector a population it has already skewed. Aggregate before you drop, or your request rate is wrong.</p>
+<p>Which means the sampler is on one branch only:</p>
+<pre><code>flowchart LR
+    app["Instrumented service"] --&gt; recv["OTLP receiver"]
+    recv --&gt; conn["span metrics connector"]
+    recv --&gt; tail["tail sampling processor"]
+    conn --&gt; prom["Metrics backend: billed per active series"]
+    tail --&gt; traces["Trace backend: billed per byte stored"]
+</code></pre>
+<p>The sampler never touches the branch that generates series. Every span the receiver accepts contributes its dimension values to the metrics stream, at full volume, whatever the sampling rate says. Turning sampling down to 0.1 percent changes the bottom branch and leaves the top one exactly where it was.</p>
+<h2>Bucket the attribute, don’t delete it</h2>
+<p>The fix is not to stop recording tenant. It is to stop letting tenant be a <em>dimension</em>, while leaving it on the span where it is cheap — byte-priced, sampled, and still there when you open a trace and ask which tenant this was.</p>
+<p>OpenTelemetry’s semantic conventions already encode this discipline. <code>http.route</code> is “the matched route template for the request. This MUST be low-cardinality and include all static path segments, with dynamic path segments represented with placeholders.” The spec even forecloses the shortcut: the route attribute “MUST NOT be populated when this is not supported by the HTTP server framework as the route attribute should have low-cardinality and the URI path can NOT substitute it.” Route is the label. Path is the span attribute. Same split, applied to your own identifiers.</p>
+<pre><code>processors:
+  # Runs before the connector, so tenant.tier exists by the time dimensions are read.
+  # tenant.id is never listed as a dimension, so it never becomes a label - but it
+  # stays on the span: byte-priced, sampled, and still there when you open the trace.
+  transform/metric_dims:
+    error_mode: ignore
+    trace_statements:
+      - set(span.attributes["tenant.tier"], "free")
+          where span.attributes["tenant.plan"] == "free"
+      # Guard against nil: an absent plan is not a paid plan, and nil != "free".
+      - set(span.attributes["tenant.tier"], "paid")
+          where span.attributes["tenant.plan"] != nil
+            and span.attributes["tenant.plan"] != "free"
+
+connectors:
+  span_metrics:
+    dimensions:
+      - name: http.route      # low-cardinality by spec, not by hope
+      - name: tenant.tier     # two values, not three thousand
+    # Circuit breaker. Default is 0, meaning no limit at all.
+    aggregation_cardinality_limit: 20000
+    # Default is 0: a series that stops receiving spans is exported forever.
+    metrics_expiration: 30m
+
+service:
+  pipelines:
+    # Full, unsampled stream -&gt; connector. Aggregate before you drop.
+    traces/metrics:
+      receivers: [otlp]
+      processors: [transform/metric_dims]
+      exporters: [span_metrics]
+    # Same stream -&gt; sampler -&gt; storage.
+    traces/storage:
+      receivers: [otlp]
+      processors: [tail_sampling]
+      exporters: [otlp_http/tempo]
+    metrics/span_metrics:
+      receivers: [span_metrics]
+      exporters: [prometheus_remote_write]
+</code></pre>
+<p>Two of those settings are load-bearing and both are off by default.</p>
+<p><code>aggregation_cardinality_limit</code> “defines the maximum number of unique combinations of dimensions that will be tracked for metrics aggregation. When the limit is reached, additional unique combinations will be dropped but registered under a new entry with <code>otel.metric.overflow="true"</code>.” A value of zero means no limit is applied — which is the default. Until you set it, there is no ceiling on what one bad deploy can cost you, and the overflow series is how you find out it happened.</p>
+<p><code>metrics_expiration</code> “defines the expiration time as <code>time.Duration</code>, after which, if no new spans are received, metrics will no longer be exported.” Its default is also zero, meaning never. A one-hour incident that sprayed fifty thousand distinct values through the connector leaves fifty thousand series being re-exported every flush interval — sixty seconds by default — until someone restarts the Collector. The spike is not a spike. It is a step.</p>
+<h2>Know the ceiling before you add the dimension</h2>
+<p>None of this says never add a dimension. Per-tenant latency for forty enterprise accounts is bounded, useful, and worth paying for. The difference between that and the incident above is that somebody knew the number in advance.</p>
+<p>Before the dimension goes in, multiply. Your existing series count is roughly the product of the connector’s built-in dimensions — it attaches “at least” <code>service.name</code>, <code>span.name</code>, <code>span.kind</code>, <code>status.code</code> and <code>collector.instance.id</code> to everything — and the new dimension multiplies whatever that is by its distinct-value count. The product is a ceiling rather than a prediction, since not every tenant touches every operation, but a ceiling you cannot afford is a decision you have already made. The connector’s own documentation names the attributes that are never acceptable here: avoid anything that changes frequently, “such as <code>request_id</code>, <code>timestamp</code>, or <code>trace_id</code>.”</p>
+<p>Then check the same shape one layer down. The OpenTelemetry spec caps attributes per span at 128 by default and requires the SDK to “discard that attribute” past the limit, so a runaway attribute loop is bounded. The <em>value length</em> limit is not: its default is “Infinity”. Nothing truncates a 40KB SQL statement you attached to a span unless you configure it to, and that one really is a volume problem — which means, for once, sampling actually helps.</p>
+<p>The rule worth carrying: when the bill moves, ask which axis moved. Bytes respond to sampling. Series respond only to fewer distinct values. Reaching for the sampling knob against a cardinality problem is how you spend a quarter cutting trace fidelity and watch the invoice not move.</p>
+<h2>Further reading</h2>
+<ul>
+ <li>Span metrics connector — <code>opentelemetry-collector-contrib</code></li>
+ <li>Transform processor — <code>opentelemetry-collector-contrib</code></li>
+ <li>OpenTelemetry specification — Attribute Limits</li>
+ <li>OpenTelemetry semantic conventions — HTTP spans</li>
+ <li>OpenTelemetry — Sampling</li>
+ <li>Prometheus — Metric and label naming</li>
+ <li>Grafana Cloud — Active series and DPM</li>
+ <li>Grafana Tempo — Architecture</li>
+</ul>

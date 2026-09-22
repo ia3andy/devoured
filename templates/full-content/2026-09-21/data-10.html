@@ -1,0 +1,87 @@
+<p>Postgres can choose a slower plan after you add an index, because the planner gains another execution path and can misjudge its cost. Here, an index on <code>created_at DESC</code> looked cheap for an <code>ORDER BY ... LIMIT 10</code> query, but its scan discarded 495,944 rows and the query went from 16.5ms to 241ms. A composite index on <code>(user_id, created_at DESC)</code> fixes it in 0.067ms.</p>
+<p>Adding an index can make an existing query slower.</p>
+<p>That sounds backwards, so I want to show you a small Postgres experiment. The query stays the same throughout. Only the available indexes change.</p>
+<h2>The Setup</h2>
+<p>The table contains one million comments with <code>id</code>, <code>user_id</code>, <code>body</code>, and <code>created_at</code> columns. User 42 owns 10,000 comments, all between 12 and 14 months old. Everyone else's comments are spread across the last two years.</p>
+<p>I used this SQL to seed the data:</p>
+<pre><code>CREATE TABLE comments (
+    id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id INT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL
+);
+
+SELECT setseed(0.212);
+INSERT INTO comments (user_id, body, created_at)
+SELECT 1 + (g % 100),
+       'Comment body ' || g,
+       CASE WHEN 1 + (g % 100) = 42
+            THEN TIMESTAMPTZ '2026-09-01' - INTERVAL '14 months'
+                 + random() * INTERVAL '2 months'
+            ELSE TIMESTAMPTZ '2026-09-01' - random() * INTERVAL '2 years'
+       END
+FROM generate_series(1, 1000000) AS g;
+
+CREATE INDEX ix_comments_user_id ON comments (user_id);
+VACUUM ANALYZE comments;
+</code></pre>
+<p>Think of a user who stopped posting a year ago. Their profile still needs to show their latest ten comments:</p>
+<pre><code>SELECT *
+FROM comments
+WHERE user_id = 42
+ORDER BY created_at DESC
+LIMIT 10;
+</code></pre>
+<p>I measured on Postgres 18.6 after <code>VACUUM ANALYZE</code>, quoting the second run of each query. Your timings will differ.</p>
+<h2>Add One Index</h2>
+<p>Initially, an index on <code>user_id</code> finds the user's comments. Postgres fetches all 10,000, sorts by date, and keeps ten. The relevant lines from <code>EXPLAIN ANALYZE</code>, which executes the query and reports the work performed:</p>
+<pre><code>Limit
+  -&gt; Sort
+       -&gt; Bitmap Heap Scan on comments (rows=10000.00 loops=1)
+            -&gt; Bitmap Index Scan on ix_comments_user_id
+Execution Time: 16.537 ms
+</code></pre>
+<p>Now add an index that could serve a separate screen listing recent comments:</p>
+<pre><code>CREATE INDEX ix_comments_created_at
+ON comments (created_at DESC);
+</code></pre>
+<p>Run the profile query again:</p>
+<pre><code>Limit
+  -&gt; Index Scan using ix_comments_created_at on comments
+       Filter: (user_id = 42)
+       Rows Removed by Filter: 495944
+Execution Time: 241.354 ms
+</code></pre>
+<p>The query went from <strong>16.5ms to 241ms</strong>. It now walks comments newest-first, fetching and discarding almost half a million rows before finding ten that belong to user 42.</p>
+<h2>Why That Plan Looked Cheap</h2>
+<p>The <strong>planner</strong> estimates the cost of each available execution path. An index matching <code>ORDER BY</code> with <code>LIMIT</code> is attractive because it can stop as soon as it finds enough matching rows.</p>
+<p>User 42 owns roughly 1% of the table. If their comments were evenly spread through the date index, finding ten would take about a thousand entries. That looks cheaper than fetching and sorting 10,000 rows.</p>
+<p>But this user's comments are all old. The planner's estimate doesn't capture where those matches occur in the date ordering.</p>
+<p>You can see the bet in the top <code>Limit</code> node's estimated total cost: <strong>9194.00</strong> for the original plan, versus <strong>63.93</strong> for the date-index plan. These are planner cost units, not milliseconds. Postgres expects the limit to stop the second plan early, even though scanning that entire index would be expensive.</p>
+<p>The estimated number of matching comments was 9,733, close to the actual 10,000. The mistake wasn't primarily how many comments belonged to this user. It was how far the scan would travel before reaching them.</p>
+<p>Stale statistics can cause bad plans, but I ran <code>VACUUM ANALYZE</code> right after seeding, so the statistics here are fresh. Running <code>ANALYZE</code> again doesn't teach ordinary per-column statistics this relationship.</p>
+<h2>Give the Query an Index That Fits</h2>
+<p>Put the equality condition first and the sort column second:</p>
+<pre><code>CREATE INDEX ix_comments_user_date
+ON comments (user_id, created_at DESC);
+</code></pre>
+<p>This index locates user 42's section, where comments are already newest-first:</p>
+<pre><code>Limit
+  -&gt; Index Scan using ix_comments_user_date on comments
+       Index Cond: (user_id = 42)
+Execution Time: 0.067 ms
+</code></pre>
+<p>Postgres reads ten entries and stops.</p>
+<p>The tradeoff is another index to store and maintain on writes. The new composite may also make the old <code>user_id</code> index redundant, but check its other queries and dependencies before dropping it.</p>
+<h2>Summary</h2>
+<p>Adding <code>ix_comments_created_at</code> gave the planner a cheaper-looking path for this query, and the estimate was wrong about how far that path would travel. The composite index on <code>(user_id, created_at DESC)</code> fixed it because it supplies both the filter and the ordering.</p>
+<p>When adding an index, compare the plans of your important queries before and after. Use the same parameters for each comparison, then repeat with representative values: an active user and someone who hasn't posted recently, for example. Testing only your most active account could hide this regression.</p>
+<p>Run <code>EXPLAIN (ANALYZE, BUFFERS)</code> and follow the work underneath <code>Limit</code>. Here, the date-index plan reported 497,260 shared-buffer hits, compared with 8,344 originally. Those are buffer accesses, including repeated accesses to a page, rather than a count of unique pages. They explain why a warm cache didn't rescue this plan.</p>
+<p>I would investigate a large <code>Rows Removed by Filter</code> count before changing planner settings.</p>
+<h2>Frequently Asked Questions</h2>
+<h3>Why can adding an index make a Postgres query slower?</h3>
+<p>The new index gives the planner another execution path. For ORDER BY with LIMIT, an index in the requested order can look cheap because Postgres expects to find enough matching rows early. If those matches occur far into the index, filtering them can cost more than fetching and sorting through another index.</p>
+<h3>How do you fix an index scan with many rows removed by filter?</h3>
+<p>Inspect the filter and ordering together. In this example, an index on (user_id, created_at DESC) locates the requested user and reads that user’s newest comments in order, so LIMIT 10 stops after ten entries.</p>
+<h3>Will ANALYZE always fix a bad query plan?</h3>
+<p>No. Stale statistics can cause bad estimates, so check them. But the statistics in this example were fresh from VACUUM ANALYZE. The missing information is where a particular user’s comments occur in date order, which ordinary per-column statistics do not describe.</p>

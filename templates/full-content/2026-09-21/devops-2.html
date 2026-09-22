@@ -1,0 +1,73 @@
+<h2>AWS Elastic Beanstalk introduces Cluster Mode</h2>
+<p>Since the first launch of AWS Elastic Beanstalk in 2011, customers have deployed full-stack applications in Java, .NET, Python, Node.js, PHP, Ruby, and Go, trusting Elastic Beanstalk to manage deployment and infrastructure operations so they could focus on business logic. Fifteen years later, that trust has only deepened, and the service has been rebuilt to match it. Now, AWS Elastic Beanstalk is the application management service on AWS that takes full operational responsibility for your production environments. Bring applications however they exist today: source code, Dockerfiles, or container images. Elastic Beanstalk creates and manages the production environment underneath. You manage your application. AWS manages everything else, deploying, scaling, patching, monitoring, and maintaining it continuously. That operational responsibility stays with AWS, for the life of the application.</p>
+<p>We have been rebuilding the operational engine underneath and delivering a series of capabilities that make it more powerful than ever. Elastic Beanstalk now uses AI-powered environment analysis to diagnose health issues and recommend fixes automatically. A new official GitHub Action lets teams deploy directly from their existing CI/CD workflows with a single YAML configuration. And we rebuilt the infrastructure foundation to deliver OpenTelemetry-based observability, traffic-splitting deployments with automatic rollback, event-driven autoscaling, secrets management through AWS Secrets Manager, and HTTPS by default via AWS Certificate Manager.</p>
+<p>Today, we’re announcing the next chapter of AWS Elastic Beanstalk: a new fully-managed Cluster Mode that deploys, scales, patches, monitors, and upgrades your applications continuously for the life of the workload. You bring your application. AWS runs it.</p>
+<p>A new Cluster Mode is built for teams running a portfolio of applications. Instead of operating each application in isolation, you run multiple applications that share infrastructure powered by Amazon Elastic Kubernetes Service (Amazon EKS), fully managed with a single operational baseline. Multiple applications share resources, so per-application cost decreases as your portfolio grows without adding operational complexity. Whether you run ten applications or a hundred, you manage them through one experience, with the same operational guarantees across every stack.</p>
+<p>Elastic Beanstalk Cluster Mode benefits for your workloads:</p>
+<ul>
+ <li><strong>Source code to production, any runtime</strong>. Upload source code in Java, .NET, Python, Node.js, PHP, Ruby, or Go. Elastic Beanstalk handles containerization automatically through Cloud Native Buildpacks when needed. No Dockerfile and no rearchitecting required. You can bring legacy applications from on-premises or deploy new services in any supported language.</li>
+ <li><strong>Enterprise compliance built in</strong>. Elastic Beanstalk is HIPAA eligible, PCI DSS compliant, and aligned to SOC 1/2/3 with no additional configuration, so teams in regulated industries can deploy production workloads with the compliance posture they already require.</li>
+ <li><strong>Production-grade deployment strategies</strong>. All-at-once, rolling, immutable, and traffic-splitting deployments with automatic rollback on failure. Event-driven autoscaling. AWS Secrets Manager integration. All native OpenTelemetry enabling easy integration with most observability backends, including Amazon CloudWatch.</li>
+ <li><strong>AI-powered troubleshooting</strong>. When something goes wrong, Elastic Beanstalk collects service-side logs and provides AI-generated recommendations to help you resolve issues faster without digging through infrastructure.</li>
+</ul>
+<h3>A first look of Elastic Beanstalk Cluster Mode</h3>
+<p>To get started, go to the <a href="https://console.aws.amazon.com/elasticbeanstalk/">Elastic Beanstalk console</a>, create a new environment, and choose the <strong>Cluster</strong> in the <strong>Deployment type</strong>.</p>
+<p>Elastic Beanstalk accepts source code, docker file, or container image to deploy your application. For example, you can provide the application code for your environment by selecting <strong>Local file</strong> and specifying container image build options. For the rest of the sections, the default values should be good for most scenarios.</p>
+<p>Choose <strong>Create</strong> button and the deployment will begin! Note that the first deployment for a given set of subnets triggers EKS cluster creation, which takes about ten-ish minutes. Subsequent deployments are faster because they reuse an existing EKS cluster.</p>
+<p>Here’s what it looks like when deployment is successful:</p>
+<p>You can also use AWS Command Line Interface (AWS CLI), the <a href="https://docs.aws.amazon.com/elasticbeanstalk/latest/dg/eb-cli3.html">EB CLI</a>, or <a href="https://docs.aws.amazon.com/sdkref/latest/guide/version-support-matrix.html">AWS SDKs</a>. For example, consider deploying an application made up of several microservices to Kubernetes. Create an application first.</p>
+<pre><code>aws elasticbeanstalk create-application \
+    --application-name "my-microservice" \
+    --description "Multi-services demo" \</code></pre>
+<p>Each microservice may have pre-built images in Amazon Elastic Container Registry (Amazon ECR). Register them as application versions:</p>
+<pre><code>IMAGES=(
+    "frontend-v1|public.ecr.aws/my-microservices/frontend:v1"
+    "cartservice-v1|public.ecr.aws/my-microservices/cart:v1"
+    "paymentservice-v1|public.ecr.aws/my-microservices/payment:v1"
+    "shippingservice-v1|public.ecr.aws/my-microservices/shipping:v1"
+)
+
+for entry in "$\{IMAGES[@]}"; do
+    IFS='|' read -r label uri &lt;&lt;&lt; "$entry"
+    aws elasticbeanstalk create-application-version \
+        --application-name $APP_NAME \
+        --version-label "$label" \
+        --image-configuration Source="\{Uri=$uri}" \
+	--region "us-west-2
+    echo "Registered: $label"
+done</code></pre>
+<p>You can set and deploy the corresponding service options for each service. For example, the frontend service is the only service that needs a public internet interface such as Application Load Balancer and also sets a health check path since it’s an HTTP service:</p>
+<pre><code>[
+    \{"Namespace": "aws:elasticbeanstalk:eks", "OptionName": "cluster-role", "Value": "arn:aws:iam::0123456789012:rol&lt;...&gt;"},
+    \{"Namespace": "aws:elasticbeanstalk:eks", "OptionName": "node-role", "Value": "arn:aws:iam::0123456789012:role/E&lt;...&gt;"},
+    \{"Namespace": "aws:elasticbeanstalk:eks:environment", "OptionName": "observability-role", "Value": "arn:aws:iam::0123456&lt;...&gt;"},
+    \{"Namespace": "aws:elasticbeanstalk:eks:environment", "OptionName": "subnets", "Value": "subnet-1,subnet-2,subnet-3,&lt;...&gt;"},
+    \{"Namespace": "aws:elasticbeanstalk:eks:environment:autoscaling", "OptionName": "min-replica", "Value": "1"},
+    \{"Namespace": "aws:elasticbeanstalk:eks:environment:autoscaling", "OptionName": "max-replica", "Value": "2"},
+    \{"Namespace": "aws:elasticbeanstalk:eks:environment", "OptionName": "cpu", "Value": "0.5"},
+    \{"Namespace": "aws:elasticbeanstalk:eks:environment", "OptionName": "memory", "Value": "256Mi"},
+    \{"Namespace": "aws:elasticbeanstalk:eks:environment", "OptionName": "memory-limit", "Value": "512Mi"},
+    \{"Namespace": "aws:elasticbeanstalk:eks:environment", "OptionName": "service-port", "Value": "8080"},
+    \{"Namespace": "aws:elasticbeanstalk:eks:alb", "OptionName": "scheme", "Value": "internet-facing"},
+    \{"Namespace": "aws:elasticbeanstalk:eks:alb", "OptionName": "healthcheck-path", "Value": "/_healthz"}
+] #frontend-options.json namespaces</code></pre>
+<p>Now, create the frontend service environment with these options. You can continue to deploy each service environment in a similar manner.</p>
+<pre><code>aws elasticbeanstalk create-environment \
+    --application-name my-microservice \
+    --environment-name frontend \
+    --version-label frontend-v1 \
+    --tier Name=Cluster,Type=EKS \
+    --option-settings file:///tmp/frontend-options.json \</code></pre>
+<p>Elastic Beanstalk Standard powered by Amazon Elastic Compute Cloud (EC2) continues to be fully supported. Standard and Cluster Mode environments run side by side within the same Elastic Beanstalk application, enabling teams to migrate one environment at a time at their own pace. Validation checks confirm compatibility before any changes are made, so no environment is forced to move.</p>
+<p>Elastic Beanstalk Standard Mode remains the best fit for:</p>
+<ul>
+ <li>Single applications or single-environment use cases</li>
+ <li>Windows/.NET Framework workloads on IIS</li>
+ <li>Applications that cannot be containerized</li>
+ <li>Workloads spending under $500/month where the EKS control plane fee and EKS Auto Mode premium add overhead that a single application cannot offset through bin-packing</li>
+</ul>
+<p>To learn more about how to deploy and manage your applications in the Cluster Mode, visit the <a href="https://docs.aws.amazon.com/elasticbeanstalk/latest/dg/beanstalk-cluster.html?trk=d8ec3b19-0f37-4f8c-8c12-189f913e205c&amp;sc_channel=el">Elastic Beanstalk Cluster Mode documentation</a>.</p>
+<p><strong>Now available</strong></p>
+<p>AWS Elastic Beanstalk Cluster Mode is generally available today in all AWS Regions that Elastic Beanstalk is available. For Regional availability and a future roadmap, visit the <a href="https://builder.aws.com/build/capabilities/explore?trk=d8ec3b19-0f37-4f8c-8c12-189f913e205c&amp;sc_channel=el">AWS Capabilities by Region</a>. If you want to call APIs, search documentation, find regional availability, and troubleshooting about this new feature, try using the <a href="https://docs.aws.amazon.com/agent-toolkit/latest/userguide/getting-started-aws-mcp-server.html?trk=d8ec3b19-0f37-4f8c-8c12-189f913e205c&amp;sc_channel=el">AWS MCP Server</a> and <a href="https://docs.aws.amazon.com/agent-toolkit/latest/userguide/plugins.html?trk=d8ec3b19-0f37-4f8c-8c12-189f913e205c&amp;sc_channel=el">plugins</a> with your preferred AI tool.</p>
+<p>There is no additional charge for Elastic Beanstalk Cluster Mode. You pay only for the underlying AWS resources your applications consume, including the EKS control plane fee, EKS Auto Mode compute, Amazon ECR, and Amazon CloudWatch. Note Elastic Beanstalk Cluster Mode is not AWS Free Tier eligible. To learn more, visit the AWS Elastic Beanstalk Pricing page.</p>
+<p>Give it a try in the <a href="https://console.aws.amazon.com/elasticbeanstalk/">Elastic Beanstalk console</a> and send feedback to <a href="https://repost.aws/tags/TAhZCjgK8eQvuM45ihyzqV6g/aws-elastic-beanstalk?trk=d8ec3b19-0f37-4f8c-8c12-189f913e205c&amp;sc_channel=el">AWS re:Post for AWS Elastic Beanstalk</a> or through your usual AWS Support contacts.</p>
