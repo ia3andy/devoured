@@ -1,0 +1,69 @@
+<h1>Introducing Aikido Altar: the model that makes sovereign security intelligence possible</h1>
+<p>Today, we’re introducing Altar, our first open-weight security model, built to bring frontier-grade defensive security into infrastructure you control.</p>
+<p>We took our first step toward sovereign security intelligence with our autonomous pentesting appliance Aikido Machine, which runs entirely inside a customer’s own infrastructure, including fully air-gapped environments. Teams with strict rules about keeping code in-house can continually detect, exploit, and validate vulnerabilities across their attack surface without breaking those rules.</p>
+<p>Altar provides Aikido Machine with advanced AI that defends, without sending an organization’s most sensitive context to a third-party inference service.</p>
+<p>To do this, we needed to bridge the deployment gap. Most capable open-weight models remain difficult to deploy at production scale while retaining the reasoning quality of frontier-grade models.</p>
+<p>We started with GLM-5.3, one of the strongest models in our security evaluations. The full model occupies 1.51 TB; quantization brings that down to 488 GB, and our expert-pruning process reduces it further to 328 GB, all while preserving most of the reasoning quality of the parent model.</p>
+<h2>The gap between frontier and open-weights models explained</h2>
+<h3><strong>Closed frontier models run on somebody else’s infrastructure</strong></h3>
+<p>Using one means your source code, your internal architecture documentation, and your unremediated findings leave your network. For a bank operating under a data-residency mandate, a hospital group subject to strict data-processing rules, or an industrial operator whose OT environment has no route to the internet at all, it is not a trade-off they're allowed to make.</p>
+<h3><strong>The deployment gap</strong></h3>
+<p>Serving a model such as GLM 5.3 at full precision requires hundreds of gigabytes of unified memory and yields limited inference speed when serving parallel conversations with high context windows. In human terms, they’re enormous.</p>
+<p>Those resource demands come partly from how these models are built. Many of today's strongest models use mixture-of-experts architectures. These models are made up of a multitude of small specialized neural networks, each called an <strong>expert</strong>. Only a small number of experts are active for each token, while the full expert pool still has to be stored and served. <strong>That means paying a significant memory and infrastructure cost for capacity that may contribute little to the workload you're actually running.</strong></p>
+<p>Security work, such as reviewing code for vulnerabilities, proposing patches, and running a penetration test, only calls on a small slice of that expert pool. But the memory cost doesn’t shrink to match: every request still has to load the full model, whether or not it is relevant to the job.</p>
+<p>Now add agents into the mix, and the usage of context explodes, which saturates memory and leads to agents fighting each other for room. Each one keeps a running record of everything it’s seen and done, and that record sits in GPU memory alongside the model itself, growing the longer an investigation runs and multiplying across every investigation running in parallel.</p>
+<p>That’s why model size matters here: the model and all that growing context draw from the same fixed pool of memory, so more of one leaves less room for the other. The goal is to make a frontier model more efficient to operate for a specific workload, preserving the capabilities that matter while freeing capacity for everything running alongside it.</p>
+<h2>What can we remove without losing what matters?</h2>
+<p>The heavy burden of carrying so many experts into a model can be turned into an advantage with the right techniques. In order to minimize the size of open-weight models in an agentic security context while maintaining high accuracy, we used quantization and pruning.</p>
+<p><strong>Expert pruning</strong> removes some of the experts from the model, typically by deleting entire expert weight blocks and adjusting the model so each token only chooses among the ones that remain. The removal itself is mechanical. Deciding which experts to remove is the hard part, and the loss can be uneven: a smaller model may retain strong coding performance while losing much of its ability to understand a particular natural language. That can leave it unable to reliably interpret documentation, business rules, or application features described in that language.</p>
+<p>To decide what to keep, we started with the most natural piece of data: traces from our pentesting harness running internal benchmarks. These capture the code, tool calls, and responses that agents work through during a full pentest, giving us representative inputs to guide expert selection. <strong>No customer data was ever involved.</strong></p>
+<p>This calibration step gives us a workload-specific basis for expert selection, without training new skills into the model.</p>
+<p>The harness traces covered the technical workload. We also needed to preserve language understanding: investigating an application means understanding its features, business rules, and intended workflows, including when its documentation or interface is in French, Dutch, or another language. We therefore added multilingual text to help preserve those capabilities during pruning.</p>
+<h3>Selection matters as much as size</h3>
+<p>Many pruning techniques exist to reduce the footprint of LLMs, so we decided to go with a technique that can preserve performance for our use cases: Cerebras REAP, <strong>R</strong>outer-weighted <strong>E</strong>xpert <strong>A</strong>ctivation <strong>P</strong>runing. We used REAP’s contribution score with a domain-preserving aggregation strategy selected through fidelity experiments. Counting how often an expert is selected gives only part of the picture. REAP estimates its contribution using both the router’s weighting and the magnitude of the expert’s output.</p>
+<p>We also examine contributions across different groups of examples. Otherwise, a capability that matters to a less common workload can be lost in an overall average. Cybersecurity, coding, and language capabilities are distributed across experts; there is no cleanly labeled set of “cyber experts” to keep or discard.</p>
+<p>In the supporting compression study, models retaining the same number of experts differed substantially in how closely their outputs tracked the reference model. Size alone did not determine what survived.</p>
+<h2>From 1.51 TB to 328 GB</h2>
+<p>We achieved a total 78.2% model size reduction compared with GLM 5.3 at full precision, and a 32.8% reduction compared with GLM 5.3 with an AWQ INT4 quantization. Altar retains <strong>168 of the original 256 routed experts</strong> in each backbone expert layer, removing 88, or <strong>34.4%</strong> of them. The router still selects eight per token, now from the smaller bank.</p>
+<p>The other part of the reduction comes from <strong>quantization</strong>. A model’s weights are the numerical values it learns during training. Quantization stores those numbers with fewer bits, trading some precision for smaller stored weights. Unlike pruning, it does not remove experts.</p>
+<p>Our starting checkpoint used AWQ to store most expert weights in four bits instead of the BF16 model’s sixteen. AWQ uses information about the model’s activity on example inputs to limit the errors introduced by lower precision. The intermediate values produced during inference, called activations, remain 16-bit: hence <strong>W4A16</strong>, or four-bit weights and 16-bit activations. Some weights also retain higher precision. We then applied pruning to this already-quantized checkpoint.</p>
+<p>Comparing both parent representations shows what each step contributes:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Checkpoint</th>
+   <th>Stored weights</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>GLM-5.3, unpruned BF16 (16-bit)</td>
+   <td>1,506.7 GB</td>
+  </tr>
+  <tr>
+   <td>GLM-5.3, unpruned AWQ INT4</td>
+   <td>488.2 GB</td>
+  </tr>
+  <tr>
+   <td>Altar, pruned W4A16</td>
+   <td>328.0 GB</td>
+  </tr>
+ </tbody>
+</table>
+<p>That is <strong>78.2% less storage</strong> than the full 16-bit model. Against the already-quantized parent, pruning removes another <strong>160 GB</strong>, a <strong>32.8% reduction</strong>.</p>
+<h2>The impact of compression on vulnerability identification capabilities</h2>
+<p>We have previously built an internal CVE benchmark which we use to assess a model's ability to identify complex real-world vulnerabilities using our AI Code Analysis harness: <strong>32 known vulnerabilities across 30 repositories, with three runs per case</strong>.</p>
+<p>We ran Altar against it. Altar averaged 60.4% recall per run and rediscovered 23 of the 32 vulnerabilities at least once across three runs.</p>
+<p>In comparison, the quantized GLM-5.3 AWQ averaged 61.5% recall and covered the same 23 vulnerabilities. The original GLM-5.3 model at full precision averaged 65.6% recall and covered 25 of 32.</p>
+<p>In other words, reducing the already-quantized checkpoint from 488 GB to 328 GB, a <strong>32.8% reduction in stored weights</strong>, resulted in approximately a one percentage point less average recall compared with the AWQ baseline, while retaining all of its vulnerability coverage. Compared with the original parent, Altar retained 23 of its 25 covered vulnerabilities, or 92%, with a 5.2 percentage-point decrease in average recall. That’s 92% of the parent’s vulnerability coverage kept at 33% less storage.</p>
+<p>That's the tradeoff we were looking for: a materially smaller model while preserving most of the parent's security capability.</p>
+<p>We report average recall per run separately from coverage across three runs: finding a vulnerability once is different from finding it consistently. Completed runs without a finding count as misses; incomplete runs are reported separately.</p>
+<p>This measures targeted CVE rediscovery within a pipeline that uses other models for surrounding stages. It does not measure blind discovery across an entire codebase, execute exploits to validate findings, or evaluate the fix-proposal stage. Those boundaries keep the benchmark distinct from the broader pentesting workflow we are crafting Altar to support.</p>
+<p>Additionally, we deployed Altar to our Aikido Machine fleet immediately after completing these evaluations. Shortly after deployment, it identified a valid critical-severity vulnerability during a client production pentest.</p>
+<h2>What’s next</h2>
+<p>The underlying idea is broader: sovereign security intelligence should run inside any environment it protects.</p>
+<p>Altar is only the beginning. On compression, we’re exploring lower-bit formats such as EXL3, which could let us retain more experts, alongside further H200 serving optimizations.</p>
+<p>The next step is to go beyond compression into training: fine-tuning models for security workflows, improving tool use and long-horizon reasoning, and building a <strong>self-learning pipeline informed by our internal benchmarks to guide and shape future models</strong>.</p>
+<p>That work will extend across vulnerability research, code analysis, remediation and other defensive security workflows.</p>
+<p><strong>Aikido Labs exists to keep pushing that further: models that get more capable over time without losing the constraint that matters, defenders have to be able to run them entirely inside the environments they're responsible for protecting. </strong></p>
+<p>Altar’s weights are available under Aikido’s organization. Altar can be deployed and served comfortably using a 4-H200s node and the latest version of vLLM.</p>
