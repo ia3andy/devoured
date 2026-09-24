@@ -1,0 +1,116 @@
+<h1>Treg (OpenRouter for Tools)</h1>
+<p><strong>OpenRouter, but for agent tools instead of models.</strong> Point an agent at one base URL with one token and it can do the job: <strong>3,000+ catalogued endpoints across 60+ providers</strong> — SEO and backlinks, social and trends, people and company enrichment, ads, scraping, image and video generation — <strong>priced per call, from a cent</strong>, with no provider signup. Plus your own team's keys, skills and CLIs, callable by every teammate's agent without the credential ever leaving the server.</p>
+<p><strong>Ask for the task, not the tool.</strong> You do not need to know which vendor sells backlink data, or to hold an account with them. Search for what you want to do, read the price, call it.</p>
+<p>Built for the Superdesign team, live at <a href="https://treg.to">treg.to</a> — anyone can self-host.</p>
+<h2>Why it exists</h2>
+<p>The tools an agent needs for real work sit behind subscriptions nobody buys for a single run — Semrush $139/mo, Moz $99/mo, Crunchbase $99/mo, Apollo $59/seat — behind signup walls, or behind no public API at all (invite-only, partner-only, app-review-only). treg carries those accounts and bills fractions of a cent per call.</p>
+<h2>Two kinds of tool, one token</h2>
+<ul>
+ <li><strong>The catalog</strong> — external endpoints treg can serve with its own key or through a verified public route that needs no provider key. Own-key calls use the team's prepaid balance; anonymous calls are free. No account with the provider is needed. New verified accounts receive <strong>$1.00 free</strong> once, when they create an eligible team.</li>
+ <li><strong>Your own tools</strong> — anything a teammate registered: a paid API account, an OAuth connection, a vendor CLI, a <code>SKILL.md</code>. <strong>Your own key always wins over treg's, and those calls are never metered.</strong></li>
+</ul>
+<p>The vocabulary for the second half:</p>
+<ul>
+ <li><strong>tool</strong> = something the registry calls for you with the org's credential. Two kinds: 
+  <ul>
+   <li><strong>endpoint</strong> — an upstream <code>base_url</code> + credential <strong>bindings</strong> (each binding injects one secret into the request; a request can carry several, e.g. an OAuth bearer <em>and</em> a <code>developer-token</code> header).</li>
+   <li><strong>CLI</strong> — a vendor binary (<code>stripe</code>, <code>gh</code>, <code>vercel</code>, ...) run with the credential injected.</li>
+  </ul></li>
+ <li><strong>skill / bundle</strong> = a recipe (<code>SKILL.md</code>) + its secrets + its tool(s), registered together.</li>
+</ul>
+<p><strong>The one rule:</strong> the proxy <strong>relays, never models</strong> the upstream, and <strong>injects auth server-side</strong> — so it survives upstream API changes and callers never hold keys.</p>
+<hr>
+<h1>Part 1 · Using the registry</h1>
+<p>Visit <a href="https://treg.to"><strong>treg.to</strong></a> (hosted on Render) — the dashboard, sign-in, and every URL below live there.</p>
+<h2>Quickstart</h2>
+<p>Same flow as the dashboard's <strong>Getting started</strong> guide:</p>
+<pre><code># 1. install the CLI — also points it at the registry
+curl -fsSL https://treg.to/install.sh | sh
+
+# 2. sign in (GitHub default · --email for a one-time code · --token for agents/CI)
+treg login
+
+# 3. do something useful immediately — no key, nothing registered
+treg catalog search "backlinks for a domain"     # find a tool by what it DOES
+treg call tikhub.tiktok.user.profile --query uniqueId=tiktok
+treg balance                                     # exactly what that cost
+
+# (or `treg onboard` for the guided walkthrough)</code></pre>
+<p>Fish Audio provides S2.1 Pro speech, public-voice discovery, and private voice cloning. Speech is binary stdout, so redirect it to a file. A discovered voice's <code>_id</code> or a team voice id is the TTS <code>reference_id</code>; voices created on treg's Fish account are durable team resources:</p>
+<pre><code>treg call fishaudio.tts.s2-1-pro --method POST --header model=s2.1-pro \
+  --data '\{"text":"Hello from treg","format":"mp3"}' &gt; speech.mp3
+treg call fishaudio.voices.discover --query self=false --query licensed=false --query language=en
+treg resources list --provider fishaudio --kind voice</code></pre>
+<p>With your own Fish key, requests remain an unrestricted, unmetered upstream relay and Fish owns the account boundary.</p>
+<p>Catalog tool inputs are described by <code>treg catalog get &lt;id&gt;</code>. Tools marked <code>strict_query</code> reject undeclared or repeated query parameters, unsupported values and request bodies.</p>
+<p>Your token identifies you on every call (<code>X-Treg-Token</code> header) and is the same for all tools. Discover what your team has shared: <code>treg tool ls</code> · check credential health: <code>treg health</code>.</p>
+<h3>Or install it as a Claude Code plugin</h3>
+<pre><code>/plugin marketplace add superdesigndev/treg
+/plugin install treg@treg</code></pre>
+<p>Installs with no token and no configuration. The skill loads as <code>treg:treg</code> and, on its first run, walks your agent through the rest — the CLI, sign-in, then <code>treg mcp install</code> — so you end up with the command line <strong>and</strong> treg's tools. Other agents: <code>npx skills add superdesigndev/treg -s treg</code> (the <code>-s</code> matters — without it you also get this repo's internal dev skills).</p>
+<h3>Claude.ai connector</h3>
+<p>The Claude Connectors Directory surface is <code>https://treg.to/mcp/v2/</code>. It exposes only curated catalog endpoints and separates read calls from write calls so Claude receives accurate safety signals.</p>
+<h2>Call a tool you don't have a key for</h2>
+<p>The catalog is grouped by what endpoints <strong>do</strong>: keyword and rank tracking, backlinks and authority, AI visibility, trending and discovery, publishing to socials, people and company enrichment, ads management and creative, measurement.</p>
+<pre><code>treg catalog                                    # every platform, busiest first
+treg catalog search "find a work email"         # by the job, not the vendor
+treg catalog get hunter.people.email.find       # params, PRICE, example response
+treg call hunter.people.email.find --query domain=reddit.com --query full_name="Alexis Ohanian"</code></pre>
+<p><strong>How a catalogued call is served</strong> — the credential ladder, in order:</p>
+<ol>
+ <li>your team registered its own tool for that provider → that tool, that key;</li>
+ <li>your team stored a secret for the provider → injected through a virtual tool;</li>
+ <li>neither, and the endpoint has a verified public route → <strong>no provider key</strong>, free;</li>
+ <li>otherwise → <strong>treg's own key</strong>, billed to the team's prepaid balance.</li>
+</ol>
+<p>The anonymous price assumes the caller does not send a provider credential header. The faithful relay preserves caller headers, so a caller-supplied provider key can use that key's credits. Your own credential always beats treg's, so connecting a key you already pay for makes those calls free of the balance rather than duplicating them. An endpoint treg has no published price for is <strong>refused</strong>, not served free — you are told to connect your own key instead. Where several providers serve one capability, <code>treg catalog search</code> shows them side by side with prices; <strong>choosing is yours</strong> — treg does not silently pick or fail over between providers for you.</p>
+<pre><code>treg balance          # credit left, calls in flight, recent spend
+treg topup            # add funds, or set up automatic top-ups</code></pre>
+<p>Out of balance is an HTTP <strong>402</strong> carrying <code>balance_micro</code>, <code>estimated_cost_micro</code> and a <code>topup_url</code>, so an agent can act on it without reading prose.</p>
+<h2>Share &amp; use your own tools</h2>
+<p>The zero-thought path — point treg at a project and it figures out what's shareable:</p>
+<pre><code>treg scan     # read-only preview: the keys, skills &amp; CLIs upload would register
+treg upload   # register them (encrypted server-side); idempotent, --replace to update</code></pre>
+<p><code>treg upload</code> scans the <code>.env</code> (matching keys against ~80 known providers), every skill subdirectory, and installed catalog CLIs. Three kinds of things go into the registry — here's how to share and use each:</p>
+<h3>1. Endpoints (HTTP APIs)</h3>
+<p><strong>Share</strong> — one upstream URL callable with a stored key, or bulk from a <code>.env</code>:</p>
+<pre><code>treg secret add STRIPE_KEY --value sk_live_123
+treg add stripe --base-url https://api.stripe.com --secret STRIPE_KEY
+
+treg upload env --select openai,stripe,resend     # or straight from the .env</code></pre>
+<p><strong>Use</strong> — the agent-native way: build the <strong>real</strong> upstream request and prefix it with the proxy. treg resolves the tool by host, injects the credential, and relays everything else faithfully:</p>
+<pre><code>Real request:   GET https://api.intercom.io/conversations?per_page=5
+Through treg:   GET https://treg.to/call/https://api.intercom.io/conversations?per_page=5
+                    header:  X-Treg-Token: &lt;your token&gt;</code></pre>
+<h3>2. CLIs</h3>
+<p><strong>Share</strong> — automatic: <code>treg upload</code> detects installed catalog CLIs (<code>stripe</code>, <code>gh</code>, <code>vercel</code>, …) and registers them; a recipe-only catalog CLI skill (e.g. <code>stripe-cli</code>) auto-becomes runnable too.</p>
+<p><strong>Use</strong> — <code>treg run</code> executes the vendor CLI <strong>with the org's credential injected</strong>, so you never hold the key or log in:</p>
+<pre><code>treg run stripe -- get /v1/balance
+treg run gh -- pr list
+treg run --server agentmail-cli inboxes list   # runs on the registry server: the key never reaches you</code></pre>
+<h3>3. Skills</h3>
+<p><strong>Share</strong> — a skill is a whole capability (<code>SKILL.md</code> recipe + its secrets + its tool(s)), registered together so the whole team runs the same skill, maintained in one place.</p>
+<p><strong>Use</strong> — pull any shared skill into your agent; its API calls go through treg with your token, so the key stays on the server, never in the skill.</p>
+<h2>Teams</h2>
+<p>An account can own up to 10 teams. Everything is scoped to an <strong>org</strong>: a token = a <code>(user, org)</code> membership, and every secret, tool, and skill belongs to the active org. Roles: <strong>owner / admin / member / viewer</strong>.</p>
+<pre><code>treg org create "Acme"                        # make a team, become owner
+treg org invite teammate@acme.com             # invite by email (pick role + tool access)
+treg org join &lt;code&gt; --email you@acme.com     # accept an invite (creates you if new)</code></pre>
+<h1>Part 2 · Self-hosting &amp; development</h1>
+<h2>Run it locally</h2>
+<p>One command (needs <code>tmux</code> + <a href="https://docs.astral.sh/uv/"><code>uv</code></a>; it syncs the venv itself):</p>
+<pre><code>scripts/dev-local.sh up        # server on http://localhost:18790, dev-safe settings</code></pre>
+<p>That runs the server in tmux with hot-reload, its own sqlite DB, and email OTP dev mode.</p>
+<blockquote>
+ <p><strong>Installing to run a server (not from source):</strong> the base package is the <strong>CLI only</strong>. To run a registry, install the server extra — <code>pip install "tools-registry[server]"</code> — which adds FastAPI, the database drivers, and encryption.</p>
+</blockquote>
+<h2>Architecture</h2>
+<p><strong>Request flow for <code>/call</code>:</strong> resolve tool (by URL host + longest <code>base_url</code> prefix, or by name) → decrypt its secret(s) → apply each binding's injector → stream to the upstream → fire-and-forget audit record.</p>
+<p><strong>Faithful-relay contract:</strong> the proxy alters <strong>only</strong> three things, everything else is verbatim:</p>
+<ol>
+ <li>hop-by-hop transport headers (re-derived per hop),</li>
+ <li>treg's own control + edge-forwarding headers and session cookie — all stripped, never leak upstream,</li>
+ <li>the injected credential(s).</li>
+</ol>
+<h2>License</h2>
+<p>Apache 2.0 with additional terms: use it freely — including commercially, inside your own organization (self-hosting your own registry is encouraged). The restriction: don't redistribute the code to third parties as a competing hosted/managed registry service without written permission.</p>

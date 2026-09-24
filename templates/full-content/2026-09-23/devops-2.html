@@ -1,0 +1,137 @@
+<h2>Kubernetes v1.37: Tracking When a PersistentVolumeClaim Was Last Used (Beta)</h2>
+<p>Kubernetes v1.37 promotes the <code>PersistentVolumeClaimUnusedSinceTime</code> feature gate to Beta (enabled by default). With this feature, the PersistentVolumeClaim (PVC) protection controller adds an <code>Unused</code> condition to each PVC, telling you whether any running pod currently references it — no custom tooling or cross-referencing required.</p>
+<p>For the API definition of PVC conditions, see the PersistentVolumeClaim API reference. Read on to learn how the <code>Unused</code> condition works and how to use it.</p>
+<h2>Why track PVC usage?</h2>
+<p>In large-scale Kubernetes clusters, it is common for users to create PVCs and then delete the associated pods without cleaning up the storage, because Kubernetes does not automatically delete PVCs when their pods are removed (to protect against accidental data loss). Over time, these <em>orphaned</em> PVCs may accumulate, silently consuming storage capacity and driving up cloud costs.</p>
+<p>Before Kubernetes v1.37, it was easy to identify an unused PersistentVolume, but much harder to determine whether a PVC was still being used. Doing so required cross-referencing pods, PersistentVolumes, and PVCs over a potentially large window of time. Administrators often resorted to custom monitoring pipelines or scripts to answer a seemingly simple question: <em>"Is anything actually using this volume?"</em></p>
+<p>The <code>PersistentVolumeClaimUnusedSinceTime</code> feature solves this by making the answer available natively in the PVC status. Once the feature is enabled, every PVC gets an <code>Unused</code> condition managed by the PVC protection controller.</p>
+<h3>User stories</h3>
+<ul>
+ <li><strong>Storage administrator</strong>: "I want to know which PVCs in my cluster are not being used by any pod so I can safely identify orphaned volumes and schedule them for deletion."</li>
+ <li><strong>DevOps engineer</strong>: "I want to list PVCs that have the <code>Unused</code> condition set to <code>True</code> so I can automate cleanup in development environments."</li>
+</ul>
+<h2>How does it work?</h2>
+<p>The PVC protection controller — which already watches pods to enforce the storage object in use protection — now also manages a new <code>Unused</code> condition on PVCs.</p>
+<p>The condition works as follows:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Scenario</th>
+   <th>Condition status</th>
+   <th>Reason</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>No non-terminal pods reference the PVC</td>
+   <td><code>Unused=True</code></td>
+   <td><code>NoPodsUsingPVC</code></td>
+  </tr>
+  <tr>
+   <td>At least one running or pending pod references the PVC</td>
+   <td><code>Unused=False</code></td>
+   <td><code>PodUsingPVC</code></td>
+  </tr>
+ </tbody>
+</table>
+<p>A few details worth noting:</p>
+<ul>
+ <li><strong>Terminated pods don't count</strong>: A pod that has completed (phase <code>Succeeded</code> or <code>Failed</code>) does not keep the PVC marked as in use. This means batch jobs with <code>restartPolicy: Never</code> won't prevent the PVC from becoming <code>Unused=True</code> after they finish.</li>
+ <li><strong>Pending pods do count</strong>: Even an unschedulable pod (for example, one with an impossible node selector) still counts as using the PVC. The intent to use the volume is enough.</li>
+ <li><strong>Multiple pods</strong>: If several pods reference the same PVC, the condition transitions to <code>Unused=True</code> only after the *<em>last</em>" non-terminated pod is removed or terminates.</li>
+</ul>
+<h3>Using <code>lastTransitionTime</code> to find when a PVC became idle</h3>
+<p>Like every Kubernetes condition, the <code>Unused</code> condition carries a standard <code>lastTransitionTime</code> field. This means you get a useful bonus for free: when the condition transitions from <code>False</code> to <code>True</code>, the <code>lastTransitionTime</code> records exactly when the PVC became idle. You can use this timestamp to answer questions like <em>"how long has this PVC been sitting unused?"</em> — for example, to find PVCs that have been idle for more than 30 days (see the example query below).</p>
+<h2>What changed from Alpha to Beta?</h2>
+<p>Kubernetes v1.36 introduced this feature as Alpha, where you had to enable the <code>PersistentVolumeClaimUnusedSinceTime</code> feature gate explicitly. For Beta in v1.37, the feature gate is enabled by default, and the feature has full end-to-end test coverage.</p>
+<h2>How to use it</h2>
+<p>Since the feature is Beta and enabled by default in Kubernetes v1.37, the <code>Unused</code> condition will appear on PVCs automatically. Here is a walkthrough to see it in action:</p>
+<ol>
+ <li>
+  <p>Create a PVC:</p>
+  <pre><code>apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-data
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+</code></pre></li>
+ <li>
+  <p>After a short time, inspect the PVC conditions:</p>
+  <pre><code>kubectl get pvc my-data -o jsonpath='\{.status.conditions[*]}' | jq .
+</code></pre>
+  <p>You should see an <code>Unused</code> condition with status <code>True</code> and reason <code>NoPodsUsingPVC</code>:</p>
+  <pre><code>\{
+  "lastProbeTime": null,
+  "lastTransitionTime": "2026-09-14T12:03:11Z",
+  "message": "No pods are currently referencing this PVC",
+  "reason": "NoPodsUsingPVC",
+  "status": "True",
+  "type": "Unused"
+}
+</code></pre></li>
+ <li>
+  <p>Create a pod that uses the PVC:</p>
+  <pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: my-app
+spec:
+  containers:
+  - name: app
+    image: busybox
+    command: ["sleep", "3600"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: my-data
+</code></pre></li>
+ <li>
+  <p>Check the condition again — it should now show <code>Unused=False</code>:</p>
+  <pre><code>kubectl get pvc my-data -o jsonpath='\{.status.conditions[?(@.type=="Unused")].status}'
+</code></pre>
+  <p>Output:</p>
+  <pre><code>False
+</code></pre></li>
+ <li>
+  <p>Delete the pod and wait for the condition to transition back to <code>Unused=True</code>:</p>
+  <pre><code>kubectl delete pod my-app
+kubectl get pvc my-data -o jsonpath='\{.status.conditions[?(@.type=="Unused")]}'
+</code></pre>
+  <p>The condition should show <code>Unused=True</code> with reason <code>NoPodsUsingPVC</code> again.</p></li>
+</ol>
+<h3>Finding unused PVCs across the cluster</h3>
+<p>To list all PVCs that have been unused for more than 30 days, you can use a command like:</p>
+<h4>Note:</h4>
+<p>This command uses <code>jq</code>, a command-line JSON processor.</p>
+<pre><code>kubectl get pvc -A -o json | jq -r '
+  .items[]
+  | select(.status.conditions[]? | select(.type=="Unused" and .status=="True"))
+  | select(
+      (.status.conditions[] | select(.type=="Unused") | .lastTransitionTime) as $t
+      | (now - ($t | fromdateiso8601)) &gt; (30 * 86400)
+    )
+  | "\(.metadata.namespace)/\(.metadata.name) unused since \(.status.conditions[] | select(.type=="Unused") | .lastTransitionTime)"
+'
+</code></pre>
+<h2>What's next?</h2>
+<p>Depending on feedback and adoption, the Kubernetes project intends to graduate this feature to General Availability (GA) in a future release. If you have feedback on this feature, please open an issue in the kubernetes/kubernetes repository.</p>
+<p>To learn more about this enhancement, refer to KEP-5541: PersistentVolumeClaim last used time.</p>
+<h2>Getting involved</h2>
+<p>The Kubernetes project always welcomes new contributors. If you would like to get involved, you can join us at SIG Storage.</p>
+<p>If you would like to share feedback, you can do so on our public Slack channel (visit https://slack.k8s.io/ for an invitation if you need one).</p>
+<p>Special thanks to the contributors who helped design and implement this feature (alphabetical order):</p>
+<ul>
+ <li>Arvind Parekh</li>
+ <li>Hemant Kumar</li>
+ <li>Jan Šafránek</li>
+ <li>Kevin Hannon</li>
+ <li>Roman Bednář</li>
+</ul>

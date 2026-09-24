@@ -1,0 +1,133 @@
+<h2>Props Are Not a Design System</h2>
+<p>Most UI kits let you pass any style as a prop — radius, size, color, or a wall of Tailwind classes, whatever you need. That flexibility is exactly the problem: it turns every component call into a one-off styling decision, and no two buttons end up the same. Let’s talk about practices that prevent building an inconsistent, unmaintainable code base that won’t scale.</p>
+<p>Look at this button built with Tailwind for example:</p>
+<pre><code>&lt;button
+  className="
+    inline-flex items-center justify-center gap-2
+    whitespace-nowrap rounded-md text-sm font-medium
+    ring-offset-background transition-colors
+    focus-visible:outline-none focus-visible:ring-2
+    focus-visible:ring-ring focus-visible:ring-offset-2
+    disabled:pointer-events-none disabled:opacity-50
+    bg-primary text-primary-foreground
+    hover:bg-primary/90
+    h-10 px-4 py-2
+    dark:bg-primary dark:text-primary-foreground
+    dark:hover:bg-primary/90
+    sm:h-9 sm:px-3
+    md:h-10 md:px-4
+    lg:text-base
+    [&amp;_svg]:pointer-events-none
+    [&amp;_svg]:size-4
+    [&amp;_svg]:shrink-0
+  "
+&gt;
+  Save changes
+&lt;/button&gt;</code></pre>
+<p>You can do the same thing with pure HTML too:</p>
+<pre><code>&lt;button
+  style="
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    white-space: nowrap;
+    border-radius: 0.375rem;
+    font-size: 0.875rem;
+    line-height: 1.25rem;
+    font-weight: 500;
+    transition: color 150ms, background-color 150ms, border-color 150ms,
+      text-decoration-color 150ms, fill 150ms, stroke 150ms;
+    background-color: var(--primary);
+    color: var(--primary-foreground);
+    height: 2.5rem;
+    padding: 0.5rem 1rem;
+  "
+&gt;
+  Save changes
+&lt;/button&gt;</code></pre>
+<p>Both examples do the same thing: <em>the style is decided at the call site</em>, instance by instance, instead of being named once and reused. That’s what I mean by <strong>inlining</strong> - <em>the mechanism doesn’t matter</em>, whether it’s a <code>style</code> attribute, style props, or a wall of utility classes.</p>
+<p>Aside from the obvious technical issues of page size and caching, there are a few more important foundational problems:</p>
+<ol>
+ <li>you cannot ensure visual consistency, even within a single file</li>
+ <li>such code has no semantics, so you can’t tell what it means</li>
+ <li>such code has no system behind it, so it is difficult to maintain - even with an LLM you’ll wait a long time, because this error-prone style requires many iterations to correct</li>
+</ol>
+<p>To address these problems, we need to stop deciding style at the call site and start defining it once, as a reusable, named unit of the interface.</p>
+<p>The implementation depends on the stack, but most projects today build on component-based UI kits, so that’s what the examples below will use. Each component will be built from <strong>variants</strong> and <strong>modifiers</strong>.</p>
+<h2>Use variants</h2>
+<p>A variant is the self-contained style that completely describes all the visual aspects of a component, given a semantic name.</p>
+<p>You can use a variant like this:</p>
+<pre><code>&lt;Button variant="primary"&gt;Save changes&lt;/Button&gt;
+&lt;Button variant="secondary"&gt;Cancel&lt;/Button&gt;</code></pre>
+<p>In pure HTML with BEM methodology, it would look like this:</p>
+<pre><code>&lt;button class="Button Button__variant_primary"&gt;Save changes&lt;/button&gt;
+&lt;button class="Button Button__variant_secondary"&gt;Cancel&lt;/button&gt;</code></pre>
+<p>A variant must contain all implementation details of the visual - inner geometry, colors, typography, everything. It must not expect its styles to be supplemented by anything external, whether that’s a global reset, a stray <code>font-family</code>, or any other in-place styling.</p>
+<p>A variant defines the semantic unit of the user interface. That’s what makes a design system observable: you can see exactly which variants of a component exist and consistently update all of them at once.</p>
+<h2>Use modifiers</h2>
+<p>When you use a UI kit on a large project with a rich visual design, you may be tempted to write something like this:</p>
+<pre><code>&lt;Button
+	variant="primary"
+	radius="xl"
+	fontSize="xl"
+	fontWeight=\{500}
+	fontFamily="fancy"
+&gt;
+	Buy
+&lt;/Button&gt;</code></pre>
+<p>This is the same call-site styling problem again, just typed: the props override the variant from outside, so it no longer defines the button’s final look. Worse, those overrides don’t track the variant — update the variant or introduce a new color scheme, and they silently fall out of sync.</p>
+<p>If we need a variation of a view, we can implement a <strong>modifier</strong> instead, to keep things manageable. A modifier is part of the component’s API, at the same level as the variant - not an escape hatch around it.</p>
+<p>For example, we can use <code>variant</code> to set the visual style of a button and add a modifier <code>size</code> to control its geometry:</p>
+<pre><code>&lt;Button variant="primary" size="xl"&gt;Buy&lt;/Button&gt;</code></pre>
+<p><em>If we find ourselves applying many modifiers at once, that’s a signal to introduce another variant instead:</em></p>
+<pre><code>&lt;Button variant="fancy-primary" size="xl"&gt;Buy&lt;/Button&gt;</code></pre>
+<p>This is the core discipline: variants and modifiers aren’t just two features of a UI kit, they’re a rule for where a styling decision is allowed to live, and when a recurring combination of modifiers has earned its own name.</p>
+<p>The implementation example in vanilla CSS with a BEM-style modifier:</p>
+<pre><code>.button__size_xl \{
+	border-radius: 12px;
+	font-size: 3rem;
+	font-weight: 500;
+	/* ... */
+}</code></pre>
+<p>CSS modules for Mantine UI:</p>
+<pre><code>.root \{
+	&amp;[data-size="xl"] \{
+		border-radius: 12px;
+		font-size: 3rem;
+		font-weight: 500;
+		/* ... */
+	}
+}</code></pre>
+<p>ChakraUI theme:</p>
+<pre><code>export default defineConfig(\{
+	theme: \{
+		semanticTokens: \{
+			colors: \{
+				// ...
+			},
+		},
+		recipes: \{
+			button: defineRecipe(\{
+				variants: \{
+					size: \{
+						xl: \{
+							borderRadius: "12px",
+							fontSize: "3rem",
+							fontWeight: "500",
+						},
+					},
+					variant: \{
+						accent: \{
+							// ...
+						},
+					},
+				},
+			}),
+		},
+	},
+});</code></pre>
+<p>Same rule, three different technologies - variants and modifiers work regardless of the tools you use.</p>
+<h2>Design the system</h2>
+<p>This approach can be applied to almost any UI kit, even one that wasn’t designed with this discipline in mind.</p>
+<p>If you follow it, you’ll eventually end up with a design system even if you didn’t set out to build one - you’ll naturally be forced to identify the reusable units of your interface. Your code will stop being a pile of one-off styling decisions and start being a system.</p>

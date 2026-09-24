@@ -1,0 +1,72 @@
+<h2>Analyzing Jev, a new AI model</h2>
+<p>A new AI model called Jev launched last week and went viral.</p>
+<p>It's not an LLM. It doesn't generate text or pictures, but could be very useful for a number of use cases. The creators call it “the first System One model”, tout its performance (193x faster, 444x cheaper) and promise it can't hallucinate.</p>
+<p>So, what is it?</p>
+<h2>How it (probably) works</h2>
+<p>Behind the impressive marketing is a very interesting model. Jev is a close relative of LLMs like GPT, Claude, or DeepSeek, but is actually more similar to the BERT series of models, which are used for classification, not generation. (If you've ever wondered why someone calls out a difference between “AI” and “GenAI”, that's the distinction they mean).</p>
+<p>TypeSafe (the creators of Jev) haven't actually published any papers on the system, but here's a reasonable guess and simplification, just to give you a sense of how it works.</p>
+<p>Imagine going back to 2022. GPT-3, the best LLM at the time, can autocomplete text (you give it some text as an input and it continues it). Then InstructGPT shows how to make the LLM follow instructions from the user. Following the ChatGPT launch, the advances pile up, with reasoning, reinforcement learning, agentic use cases, and all the modern tech tricks LLMs now employ.</p>
+<p>BERTs, meanwhile, are almost stuck in time. There's ModernBERT, which modernizes it a lot, but you still need to fine-tune your model for the specific task. This is annoying, cumbersome, and more expensive than just asking an LLM. But these classification models are still much faster and cheaper than LLMs for suitable tasks, once you go through the trouble of training them.</p>
+<p>Now imagine someone going, “<em>OK, how can we modernize BERTs with all the cool tech LLMs have been getting? Like using instructions in the input instead of having to re-train, making it really large, and using reinforcement learning?</em>” That's basically what Jev is (not exactly right, but it's a good analogy).</p>
+<p>Since it only ingests the input and provides a few probabilities as output, it's much faster and cheaper than LLMs. Jev's model size is not publicly known, but even if it's 100x larger than ModernBERT, it'd still be a paltry 40B params next to the humongous 2T-5T LLMs.</p>
+<p>The authors also mention performance improvements due to not needing to generate text tokens and other workflow simplification, as well as the fact that they can evaluate the questions in parallel.</p>
+<p>The “System One” moniker is a clever marketing trick that means “it's not a reasoning model”. They borrow the term from Thinking, Fast and Slow, where System 1 means intuitive, fast, automatic thinking and System 2 means deliberate, slower, effortful reasoning.</p>
+<p>What about the hallucination claim? In the context of Jev, no hallucination means it can't generate output outside of the specified structure (i.e. it's “type-safe”), but that doesn't mean it can't generate incorrect output.</p>
+<h2>Using Jev</h2>
+<p>This brings me to the usage part: you'd use Jev (and other classification models like BERTs) to answer very specific questions, like “is this email spam?”, and it can answer with a Yes/No, a score (from a continuous domain, like 0.0-10.0), or a choice from a few discrete possibilities (classification).</p>
+<p>Interestingly, the questions are independent and evaluated in parallel, which helps with performance. It also means you can just batch all the questions/classifications for a given piece of data at once, instead of going step by step.</p>
+<p>Since Jev doesn't need to be fine-tuned, it's easy to use it via an API (and in fact, it's the only way to use it – don't expect the weights). Here's one official example, in Python:</p>
+<pre><code>from typesafe_sdk import Choice, Noul, Score, TypeSafeClient
+
+client = TypeSafeClient()
+
+ticket = """
+Hi, I've been trying to connect my Stripe account for 3 days
+and the integration keeps failing.
+I'm losing sales. Please help ASAP.
+"""
+
+response = client.system_one(
+    state=ticket,
+    questions=\{
+        "department": Choice(
+            instructions="Which team should handle this",
+            criteria=\{
+                "billing": "Payment or subscription issues",
+                "technical": "Bugs or integration problems",
+                "sales": "Pricing or account questions",
+            },
+        ),
+        "frustration": Score(
+            instructions="How frustrated the customer appears",
+            criteria=[
+                "Calm, just stating facts",
+                "Frustrated but civil",
+                "Very angry, strong language",
+            ],
+        ),
+        "is_urgent": Noul(
+            instructions="The message conveys urgency or time-sensitivity",
+        ),
+    },
+)
+
+print(response.answers["department"].choice)  # "technical"
+print(response.answers["frustration"].score)  # 1.0
+print(response.answers["is_urgent"].noul)     # 1.0
+</code></pre>
+<p>Here you describe the input (i.e. the “state” of the system) and ask a number of questions. The instructions on how to classify/decide are actually part of each question, not the input state.</p>
+<h2>How about prompt injection?</h2>
+<p>If this is not a quirk of the API but actually how the model was trained, with state and instructions being separate, this might mean Jev is much harder to prompt-inject.</p>
+<p>I tried a few times to convince the above example to route the query to a different department but was unsuccessful. While I might have had more success had I tried harder, it does seem like Jev is a bit more resilient to these kinds of attacks.</p>
+<p>The authors are coy about this aspect, saying the adversarial examples for Jev are different from those of LLMs so that they work even better together.</p>
+<h2>Jev vs BERT</h2>
+<p>A few months ago I trained a BERT model to classify some Croatian language texts, and I wondered how Jev would fare on the same task, so I gave it a go.</p>
+<p>I ran it zero-shot on a random sample of 3,000 texts, with a one-sentence English instruction, and the (Croatian) text, asking for binary classification.</p>
+<p>Jev got it right 97.1% of the time, compared to 97.6% for my fine-tuned model – basically the same. Looking at the cases where the two models disagreed, most turned out to be mislabeled data, and Jev was the one following the stated definition more literally.</p>
+<p>Cost and speed were as advertised: the entire run took about a minute and cost around 20 cents. My local model ran at about the same speed (on NVidia RTX 3060).</p>
+<h2>Is it useful?</h2>
+<p>Yes. If your use case is something that fits how Jev works, it could be much better than LLMs. Of course, if you already have a locally tuned BERT, the gains may not be much, if any – should be easy to test!</p>
+<p>In my case, had I had access to Jev a few months ago, I wouldn't have needed to go to trouble of fine-tuning my own model. I'd spend a tiny bit more money (ignoring the hardware cost), which would be more than recouped in development savings.</p>
+<p>What I'm most excited about is the combination of technical excellence and marketing excellence that raised the profile for this type of AI system, which has fallen by the wayside compared to the hype and capabilities of LLMs. That led people to use them in cases where they really aren't the best fit.</p>
+<p>Jev and all the copycats that are sure to appear will bring a breath of fresh air and some extra breathing room to many orgs' wallets :)</p>
