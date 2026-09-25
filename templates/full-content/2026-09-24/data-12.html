@@ -1,0 +1,48 @@
+<h1>Profile your Polars queries</h1>
+<p>TL;DR; Add <code>pl.Config.enable_monitoring()</code> to your python environment to enable profiling of your query allowing you to view your query’s progress live and find &amp; optimize bottlenecks.</p>
+<p>Our query profiler is now available for open source Polars users for free. This enables users to debug &amp; profile queries running on their own (local) infrastructure using an intuitive interface and soon an MCP for your agents. The profiler gets you the most detailed information of what Polars during execution. You get a glimpse under the hood of the query engine. You can see rows flowing through the query, see how many rows are filtered which join produces most data and much more.</p>
+<p>With this information you can point out bottle necks in your queries, recommend optimizations (using an agent) and act as a live progress indicator for long running queries. The query is executed locally and sends live telemetry data to the platform. This functionality is available for the streaming and distributed engine.</p>
+<h2>Getting started</h2>
+<p>Using the query profiler is a one line change in your data pipelines. First <code>pip install polars_cloud</code> in your python environment. This enables the functionality to send telemetry data to the platform. Second, enable the flag <code>pl.Config.enable_monitoring()</code> in the root of your script.</p>
+<p>Try it out today using the script below:</p>
+<pre><code>from datetime import date
+
+import polars as pl
+pl.Config.enable_monitoring()
+
+BASE = "s3://polars-public-datasets/tpch/sf1"
+OPTS = \{"aws_skip_signature": "true", "aws_region": "eu-west-1"}
+lineitem = pl.scan_parquet(f"\{BASE}/lineitem/*.parquet", storage_options=OPTS)
+orders = pl.scan_parquet(f"\{BASE}/orders/*.parquet", storage_options=OPTS)
+late = lineitem.filter(pl.col("l_commitdate") &lt; pl.col("l_receiptdate"))
+
+result = (
+    orders.join(late, left_on="o_orderkey", right_on="l_orderkey", how="semi")
+    .filter(pl.col("o_orderdate").is_between(date(1993, 7, 1), date(1993, 10, 1), closed="left"))
+    .group_by("o_orderpriority")
+    .agg(pl.len().alias("order_count"))
+    .sort("o_orderpriority")
+    .collect()
+)</code></pre>
+<h2>How it works</h2>
+<p>The profiler hooks into the streaming engine and sends back telemetry data at key points:</p>
+<ul>
+ <li>After query planning &amp; optimization the optimized plan (logical &amp; physical) is sent</li>
+ <li>During query execution the progress of each node is sent at fixed intervals (currently every 5s)</li>
+ <li>Once the query is finished a final flush is done to ensure accurate metrics and timings</li>
+</ul>
+<p><strong>Security &amp; Privacy</strong></p>
+<p>Only the query plan is shared with the platform, the data never leaves your environment.</p>
+<h2>Analyzing your Query</h2>
+<p>If you are in charge of running data pipelines, the query profiler is a great tool for analyzing and optimizing (historical) queries. It allows you to observe where time is spent, identify bottlenecks and optimize your queries.</p>
+<p>During a query (or for historical queries) you can view the progress at https://cloud.pola.rs/portal/ under queries. Clicking on the query shows the high level details and both plans.</p>
+<p>The logical plan contains the query plan after optimizations and the physical plan contains the detailed execution nodes with performance metrics included.</p>
+<p>In the query above we can see that 24.9 MiB + 15 MiB ~ 40 MiB were loaded from S3 and the majority of the CPU time was spent on the join. This query was bound by I/O speed as the CPU time of the join was low (~103ms) compared to total query time (~5s) indicating the join was waiting on data loaded from S3. For more details on how to use the query profiler go to our user guide.</p>
+<h2>Try it out!</h2>
+<p>Run your queries and let us know your experience by commenting on our Discord or adding feature requests to our issue tracker.</p>
+<h2>Up Next</h2>
+<p>We are already working on the next big release for the query profiler. In the upcoming weeks you can expect the release of our MCP server which allows your agents to profile queries. Additionally we are adding node specific metrics to our plans to increase the capabilities to analyze your queries.</p>
+<h2>Footnotes</h2>
+<ol>
+ <li>Usage is limited to fair use to prevent excessive platform use.</li>
+</ol>

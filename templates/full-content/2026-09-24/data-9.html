@@ -1,0 +1,246 @@
+<h1>Jevflake</h1>
+<p>Jevflake lets Snowflake ask questions about your data using Jev, the decision model from TypeSafe AI. It is a dbt package, with a Terraform module for teams that manage Snowflake that way.</p>
+<p>Jev does not write text. You give it a row and a typed question. It gives back a typed answer with a probability. That makes it a good fit for SQL: the answer is a number or a label you can filter, join, and test.</p>
+<p>This package does three things:</p>
+<ol>
+ <li>Sets up Snowflake so it is allowed to call the Jev API.</li>
+ <li>Creates SQL functions that call Jev: <code>jev_noul</code>, <code>jev_choice</code>, <code>jev_score</code>, and <code>jev_ask</code>.</li>
+ <li>Gives you dbt macros and tests so answers are stored once, reused, and checked like any other model.</li>
+</ol>
+<p>If you manage Snowflake with Terraform, there is a Terraform module that does steps 1 and 2 instead of dbt.</p>
+<p>This project is not affiliated with TypeSafe AI, Snowflake, or dbt Labs.</p>
+<h2>The three question types</h2>
+<ul>
+ <li><strong>Noul</strong> is a yes or no question. The answer is a probability from 0 to 1 that the answer is yes.</li>
+ <li><strong>Choice</strong> picks one option from a fixed list. The answer has the pick, a probability for each option, and a confidence number.</li>
+ <li><strong>Score</strong> rates the row against ordered levels. The answer has a score, probabilities, and a confidence number. The score is the probability weighted average of the level numbers, so three levels give a score from 0 to 2.</li>
+</ul>
+<h2>Before you start</h2>
+<ul>
+ <li>A Snowflake account with external access turned on. Trial accounts have it off by default, and your Snowflake account representative has to turn it on.</li>
+ <li>A role that can create an integration. By default that is <code>ACCOUNTADMIN</code>.</li>
+ <li>A TypeSafe API key from https://console.typesafe.ai.</li>
+ <li>dbt 1.8 or newer with <code>dbt-snowflake</code>. It has been tested on dbt 1.12.</li>
+</ul>
+<p>The Python function needs the <code>pandas</code> and <code>requests</code> packages. Snowflake installs them for you. Depending on the account, they come from Snowflake's PyPI repository or from its Anaconda channel. If creating the function fails with a message about Anaconda terms, an <code>ORGADMIN</code> has to accept those terms once in Snowsight.</p>
+<h2>Setup</h2>
+<h3>1. Store your API key as a Snowflake secret</h3>
+<p>Run this once in Snowflake. The package never sees the key itself, so it never lands in dbt logs.</p>
+<pre><code>create schema if not exists analytics.jevflake;
+
+create secret analytics.jevflake.jev_api_key
+  type = generic_string
+  secret_string = 'your-typesafe-api-key';</code></pre>
+<p>Use your own database in place of <code>analytics</code>. By default the package looks in your dbt target database, in a schema called <code>jevflake</code>.</p>
+<h3>2. Add the package</h3>
+<pre><code>packages:
+  - git: "https://github.com/KranzL/Jevflake.git"
+    revision: main</code></pre>
+<p>Then run <code>dbt deps</code>.</p>
+<h3>3. Create the network access and the functions</h3>
+<pre><code>dbt run-operation jevflake.setup --args '\{grant_to: [transformer]}'</code></pre>
+<p>This creates:</p>
+<ul>
+ <li>the schema if it does not exist yet</li>
+ <li>a network rule that allows traffic to <code>api.typesafe.ai</code> only</li>
+ <li>an external access integration called <code>jev_access</code></li>
+ <li>the SQL functions</li>
+ <li>for each role in <code>grant_to</code>: usage on the schema and on the functions</li>
+</ul>
+<p>A role in <code>grant_to</code> can call the functions with only those grants, plus usage on the database and a warehouse. It does not need access to the integration or the secret. If a role lacks usage on the database, an admin can grant it:</p>
+<pre><code>grant usage on database analytics to role reporter;</code></pre>
+<p>You can run setup again at any time, and you should after you change any setting below. Pass the same <code>grant_to</code> every time. Setup recreates the functions, and Snowflake drops the old grants when it does.</p>
+<p>To see the SQL without running it:</p>
+<pre><code>dbt run-operation jevflake.setup --args '\{dry_run: true}'</code></pre>
+<p>Database, schema, role, and column names are used unquoted. Stick to plain identifiers made of letters, digits, and underscores.</p>
+<h4>If your dbt role cannot create integrations</h4>
+<p>Split the work. An admin runs the first command. The dbt role runs the second.</p>
+<pre><code>dbt run-operation jevflake.setup_network --args '\{grant_to: [transformer], callers: [reporter]}'
+dbt run-operation jevflake.setup_functions --args '\{grant_to: [reporter]}'</code></pre>
+<ul>
+ <li>In <code>setup_network</code>, <code>grant_to</code> lists the roles that will create the functions. They get usage on the integration, read on the secret, and usage and create function on the schema. <code>callers</code> lists the roles that will call the functions. They get usage on the schema, which only the schema owner can grant.</li>
+ <li>In <code>setup_functions</code>, <code>grant_to</code> lists the roles that will call the functions. They get usage on each function.</li>
+</ul>
+<p>If the secret lives in a different schema than the functions, the role that creates the functions also needs usage on that schema.</p>
+<h4>Removing it</h4>
+<p>To remove the functions, the integration, and the network rule:</p>
+<pre><code>dbt run-operation jevflake.teardown</code></pre>
+<p>The secret and the schema are left in place.</p>
+<h2>Use it in plain SQL</h2>
+<pre><code>select
+    ticket_id,
+    analytics.jevflake.jev_noul(body, 'The customer is asking for a refund') as wants_refund
+from support_tickets;</code></pre>
+<pre><code>select
+    ticket_id,
+    analytics.jevflake.jev_choice(
+        body,
+        'Which team should handle this ticket',
+        parse_json('\{"billing": "Charges and refunds", "technical": "Bugs and errors"}')
+    ) as answer
+from support_tickets;</code></pre>
+<p>The arguments are what Jev reads, the instructions, and the criteria:</p>
+<ul>
+ <li><code>jev_noul(state, instructions)</code> returns a float. An optional third argument describes what counts as yes and no: <code>parse_json('\{"true": "...", "false": "..."}')</code>.</li>
+ <li><code>jev_choice(state, instructions, criteria)</code> returns a variant. The criteria is an object that maps each option to a short description.</li>
+ <li><code>jev_score(state, instructions, criteria)</code> returns a variant. The criteria is an array of level descriptions, lowest first.</li>
+</ul>
+<p><code>jev_choice</code> and <code>jev_score</code> return the whole answer. Read parts of it with <code>answer:choice</code>, <code>answer:score</code>, <code>answer:confidence</code>, <code>answer:probabilities</code>, and for a score <code>answer:legend</code>.</p>
+<p>What Jev reads must be text, an object, or an array. Pass a text column as it is. To send more than one column, pass <code>object_construct('subject', subject, 'body', body)</code>. Jev rejects a bare number, date, or boolean, and the answer comes back null. Cast those to text first, for example <code>amount::varchar</code>, or put them inside an object.</p>
+<p><code>jev_ask</code> takes many named questions at once and makes one API call per row. Use it when you have more than one question about the same row. It is cheaper and faster than separate calls, because the row is only sent once.</p>
+<pre><code>select
+    ticket_id,
+    analytics.jevflake.jev_ask(
+        object_construct('subject', subject, 'body', body),
+        parse_json('\{
+          "ticket_type": \{
+            "type": "choice",
+            "instructions": "Which team should handle this ticket",
+            "criteria": \{"billing": "Charges and refunds", "technical": "Bugs and errors"}
+          },
+          "blocked": \{
+            "type": "noul",
+            "instructions": "The customer is blocked from running their business"
+          }
+        }')
+    ):answers as answers
+from support_tickets;</code></pre>
+<p>The result has one entry per question name, for example <code>answers:ticket_type:choice</code> and <code>answers:blocked:noul</code>.</p>
+<p>You will also see a function called <code>jev_ask_json</code> in the schema. It is the Python function the others are built on. You do not need to call it.</p>
+<h2>Use it in dbt models</h2>
+<h3>Store answers in a judgments model</h3>
+<p>This is the recommended way. Answers are stored in a table, one row per key and question. A row is only sent to Jev again if its content changes, you change the questions, or you change <code>jevflake_model</code>.</p>
+<pre><code>\{\{ config(
+    materialized='incremental',
+    unique_key=['ticket_id', 'question']
+) }}
+
+\{\{ jevflake.judgments(
+    relation=ref('stg_support_tickets'),
+    key='ticket_id',
+    state=['subject', 'body'],
+    questions=\{
+        'ticket_type': jevflake.choice_question(
+            'Which team should handle this ticket',
+            \{
+                'billing': 'Charges, refunds, invoices, plans',
+                'technical': 'Bugs, crashes, errors, slow pages',
+                'account': 'Login, access, profile changes'
+            }
+        ),
+        'urgency': jevflake.score_question(
+            'How urgent is this ticket',
+            ['No time pressure', 'Normal queue', 'Customer is blocked right now']
+        ),
+        'has_contact_info': jevflake.noul_question(
+            'The text contains a phone number or an email address'
+        )
+    }
+) }}</code></pre>
+<p>Arguments:</p>
+<ul>
+ <li><code>relation</code> is the model or source to read.</li>
+ <li><code>key</code> is the column, or list of columns, that identifies a row.</li>
+ <li><code>state</code> is what Jev gets to read. It can be one SQL expression, a list of columns, or a mapping of labels to SQL expressions. Send only the columns the questions need. TypeSafe's docs say unrelated content lowers accuracy, and in testing the same question gave noticeably different probabilities with and without an extra column.</li>
+ <li><code>questions</code> is a mapping of names to questions. All of them go out in one API call per row.</li>
+</ul>
+<p>Columns in the result: your key columns, <code>question</code>, <code>answer_type</code>, <code>noul</code>, <code>choice</code>, <code>score</code>, <code>confidence</code>, <code>probabilities</code>, <code>error</code>, <code>answer</code>, <code>model</code>, <code>state_hash</code>, <code>questions_hash</code>, <code>judged_at</code>.</p>
+<p>Things to know about what gets stored:</p>
+<ul>
+ <li>If you change any question, every row is asked again on the next run.</li>
+ <li>If you remove or rename a question, its old rows stay until you run the model with <code>--full-refresh</code>. The same goes for rows that are deleted from the source.</li>
+ <li>Rows with a null key are skipped. When <code>state</code> is a single SQL expression and it is null, the row is skipped too. Skipped rows are never sent to Jev and leave no row in the result. When <code>state</code> is a list of columns or a mapping, the row is always sent, even if every column is null.</li>
+ <li>The <code>model</code> column holds the versioned model ID the API reports, falling back to your configured <code>jevflake_model</code>.</li>
+</ul>
+<h3>Put an answer straight into a column</h3>
+<pre><code>select
+    ticket_id,
+    \{\{ jevflake.noul('body', 'The customer is asking for a refund') }} as wants_refund,
+    \{\{ jevflake.choice('body', 'What is the tone', ['calm', 'frustrated', 'happy']) }} as tone,
+    \{\{ jevflake.score('body', 'How urgent is this', ['low', 'medium', 'high']) }} as urgency
+from \{\{ ref('stg_support_tickets') }}</code></pre>
+<p>The first argument is a SQL expression written as a string, a list of columns, or a mapping, the same as <code>state</code> above. <code>noul</code> gives the probability as a float, <code>choice</code> gives the chosen label as text, and <code>score</code> gives the score as a float. For <code>choice</code> you can pass a list of options, or a mapping of options to descriptions.</p>
+<p>Each macro is one API call per row, every time the model runs. Make the model incremental, or use a judgments model, so you do not pay for the same rows twice.</p>
+<h3>Review queue</h3>
+<p>Some answers should go to a person. This macro selects errors, yes or no answers in the uncertain middle, and choices or scores with low confidence.</p>
+<pre><code>\{\{ jevflake.review_queue(ref('ticket_judgments'), noul_low=0.2, noul_high=0.8, min_confidence=0.5) }}</code></pre>
+<h3>Tests</h3>
+<p>These run on a judgments model. They read stored answers, so running tests costs nothing.</p>
+<pre><code>models:
+  - name: ticket_judgments
+    data_tests:
+      - jevflake.no_errors
+      - jevflake.noul_between:
+          arguments:
+            question: has_contact_info
+            max_value: 0.2
+      - jevflake.confidence_at_least:
+          arguments:
+            question: ticket_type
+            threshold: 0.5
+          config:
+            severity: warn</code></pre>
+<ul>
+ <li><code>no_errors</code> fails on rows Jev rejected, for example text that is too long.</li>
+ <li><code>noul_between</code> fails when a yes or no probability is outside <code>min_value</code> and <code>max_value</code>. They default to 0 and 1.</li>
+ <li><code>confidence_at_least</code> fails when a choice or score has confidence below <code>threshold</code>. Leave out <code>question</code> to check every choice and score in the model.</li>
+</ul>
+<p>The <code>arguments</code> key needs dbt 1.10.5 or newer. On older versions, put the test arguments directly under the test name.</p>
+<h2>Settings</h2>
+<p>Set these as <code>vars</code> in your <code>dbt_project.yml</code>. Run <code>jevflake.setup</code> again after changing any of them.</p>
+<ul>
+ <li><code>jevflake_database</code>: where the functions live. Default: your target database.</li>
+ <li><code>jevflake_schema</code>: default <code>jevflake</code>.</li>
+ <li><code>jevflake_secret</code>: full name of the secret. Default <code>&lt;database&gt;.&lt;schema&gt;.jev_api_key</code>.</li>
+ <li><code>jevflake_integration</code>: default <code>jev_access</code>. Integrations are account level, so the name must be unique in the account.</li>
+ <li><code>jevflake_network_rule</code>: default <code>jev_egress</code>.</li>
+ <li><code>jevflake_model</code>: default <code>jev-1.13.0</code>. It is pinned so answers do not shift under you. The model name is part of the cache key, so changing it asks every row again.</li>
+ <li><code>jevflake_concurrency</code>: API calls in flight per batch. Default <code>8</code>. Snowflake can run several batches at once, so the total can be higher.</li>
+ <li><code>jevflake_max_batch_size</code>: the most rows Snowflake hands the function at once. Default <code>64</code>.</li>
+ <li><code>jevflake_max_retries</code>: default <code>6</code>.</li>
+ <li><code>jevflake_timeout_seconds</code>: default <code>30</code>.</li>
+ <li><code>jevflake_rows_per_request</code>: default <code>1</code>. See below.</li>
+ <li><code>jevflake_python_version</code>: default <code>3.11</code>.</li>
+</ul>
+<h3>Rows per request</h3>
+<p>By default each row is its own API call. At the time of writing TypeSafe allows 1,200 calls per minute, so that is the speed limit: about 72,000 rows per hour. TypeSafe says its limits can change, so check their models page.</p>
+<p>Setting <code>jevflake_rows_per_request</code> higher packs several rows into one call. It is faster. It is also experimental: rows in the same call can influence each other, and Jev's own docs say unrelated content lowers accuracy. In a direct API test with three rows, the packed answers were within 0.01 of the single row answers and used about half the tokens. That is a tiny sample, and the packed path has not been run inside Snowflake. Compare answers on a sample of your own data before you trust it.</p>
+<h2>Costs and limits</h2>
+<ul>
+ <li>Jev costs $0.042 per million input tokens. Output is free. Every call carries fixed overhead: in testing, one sentence of text with one short question used about 290 input tokens. A short support ticket with three questions came to about 470 input tokens, which works out to roughly $20 per million rows.</li>
+ <li>The Snowflake warehouse keeps running while it waits on the API. A small warehouse is enough. A bigger one does not help, because the API rate limit is the cap.</li>
+ <li>Jev reads up to 32k tokens of state plus the longest question per call, within 64k tokens for state plus all questions combined.</li>
+ <li>Snowflake gives the function 180 seconds per batch of rows. If heavy rate limiting pushes a batch past that, the query fails. Lower <code>jevflake_max_batch_size</code> if you see it.</li>
+ <li>Busy or rate limited calls are retried with backoff. If retries run out, the query fails. A bad API key fails the query right away.</li>
+ <li>Rows that Jev rejects do not fail the query. In a judgments model they come back with <code>answer_type = 'error'</code> and the reason in <code>error</code>. In plain SQL, <code>jev_noul</code> returns null for them, and <code>jev_choice</code>, <code>jev_score</code>, and <code>jev_ask</code> return an answer with <code>type</code> set to <code>error</code>.</li>
+</ul>
+<h2>What Jev is bad at</h2>
+<p>From TypeSafe's own notes on Jev 1.13:</p>
+<ul>
+ <li>Counting, comparing numbers, and ordering dates. Do those in SQL.</li>
+ <li>Questions with double negatives or several steps of reasoning.</li>
+ <li>It answers the question you wrote, not the one you meant. Be literal and specific.</li>
+ <li>Asking a question and its opposite will not give answers that add up. Pick one phrasing.</li>
+ <li>Text inside a row can steer the answer. Do not let an answer trigger anything destructive without a check.</li>
+</ul>
+<p>Two more things seen in testing. The same question can give slightly different probabilities depending on which other questions are in the same call, by a point or two. Running the identical call twice gave identical answers, but TypeSafe's docs do not promise that.</p>
+<h2>Your data</h2>
+<p>Row content is sent to TypeSafe's API. It leaves Snowflake. Read TypeSafe's terms and privacy policy, and check with your security team before pointing this at sensitive data.</p>
+<h2>Set it up with Terraform instead</h2>
+<p>The terraform folder has a module that creates the network rule, the integration, the functions, and the grants, and optionally the schema and the secret. If you use it, skip step 3 above and point the dbt vars <code>jevflake_database</code> and <code>jevflake_schema</code> at the schema Terraform made. The dbt macros and tests work the same either way.</p>
+<h2>Run the example project</h2>
+<p><code>integration_tests/</code> is a small dbt project with ten sample support tickets. It needs the setup above, and these environment variables for a Snowflake user with key pair authentication: <code>SNOWFLAKE_ACCOUNT</code>, <code>SNOWFLAKE_USER</code>, <code>SNOWFLAKE_PRIVATE_KEY_PATH</code>, <code>SNOWFLAKE_ROLE</code>, <code>SNOWFLAKE_WAREHOUSE</code>, <code>SNOWFLAKE_DATABASE</code>, and optionally <code>SNOWFLAKE_SCHEMA</code>.</p>
+<pre><code>cd integration_tests
+dbt deps --profiles-dir .
+dbt build --profiles-dir .</code></pre>
+<p>This sends the ten tickets to Jev, which costs a fraction of a cent. Two of the tests are set to warn, and you should expect them to: one sample ticket really does contain contact details, and one is a close call between two teams.</p>
+<h2>Development</h2>
+<p>The offline checks need no packages and no Snowflake account:</p>
+<pre><code>python3 -m unittest discover -s tests</code></pre>
+<p>They cover the Python handler, and they check that the Terraform copy of the handler matches the dbt macro. After changing <code>macros/setup/handler.sql</code>, run <code>python3 scripts/sync_terraform_handler.py</code>.</p>
+<h2>Status</h2>
+<p>Version 0.1. It has been run against one live Snowflake account with a real Jev key, on dbt 1.12.5 with dbt-snowflake 1.12.1.</p>
+<p>What was run: setup, the split setup with a separate admin role, function builder role, and caller role, teardown, every SQL function, the example project with its tests, a second run that sent no rows back to Jev, a run after editing one ticket that sent only that ticket, and the Terraform module.</p>
+<p>What has not been run: large tables, so rate limit behaviour at volume is untested. Packing several rows into one call has not been run inside Snowflake. dbt versions older than 1.12 have not been tried.</p>
+<h2>License</h2>
+<p>MIT</p>

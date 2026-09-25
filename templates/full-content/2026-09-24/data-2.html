@@ -1,0 +1,111 @@
+<h1>If You Last Used Cassandra 3.11, You Might Not Recognize It Today</h1>
+<p>If you learned Cassandra around version 3.11, the advice was fairly consistent: design tables around queries, be careful with secondary indexes, choose a compaction strategy for each workload, and arrange repair scheduling yourself. For conditional updates, use lightweight transactions. For transactions spanning multiple partitions, expect to do more work outside the database.</p>
+<p>In consulting work, I still encounter 3.11 clusters operated according to that model. Much of it remains useful, but several limitations behind those recommendations have changed. Cassandra now has storage-integrated indexing, vector search, a more flexible compaction strategy, and built-in repair scheduling. The 6.0 work goes further into cluster metadata and transactions.</p>
+<p>As of September, 2026, Apache Cassandra 5.0.9 is the latest GA release. Cassandra 6.0 remains pre-GA, with alpha builds available. That distinction matters: SAI is something to evaluate on the stable release; Accord is a reason to follow and test the next one.</p>
+<p>The interesting part is not that Cassandra gained more configuration knobs. It is that several old assumptions about how Cassandra must be queried and operated have started to loosen. A rough comparison looks like this:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Area</th>
+   <th>What changed</th>
+   <th>Release</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Streaming</td>
+   <td>An eligible whole SSTable can use a zero-copy transfer path</td>
+   <td>4.0</td>
+  </tr>
+  <tr>
+   <td>Operational limits</td>
+   <td>Guardrails provide configurable warnings and failures</td>
+   <td>4.1</td>
+  </tr>
+  <tr>
+   <td>Secondary indexing</td>
+   <td>Storage-Attached Indexing, or SAI</td>
+   <td>5.0</td>
+  </tr>
+  <tr>
+   <td>Compaction</td>
+   <td>Unified Compaction Strategy, or UCS</td>
+   <td>5.0</td>
+  </tr>
+  <tr>
+   <td>Similarity queries</td>
+   <td>Native vectors and approximate nearest-neighbor search</td>
+   <td>5.0</td>
+  </tr>
+  <tr>
+   <td>Repair scheduling</td>
+   <td>Auto Repair, with explicit opt-in in the 5.0 backport</td>
+   <td>5.0.8+</td>
+  </tr>
+  <tr>
+   <td>Cluster metadata</td>
+   <td>Transactional Cluster Metadata</td>
+   <td>6.0 work</td>
+  </tr>
+  <tr>
+   <td>Cross-partition transactions</td>
+   <td>Accord integration</td>
+   <td>6.0 work</td>
+  </tr>
+ </tbody>
+</table>
+<blockquote>
+ <p>I wrote about some of the older pitfalls in 7 mistakes when using Apache Cassandra. The useful question now is which advice still follows from Cassandra's architecture and which reflected limitations of an older implementation.</p>
+</blockquote>
+<h2>Cassandra 4.0 improved the cost of moving data</h2>
+<p>Streaming transfers data between nodes during bootstrap, replacement, rebuild, repair, and topology changes. In a large cluster, it determines how long a node takes to become useful and how quickly lost replica data can be restored.</p>
+<p>Cassandra 4.0 introduced a zero-copy streaming path for eligible whole SSTables. Instead of deserializing their contents into Java objects and serializing them again, Cassandra can transfer the files more directly. Partial transfers and other cases still need the appropriate streaming path; the optimization does not apply to every transfer.</p>
+<p>The 4.0 streaming documentation reports roughly a fivefold improvement in the benchmark used to introduce the feature. That is not a capacity estimate for every cluster, but it explains why the change mattered: less allocation and CPU work can leave more of the transfer limited by storage and network throughput.</p>
+<p>For a node holding terabytes of data, faster streaming can shorten replacement and reduce the time spent with missing replicas. It is an operational improvement even if the application's CQL stays exactly the same.</p>
+<h2>Guardrails move some limits into the database</h2>
+<p>Older Cassandra deployments often depended on conventions enforced in code review or runbooks. Avoid creating hundreds of tables. Keep collections bounded. Do not let an application issue queries over an uncontrolled number of partitions. Use <code>ALLOW FILTERING</code> carefully.</p>
+<p>The Guardrails Framework introduced in 4.1 lets operators express some of these rules in Cassandra itself. Depending on the guardrail, a configuration can warn, reject an operation after a threshold, or disable a feature. Examples include table and index counts, collection sizes, and the number of partition keys selected by a query. <code>ALLOW FILTERING</code> can be disabled.</p>
+<p>A warning gives an application team a chance to fix growing usage before it reaches the failure threshold. A rejection prevents an operation that exceeds the configured limit. Neither replaces workload design, but both are more reliable than assuming every developer has read the same operational guide.</p>
+<h2>Secondary-index advice needs to distinguish SAI from older indexes</h2>
+<p>If you learned Cassandra years ago, there is a good chance somebody told you: <em>Don't use secondary indexes.</em></p>
+<p>That advice was often justified. Traditional Cassandra secondary indexes could behave poorly at scale, especially when queries had to scatter across many partitions or index cardinality did not match the workload. Experienced teams often preferred another Cassandra pattern: create another table containing exactly the shape required by the query.</p>
+<p>Suppose we have users:</p>
+<pre><code>CREATE TABLE users (
+    id uuid PRIMARY KEY,
+    country text,
+    age int,
+    status text,
+    name text
+);</code></pre>
+<p>and we need queries by <code>country</code> and <code>age</code>. The traditional Cassandra answer might be another table <code>users_by_country_and_age</code> with an appropriate partition and clustering key.</p>
+<p>Cassandra 5.0 adds Storage-Attached Indexing. We can index the columns used for filtering:</p>
+<pre><code>CREATE INDEX users_country_idx
+ON users(country)
+USING 'sai';
+
+CREATE INDEX users_age_idx
+ON users(age)
+USING 'sai';
+
+CREATE INDEX users_status_idx
+ON users(status)
+USING 'sai';</code></pre>
+<p>SAI integrates indexes with memtables and SSTables. Reads combine results from those structures, and the index lifecycle follows the storage engine's flushes and compactions. It supports numeric ranges, combinations of indexed predicates, collection predicates, and text equality. For some access patterns, that can remove the need for an additional query-specific table.</p>
+<h3>An index does not eliminate query fan-out</h3>
+<p>SAI changes how Cassandra finds matching rows. It does not make a query over many partitions equivalent in cost to a lookup using one partition key. The physical layout remains different. A table partitioned by country, with age as a clustering column, can serve this query from the relevant country's replica set. In the <code>users</code> table, rows remain partitioned by ID, so an indexed query can require work across multiple token ranges.</p>
+<h2>UCS makes compaction behavior easier to adjust</h2>
+<p>Cassandra operators have traditionally chosen among several compaction strategies: STCS for write-heavy workloads, LCS for lower read amplification, and TWCS for time-series data. Cassandra 5.0 adds Unified Compaction Strategy. The UCS documentation recommends it for most workloads and describes how to configure behavior resembling the older strategies.</p>
+<p>UCS exposes the tiered-versus-leveled trade-off through scaling parameters. Positive values favor tiered behavior, negative values favor leveled behavior, and different levels can use different settings. Sharding allows compaction work to run in parallel and helps control SSTable sizes on nodes holding large datasets.</p>
+<h2>Vector search can stay next to operational data</h2>
+<p>Cassandra 5.0 introduces a native <code>vector</code> type and approximate nearest-neighbor search through SAI. A product can store both its operational fields and an embedding. Keeping the record and embedding together can avoid copying that data into a second database purely for vector retrieval.</p>
+<p>The most relevant case is an application that already stores a large operational dataset in Cassandra and wants similarity queries over it. That does not settle the choice of retrieval system. Approximate search quality, filtering, latency, update behavior, and operational cost still need evaluation.</p>
+<h2>Auto Repair adds built-in scheduling</h2>
+<p>Cassandra replicas can temporarily diverge. Auto Repair, developed through CEP-37 for 6.0 and backported to 5.0.8, moves that orchestration into Cassandra. It supports full, incremental, and preview repair scheduling, token-range splitting, repair history, and table priorities. A built-in scheduler reduces the need to operate a separate orchestration service.</p>
+<h2>Cassandra 6.0 orders cluster metadata changes</h2>
+<p>Transactional Cluster Metadata, defined in CEP-21, introduces a Cluster Metadata Service and an ordered log of transformations. Nodes apply committed metadata changes in that order. This provides a common history for changes such as schema updates and token ownership transitions. Gossip still has a role; it is no longer expected to establish the authoritative order of critical metadata changes.</p>
+<h2>Accord extends the transaction model across partitions</h2>
+<p>CEP-15 introduces Accord for general-purpose transactions with strict serializability. It targets a leaderless protocol with a one-WAN-round-trip fast path under normal conditions. It allows Cassandra to coordinate the conditional debit and credit as one transaction. Strict serializability means committed transactions behave as if executed in a serial order that also respects real-time ordering.</p>
+<h2>What still needs the same care</h2>
+<p>Partition keys still determine data placement. Uneven traffic can produce hot partitions, and large partitions remain expensive to read, compact, and move. Denormalization remains useful for predictable, frequent queries. Tombstones and TTLs still affect reads, compaction, and repair.</p>
+<h2>Returning from 3.11</h2>
+<p>For someone running 3.11, Cassandra 5.0 is the practical release to evaluate first. SAI, UCS, and vector search are already available. There is also a maintenance reason to move: Apache announced the end of life of the 3.x series with 5.0. Plan the move through a supported 4.x release before 5.0. I would keep the version upgrade separate from schema and indexing changes, then compare representative queries and operational tasks on the upgraded cluster.</p>

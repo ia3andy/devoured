@@ -1,0 +1,67 @@
+<h1>How we made claude.ai 3x faster in two weeks</h1>
+<p>Once Claude can measure something, it can make it faster. So we kept finding more things to measure.</p>
+<p>This August, we made the core user experience of claude.ai and the Claude desktop app about 3x faster in a two-week sprint. Users had been telling us it was slow, and they were right. We ran everything from a single Slack channel, with Claude in every thread.</p>
+<p>We focused on four journeys that make up 95% of user activity. At the 75th percentile, time to a typeable page on a fresh load of claude.ai went from 3.1 seconds to 0.55, starting a new Claude Code session went from 0.8 seconds to 0.3, and loading a Claude Cowork cloud session went from 2.6 seconds to 0.73. In aggregate, we estimate that saves tens of thousands of user-hours of waiting every day.</p>
+<p>We used Claude Tag (beta), running an internal research model roughly comparable to Opus 5.5. Claude found bottlenecks, built benchmarks, shipped improvements, and watched every deploy. We steered by setting goals, making tradeoffs, and approving every change. With that approach, we merged more than three thousand changes without a single customer-facing incident or rollback. This post covers what we shipped, how we measured it, and the loop we built with Claude to do it safely.</p>
+<h2>THE BRIEF</h2>
+<p>Before the sprint, we created a Slack channel with the following standing instructions:</p>
+<blockquote>
+ <p>@Claude Your job is to facilitate all things related to the performance of the claude.ai website and desktop app. Your responsibilities include monitoring deploys for performance regressions, assessing the accuracy and comprehensiveness of existing telemetry, maintaining well-curated observability dashboards, proactively implementing solutions for observed issues and low-hanging fruit, proposing performance project opportunities, and communicating with your human teammates. […]</p>
+ <p>The ultimate goal for this channel is for you to become as autonomous as possible, but today we know that isn’t yet possible.</p>
+</blockquote>
+<p>We asked Claude to analyze usage data through the Datadog MCP server. It identified the four highest-impact user journeys: launching the app, starting a conversation, loading an existing conversation, and sending a message. Between web and desktop, and across our products, those journeys came to thirteen distinct measurements. To establish baselines, we added instrumentation until they were directly comparable: each started with a user interaction, ended once the result was rendered, and disambiguated client and server work.</p>
+<p>We kicked off the sprint with a list of about twenty hand-picked projects, each targeting a specific journey. Claude estimated the impact of each project in milliseconds, and we aggregated those estimates to set our targets for the sprint. Some of the projects were fairly large, but we thought we could probably achieve most of them within two weeks.</p>
+<p>We hit twelve of the thirteen targets by day three.</p>
+<p>The planned projects landed early. For faster launches, we baked a static composer into the HTML so users can type during React initialization, and precompiled a V8 code cache so the desktop shell’s main process doesn’t recompile from scratch. For faster navigations, we kept the composer mounted between conversations, prefetched sessions when the user hovered over them, and cut sidebar re-renders by 90%.</p>
+<p>We had also left room for Claude to identify opportunities and propose new workstreams. Those workstreams quickly ramped into full projects of their own, which far exceeded our initial targets. So we set new targets, then looked for more things to measure:</p>
+<blockquote>
+ <p>@Claude we’ve ended up funding nearly every project in the original projects list and more. let’s do a refresh […] what have we not explored, what can we hill climb on, where is the most opportunity at this point? […] i am open to WACKY ideas</p>
+</blockquote>
+<h2>ANYTHING CAN BE HILL CLIMBED</h2>
+<p>From the start, we knew we wanted to iterate faster than our deploy cadence. Claude could work asynchronously for many hours, even overnight, and we wanted to let it validate its prototypes without waiting for field reads. To achieve that, we looked for other ways to measure performance in the lab.</p>
+<p>We treated every new benchmark with some skepticism. Each one had two jobs: first, a metric Claude could move in the lab; second, a guardrail in CI with a number that could only ratchet down. If a benchmark was flaky, or if it didn’t actually correlate with user latency, we threw it out rather than let Claude climb the wrong hill.</p>
+<blockquote>
+ <p>@Claude please prove that hill climbing against each of these can result in measurable wall clock perf wins. we’ll unship the benches for any candidates that cannot prove that</p>
+</blockquote>
+<p>Wall-clock time is what users feel, but it’s noisy, and milliseconds are too flaky to use as a CI gate. Instruction counts were appealing because they were deterministic, but we still needed Claude to prove they tracked wall-clock time.</p>
+<p>So we asked Claude to drive the count down on two hot paths: the routine that assembles a conversation’s message tree, and a scanner for status lines in Claude Code output. Claude profiled both with Valgrind and found that a quarter of the first path’s instructions were megamorphic dictionary lookups, resolving the same message ID three separate times.</p>
+<p>An hour later it had cut instructions on both paths by 48% and 31%, and wall-clock time had dropped 78% and 44%. We checked in two new ratchets. From then on, any PR that raised the instruction counts of those paths failed CI, and a daily job lowered each ceiling whenever the count went down.</p>
+<p>That led us to the central lesson of the sprint. <strong>With Claude, measuring something makes it tractable.</strong></p>
+<p>Measurement used to be step zero: you’d add a metric, wait for data to roll in, and only then start to understand the problem. With Claude, it’s step one of the climb. As soon as Claude had a number to beat, it could start optimizing. This meant the highest-leverage thing we could do was find more things to measure.</p>
+<h2>THE LOOP, THREAD BY THREAD</h2>
+<p>All of this ran in the same Slack channel, with multiple engineers and Claude jamming in every thread. From there, the sprint settled into a loop:</p>
+<ol>
+ <li>Someone would open a thread about a slow stretch of a journey, often with a screenshot or recording.</li>
+ <li>Claude would trace the flow, then find or build a benchmark that demonstrated the problem.</li>
+ <li>Once it had a promising result in the lab, Claude would come back with a PR — often several, sized for risk and review, with anything user-visible behind a flag.</li>
+ <li>After it shipped, Claude watched the deploy and read the field data.</li>
+ <li>If performance improved, Claude locked in the win by ratcheting the benchmark down; if not, it turned the flag off and iterated.</li>
+ <li>Then it went looking for the next slow spot in the same journey.</li>
+</ol>
+<p>An example: someone shared a screen recording that showed sidebar rows popping in after the page loaded. Chat and Cowork rows resolved at different times, making the page feel janky. None of our existing monitors detected it.</p>
+<p>Issac had the idea to reference the underlying Layout Instability API directly. Claude created a telemetry event that mapped the sources of each layout-shift entry to a named region (e.g. sidebar, transcript) and phase (e.g. before first paint, after typeable). It added an integration test that opened the page with a populated sidebar, held the sidebar’s data until after first paint, and failed on any shift in any named region.</p>
+<h2>SCALING HORIZONTALLY</h2>
+<p>Once the loop worked on one thread, running it on more was just a matter of opening them. Instead of closing a thread once its original request had been fulfilled, Claude would <em>keep going</em>. An individual thread would put up fifty, sometimes a hundred, optimization PRs. Increasingly, it was Claude, not one of us, opening new threads to chase opportunities it had found on its own, as part of a separate investigation or nightly job.</p>
+<p>Every measurement found something to improve. Claude ran a React hook census and found 6,900 hooks and 900 store subscriptions in the composer’s typing path, re-rendering on every keystroke. Claude counted style recalculations and found a single :root:has() selector adding 24 milliseconds to every DOM change.</p>
+<p>We rarely knew where a thread would lead. In a sweep for CPU hitches, Claude noticed that highlighting a finished code block could freeze the page for about a second. It dug in the lab and found the culprit: em dashes. If a reply’s markdown contained any non-Latin-1 character, like an em dash or a curly quote, V8 stored the entire string as UTF-16, which put every syntax-highlighting regex on its slower two-byte path. Claude fixed it with a twenty-line change to copy each code block into a one-byte string before highlighting it.</p>
+<h2>GUARDRAILS</h2>
+<p>We’d prepared for the pace. Every PR went through automated review with at least one human approval, unit tests always came before optimizations, and anything that could cause a user-visible problem shipped behind a short-lived feature flag.</p>
+<p>If the React render is off by even a pixel, the magic is lost. So Claude built dozens of guardrails:</p>
+<ul>
+ <li>The static markup is generated by rendering the real React component in jsdom, and a test guarantees they never drift.</li>
+ <li>An integration test suite compares the static page against the React render across fourteen viewport sizes, and asserts alignment within 1 px.</li>
+ <li>A keystroke test types straight through the handoff and fails on any lost or reordered key.</li>
+ <li>In the field, every handoff reports shifts to a tenth of a pixel. Claude opens a thread for any event with nonzero movement.</li>
+</ul>
+<h2>STEERING</h2>
+<p>The loop was productive, but it wasn’t autonomous. Keeping it fast, safe, and on track was our job, and it had three parts.</p>
+<p><strong>Ambition.</strong> By default, Claude is careful about scope. It tickets findings, hedges on feasibility, and pads its estimates. But we were confident in our guardrails. A lot of what we did, especially early on, was to encourage Claude to be bolder.</p>
+<p><strong>Taste.</strong> Every thread had a named human owner, and Claude highlighted any user-perceptible change with before-and-after screenshots or recordings for them to rule on.</p>
+<p><strong>Direction.</strong> We kept each thread deliberately narrow, focused on one benchmark or journey, and asked Claude to find improvements only within that scope. We thought of the threads as a hundred and fifty hammers seeking nails.</p>
+<h2>AN 8-MILLISECOND BUDGET</h2>
+<p>Once the mechanism and ambition were established, Claude got to work. Each painted frame had a budget of 8.33 milliseconds, so Claude stepped through a long reply frame by frame, timing each one to find the slow parts. It eliminated O(message length) work per chunk by memoizing finished blocks, moved tokenization logic for growing code fences to a worker, and revealed tables cell by cell.</p>
+<p>In that one thread, we landed nearly sixty PRs. Long replies blocked the main thread for about 200 milliseconds in total where they used to block it for about 750, ran on about a third of the CPU, and held 120 fps from start to finish on a 120 Hz MacBook.</p>
+<p>When we started the sprint, we hadn’t planned to hill climb on the milliseconds between frames while streaming. But it turned out we <em>could</em> count them — and anything we could count, Claude could climb.</p>
+<h2>WHAT’S NEXT</h2>
+<p>Today, claude.ai and the desktop app are about 3x faster than they were in early August, and the ratchets should keep them there. But we’re not done: the 95th percentile, other journeys, and very long conversations still have room to improve.</p>
+<p>When we shared the results internally, Issac put it best: “You could not have convinced me this was possible even six months ago.” We expect to keep working this way, one thread at a time, at any scale. The channel’s still going.</p>
