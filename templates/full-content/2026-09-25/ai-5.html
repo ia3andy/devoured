@@ -1,0 +1,137 @@
+<h1>Managed Deep Agents v0.8: new auth, memory, and channels</h1>
+<h2>Key Takeaways</h2>
+<ul>
+ <li><strong>Identity-scoped auth and memory:</strong> user-owned credentials and user-level memory let agents act on the right permissions and remember caller-specific context.</li>
+ <li><strong>HTTP channels:</strong> use agents in internal tools, customer portals, support systems, and other product surfaces that can send webhooks.</li>
+ <li><strong>Built-in web search: </strong>Managed Deep Agents now includes web search powered by Parallel out of the box.</li>
+</ul>
+<p>Today we’re launching Managed Deep Agents 0.8, which adds support for user-owned credentials, user-level memory, HTTP channels, file transfer in Slack and adds a pre-built tool for web search powered by Parallel.</p>
+<p><a href="https://docs.langchain.com/langsmith/python/managed-deep-agents-overview">Managed Deep Agents</a> (MDA) is the simplest way to build, deploy, and run mission-critical agents in production, so engineering teams can focus on agent behavior instead of rebuilding the same infrastructure that every agent needs. With today’s release, we’re expanding Managed Deep Agents to support four challenges that most teams face when running agents in production: agent memory, authentication, channels, and tool management.</p>
+<p><a href="https://docs.langchain.com/langsmith/python/managed-deep-agents-quickstart/?utm_medium=internal&amp;utm_source=blog&amp;utm_campaign=q3-2026_mda-0.8-release_co">Try Managed Deep Agents</a></p>
+<h2>About Managed Deep Agents</h2>
+<p><a href="https://docs.langchain.com/langsmith/python/managed-deep-agents-overview">Managed Deep Agents</a> combines the Deep Agents harness with all of the infrastructure required to run agents in production. A Managed Deep Agent is a code-first project in your repo that allows you to easily organize all your agent’s primitives into a simple directory:</p>
+<pre><code>my-agent/
+  agent.py | agent.ts | agent.tsx
+  pyproject.toml | package.json    	# project dependencies
+  instructions.md                  		# prompt synced to Context Hub
+  identity.py | identity.ts        		# auth, thread scoping, memory scoping
+  memory.py | memory.ts            	# define your agent's memory
+  tools/                           			# custom tools
+  channels/                       	 	# entry points like Slack and GitHub
+  middleware/                      		# custom middleware
+  schedules/                       		# managed cron schedules
+  connectors/                      		# managed connectors
+  skills/                          			# skills synced to Context Hub
+  sandbox/                         		# sandbox configuration
+  evals/                           			# agent evals
+</code></pre>
+<h2>Managed Deep Agents in practice</h2>
+<p>Imagine you’re building an internal agent to support your sales team (we’ll call this agent our <strong>GTM Agent</strong> in this post). You want your agent to be able to look up account details, research the account, draft meeting briefs, follow-up emails, and so on, and help keep your team’s accounts engaged. To support this, your agent needs memory, tool access, web search, reasoning, and planning.</p>
+<p>Agent harnesses, like <a href="https://www.langchain.com/deep-agents">Deep Agents</a>, help with building these agents. They provide primitives for building complex agents that can take on long-running, mission-critical tasks. With Deep Agents, getting a prototype up and running is straightforward, but making the agent work seamlessly in production requires a lot more.</p>
+<p>That’s where Managed Deep Agents comes in. It packages your customized Deep Agents harness with the managed infrastructure required to run an agent like this at scale. This includes adding channels, like Slack, identity and authentication, and managing permissions for tools. Building this infra typically takes quarters of roadmap and requires ongoing maintenance. Managed Deep Agents allows engineers to focus on building the agent logic and hand off the boilerplate code.</p>
+<h2>Memory for your agent, scoped to the user</h2>
+<p>When an agent is used by multiple users in production, robust, secure systems to manage memory are important. Managed Deep Agents already supported durable agent memory, which lets a deployment retain instructions and preferences across conversations. Setting up memory can be done through simple declaration files:</p>
+<pre><code># A memory declaration file enables durable agent and user-level memory.
+my-agent/
+  agent.py
+  memory.py</code></pre>
+<p>With Managed Deep Agents 0.8, we’ve added a second layer for user-level memory, scoped to the authenticated person starting the agent run. This gives the agent a place to store caller-specific context, such as preferences, working style, recurring tasks, or details the user has asked it to remember, without mixing that context with the shared agent-level memory.</p>
+<pre><code>from managed_deepagents import MemoryLayer, define_memory
+memory = define_memory(
+    agent=MemoryLayer(),
+    user=MemoryLayer(),
+)
+</code></pre>
+<p>Under the hood, durable memory is backed by LangSmith <a href="https://www.langchain.com/blog/introducing-context-hub">Context Hub</a>, which enables teams to store, version, and collaborate on agent files like Skills and AGENTS.md. Agent memory is mounted at <code>/memories/agent/</code> and shared by everyone using the deployment. User memory is mounted at <code>/memories/user/ </code>and keyed to the caller’s authenticated identity. The runtime never copies content between these layers, so teams can keep shared knowledge and personal context separate by default. This is useful in real-world agent use cases, such as:</p>
+<ul>
+ <li>A support agent might use agent memory for team-wide escalation rules and user memory to remember that a specific teammate prefers concise Slack updates.</li>
+ <li>A research agent might keep shared research procedures in agent memory, while storing an individual user’s preferred source types or formatting conventions in user memory.</li>
+</ul>
+<blockquote>
+ <em>"Building with Managed Deep Agents has been such a smooth experience. The LangChain team partners well with us, and helped troubleshoot quickly. Our production chat app runs as a Managed Deep Agent - with Context Hub and user-level memory, we are able to maintain client confidentiality while delivering a superior experience." <br><br>
+   — Zahid, CTO, </em><a href="http://kyth.ai"><em>Kyth.ai</em></a>
+</blockquote>
+<p>Memory is easily configurable and lives within a single file in a Managed Deep Agents project. You can enable the agent layer, the user layer, or both. You can also define access policies for each layer, giving teams control over when memory is available and what scope it applies to. Unless specified, Managed Deep Agents uses the following defaults:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Run source</th>
+   <th>Agent memory</th>
+   <th>User memory</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Slack one-to-one DM</td>
+   <td>Allowed</td>
+   <td>Allowed</td>
+  </tr>
+  <tr>
+   <td>Slack channel or group DM</td>
+   <td>Allowed</td>
+   <td>Denied</td>
+  </tr>
+  <tr>
+   <td>HTTP</td>
+   <td>Allowed</td>
+   <td>Denied</td>
+  </tr>
+ </tbody>
+</table>
+<p>This layered approach ensures user-level information is not ‘leaked’ into a conversation with multiple users. Consider the <strong><em>GTM agent</em></strong> mentioned earlier. Users could initiate requests in a direct DM with the agent, or they could start a request in a Slack group. Defined access policies and defaults ensure that:</p>
+<ul>
+ <li>A direct DM has the agent acting as per the user’s preference.</li>
+ <li>Requests with multiple users in a thread or a slack group has the agent defaulting to workspace / team preferences.</li>
+ <li>There is no leakage of preferences and stored memory between the two scenarios.</li>
+</ul>
+<p>Learn more about setting up agent and user-level memory <a href="http://docs.langchain.com/langsmith/python/managed-deep-agents-memory">here</a>.</p>
+<h2>Securely provide user and agent identity through connections</h2>
+<p>Connections link a Managed Deep Agent to an external service such as GitHub, Notion, or Tavily. Connections are named credentials in your LangSmith workspace that your tools only read at runtime.</p>
+<p>As with memory, it’s important to scope credentials according to the agent’s purpose and how users interact with it. With Managed Deep Agents, you can scope credentials at the user- or agent-level.</p>
+<p>Agent-owned credentials are shared across all users, which is useful for an agent capability that does not differ per person, such as web search. By contrast, user-owned credentials are important when the user will have unique permissions within a tool. This is often necessary for tools like GitHub, Linear, and Notion.</p>
+<p>For example, our <strong>GTM agent</strong> should be able to pass through user credentials and use Salesforce data when a user requests it in a DM. The agent should also be able to use agent-credentials to search the web and find information about a customer.</p>
+<p>Managed Deep Agents comes with OOTB support for <a href="https://docs.langchain.com/langsmith/python/managed-deep-agents-connections#use-the-oauth-catalog">23 services</a> including Linear, GitHub and Google Workspace tools, where LangSmith manages authorization, tokens and methods so developers only need to set up user ID and secrets.</p>
+<p>Learn how to set up and use credentials in connections <a href="https://docs.langchain.com/langsmith/python/managed-deep-agents-connections">here</a>.</p>
+<h2>Accessing agents through user-preferred channels</h2>
+<p>Internal agents are commonly accessed through existing communication channels like Slack. Managed Deep Agents provides pre-built Slack support to make it simple to expose agents where your team is already working.</p>
+<p>With today’s release, Managed Deep Agents now supports richer <a href="https://langchain-5e9cc07a-preview-docsmd-1789592284-4ee7e30.mintlify.site/langsmith/python/managed-deep-agents-channels-slack">Slack workflows with file transfer</a>, and adds <a href="http://docs.langchain.com/langsmith/python/managed-deep-agents-channels-http">HTTP channels</a> for connecting agents to any service that can send a JSON webhook.</p>
+<pre><code># channels/orders.py
+from managed_deepagents import channels
+
+
+from lib.orders import parse, verify, messaging
+channel = channels.http(
+    provider="orders",
+    verify=verify,
+    parse=parse,
+    messaging=messaging,
+)</code></pre>
+<p>For Slack-based workflows, users can invoke an agent from a DM, an app mention, or a thread reply. With file transfer support, they can also send the materials the agent needs directly in the conversation, such as logs, spreadsheets, contracts, screenshots, or customer documents. For example, with our <strong>GTM agent</strong>, a user can now add notes from a previous call or documents shared by a customer right inside Slack while making a request to the agent. The agent then picks up the file, adds it to the context and responds based on it.</p>
+<p>HTTP channels let teams bring agents into internal tools, customer portals, support systems, order systems, or any product surface that can send a webhook. This is useful for customer-facing agents that live on multiple channels. For example, a customer support agent that manages intake and triage can live in your product and an agent that schedules demos and meetings can live on your webpage.</p>
+<p>For both Slack and HTTP methods, teams keep control over authentication, identity, and memory, while giving users access to agents in the channels they already prefer.</p>
+<blockquote>
+ <em>“[Managed Deep Agents is] by far the most complete agent platform, end to end. Slack integration worked perfectly and made life easier since we access all our agents through slack. We were able to deploy multiple agents, with custom MCP servers, to production using the CLI and GitHub actions. Now we have always-on triage with access to the right monitoring and the ability to open PRs and alert teams.” <br><br>
+   —&nbsp;Derek Gilbert, Engineering, Consensus</em>
+</blockquote>
+<h2>Built-in web search, powered by Parallel</h2>
+<p>Web search is one of the most common agent tools, so we decided to build it right into Managed Deep Agents. Now, you can use web search powered by <a href="https://parallel.ai/">Parallel</a> without creating a separate vendor account, managing another API key, and wiring a search tool into the agent themselves.</p>
+<p>Simply specify the MCP server in the tools folder and LangSmith manages the Parallel credentials and executes the tool. The agent receives relevant excerpts and source URLs it can cite, while calls, latency, and errors show up in LangSmith traces.</p>
+<p>Add Parallel to the servers map in <code>tools/mcp.py / tools/mcp.ts</code>. Define <code>mcp</code> only once</p>
+<pre><code>from managed_deepagents import define_mcp
+
+mcp = define_mcp(
+    servers=\{
+        "Parallel": \{
+            "transport": "http",
+            "url": "https://api.smith.langchain.com/v1/managed-tools/servers/parallel/mcp",
+        },
+    },
+)</code></pre>
+<h2>Getting started</h2>
+<p>Managed Deep Agents 0.8 simplifies agent authentication, memory, and channels, and brings in web search as a pre-built tool.</p>
+<p>We’re excited to see how teams use these new capabilities, so we’re making <strong>Parallel web search available free</strong> through Managed Deep Agents while MDA is in beta.</p>
+<p>Learn more in the <a href="https://docs.langchain.com/langsmith/python/managed-deep-agents-overview">Managed Deep Agents docs</a>, or get started with:</p>
+<pre><code>uvx --from managed-deepagents mda init my-agent
+cd my-agent
+uv run mda deploy</code></pre>
+<p>We’re continuing to improve Managed Deep Agents and would love to hear what you’re building. <a href="https://www.langchain.com/join-community">Join our Slack community</a> to share what you’re building and reach out to us with any feedback.</p>

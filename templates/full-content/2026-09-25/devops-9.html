@@ -1,0 +1,68 @@
+<h1>Global AI routing with &lt;1% overhead on multi-cluster GKE Inference Gateway</h1>
+<p>Demand for AI infrastructure is at an all-time high. Global accelerator shortages mean engineering teams can rarely get all the compute they need from just one data center — capacity comes a cluster here, a cluster there, often an ocean apart. At the same time, workloads are getting hungrier: Today’s long-running agentic workloads often have context windows of 100k to 800k+ tokens, which consume accelerator memory faster than any previous generation of AI traffic.</p>
+<p>In this environment, the goal is to maximize "intelligence per dollar." Fragmented, poorly balanced infrastructure is rarely up to the task though, allowing expensive accelerators to sit idle, while requests queue up somewhere else.</p>
+<p>To close that gap, we built a layered routing architecture that makes globally scattered capacity behave like a single pool behind a single entry point. At the edge, the multi-cluster GKE Inference Gateway focuses on global, multi-region traffic distribution and high availability. Beneath that, the LLM-d router handles the complex, memory-aware scheduling algorithms that keep utilization high.</p>
+<p>This architecture is deliberately runtime-, model-, and accelerator-agnostic — it works across serving frameworks, model families, and GPU or TPU hardware. To make the results concrete rather than abstract, we recently benchmarked managing production-level global request routing at scale across a multi-region GKE deployment of 17,000 compute nodes spread across the US and Europe. The deployment served a leading Mixture of Experts (MoE) foundation model using SGLang.</p>
+<p>The results: Scaling to three clusters achieved a near-linear throughput boost while maintaining a 99.9% success rate under heavy multi-client concurrency. Additionally, routing traffic through the multi-cluster GKE Inference Gateway added less than 1% overhead, delivering 99.5% of the throughput of a direct, local cluster call.</p>
+<h3>Three regions, one endpoint</h3>
+<p>The deployment spanned three GKE clusters in three geographic regions: us-east5 (the config cluster), us-west8, and europe-west4. However, from the client’s perspective, none of that geography exists. Requests hit a single global virtual IP, and the gateway decides — in real time — which cluster should serve each one.</p>
+<p>What makes that decision smart rather than blind is telemetry. Instead of traditional round-robin routing at the network layer, the multi-cluster load balancer is configured to route traffic based on live application signals. Specifically, the Endpoint Picker Proxy (EPP) reads the KV-cache token utilization natively exposed by the underlying inference engines and emits it as a metric for the load balancer. When the load balancer sees a region running hot based on this emitted metric, it spills traffic to the next healthy region.</p>
+<p>Multi-cluster GKE Inference Gateway topology. The config cluster holds routing configuration but sits outside the request path; each target cluster runs its own EPP and reports KV-cache utilization back to the load balancer.</p>
+<p>Distributed LLM engines also operate differently than standard web apps. In a typical inference engine's distributed mode (such as tensor parallelism across multiple nodes), only the master (rank-0) pod serves the API. GKE already handles local routing using standard Service selectors and LeaderWorkerSet (LWS) to direct traffic exclusively to leader pods. The multi-cluster Inference Gateway also integrates with this foundation: It routes global traffic to the correct regional services, helping your cross-region load balancing respects your underlying multi-node topologies out of the box.</p>
+<h3>Measuring the routing overhead</h3>
+<p>The first question every team asks about a global routing tier is almost always, ‘How much throughput am I giving up for cross-region capability?’</p>
+<p>The benchmarks answer this directly: Deploying the multi-cluster GKE Inference Gateway to maximize your accelerator fleet doesn't have to come at the cost of throughput. Routing traffic through the Gateway added less than 1% overhead, delivering 99.5% of the throughput of a direct, local cluster call.</p>
+<h3>Linear scaling across regions</h3>
+<p>A bigger test is scale. In our test, growing the fleet from one cluster to three, spanning the US and Europe, while every client request originated from a single region (us-east5), put real pressure on the Gateway: If it couldn’t distribute load efficiently across those distances, throughput would flatten as hardware was added.</p>
+<p>Instead, throughput multiplied almost exactly in line with capacity:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Fleet topology</th>
+   <th>Request throughput</th>
+   <th>Token throughput</th>
+   <th>Success rate</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>1 cluster (us-east5-a)</td>
+   <td>0.72 req/s</td>
+   <td>2,898 tok/s</td>
+   <td>99.87%</td>
+  </tr>
+  <tr>
+   <td>2 clusters (+ us-west8-a)</td>
+   <td>1.40 req/s</td>
+   <td>6,380 tok/s</td>
+   <td>99.95%</td>
+  </tr>
+  <tr>
+   <td>3 clusters (+ europe-west4- b)</td>
+   <td>2.10 req/s</td>
+   <td>8,457 tok/s</td>
+   <td>99.90%</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Memory-aware routing in action</h3>
+<p>Round-robin load balancing is inadequate for serving LLMs because it treats every request as equal. They aren’t. Heavy prompts saturate GPU compute cores, long generations stress memory bandwidth, and long-context conversations quietly eat VRAM until the engine can’t schedule anything new.</p>
+<p>Here, the pressure on memory bandwidth came from the routing signal chosen for this deployment. By mapping Inference Engine's native token-usage metric onto the Gateway’s KV-cache signal, the routing plane gained a real-time view of memory pressure across the entire 17,000 fleet. (Depending on the workload, the Gateway can route on other signals too, like queue depth or running concurrency.)</p>
+<p>Under live production loads, as the primary region climbed toward its high-bandwidth memory (HBM) limits, the Gateway detected the saturation the moment the cluster crossed its 40% KV-cache utilization threshold; it then automatically began routing the overflow to the next healthy region. No operator intervention was needed. The complexity of running in multiple regions simply never reached the user.</p>
+<h3>The payoff</h3>
+<p>By routing traffic based on live KV-cache utilization, this GKE Inference Gateway setup effectively pools globally scattered compute capacity into one unified engine. For this deployment, the result was a near-linear throughput boost across three global regions, with virtually zero routing overhead.</p>
+<p>This translates directly into maximizing 'intelligence per dollar,' extracting near-perfect proportional performance out of every accelerator you add to your fleet, rather than letting capital go to waste.</p>
+<h3>What this means for your team</h3>
+<ul>
+ <li><strong>Smarter load balancing pays for itself</strong>. Round-robin routing wastes expensive GPU capacity because it can’t see memory or compute pressure. Routing on real-time application signals turns fragmented regional clusters into one efficient fleet — the difference between stranded hardware and 90%+ utilization of scarce compute.</li>
+ <li><strong>Agentic workloads change the bottleneck</strong>. Long-running agents with extreme context windows exhaust memory long before there’s no more compute. If your routing layer can’t see memory pressure, your compute will strand compute behind full VRAM. Make KV-cache utilization a first-class routing signal.</li>
+ <li><strong>AI traffic breaks web-era assumptions</strong>. Traditional load balancers are tuned for sub-second transactions; LLM requests can run for minutes. Plan connection limits and timeouts for AI-scale latency early, or expect aborted connections in production.</li>
+ <li><strong>Your routing layer must integrate with native serving patterns</strong>. Distributed LLM engines have master-worker topologies where only certain pods can serve traffic. By pairing your Gateway with native Kubernetes constructs like LeaderWorkerSet (LWS), your global routing respects local pod topologies out of the box, saving your team from building custom proxy infrastructure.</li>
+ <li><strong>For large foundation model builders, bet on an open, portable stack.</strong> Teams operating at frontier scale face the most acute capacity fragmentation, forcing them to hunt for compute resources across whichever regions have availability capacity. An open, portable inference stack such as LLM-d on GKE lets you absorb that capacity wherever it lands, rather than hard-wiring your serving architecture to any single cluster, region, or bespoke infrastructure.</li>
+</ul>
+<h3>Next steps</h3>
+<ol>
+ <li>Deploy it yourself: Set up the multi-cluster GKE Inference Gateway.</li>
+ <li>Understand the architecture: About multi-cluster GKE Inference Gateway.</li>
+ <li>Learn about the cross-region spillover behavior featured in this post: About elastic cross-region high availability and Configure elastic cross-region high availability.</li>
+</ol>

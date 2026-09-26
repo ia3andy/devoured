@@ -1,0 +1,35 @@
+<h1>Cloudflare Introduces the Agent Development Lifecycle Stack to Replace Traditional SDLC</h1>
+<p>Cloudflare has introduced the Agent Development Lifecycle, a foundational shift aimed at replacing the traditional Software Development Lifecycle for artificial intelligence-driven engineering. The company argues that while artificial intelligence models accelerate code generation, downstream phases such as testing, deployment, and maintenance remain bottlenecked by human-in-the-loop continuous integration pipelines. To resolve this, Cloudflare proposes transitioning from software teams to automated software factories where agents manage entire lifecycles autonomously.</p>
+<p>The traditional Software Development Lifecycle relies on human-paced reviews and linear pipelines. According to Cloudflare, these structures break down at agent scale. A platform purpose-built for the Agent Development Lifecycle must be programmatic, horizontally scalable, and event-driven. It requires preview deployments for every agent to test against production environments simultaneously, eliminating staging bottlenecks. Furthermore, systems must ensure atomic changes and implement self-improving feedback loops driven by production data rather than manual human overrides.</p>
+<blockquote>
+ <p>A CI/CD pipeline is just a Workflow. But a Workflow can be so much more than a CI/CD pipeline.</p>
+</blockquote>
+<p>To actualise this architecture, Cloudflare positions its Workflows product as the core orchestration layer. Unlike static pipelines, Workflows can dynamically spawn containers, execute headless browsers, and dispatch subagents. Building on this primitive, Cloudflare introduced @cloudflare/ci, a continuous integration and delivery system that runs directly on Workflows. This tool allows developers to chain execution steps with dependency caching and credential support, enabling agents to handle failures, remediate bugs, and triage issues autonomously.</p>
+<pre><code>import \{ WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
+import \{ init } from '@flue/runtime';
+import \{ Reviewer } from './agents/reviewer.ts';
+import \{ collectFindings } from './shared/nightly.ts';
+
+type Params = \{ date: string };
+
+export class NightlyReview extends WorkflowEntrypoint \{
+  async run(event: WorkflowEvent&lt;Params&gt;, step: WorkflowStep) \{
+    const findings = await step.do('collect findings', () =&gt; collectFindings(event.payload.date));
+
+    const agent = init(Reviewer, \{ id: `nightly-$\{event.payload.date}` });
+
+    const receipt = await step.do('dispatch review', () =&gt;
+      agent.dispatch(`Review these findings:\n$\{findings}`),
+    );
+
+    const review = await step.do('read review', async () =&gt; \{
+      const reply = await agent.read(receipt);
+      return \{ text: reply.text, data: reply.data };
+    });
+
+    // ...
+  }
+}</code></pre>
+<p>Observability serves as another critical component of the platform. Traditional application telemetry captures infrastructure metrics but misses the reasoning behind agent actions. To address this, Cloudflare launched a dedicated observability dashboard featuring OpenTelemetry-compatible tracing. This provides visibility into exact model calls, tool executions, and token consumption. Integrating natively with frameworks like Think, Flue, and the AI SDK, the platform enables engineers to replay sessions, inspect subagent handoffs, and debug malformed arguments without manually parsing execution logs.</p>
+<p>Crucially, the Agent Development Lifecycle introduces the Agent Access Model to secure autonomous operations. Recognising that agents operate at machine speed and cannot be managed via prompt-based boundaries, Cloudflare enforces policies at the network and harness layers. Agents receive short-lived, task-bound credentials with a capability ceiling. A Trust Ratchet mechanism dynamically reduces these capabilities once an agent touches protected resources, ensuring least-privilege execution and preventing lateral movement if an agent processes malicious input.</p>
+<p>By standardising on open-source observability, robust orchestration primitives, and strict credential bounding, Cloudflare aims to build the infrastructure agents need to operate securely across the entire software factory ecosystem. While these tools represent early iterations, they signal a decisive industry movement toward dynamic, autonomous systems where artificial intelligence securely handles the application lifecycle end-to-end.</p>

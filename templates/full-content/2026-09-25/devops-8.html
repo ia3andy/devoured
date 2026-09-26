@@ -1,0 +1,64 @@
+<h1>From Dockerfile to Kit: the Docker Sandboxes Kit Specification</h1>
+<p>Agents need containment, and a sandbox is only half of it. Something still has to say which agent runs there, what it gets, and what it may touch. That is a Kit: an ordinary OCI image, so the answer travels with the agent and means the same thing on any conforming runtime. Today we published the Docker Sandbox Kit Specification v3, open source under Apache 2.0 at <a href="https://github.com/docker/sandbox-kit-spec">docker/sandbox-kit-spec</a>. Here is why I wrote it.</p>
+<h2>Everything that makes an agent useful is a grant</h2>
+<p>I run a lot of agents. They write code, run tests, install dependencies, call APIs, and work on infrastructure while I do something else. None of it happens without access, so I grant it one piece at a time: a bind mount, a token with broader scope than the task needs, a firewall rule that was quicker to open than to narrow. Each grant is reasonable on its own. Together they take back the isolation I was relying on, and none needed an exploit. The holes are configuration, added on purpose, usually by me.</p>
+<p>I am worse at taking any of it back, and I could not reproduce the grants my setup depends on. No file records them. They live in shell history, dashboards, and my memory. I cannot hand that to a colleague or diff it against last week.</p>
+<h2>Containers package applications. Sandboxes contain agents.</h2>
+<p>A container packages applications. It shares the host kernel and uses namespaces and cgroups to give one fixed workload its own view of the filesystem, network, and processes. That is the right tool for software that runs, does its job, and touches only what it was handed.</p>
+<p>An agent, however, is a probabilistic actor. It decides what to do next and then does it, to my filesystem, network, credentials, and cloud account. It will install a package that needs root, open a port nobody planned for, and try the next thing when the first is blocked. A container was not built for that: the boundary is the same kernel the actor is probing.</p>
+<p>A Docker Sandbox is a microVM with its own kernel, so the boundary sits below anything the model can reach or rewrite. Inside one I can hand an agent root and let it loose, because the damage stops at the sandbox boundary. The sandbox is what lets me run an agent with the safeties off.</p>
+<p>But an empty sandbox is not an environment. Something still has to say which agent runs, which tools and MCP servers it gets, which skills and instructions shape it, and exactly what it may touch.</p>
+<h2>What a Dockerfile cannot say</h2>
+<p>A Dockerfile answers everything about the software itself: how it is built, what gets packaged, how it starts. It was never standardized; OCI standardized the image it produces and how registries distribute it. What a Dockerfile does not describe is the outside: networks, credentials, volumes, tools, context. That half has lived in <code>docker run</code> flags, a Compose file, a CI config, and someone’s memory. Unversioned, unreviewable. A Kit writes it down with the content.</p>
+<h2>One image, one digest</h2>
+<p>If you have used <code>sbx</code>, you have used Kits. This is the third version of the format, and the change that matters is that a Kit is now an ordinary OCI image rather than its own artifact: no media type, no sidecar file, nothing for a registry to learn. The manifest carries the declarations in one annotation, <code>vnd.docker.sandbox.kit.descriptor</code>; the layers carry the content.</p>
+<p>A Kit therefore builds with <code>docker buildx build</code>, pulls with <code>docker pull</code>, gets scanned and signed by the tooling you already run, and works in a <code>FROM</code>. Pinning the digest pins content, declarations, and metadata together. The tooling and distribution path are free; the format is something you learn: a grammar, a page per capability type, <code>provides</code> and <code>requires</code>, <code>kind: set</code>.</p>
+<p>Two kinds of Kit exist. A workload runs and supplies the root filesystem. A mixin is an overlay: a CLI with its network rule, a credential binding, context for an agent. You launch one workload and any number of mixins.</p>
+<h2>Authority you can read</h2>
+<p>Part of the GitHub CLI mixin in the repository:</p>
+<pre><code>capabilities:
+  - type: com.docker.sandbox/network-policy@2
+    config:
+      runtime:
+        allow:
+          - github.com
+          - hosts: [api.github.com]
+            methods: [GET, HEAD, POST, PATCH, PUT, DELETE]
+        deny:
+          - hosts: [api.github.com]
+            methods: [DELETE]
+            paths: [/repos/**]
+
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    config:
+      service: github
+      phase: runtime
+      apiKey:
+        name: GH_TOKEN
+        proxyManaged: true
+        inject:
+          - \{domain: api.github.com, header: Authorization, format: "Bearer %s"}
+</code></pre>
+<p>Read it as a permission slip. This Kit asks to reach GitHub and nowhere else, and for most of the API but not deletes under <code>/repos/**</code>, because deny wins. The token that can open a pull request cannot delete the repository. The credential is proxy-managed: a conforming runtime injects the real value into requests to the named domains, and inside the sandbox there is only a sentinel.</p>
+<p>Two words carry weight: <em>asks</em> and <em>conforming</em>. A Kit grants itself nothing. Each entry is a request, and the host decides. A conforming runtime, one that implements the behaviour the specification describes, blocks hosts not on the list. Without one, the annotation is inert: an image and no enforcement. Docker Sandboxes is the first conforming runtime.</p>
+<p>Everything a Kit needs goes through that one list, typed and versioned. Grants (network rules, credentials, volumes, ports, devices, skills paths) count toward “what may this Kit do”; entries that ask the runtime to act, like a lifecycle hook, do not. A required request the host cannot satisfy refuses the launch, rather than starting an agent with less authority than it declared, or more.</p>
+<h2>Composition is a function, not a sequence</h2>
+<p>Container images never solved multiple inheritance: a Dockerfile stage has one <code>FROM</code>. Mixins are overlays ordered by the dependency graph the Kits declare through <code>provides</code> and <code>requires</code>, never by the order you typed the flags, so the same set always composes to the same image.</p>
+<p>The resolver is strict on purpose. Every <code>requires</code> is satisfied from inside the set or resolution fails; nothing is fetched to cover a gap. Exactly one workload is allowed. Two Kits providing the same name fail rather than one silently shadowing the other (composing the Claude workload with the Claude mixin is the canonical mistake). Where Kits overlap, declarations reconcile: network rules union, hooks run in dependency order, guidance becomes one document, licenses union. Incompatible requests are an error, not a coin flip.</p>
+<p>A <code>kind: set</code> descriptor names other Kits; publishing it runs the same coherence rules at build time and merges them into one ordinary Kit. An incoherent set fails at your build, not at someone else’s launch.</p>
+<h2>The diff is the review</h2>
+<p>The Claude Code Kit in the repository declares the hosts it asks to reach, its credential, the volumes that persist between sessions, and its install and startup hooks. When the next version asks for another host or a second credential, that is a change in authority, not a software update, and it shows up in the pull request as added lines a human can refuse.</p>
+<p>Review depends on somebody reading the diff, so the specification defines a second gate that does not. Every descriptor reduces to a normalized set of everything the host would have to grant; a runtime that gates updates records that set and compares the next version against it. A version inside what was granted may apply without asking. Any widening stops and asks, and removing a deny rule counts: if a later <code>gh</code> Kit dropped <code>DELETE /repos/**</code>, the runtime holds the upgrade. That is why the declarations had to live in the artifact, not beside it.</p>
+<h2>Why this is a specification and not a feature</h2>
+<p>A Kit that stopped meaning anything when run somewhere else would be lock-in, not a trust boundary. So the grammar is normative, every capability type has its own page describing what a conforming runtime must implement, and types version independently (<code>network-policy@1</code> and <code>@2</code> both exist today). Two conformance suites ship with it: one judges whether an artifact is a conforming Kit, the other whether a runtime behaves as the pages say. Every normative statement is covered by a check or a written waiver.</p>
+<p>Docker maintains the specification today, and it should not stay under a single vendor: a format for deciding what an agent may do is worth less if it belongs to whoever sells you the runtime. Docker Sandboxes will be a first-class implementation, not the only one. If a Kit you want cannot be expressed, or a runtime duty cannot be implemented as stated, open an issue.</p>
+<h2>Try it</h2>
+<p>sbx is our sandbox CLI (<a href="https://github.com/docker/sbx-releases#install">brew install docker/tap/sbx</a>). From a checkout of the repository:</p>
+<pre><code>cd examples
+sbx run ./hello --kit ./gh .
+</code></pre>
+<p>Edit a descriptor and only that Kit rebuilds; <code>docker buildx build</code> publishes it to any registry. Docker Cloud Sandboxes runs the same Kits with the same trust model on elastic capacity. The specification, capability pages, and a worked tour are in docker/sandbox-kit-spec.</p>
+<h2>Not only agents</h2>
+<p>Agents forced this into the open because the authority they ask for is so large, but ordinary workloads have always arrived with unwritten expectations: the endpoints they call, the credentials they need, the volume that must survive a restart. That knowledge has lived in a Helm chart, a runbook, or a colleague. It is the same gap, less alarming when a web service gets it wrong. This specification is where any software writes down what it needs from the world around it; agents were the case urgent enough to have it built.</p>
+<p>Dockerfiles made software reproducible. Kits make authority reproducible.</p>
