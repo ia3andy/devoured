@@ -1,0 +1,121 @@
+<p>Two years ago I compared pg_repack and pg_squeeze, the two extensions most of us reach for when a table has bloated beyond what autovacuum will ever give back and <code>VACUUM FULL</code> isn't an option.</p>
+<p>PostgreSQL 19 changes the starting point. <code>REPACK</code> brings <code>VACUUM FULL</code> and <code>CLUSTER</code> together under one command, and <code>REPACK (CONCURRENTLY)</code> does the rewrite online. It needs no extension and no <code>shared_preload_libraries</code>, so it works on managed services too. That will bring online repacking to a much wider audience, so I spent the last few weeks measuring what it actually does to a running database, and how it compares with the two extensions.</p>
+<h2>How it works</h2>
+<p>Rewriting a table is easy when nobody is using it. <code>VACUUM FULL</code> takes an <code>ACCESS EXCLUSIVE</code> lock, copies the live rows into a new file, rebuilds the indexes and swaps the files. Nobody can read or write the table in the meantime, and on a big table that's minutes or hours.</p>
+<p>The online version <code>REPACK (CONCURRENTLY)</code> does the same. Except you can use the table while it's being copied and hence it keeps changing while the process runs. A row copied in the first few seconds can get updated two minutes later. Or deleted. An online repack tool needs to do three things.</p>
+<ul>
+ <li>Consistent starting point</li>
+ <li>Record of everything that changed during the process</li>
+ <li>And a way how to apply those changes</li>
+</ul>
+<p><code>REPACK</code> gets the first two steps for free from logical decoding. The mechanism logical replication is using. It starts by creating a temporary replication slot, which gives it a snapshot. Point in time for the initial copy. Because every change that happens during that phase is written to WAL anyway, a background worker simply reads the WAL and collects the changes to the table.</p>
+<p>Then comes the I/O intensive part. REPACK copies the rows visible in that snapshot into a new file, leaving the dead ones behind, and builds all the indexes again. Meanwhile the worker keeps collecting changes. When the copy is ready, REPACK replays them onto it and catches up.</p>
+<p>On a busy database catch-up never quite finishes. At the very end REPACK needs to have a point where it takes <code>ACCESS EXCLUSIVE</code>, replays the last changes, swaps the files and commits. This is the only time when the table is unavailable. All of this, from the snapshot to the swap, is a single transaction.</p>
+<p>pg_squeeze works the same way. REPACK was actually derived from it. It uses the same slot, same snapshot, same single transaction. The difference is that it lives outside core, so it needs <code>shared_preload_libraries</code> and a restart, and its slot holds on to WAL until it gets around to decoding it.</p>
+<p>pg_repack predates logical decoding and keeps its record with a trigger instead. Every insert, update and delete on your table also writes a row into a log table. It copies the table, then applies the log in small batches, each in its own transaction, and swaps. So every change is written twice, and there's something installed on your table for as long as it runs.</p>
+<h2>The numbers</h2>
+<table>
+ <thead>
+  <tr>
+   <th>tool</th>
+   <th>duration</th>
+   <th>WAL generated</th>
+   <th>peak extra disk</th>
+   <th>size after</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>VACUUM FULL (blocking, reference)</td>
+   <td>109 s</td>
+   <td>17.3 GB</td>
+   <td>18.7 GB</td>
+   <td>17.7 GB</td>
+  </tr>
+  <tr>
+   <td>REPACK (CONCURRENTLY)</td>
+   <td><strong>107 s</strong></td>
+   <td>18.8 GB</td>
+   <td>18.7 GB</td>
+   <td>17.7 GB</td>
+  </tr>
+  <tr>
+   <td>pg_repack</td>
+   <td>162 s</td>
+   <td>33.5 GB</td>
+   <td>18.5 GB</td>
+   <td>17.7 GB</td>
+  </tr>
+  <tr>
+   <td>pg_squeeze</td>
+   <td>165 s</td>
+   <td>18.8 GB</td>
+   <td>21.2 GB</td>
+   <td>17.7 GB</td>
+  </tr>
+ </tbody>
+</table>
+<p>With 3,000 single-row updates per second hitting the table the whole time:</p>
+<table>
+ <thead>
+  <tr>
+   <th>tool</th>
+   <th>duration</th>
+   <th>WAL generated</th>
+   <th>peak extra disk</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>REPACK (CONCURRENTLY)</td>
+   <td>130 s</td>
+   <td>24.5 GB</td>
+   <td>18.8 GB</td>
+  </tr>
+  <tr>
+   <td>pg_repack</td>
+   <td>198 s</td>
+   <td>43.4 GB</td>
+   <td>18.7 GB</td>
+  </tr>
+  <tr>
+   <td>pg_squeeze</td>
+   <td>181 s</td>
+   <td>27.7 GB</td>
+   <td>28.4 GB</td>
+  </tr>
+ </tbody>
+</table>
+<p>pg_repack's WAL is the number to look at: 1.8 times as much goes through your archive, your backups and every replica, even with nothing writing to the table. Its copy is an <code>INSERT … SELECT</code> logged row by row, where the other tools log the new file page by page. When sizing disk for any online repack, count on a second copy of the table and its indexes, plus room for the WAL and the file of changes collected during the run.</p>
+<h2>VACUUM is held back</h2>
+<p>If you've ever attended a PostgreSQL conference talk about VACUUM, you might remember the advice: never stop autovacuum. Let it do its job. But this is exactly what happens when you run an online repack.</p>
+<p>This isn't specifically about REPACK. Alongside the I/O load, it's the second thing to know before starting a five-hour repack on a Tuesday afternoon. The reason is MVCC. Online repacking needs to keep seeing the table as it looked when the operation started. PostgreSQL therefore can't remove row versions that the old snapshot might still need.</p>
+<p>VACUUM still runs during the repack, but it can't remove those row versions. ANALYZE is different. It can continue updating planner statistics normally.</p>
+<h2>The swap at the end</h2>
+<p>On a quiet table, getting <code>ACCESS EXCLUSIVE</code> for the swap takes milliseconds. It has to wait for every transaction that holds any lock on the table, though: an ETL job, a long <code>SELECT</code> for a report, a session left idle in transaction after reading from it. If this happens, REPACK waits behind the report, and every new query waits behind REPACK.</p>
+<p>Setting <code>lock_timeout</code> limits how long everyone waits. The catch is that REPACK tries only once. By the time it asks for the lock, the copy, the index builds and the catch-up are already done, and a timeout throws all of that away. On the 28 GB table that was two minutes of work, and 38 minutes for 100 GB on the cloud VM.</p>
+<p>pg_repack handles this better. It asks for the lock with a short timeout, and if it doesn't get it, it lets go and tries again. Queries get through between the attempts, so the application sees slowness instead of a complete stop.</p>
+<h2>Old snapshots find an empty table</h2>
+<p>The documentation says <code>REPACK (CONCURRENTLY)</code> is not MVCC-safe. A REPEATABLE READ transaction takes its snapshot (by reading some other table, so it holds no lock on ours), the table gets repacked, then the transaction counts the rows.</p>
+<p>Every row in the new copy was written by REPACK's transaction, which that old snapshot considers to be in the future. A long export in REPEATABLE READ that reads the table only after the swap gets nothing back, and nothing tells it why.</p>
+<h2>Memory, and a hard ceiling on concurrent changes</h2>
+<p>For every row other sessions update or delete during the run, the REPACK backend keeps about 50 bytes in memory until it commits. Nothing like <code>maintenance_work_mem</code> bounds it, and the docs only mention extra disk.</p>
+<p>REPACK (CONCURRENTLY) can't finish if more than 105 million rows are updated or deleted during the run. It fails at the very end, and the original table is left untouched.</p>
+<h2>When the run is long</h2>
+<p>The length of the run comes from the size of the table and the speed of the storage, and everything above gets worse with it.</p>
+<h2>Requirements, and what happens when it fails</h2>
+<ul>
+ <li>The table needs a replica identity index: a primary key or <code>REPLICA IDENTITY USING INDEX</code>. A deferrable primary key doesn't count, and REPLICA IDENTITY FULL and NOTHING aren't supported.</li>
+ <li>It doesn't run on a partitioned table's parent, only on individual partitions.</li>
+ <li>It needs a free slot under <code>max_repack_replication_slots</code> (5 by default, counted separately from <code>max_replication_slots</code>) and a free background worker slot (<code>max_worker_processes</code>).</li>
+ <li><code>wal_level = replica</code> is enough. PostgreSQL 19 switches <code>effective_wal_level</code> to <code>logical</code> for the whole server as soon as any logical slot exists, REPACK's temporary one included, and only switches it back at the next checkpoint after the last one is dropped. Until then all your WAL carries the extra decoding information.</li>
+</ul>
+<h2>Before you run it</h2>
+<p>Most of this comes down to the length of the run, so start there. Multiply the table's update and delete rate by how long you expect REPACK to take, and keep the result well under 100 million rows.</p>
+<ul>
+ <li>Look for long transactions and long queries in <code>pg_stat_activity</code>. They either stretch the vacuum hold or sit in front of the final lock.</li>
+ <li>Make sure the disk can take a second copy of the table and its indexes, plus WAL.</li>
+ <li>Decide on <code>lock_timeout</code> before you start. Without it, the swap can stall everyone for as long as the slowest query on the table. With it, the whole run can be thrown away at the last step.</li>
+</ul>
+<h2>Which one to use</h2>
+<p>Once you get to PostgreSQL 19, REPACK (CONCURRENTLY) is the best option for most of us. It was the fastest online repack in every run, the lightest on WAL once writes were flowing, and the only one that left nothing behind when I broke it. Unlike the extensions, it will run on managed Postgres, where most of these tables live.</p>

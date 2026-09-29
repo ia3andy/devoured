@@ -1,0 +1,97 @@
+<h2>scriptc</h2>
+<p>scriptc compiles TypeScript and JavaScript to typed IR, readable C, textual LLVM IR, native assembly and objects, native executables, and WebAssembly modules. It uses the TypeScript compiler for parsing and type checking. Source outputs require only Node. On macOS 15+ arm64, ordinary LLVM-tier executables use scriptc's bundled helper and precompiled runtime pack; clang is only the platform linker driver and does not compile program or runtime C.</p>
+<p>Static builds include a small native runtime, but no Node or JavaScript engine. Code that cannot compile statically is reported as a diagnostic. For npm packages and <code>any</code>-typed code, <code>--dynamic</code> embeds quickjs-ng explicitly.</p>
+<p>scriptc is experimental and targets macOS, Linux, Windows, and WebAssembly via WASI Preview 1.</p>
+<h2>Installation</h2>
+<p>The compiler requires Node.js 24 or newer. <code>--emit=ir|c|llvm</code> needs only Node. <code>--emit=asm|obj</code> uses the matching optional platform helper installed with scriptc on supported macOS, Linux, and Windows hosts (and for WASI), but needs no compiler, archiver, linker, or SDK. Ordinary LLVM-tier executable builds need a platform linker driver and SDK/sysroot, but use the bundled helper plus precompiled runtime pack rather than compiling generated or runtime C. Set <code>SCRIPTC_LINKER</code> to choose that driver. Explicit C builds, LLVM fallbacks, <code>--sanitize</code>, and the deprecated <code>SCRIPTC_CC=clang|zigcc</code> compatibility route additionally need a C compiler. The executables it produces do not require Node.</p>
+<pre><code>$ npm install -g scriptc</code></pre>
+<h2>Build a program</h2>
+<p>Create <code>hello.ts</code>:</p>
+<pre><code>const who = process.argv.length &gt; 2 ? process.argv[2] : "world";
+console.log(`hello, $\{who}`);</code></pre>
+<p>Compile and run it in one step:</p>
+<pre><code>$ scriptc run hello.ts
+hello, world</code></pre>
+<p>Or write a standalone executable:</p>
+<pre><code>$ scriptc build hello.ts -o hello
+$ ./hello ctate
+hello, ctate</code></pre>
+<p>Or stop at a source-level compiler artifact without invoking clang, an archiver, or a linker:</p>
+<pre><code>$ scriptc build hello.ts --emit=ir &gt;/dev/null
+$ ls .scriptc/
+hello.ir.json
+$ scriptc build hello.ts --emit=c &gt;/dev/null
+$ ls .scriptc/
+hello.c
+hello.ir.json
+$ scriptc build hello.ts --emit=llvm &gt;/dev/null
+$ ls .scriptc/
+hello.c
+hello.ir.json
+hello.ll
+$ scriptc build hello.ts --emit=asm &gt;/dev/null
+$ ls .scriptc/
+hello.c
+hello.ir.json
+hello.ll
+hello.s
+$ scriptc build hello.ts --emit=obj &gt;/dev/null
+$ ls .scriptc/
+hello.c
+hello.ir.json
+hello.ll
+hello.o
+hello.s</code></pre>
+<p>Different output kinds accumulate in <code>.scriptc/</code>; rebuilding a kind updates its file.</p>
+<p><code>--emit=obj</code> writes a relocatable program object, not a standalone library. It has undefined <code>scr_*</code> runtime references and a required <code>scr_runtime_abi_v3</code> marker; <code>scriptc build --lib --profile ...</code> remains the self-contained archive interface. The helper runs on macOS 15+ arm64 and emits artifacts with an <code>arm64-apple-macosx14.0.0</code> deployment target. Sanitized assembly/object emission is rejected until the helper's AddressSanitizer pipeline matches the executable path.</p>
+<p>External object consumption is experimental. Use <code>--print=native-link-info</code> to emit the object and print a versioned JSON recipe containing its target, <code>main</code> entry, exact <code>@scriptc/runtime</code> source pack, required system libraries, FFI inputs, and ABI marker. The recipe never uses hidden scriptc cache paths.</p>
+<h2>Use Node APIs</h2>
+<p>Supported Node APIs compile to the native runtime. For example, <code>server.ts</code>:</p>
+<pre><code>import \{ createServer } from "node:http";
+
+const server = createServer((req, res) =&gt; \{
+  res.setHeader("content-type", "application/json");
+  res.end(JSON.stringify(\{ path: req.url }));
+});
+
+server.listen(8080, () =&gt; \{
+  console.log("listening on http://localhost:8080");
+});</code></pre>
+<pre><code>$ scriptc build server.ts -o server
+$ ./server
+listening on http://localhost:8080</code></pre>
+<h2>Check static coverage</h2>
+<p><code>scriptc coverage</code> shows how much of a program can compile statically and gives a coded diagnostic for every dynamic or unsupported site.</p>
+<pre><code>$ scriptc coverage hello.ts
+
+  statements analyzed   2
+  compile statically    2  (100%)
+
+  fully static — this program has no dynamic remainder.</code></pre>
+<h2>Build WebAssembly</h2>
+<p>WASI and other cross-target builds require Zig. Its bundled WASI libc produces a portable WASI Preview 1 module through the production LLVM backend:</p>
+<p>Install Zig and make sure the <code>zig</code> executable is available on your <code>PATH</code>. <code>SCRIPTC_CC=zigcc</code> is scriptc's selector for invoking Zig's <code>cc</code> subcommand; <code>zigcc</code> is not a standalone executable.</p>
+<pre><code>$ SCRIPTC_CC=zigcc SCRIPTC_TARGET=wasm32-wasi scriptc build hello.ts --no-keep-c -o hello.wasm &gt;/dev/null
+$ file hello.wasm
+hello.wasm: WebAssembly (wasm) binary module version 0x1 (MVP)
+$ SCRIPTC_CC=zigcc SCRIPTC_TARGET=wasm32-wasi scriptc run hello.ts
+hello, world</code></pre>
+<p>The WASI target supports the same executable language tiers as the native targets, including async/await, promises, generators, timers, stdin/readline events, callback and promise filesystem APIs, and <code>--dynamic</code>. APIs that require capabilities absent from portable WASI Preview 1—network sockets/fetch, child processes, OS signals, and filesystem watching—fail before linking with <code>SC3002</code>; sanitizer builds, native FFI, and library-mode archive builds are target diagnostics too.</p>
+<h2>Use npm packages</h2>
+<p>Pass <code>--dynamic</code> to embed an npm package's JavaScript in the executable. The result does not read <code>node_modules</code> at runtime.</p>
+<pre><code>import pc from "picocolors";
+
+console.log(pc.green("hello from scriptc"));</code></pre>
+<pre><code>$ npm install picocolors
+$ scriptc build cli.ts --dynamic -o cli
+$ ./cli
+hello from scriptc</code></pre>
+<h2>Documentation</h2>
+<p>See the quickstart and CLI reference for the complete workflow. The docs also describe npm dependencies, native FFI, platform support, and the current limitations.</p>
+<h2>Development</h2>
+<pre><code>$ pnpm install &amp;&amp; pnpm -r build
+$ vercel link &amp;&amp; vercel env pull  # writes a project-scoped VERCEL_OIDC_TOKEN
+$ pnpm test:sandbox</code></pre>
+<p>The normal workspace build needs no local LLVM installation. To rebuild a native helper/runtime pack, install CMake, Ninja, and the pinned LLVM 22 development package on that target host, then run the matching <code>@scriptc/llvm-&lt;platform&gt;</code> and <code>@scriptc/runtime-&lt;platform&gt;</code> <code>build:native</code> scripts. The macOS full test suite also uses those generated artifacts.</p>
+<p><code>pnpm test:sandbox</code> loads <code>.env.local</code>, preflights Vercel authentication and project access, and uses the managed <code>vercel/sandbox/universal</code> image by default. It installs the repository-pinned Node, pnpm, and LLVM toolchain plus ScriptC dependencies in each disposable Sandbox before building the uploaded worktree. Set <code>SCRIPTC_SANDBOX_IMAGE</code> to a fully qualified VCR reference only to use the optional prebuilt image from <code>pnpm test:sandbox:image</code>. The prebuilt image keeps the roughly four-minute fast path; cold managed-image runs take longer because they install the pinned toolchain in each Sandbox.</p>
+<p><code>VERCEL_OIDC_TOKEN</code> is preferred. For access-token authentication, set <code>VERCEL_TOKEN</code>, <code>VERCEL_TEAM_ID</code>, and <code>VERCEL_PROJECT_ID</code>; team and project are never inferred from <code>SCRIPTC_SANDBOX_IMAGE</code>. The legacy VCR command used by <code>pnpm test:sandbox:image</code> cannot authenticate with an OIDC JWT, so image builds use <code>VERCEL_TOKEN</code> when available or the existing Vercel CLI login; OIDC claims still select the VCR team and project. The test corpus runs each program under Node and as a compiled native binary, then compares stdout, stderr, and exit codes byte for byte. The full gate also runs the corpus with AddressSanitizer and the runtime reference-count audit.</p>

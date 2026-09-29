@@ -1,0 +1,78 @@
+<p>Earlier this year, I wrote a paper introducing Robotics Harness Optimization (RHO). In RHO, we use evolutionary search to improve robot policies that are whole code repositories. We tested it on repositories that both excluded and included LLMs at inference. The former are static codebases and are akin to what robotics engineers ship to companies as integration solutions while the latter are what researchers have been exploring through <em>Code-as-Policies</em> (CaP).</p>
+<p>A few weeks after we released RHO, a new approach came out: <em>Graph-as-Policy</em> (GaP). In GaP, humans write skills (nodes) and LLMs merely have to stitch them together (connect them with edges). So naturally I was asked: can RHO optimize a graph? 🤔</p>
+<p>In the rest of this post, I’ll share what happened when I applied RHO for fifty generations over an example graph from the GaP codebase. TLDR:</p>
+<ul>
+ <li><strong>5.27×</strong> Throughput gain over the baseline</li>
+ <li><strong>4.17 → 1</strong> Grasps per trial</li>
+ <li><strong>$37</strong> Total search cost, both experiments</li>
+</ul>
+<h2>Graph-as-Policy</h2>
+<p><strong><em>Graph-as-Policy</em></strong> (Chen et al., <code>arXiv:2607.05369</code>) replaces end-to-end policies (think RL trained policy or a VLA) with a directed computation graph whose nodes are individually meaningful skills: observe, perceive, compute a grasp, move, release. Their project page puts it plainly: the graph is the policy.</p>
+<p>These graphs, like CaP before them, exhibit some interesting properties. First, the policy is source code you can read and diff, so a change can be quoted in lines. Next, failures localise to a named stage instead of somewhere unknown in a neural network. Lastly, edits are cheap, local, and searchable. Our evolutionary search process can propose “add a node” and score it without needing to collect demonstrations.</p>
+<p>The starting graph from the GaP repo has twenty nodes (eighteen inside three subgraphs, plus the <code>done</code> and <code>abort</code> terminals), wired by conditional edges that route on each subgraph’s exit value.</p>
+<p>And here is the query it perceives with:</p>
+<pre><code># seed/graphs/grocery_packing/workflow.json, perceive_item node inputs
+"object_name":        "grocery item",
+"object_description": "a packaged grocery product such as a can, box,
+                       carton, jar, or bottle. Never the wicker basket
+                       or storage container that the items are being
+                       packed into."</code></pre>
+<h2>The experiment</h2>
+<p>The example from the GaP is grocery packing with a simulated Franka Panda arm. It uses a LIBERO scene with a table of groceries, one wicker basket, and a sentence as the input task/prompt statement: <em>“Pick the cream cheese and place it in the basket.”</em> In this LIBERO setup, the hard part is object localization: the products are 20–40 pixels across in the camera image and several look alike. The robot has no privileged access to where anything is. It gets wrist and exterior color and depth cameras, and the sole prompt sentence.</p>
+<p>Besides this introductory task, we look at the full benchmark which has eleven instructions. Ten of them name a single item: alphabet soup, cream cheese, salad dressing, BBQ sauce, ketchup, tomato sauce, butter, milk, chocolate pudding, and orange juice. The job is to put that one item in the basket. Nothing else. The eleventh says <em>“Pick all the objects and place them in the basket,”</em> and it’s played across ten different table layouts.</p>
+<p>Here’s the interesting thing. The exemplar graph never actually reads the instruction. Its perception node is hardcoded to query for “a grocery item,” so it finds one, carries it to the basket, fails the completion test, and loops around to try another. It’s basically playing process of elimination. On the ten single-item instructions it grasps an average of 4.17 objects to complete a task that needs exactly one.</p>
+<p>To see what RHO would do with this, I ran two searches of fifty generations each over that same starting graph. In the first experiment, <em>Compose-Only</em>, I allow the agent to only add new nodes and rewire the graph, but has to use the human-written skills as given. <em>Compose-and-Edit</em> can do all of that and also <em>rewrite</em> the skills themselves.</p>
+<p>In HELIX, we can express the difference of the two experiments in three lines of configuration:</p>
+<pre><code># Experiment 1 - Compose-Only: may rewire the graph, may not edit the shared skills
+registries = ["…/open-robot-skills"]
+
+# Experiment 2 - Compose-and-Edit: same freedoms, plus its own writable skill copy first
+registries = [".", "…/open-robot-skills"]</code></pre>
+<h2>Results</h2>
+<p>Following the GaP paper, I report throughput: successes per hour, or success rate divided by cycle time.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Policy</th>
+   <th>Success rate</th>
+   <th>Cycle time</th>
+   <th>Successes/hr</th>
+   <th>vs. baseline</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Baseline</td>
+   <td>67/100</td>
+   <td>144.9 s</td>
+   <td>16.6</td>
+   <td>1.00×</td>
+  </tr>
+  <tr>
+   <td>Compose-and-Edit</td>
+   <td>97/100</td>
+   <td>68.0 s</td>
+   <td>51.3</td>
+   <td>3.08×</td>
+  </tr>
+  <tr>
+   <td>Compose-Only</td>
+   <td>96/100</td>
+   <td>39.4 s</td>
+   <td>87.6</td>
+   <td>5.27×</td>
+  </tr>
+ </tbody>
+</table>
+<p>The two RHO experiments are indistinguishable on accuracy; their success-rate intervals overlap almost completely. However, their throughputs tell a different story.</p>
+<h2>Why it’s faster</h2>
+<p>Look at the pass count. Per-iteration cost is <em>worse</em> for both searched policies: 28.8 seconds for the baseline against 33.8 and 37.9. They made the loop run fewer times, while spending slightly more inside each pass. The baseline’s pass count has a long right tail: a mean of 5.04, with trials running out to eighteen passes. Both searched policies are single spikes.</p>
+<p><strong>Artifact one: disambiguation, worth roughly four grasps</strong></p>
+<p>The baseline asks for a generic grocery item, so it picks an arbitrary one. Compose-Only added a node that runs <em>before</em> perception and resolves the target out of the instruction.</p>
+<p><strong>Artifact two: the completion check, worth the gap between the two searched policies</strong></p>
+<p>Only Compose-Only found this one. The baseline and Compose-and-Edit have no equivalent at this point in the graph. Having placed the right item, they loop back and run a whole additional perception cycle (about 34 seconds) before their completion check can fire. Compose-Only asks, gets an answer, and exits.</p>
+<h2>The part that only works in simulation</h2>
+<p>The completion check calls <code>sim.check_success</code>, the simulator’s own goal predicate. The starting graph already polls it after every perception pass, so all three policies use it; Compose-Only just calls it earlier. A real robot has no such oracle. Without it, Compose-Only would take one extra perception pass per trial (about 38 seconds), which puts it at roughly ≈2.8× the baseline instead of 5.27×.</p>
+<h2>What I take from this</h2>
+<p>The main lesson for me is that it doesn’t much matter what form the robot policy takes, as long as it’s code. The same RHO loop has now worked on three pretty different kinds: repositories on CaP-Bench, an LLM agent’s harness on RAI, and a Graph-as-Policy here.</p>
+<p>The recipe is the same every time: hand a coding agent the policy’s source, score what it writes in simulation, and keep what works. The best part is that in all cases, we are using RHO to improve robotics policies without the need for human demonstration data.</p>

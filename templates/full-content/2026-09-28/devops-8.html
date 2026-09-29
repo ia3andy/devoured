@@ -1,0 +1,99 @@
+<h1>Maximizing Apache Spark availability: Mitigating compute stockouts with flexible VMs and other best practices</h1>
+<p>The surge in AI development has created unprecedented demand for compute capacity around the globe. This can have negative implications for data processing and pipelines with Apache Spark. Whether you are managing your own Spark infrastructure or using a managed service, you can face availability constraints. However, a significant advantage of using Google’s Managed Service for Apache Spark is the availability of flexible VMs, which provide a targeted mechanism to adopt a dynamic, resource-agnostic philosophy and ensure your pipelines remain operational, even during regional or zonal capacity stockouts.</p>
+<h3>Understanding capacity stockouts</h3>
+<p>Capacity stockouts occur when demand for a specific machine family (such as N2 or N2D) exceeds available capacity in a target zone or region. For time-sensitive analytics pipelines, rigid single-VM requirements transform standard provisioning into a single point of failure which can result in cluster creation delays, failed executions, and potentially compromised business SLAs.</p>
+<h3>Flexible VMs</h3>
+<p>Flexible VMs fundamentally overhaul how a Managed Spark cluster requests compute resources. Rather than binding a cluster to a rigid instance type, flexible VMs allow teams to establish an ordered list of acceptable machine families for master, primary worker, and secondary worker nodes.</p>
+<h4>Key features</h4>
+<ul>
+ <li><strong>Multi-family blending:</strong> Mix nodes across diverse machine types and generations, combining Gen2 families (e.g., N2, N2D) with Gen4 families (e.g., N4, C4) in a single configuration.</li>
+ <li><strong>Mixed storage support:</strong> Broaden available capacity pools by allowing storage options to dynamically adapt to the underlying host family's supported disk types.</li>
+ <li><strong>Comprehensive cluster coverage:</strong> Apply flexible rules to primary workers, secondary (preemptible/spot) workers, and master nodes to guarantee cluster provisioning end-to-end.</li>
+</ul>
+<h3>Ranked configuration: A strategy for success</h3>
+<p>A successful flexible VM implementation relies on intentional ranking. By defining a clear hierarchy of options, Managed Spark clusters automatically attempt provisioning, systematically mitigating stockout risks without requiring manual intervention. To improve the availability of suitable VMs, we recommend specifying at least two machine families in the highest priority (Rank 0) flexible VM list.</p>
+<p>As an example, for production pipelines standardizing on <strong>n2d-standard-16</strong> shapes, the following tiering strategy provides robust resilience against capacity constraints:</p>
+<table>
+ <thead>
+  <tr>
+   <th><strong>Rank</strong></th>
+   <th><strong>Machine family examples</strong></th>
+   <th><strong>Storage recommendation</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Rank 0 (Primary)</strong></td>
+   <td>n2d-standard-16, n2-standard-16</td>
+   <td>Standard Local SSD or PD</td>
+  </tr>
+  <tr>
+   <td><strong>Rank 1</strong></td>
+   <td>n4-standard-16, n4d-standard-16</td>
+   <td>Hyperdisk Balanced</td>
+  </tr>
+  <tr>
+   <td><strong>Rank 2</strong></td>
+   <td>c4-standard-16, c3-standard-22</td>
+   <td>Hyperdisk Balanced</td>
+  </tr>
+  <tr>
+   <td><strong>Rank 3</strong></td>
+   <td>e2-standard-16</td>
+   <td>Standard PD</td>
+  </tr>
+ </tbody>
+</table>
+<p>For pipelines standardizing on legacy <strong>n1-standard-16</strong> shapes, the following tiering strategy helps transition workloads toward newer, more available architectures while preserving operational stability:</p>
+<table>
+ <thead>
+  <tr>
+   <th><strong>Rank</strong></th>
+   <th><strong>Machine family examples</strong></th>
+   <th><strong>Storage recommendation</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Rank 0 (Primary)</strong></td>
+   <td>n1-standard-16, n2-standard-16</td>
+   <td>Standard Local SSD or PD</td>
+  </tr>
+  <tr>
+   <td><strong>Rank 1</strong></td>
+   <td>n2d-standard-16</td>
+   <td>Standard Local SSD or PD</td>
+  </tr>
+  <tr>
+   <td><strong>Rank 2</strong></td>
+   <td>n4-standard-16, n4d-standard-16</td>
+   <td>Hyperdisk Balanced</td>
+  </tr>
+  <tr>
+   <td><strong>Rank 3</strong></td>
+   <td>e2-standard-16</td>
+   <td>Standard PD</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Leveraging Hyperdisk Balanced</h3>
+<p>Unlocking maximum availability with flexible VMs often requires adopting modern storage architectures like Hyperdisk Balanced. Newer instance families (including N4 and C4) rely on Hyperdisk to deliver predictable performance across variable VM sizes. Starting with default IOPS and throughput settings typically provides a reliable baseline for the majority of distributed Spark jobs.</p>
+<h3>Trade-offs and key considerations</h3>
+<p>While flexible VMs dramatically improve cluster provisioning success, aligning them with enterprise requirements involves evaluating several architectural and financial factors:</p>
+<h4>1. Resource quotas</h4>
+<p>It is no longer enough to have one specific machine (e.g., N2) quota. You need to ensure you have sufficient compute and disk quotas allocated for all specific machine types and disks (including Hyperdisk) defined in their flexible VM lists.</p>
+<h4>2. Compute flexible Committed Use Discounts (CUDs)</h4>
+<p>Traditional, resource-based CUDs are tied to specific machine families, which limits flexibility. Adopt Compute flexible Committed Use Discounts (CUDs) to apply savings across multiple VM families and regions.</p>
+<h4>3. Performance Characteristics</h4>
+<p>Performance can vary between machine generations, as well as between Local SSD and Hyperdisk. While the Managed Spark team maintains internal benchmarks for these comparisons, actual outcomes are workload-dependent. Testing your specific Spark jobs across these families is essential for understanding SLA impacts.</p>
+<h3>Additional recommendations</h3>
+<p>In addition to implementing flexible VMs, there are several other key architectural and scheduling strategies to improve resource availability and workload stability:</p>
+<ul>
+ <li><strong>AutoZone:</strong> Implement AutoZone routing to allow Managed Spark to automatically select the zone best suited to execute the job based on current capacity.</li>
+ <li><strong>Smaller machine shapes:</strong> Avoid high in demand, large-core shapes. Design workloads and YARN containers to utilize smaller machine shapes (such as 4, 8, or 16 cores). These smaller shapes are much easier to fulfill from the available GCE on-demand pool.</li>
+ <li><strong>Autoscaling:</strong> Deploy cluster autoscaling with reasonable <code>maxInstances</code> to manage capacity effectively for bursty or unpredictable workloads without relying on rigid, massive upfront provisioning.</li>
+ <li><strong>Partial cluster creation:</strong> Configure a minimum acceptable number of primary workers. This allows clusters to spin up under resource constraints and begin executing, while autoscaling can dynamically add remaining workers as resources become available.</li>
+ <li><strong>Establish regional fallbacks:</strong> Some regions, such as <code>us-central1,</code> can experience high demand. Setting up fallbacks to other regions reduces capacity stockout risks.</li>
+</ul>
+<h3>Keep your Spark jobs running with flexible VMs</h3>
+<p>Managing your own Apache Spark infrastructure can be complex, especially when capacity stockouts disrupt your data processing. Utilizing a managed service like Managed Service for Apache Spark provides unique advantages — including built-in platform resilience and access to flexible VMs. By adopting a prioritized fallback strategy with flexible VMs, you can protect your workloads from regional hardware shortages and keep your critical pipelines running.</p>

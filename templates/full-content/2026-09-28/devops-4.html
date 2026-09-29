@@ -1,0 +1,33 @@
+<h2>A Type Stronger than the Sum of its Components</h2>
+<p>Have you ever written a type that you appreciated so much you still think about it? Like eating a really good meal, where if you try hard enough, you can still recall the taste in your mouth. I had a mini moment of Rust joy the other day and wanted to share the experience.</p>
+<p>TLDR: I turned an enum with N variants into N types. Nothing earth-shattering, but it made my life better.</p>
+<p>Specifically, <code>std::path::Component</code> is an enum that you can get from any <code>std::path::Path</code> reference. Where a path can be viewed as an iterator of components. To give you an example <code>/tmp/hello</code> is <code>[Component::RootDir, Component::Normal("tmp"), Component::Normal("hello")]</code>. This enum is very handy for decomposing and working with paths, but an interface that takes one component that could be any of those variants is overly broad and not terribly useful.</p>
+<p>In a library where I work with paths a lot I made owned structs for each of those component types so that I could write a function signature like this:</p>
+<pre><code>impl AbsPath \{
+    // ...
+    pub(crate) fn join_normal(&amp;self, path: &amp;NormalComponent) -&gt; AbsPath \{
+        AbsPath(self.as_ref().join(path.as_ref()))
+    }
+}
+</code></pre>
+<p>Where <code>NormalComponent</code> is a <code>struct NormalComponent(OsString)</code> that is guaranteed to come from a <code>Component::Normal</code> variant. In the example above, I’m using properties of this type to guarantee that joining it to a path that is already absolute will produce a path that is also absolute.</p>
+<p>It might not sound earth-shattering, but prior to that, the alternative was something like:</p>
+<pre><code>pub(crate) fn join_normal(&amp;self, path: &amp;OsStr) -&gt; AbsPath
+</code></pre>
+<p>But an <code>OsStr</code> could be anything. It could contain <code>..</code> or be an absolute path (in which case, the join API replaces the target). Another use case is using it to represent the entries inside a directory.</p>
+<p>In hindsight, it’s such an obvious move: Take an existing, well-designed enum and make a type for each of the variants it can hold. If it’s useful to know you have 1 of N possible things (an enum), it’s probably also useful to know you have 1 very specific thing that can also fit into that enum. An enum is also known as a “sum type.” So another way to think of this is if it’s useful to have a sum type, it’s also useful to have the individual components of that type.</p>
+<p>Prior to this abstraction, I produced a range of other types:</p>
+<ul>
+ <li>AbsPath - A path that is <code>absolute</code>-ized.</li>
+ <li>RelativePath - You guessed it, a path that is relative.</li>
+ <li>CanonicalPath - A path that has been <code>canonicalize</code>-d.</li>
+</ul>
+<p>I found these useful, but still overly broad. A weird thing with working with paths is that they represent a lexical value and a physical location, and the two can be different. A path that is lexically relative might be a symlink on disk with an absolute target. And trying to normalize or transform paths can have weird consequences. Like if you try to get metadata from a file at <code>/path/to/location/skipped/..</code> it will fail if <code>skipped</code> does not exist or is not a directory. However, if you canonicalize the path first, that will succeed and produce <code>/path/to/location</code>, which will not fail when you try to get metadata from it.</p>
+<p>An absolute path is not normalized, so it can have <code>..</code> (<code>ParentDir</code>) and <code>.</code> (<code>CurDir</code>) in it. But if you don’t know how the path will be used (in my library, I don’t know why someone is asking for facts about that given path). You cannot safely normalize those values unless you’ve resolved their physical parent. That’s because <code>/path/to/location/skipped</code> from above could also be a symlink to a completely different absolute path, which needs to be resolved before the “apply <code>..</code> to fold parent directory” happens. And to make matters worse, Windows has special paths that change the behavior of lookups. So paths that start with <code>\\?\</code> like <code>\\?\C:\windows</code> treat <code>.</code> and <code>..</code> as literal values.</p>
+<p>That means, when you run a path through <code>std::path::canonicalize</code> it returns a path with this syntax. Which also means that it is unsafe to call <code>canonicalize(canonicalize(&amp;path).join(&amp;other))</code> on Windows. If <code>&amp;other</code> contains a <code>..</code>, it will produce a verbatim lookup that will likely fail. Thankfully, the <code>Component</code> parsing is consistent here, so it always returns a <code>Component::ParentDir</code> for a <code>..</code> rather than a <code>Component::Normal("..")</code>.</p>
+<p>Join safety is probably the biggest benefit I got out of this new type, but it’s also fun that I can do things like this:</p>
+<pre><code>fn up(position: Reached, name: ParentDirComponent) -&gt; (Step, Reached)
+</code></pre>
+<p>Here, the <code>up</code> function is walking/tracing a path on disk one component at a time. Previously, this was taking an <code>OsString</code>, which required the programmer to be careful. This type signature forces the developer to prove to the compiler that they hold a <code>..</code> component in hand before they can call this logic. Not earth-shattering either, but this level of pedantic confidence is just so…delightful here.</p>
+<p>Not everyone’s taste in food or types is the same. It’s fine if you don’t like the examples I’m serving here, but I thought this was satisfying and wanted to give you some food for thought. I would love to hear about other satisfying type patterns you’re still savoring.</p>
+<p>An AI disclaimer: Gen AI coding tools, I also code a lot of stuff by hand, and advocate for something like a “manually coded Monday.” This <code>src/component.rs</code> is exclusively my meat brain child. I actually coded it while I was in a car with no internet, waiting for my kids’ soccer practice to be over. I use Grammarly (non-gen-ai mode) to help me edit my prose.</p>

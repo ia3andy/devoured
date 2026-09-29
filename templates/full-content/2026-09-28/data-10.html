@@ -1,0 +1,45 @@
+<h1>ALP: Adaptive Lossless Floating-Point Encoding in Apache Parquet</h1>
+<p>Apache Parquet has added the <a href="https://parquet.apache.org/docs/file-format/data-pages/alpencoding/">Adaptive Lossless floating-Point (ALP) Encoding</a> – a new lightweight floating-point encoding with compression ratios similar to <code>zstd</code>, much faster decompression, random-access support, and GPU- and SIMD-friendly decoding.</p>
+<p>ALP works best for decimal values stored as floating-point types (32-bit <code>FLOAT</code> and 64-bit <code>DOUBLE</code>), such as</p>
+<ul>
+ <li>Monetary values (exchange rates, public funds, stocks, prices, etc.) – e.g., <code>1.2345</code> or <code>22.03</code></li>
+ <li>Geographic coordinates (longitude/latitude) – e.g., <code>42.3584</code>, <code>-71.0598</code></li>
+ <li>Scientific measurements (temperature, pressure, speed, degrees, etc.) – e.g., <code>-273.15</code>, <code>9.81</code>, <code>3.14159</code></li>
+</ul>
+<p>ALP is not suitable for data that uses a wide range of exponents or a large number of significant digits, such as vector embeddings, which typically span the full floating-point range. Such data can continue to use existing Parquet features such as <code>PLAIN</code> or <a href="https://parquet.apache.org/docs/file-format/data-pages/encodings/#BYTESTREAMSPLIT"><code>BYTE_STREAM_SPLIT</code></a> encoding followed by general-purpose compression like <code>ZSTD</code>.</p>
+<p>Decimal values can be stored with Parquet’s <code>DECIMAL</code> logical type, but that type requires the precision and scale to be known and declared up front and cannot store values outside that range. For this reason, systems commonly store decimal values as <code>FLOAT</code> or <code>DOUBLE</code> when the exact shape of their data is not known beforehand. For example, JavaScript’s only number type is <code>DOUBLE</code>, common data science tools such as pandas infer <code>float64</code> for decimal-looking values, and NumPy has no decimal dtype at all.</p>
+<h2>Why ALP?</h2>
+<p>Encoding floating-point data is a complicated engineering problem due to the nature of floating-point values. They do not exactly represent most real numbers. This leads to rounding errors that prevent the use of existing lightweight encodings like Delta and Frame of Reference.</p>
+<p>Prior to ALP, <code>BYTE_STREAM_SPLIT</code> was the only non-dictionary alternative to <code>PLAIN</code> for <code>FLOAT</code>/<code>DOUBLE</code> values in Parquet. It does not reduce the size of the data but <em>can</em> improve the compression ratio and speed when a heavyweight compressor is used afterwards.</p>
+<p>Heavyweight compression effectively decreases the data size, but at the cost of:</p>
+<ul>
+ <li>Decode speed – decompression speed is often the bottleneck in data access.</li>
+ <li>Random access – reading one value requires decoding an entire data page containing potentially thousands of other values.</li>
+ <li>Data dependence – variable-length compression means that decoding a value requires decoding previous values, making it hard to parallelize with modern hardware such as SIMD instructions and GPUs.</li>
+</ul>
+<p>ALP is designed to solve all three of these problems for common data patterns, while achieving a similar compression ratio to heavyweight compression.</p>
+<p>Parquet applies an encoding first, then an optional compression codec as a separate step. The charts below compare the <code>PLAIN</code> and <code>BYTE_STREAM_SPLIT</code> encodings followed by <code>ZSTD</code> compression with the <code>ALP</code> encoding and no additional compression. Users can expect ALP to decode 10x faster and retrieve individual values thousands of times faster, with a slightly lower compression ratio and slightly faster compression.</p>
+<p>Note that these numbers are for the pre-release Rust implementation of ALP, and we expect performance to improve as implementations are optimized and tuned. Even so, ALP is already faster than <code>zstd</code> in many cases, despite years of optimization work on <code>zstd</code> implementations.</p>
+<h2>Technical Overview</h2>
+<p>ALP takes advantage of a common pattern: many values stored as <code>FLOAT</code> or <code>DOUBLE</code> originated as decimal numbers with relatively few digits, such as prices or measurements. This section explains the intuition behind ALP and then covers the encoding and decoding pipelines in more detail.</p>
+<p>ALP encodes floating-point values in batches called “vectors”, ranging in size from 8 to 32K values (e.g., 1024). Each value in a vector is encoded as an integer, and the vector stores two integer parameters shared by all its values: an “exponent” (<code>e</code>) and a “factor” (<code>f</code>). Each vector can use a different exponent and factor. The original value is recovered by computing:</p>
+<pre><code>value = encoded × 10f × 10-e</code></pre>
+<p>This calculation uses floating-point arithmetic, which rounds to the nearest representable value and thus may not reproduce the original value exactly. When that happens, ALP stores the original full-precision value separately as an “exception”, keeping the encoding lossless. Special values such as <code>NaN</code>, <code>±Infinity</code>, and <code>-0.0</code> are also stored as exceptions.</p>
+<p>Within each vector, the encoded values are stored by subtracting the lowest value (the frame of reference) and then bit-packing to a fixed width. Exceptions are stored directly after the encoded array.</p>
+<h4>Example</h4>
+<p>Consider encoding the value <code>8.0605</code>, which cannot be exactly represented in IEEE 754. It is stored as the 32-bit floating-point number <code>8.06050014495849609375</code>. It can also be encoded as <code>80605</code> with exponent <code>e = 8</code> and factor <code>f = 4</code>.</p>
+<p>Picking the exponent and factor well is key to ALP’s performance. Each Parquet writer is free to choose them for each vector using any algorithm. Typically, the exponent is chosen to capture most decimal digits in the vector while minimizing exceptions, and the factor is chosen to remove as many trailing zeros as possible.</p>
+<p>To encode this vector, the parameters <code>e = 4</code> and <code>f = 3</code> are chosen first. Then the values are transformed to integers using the formula <code>encoded = round(value × 104 × 10-3)</code>. Each integer is checked by reversing the transformation. Values that do not round-trip are stored in the exception array. The minimum value across the vector becomes the frame of reference and is subtracted from each integer, and the resulting deltas are bit-packed.</p>
+<p>Decoding a vector requires similar steps, but in reverse. First, the bit-packed deltas are unpacked, and the original values are computed. Then any exceptions are “patched” by overwriting the output array at the exception positions with the exception values.</p>
+<h2>Acknowledgements</h2>
+<p>ALP was first published in a SIGMOD 2024 paper by Azim Afroozeh, Leonardo Kuffó, and Peter Boncz from the Database Architectures Group at CWI. The Vortex and Lance formats adopted ALP early, demonstrating its benefits in industrial applications. In late 2025, the community began the standardization process. Along with the authors of this blog post, many community members contributed, including Divjot Arora, Arnav Balyan, Devan Benz, Ryan Blue, Alkis Evlogimenos, Xuwei Fu, Vinoo Ganesh, Adrian Garcia Badaracco, Curt Hagenlocher, Amogh Jahagirdar, Micah Kornfield, Robert Kruszewski, Julien Le Dem, Kevin Liu, Steve Loughran, Ismaël Mejía, Antoine Pitrou, Adam Reeve, Ed Seidl, Russell Spitzer, Matt Topol, Jeffrey Vo, Daniel Weeks, Gang Wu, and Zehua Zou.</p>
+<h2>Ecosystem Adoption</h2>
+<p>The encoding was released as part of parquet-format 2.14.0 in September 2026. ALP is already supported in at least one major open-source implementation (the <code>parquet</code> 60.0.0 Rust crate), and we expect other Parquet implementations to add support in the coming months.</p>
+<h2>Conclusion</h2>
+<p>ALP brings fast, parallelizable decoding and practical random access to floating-point data in a standard form that any Parquet implementation can read once it adds support for the encoding. Its addition is one more example of Apache Parquet evolving to meet the needs of modern data systems.</p>
+<h2>Resources</h2>
+<ul>
+ <li><a href="https://parquet.apache.org/docs/file-format/data-pages/alpencoding/"><strong>ALP Encoding Specification</strong></a></li>
+ <li><a href="https://github.com/apache/parquet-format"><strong>Apache Parquet Format Specification</strong></a></li>
+ <li><a href="https://parquet.apache.org/docs/file-format/implementationstatus/"><strong>Implementation Status Page</strong></a></li>
+</ul>

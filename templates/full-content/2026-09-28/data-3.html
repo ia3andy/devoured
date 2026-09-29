@@ -1,0 +1,58 @@
+<p>At WHOOP, some of our most demanding infrastructure challenges arise when we need to run a computation at population scale. Earlier this year, we needed to simulate one of our ML models across a large internal dataset to support a time-sensitive research workload. Each simulation used several weeks of historical inputs, and the total came out to roughly 15.8 million inference tasks.</p>
+<p>The tool we had on hand was built for a much smaller job a couple of years ago. At its current per-task latency, completing the new run would have taken more than two months, far too slow to get researchers the data they were waiting on. We brought that down to six days. This post covers the changes that made this possible.</p>
+<h2>The starting point</h2>
+<p>The original tool was simple. A one-shot producer read a manifest from S3 and dropped one SQS message per inference task onto a queue. A worker pool received those messages and, for each one, fetched the corresponding input data, called our internal classification service over HTTP, and uploaded the labeled output back to S3.</p>
+<p>This was fine for its original use case, a much smaller validation run. But at 15.8M tasks and about 45 seconds each, it was nowhere near fast enough for what we needed now.</p>
+<h2>Skipping the network</h2>
+<p>The biggest source of latency was the HTTP boundary between the worker and the classification service. Each task required dozens of chunked round trips to the API, which in total accounted for more than half of every task. Combined with JSON serialization on both ends and per-request overhead, the network ended up being the dominant cost.</p>
+<p>Because we own the classification service, we could remove that boundary entirely. We pulled the pipeline into the worker as a library, loaded the model once per process at startup, and ran it directly on the data we had already fetched. That change took per-task time from 45 seconds to about 21.</p>
+<h2>Parallel workers per pod, and the <code>fork</code> deadlock</h2>
+<p>We wanted to unlock the research as quickly as possible, so we started with the fastest change available: two worker processes per pod instead of one. We first reached for Python's <code>multiprocessing.Pool</code>, which defaults to <code>fork</code> on Linux. The workers deadlocked the moment they tried to run inference.</p>
+<p>The pipeline relies on native libraries, including XGBoost and NumPy, whose underlying runtimes can initialize thread pools and internal locks. Forking after that initialization can leave child processes with an inherited lock state but without the threads needed to release those locks.</p>
+<p>We fixed it by setting the start method explicitly:</p>
+<pre><code>multiprocessing.set_start_method("spawn")</code></pre>
+<p><code>spawn</code> starts each worker as a fresh Python interpreter rather than copying the parent's memory. It's slower at startup, but it sidesteps the inherited-lock problem entirely.</p>
+<p>When we ran two workers on our existing pod size, they contended for CPU and each task got slower. We increased the pod's CPU allocation, which cleared the contention and brought per-pod throughput close to 2x. With some additional tuning across the pipeline, we shaved off another 4 seconds per task, bringing it down to 17 seconds.</p>
+<h2>Threading state across a chain of tasks</h2>
+<p>Another complication was that the steps within each task chain were not independent. Step N+1 depended on a small piece of state computed during step N, so we couldn't just fan out every step in a chain and run them in parallel.</p>
+<p>To solve this, we refactored the pipeline so that the producer inserted only the first task in each chain, and each worker took it from there. The worker processed the task, wrote the output, threaded the resulting state into a new SQS message for the next task, and enqueued that back onto the same queue. The chain continued until it was complete, and because the state traveled with the message rather than living on any one worker, different tasks in the same chain could run on different pods.</p>
+<p>One message per task chain, processed one task at a time through the queue.</p>
+<h2>At-least-once delivery, at five hundred workers</h2>
+<p>Standard SQS queues guarantee at-least-once delivery, which means the same message can occasionally be handed to more than one worker. At a small scale, these duplicates are rare enough to ignore. At 500 workers, duplicates became frequent enough to matter. Two workers would both pass our idempotency check, both start processing, and the loser of the S3 upload race would crash on "file already exists." The crash would also take out sibling tasks on the same pod.</p>
+<p>Our first instinct was to use <code>overwrite=True</code>, but we decided against it, since our worker enqueued the next task's message after the upload completed. If both workers succeeded, both would also enqueue, and we'd get two parallel copies of the same task chain from that point on. The bug would compound with every subsequent task.</p>
+<p>Instead, we wrapped the upload in a <code>try</code>/<code>except</code> and caught the "file already exists" exception. The write is atomic, meaning the file either lands completely or not at all, so that exception told us the other worker had already finished. We exited early without re-enqueuing.</p>
+<p>Worker B's early check passes, but the collision is caught at the storage layer.</p>
+<h2>Aggregating millions of files</h2>
+<p>The main job left us with millions of small CSVs in S3 that needed to roll up into summary tables so they could be interpreted by our Research team. A single-pod aggregator would have taken days, so we reached for the same pattern. A new producer sent one message per task chain, and a worker pool downloaded the files produced by each chain, computed the per-task summary in memory, and wrote the result to a pod-level CSV. Because S3 has no append operation, each pod accumulated rows in memory and overwrote its own pod-level file after every chain. A small final script then read the few dozen pod files at the end to write the global summary.</p>
+<p>The number of output files depended only on the number of pods. The producer was also incremental, which let us start aggregation before the main job finished and cut end-to-end runtime by roughly 10 hours.</p>
+<p>Together, these changes enabled us to run inference using our machine learning algorithms across all 15.8 million tasks and consolidate those results for our Research team in six days, instead of two months.</p>
+<p>The merge script only has to read one file per pod.</p>
+<h2>Results</h2>
+<p>The final per-task time was about 17 seconds, down from 45.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Phase</th>
+   <th>Tasks</th>
+   <th>Wall Clock</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Main run</td>
+   <td>15.8M</td>
+   <td>~6 days</td>
+  </tr>
+  <tr>
+   <td>Aggregation</td>
+   <td>N/A</td>
+   <td>~10 hours</td>
+  </tr>
+ </tbody>
+</table>
+<h2>What we learned</h2>
+<ul>
+ <li>When you control both ends of a network call, removing it entirely usually beats any amount of tuning around it.</li>
+ <li>Forking a process that has already loaded a native ML library can cause a deadlock. Pick <code>spawn</code> upfront to avoid it.</li>
+ <li>Idempotency has to live at the output. A task-level check alone isn't enough. Anything downstream that uses the output's existence as a signal needs to be part of the same fix.</li>
+</ul>
