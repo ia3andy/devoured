@@ -1,0 +1,177 @@
+<h1>How to Sync a Design System with Claude Design</h1>
+<p>Syncing React components into Claude Design with /design-sync: what the mirror holds, how it's verified and a step-by-step example with shadcn/ui, Tailwind v4 and Storybook.</p>
+<p>TL;DR</p>
+<p>Syncing a design system with Claude Design creates a mirror: a compiled, self-rendering copy of the component library, so Claude designs with the real components. The sync runs with /design-sync from Claude Code and checks and fixes its own work before uploading, and the mirror is a one-way snapshot. With shadcn and Tailwind v4, the key steps are an entry file with type definitions, a compiled stylesheet with safelisted layout utilities, fonts listed in extraFonts and a conventions file. Storybook is optional, but it provides the reference that makes the sync verifiable.</p>
+<p>AI design tools like Claude Design can turn a short prompt into a full screen in seconds and the first time it happens, it feels a bit like magic.</p>
+<p>Once we look closer, we realize that these tools don't know our components, so they reinvent every one of them. Instead of our <code>Button</code> component, we get a new button with hand-picked classes that only look like ours:</p>
+<pre><code>// What the tool generates
+&lt;button className="px-4 py-2 rounded bg-blue-600 text-white"&gt;Save&lt;/button&gt;
+
+// What we expect
+&lt;Button&gt;Save&lt;/Button&gt;</code></pre>
+<p>Although it looks close enough to approve, it's far enough that a developer has to rebuild every piece of it.</p>
+<p>In this article we'll answer the basic questions about syncing a design system with Claude Design - so it builds designs from our real components instead of reinventing them. Then we'll build a minimal design system with shadcn/ui, Tailwind v4 and Storybook from scratch and walk through syncing it step by step.</p>
+<h2>What Is Claude Design</h2>
+<p>Claude Design is Anthropic's design tool, built right into Claude. It turns a plain-language description (a prompt) into a design: a screen, a prototype, a slide deck or a one-pager.</p>
+<p>We can ask for one in a regular Claude conversation, work on a canvas at claude.ai/design or create one from Claude Code using the <code>/design</code> command. Then we refine it by commenting on specific elements, editing text directly or asking Claude for changes.</p>
+<p>What it doesn't know out of the box is our <strong>design system</strong>: the React components, the design tokens (colors/spacing/other named variables) and the typography already in our code.</p>
+<p>So we need a way to hand it over and that's where the design sync comes in.</p>
+<h2>Understanding the Design Sync</h2>
+<p>The design sync takes the design system from our repo and hands it over to Claude Design. Before we build and sync something ourselves, let's figure out how it works.</p>
+<h3>The Mirror</h3>
+<p>Syncing a design system means creating a <strong>mirror</strong> of it inside Claude Design: a copy of our components that Claude can actually see and use. Once it's there, Claude builds screens from our real components instead of the generated lookalikes.</p>
+<p>The important thing is that a mirror is only as good as its rendering. A component that ships without its stylesheet still arrives and Claude still "sees" a Button, but the Button is unstyled and every design built on it inherits the mistake.</p>
+<p>So for every component, the real question is simple: does it look in Claude Design exactly like it looks in our product? We'll keep coming back to that question throughout the article.</p>
+<h3>What's Inside the Mirror</h3>
+<p>The mirror doesn't include our source files. It's a compiled version of the library: a single bundle with every component, plus the stylesheet, the fonts and a copy of React - so the components can run on their own.</p>
+<p>Every component in the mirror also gets a small folder with its types (so Claude knows which props and variants exist), a standalone preview page (shown as a card in Claude Design) and a generated usage guide.</p>
+<p>On top of that, the mirror carries a README with our own usage rules, which we'll write later on.</p>
+<h3>How the Sync Works</h3>
+<p>To create the mirror, we simply run a single command in Claude Code inside our repo:</p>
+<pre><code>/design-sync</code></pre>
+<p>This command builds everything we just described and uploads it to Claude Design (after we approve it). The command reads its settings from a <code>.design-sync/</code> folder in the repo, which we'll set up in the example.</p>
+<p>Before uploading, the sync makes sure every component actually looks right. It opens each preview in a real browser, takes a screenshot and grades it.</p>
+<p>By default, each component starts with a simple placeholder card until we write a proper preview by hand. There's nothing to compare it against, so each screenshot is graded on its own. The sync looks for obvious problems, like a preview that renders blank, one that's nearly empty or variants that all look the same. Beyond that, Claude grades each card against a rubric from the screenshots and we review the result ourselves.</p>
+<p>If the repo has a Storybook (an open-source tool for previewing components in isolation), the check gets much stronger. Its stories (saved states of a component, like a primary button) become the previews and serve as the reference too. The sync screenshots the stories, and Claude compares each preview against its matching story side by side, grades the match and fixes what it can before uploading.</p>
+<h3>After the Sync</h3>
+<p>Once the checks are done and we approve the upload, the mirror shows up as a design system in our Claude account (under Settings &gt; Design systems).</p>
+<p>From there, Claude can use it in any conversation (including in Claude Code).</p>
+<p>Who else can use it depends on the plan:</p>
+<ul>
+ <li>On Pro and Max, it's personal.</li>
+ <li>On Team and Enterprise, publishing it makes it the organization's, so everyone's work picks it up from then on. Enterprise admins can also limit who's allowed to publish, set the organization's default or delete it.</li>
+</ul>
+<p>Keep in mind that the mirror is a snapshot and not a live link. When a component changes in the code, nothing happens in Claude Design until we run <code>/design-sync</code> again. And even a re-sync doesn't always clean up: a component we delete from the library may stay in the mirror, so it's a good idea to check the file list after removing one.</p>
+<p>The sync is also one-way, from our code into Claude Design. Getting a finished design back into code is a separate flow, using the <code>/design</code> command in Claude Code. Since the code is the source of truth, there's actually no need for Figma either.</p>
+<h2>Building a Minimal Design System</h2>
+<p>Enough theory. Let's build a small design system from scratch, sync it into Claude Design and see what comes out on the other side.</p>
+<p>We'll keep it minimal on purpose: three shadcn components (<code>Button</code>, <code>Card</code> and <code>Input</code>), Tailwind v4 and Storybook. That's enough to go through every step of a real sync in one sitting.</p>
+<h3>Creating the Project</h3>
+<p>First, a Vite project with React and TypeScript:</p>
+<pre><code>npm create vite@latest my-design-system -- --template react-ts
+cd my-design-system
+npm install</code></pre>
+<p>Then Tailwind v4, which now comes as a Vite plugin:</p>
+<pre><code>npm install tailwindcss @tailwindcss/vite
+npm install -D @types/node</code></pre>
+<p>We register the plugin in <code>vite.config.ts</code> and add the <code>@</code> alias that shadcn expects:</p>
+<pre><code>import path from 'path';
+import tailwindcss from '@tailwindcss/vite';
+import react from '@vitejs/plugin-react';
+import \{ defineConfig } from 'vite';
+
+export default defineConfig(\{
+  plugins: [react(), tailwindcss()],
+  resolve: \{
+    alias: \{
+      '@': path.resolve(__dirname, './src'),
+    },
+  },
+});</code></pre>
+<p>The same alias goes into both <code>tsconfig.json</code> and <code>tsconfig.app.json</code>:</p>
+<pre><code>\{
+  "compilerOptions": \{
+    "paths": \{
+      "@/*": ["./src/*"]
+    }
+  }
+}</code></pre>
+<p>And <code>src/index.css</code> starts as a single line:</p>
+<pre><code>@import 'tailwindcss';</code></pre>
+<h3>Adding Components</h3>
+<p>Now we can add shadcn and our three components:</p>
+<pre><code>npx shadcn@latest init
+npx shadcn@latest add button card input</code></pre>
+<p>The <code>init</code> command creates a <code>components.json</code>, a <code>cn()</code> helper in <code>src/lib/utils.ts</code> and the design tokens. The components themselves land in <code>src/components/ui/</code> as source files that we own.</p>
+<p>Notice what happened to <code>src/index.css</code>: <code>init</code> added every token as a CSS custom property (<code>--background</code>, <code>--foreground</code>, <code>--primary</code> and so on). That file is the foundation of our design system, and we'll get back to it when compiling the stylesheet.</p>
+<h3>Exporting the Components</h3>
+<p>The sync bundles a single entry file, so it needs one place that exports everything. We write <code>src/index.ts</code> ourselves:</p>
+<pre><code>export * from './components/ui/button';
+export * from './components/ui/card';
+export * from './components/ui/input';
+export * from './lib/utils';</code></pre>
+<p>All we do is re-export the three components along with <code>cn</code>, which Claude will need for merging class names in layouts.</p>
+<p>The sync also needs our components' type definitions. It finds the components through them, and without them it finds nothing and drops every story. We'll generate them as part of the build in a moment, so for now we just point <code>package.json</code> at where they'll be:</p>
+<pre><code>"types": "dist/index.d.ts"</code></pre>
+<h3>Adding Stories</h3>
+<p>As we saw earlier, Storybook isn't required, but it's what turns the sync from a guess into a verified result. Its stories become the previews in Claude Design and the reference every preview is compared against. So let's add it:</p>
+<pre><code>npx storybook@latest init</code></pre>
+<p>To take and compare the screenshots, the sync also needs Playwright with Chromium, so let's install them in advance:</p>
+<pre><code>npm install -D playwright
+npx playwright install chromium</code></pre>
+<p>Then there's one line we have to add by hand, since the generated preview doesn't load our stylesheet:</p>
+<pre><code>// .storybook/preview.tsx
+import '../src/index.css';</code></pre>
+<p>Now we can write a story file per component. By default, the sync captures up to six stories per component, so it's better to have one per meaningful state and skip the rest:</p>
+<pre><code>// src/stories/Button.stories.ts
+import \{ Button } from '../components/ui/button';
+
+export default \{
+  title: 'Button',
+  component: Button,
+};
+
+export const Default = \{ args: \{ children: 'Continue' } };
+export const Outline = \{ args: \{ children: 'Cancel', variant: 'outline' } };
+export const Destructive = \{ args: \{ children: 'Delete', variant: 'destructive' } };
+export const Small = \{ args: \{ children: 'Continue', size: 'sm' } };</code></pre>
+<h3>Compiling the Stylesheet</h3>
+<p>The previews in Claude Design need a real CSS file. Storybook with <code>@tailwindcss/vite</code> doesn't produce one (its CSS is loaded from a JavaScript chunk at runtime), so we compile it ourselves using the Tailwind CLI:</p>
+<pre><code>npm install -D @tailwindcss/cli
+npx @tailwindcss/cli -i ./src/index.css -o ./ds.css</code></pre>
+<p>The output, <code>ds.css</code>, contains the tokens and every utility Tailwind found while scanning our sources.</p>
+<h3>Safelisting Layout Utilities</h3>
+<p>There's a catch with the compiled stylesheet: it only contains utilities that appear in our sources. That covers the components, but none of the layout Claude writes around them, like <code>grid-cols-3</code>, <code>gap-6</code> or <code>max-w-4xl</code>.</p>
+<p>Tailwind v4.1 added <code>@source inline(...)</code> exactly for that. It generates utilities from patterns rather than from scanned files, and we add it at the end of <code>src/index.css</code>:</p>
+<pre><code>@source inline("\{sm:,md:,lg:,xl:,}\{flex,grid,flex-col,hidden,flex-1}");
+@source inline("\{sm:,md:,lg:,xl:,}grid-cols-\{1,2,3,4,6,12}");
+@source inline("\{sm:,md:,lg:,}\{gap,gap-x,gap-y}-\{0,1,2,3,4,6,8,12}");
+@source inline("\{sm:,md:,lg:,}\{p,px,py,m,mx,my,mt,mb}-\{0,1,2,3,4,6,8,12,16,auto}");
+@source inline("\{w,h}-\{full,auto,fit,4,6,8,10,12,16,24}");
+@source inline("max-w-\{sm,md,lg,xl,2xl,4xl,prose}");
+@source inline("text-\{xs,sm,base,lg,xl,2xl,3xl,4xl}");
+@source inline("\{items,justify}-\{start,end,center,between}");
+@source inline("\{hover:,dark:,}\{bg,text,border}-\{background,foreground,card,primary,secondary,muted,accent,destructive,border}");</code></pre>
+<h3>Configuring the Sync</h3>
+<p>The sync reads its settings from <code>.design-sync/config.json</code> at the project root:</p>
+<pre><code>\{
+  "pkg": "my-design-system",
+  "entry": "src/index.ts",
+  "globalName": "MyDesignSystem",
+  "storybookConfigDir": ".storybook",
+  "buildCmd": "npx @tailwindcss/cli -i ./src/index.css -o ./ds.css &amp;&amp; npx tsc src/index.ts --ignoreConfig --declaration --emitDeclarationOnly --outDir dist --jsx react-jsx --module esnext --moduleResolution bundler --target es2020 --strict --skipLibCheck",
+  "cssEntry": "ds.css",
+  "extraFonts": ["./node_modules/@fontsource-variable/geist/index.css"],
+  "readmeHeader": ".design-sync/conventions.md"
+}</code></pre>
+<h3>Writing the Conventions</h3>
+<p>The last field in the config points to the conventions file. It's the README with our usage rules, and it's the cheapest quality win we have. The previews show Claude what our components look like, whereas the conventions tell it how to use them:</p>
+<pre><code>## Using this library
+
+- There is no theme provider. Tokens are CSS variables on `:root`.
+- Dark mode is a class on an ancestor, not a prop.
+- Never hand-style a component. Use `variant` and `size` where they exist; `className` is for layout only.
+- Compose `Card` from `CardHeader`, `CardTitle`, `CardContent` and `CardFooter`.
+- Merge class names with the exported `cn()` helper.</code></pre>
+<h3>Running the Sync</h3>
+<p>All that's left is a single command in Claude Code, from the project root:</p>
+<pre><code>/design-sync</code></pre>
+<h3>Reading the Grades</h3>
+<p>As part of the run, before anything is uploaded, Claude compares each preview against its story side by side and grades it: <code>match</code>, <code>close</code> or <code>mismatch</code>. Claude fixes what it can along the way, so the grades we see at the end are what's left for us to look at.</p>
+<h3>The Result</h3>
+<p>Now that Claude Design knows our components, let's see what it does with a request for a sign-in screen. No hand-rolled <code>div</code>s and no one-off utility classes. Claude reached for <code>Card</code>, <code>CardHeader</code> and <code>Button variant="outline"</code>, and each one renders exactly like its story in Storybook.</p>
+<h2>Beyond the Minimal Example</h2>
+<p>A fresh project with three components is the easy case. An existing design system usually lives in a bigger repo, and a few more things come up there.</p>
+<p><strong>Paths in a monorepo.</strong> <code>entry</code> needs the full path from the repo root, while <code>cssEntry</code> stays relative to the package directory.</p>
+<p><strong>Custom fonts.</strong> Our example needed just one font, but a real design system usually has several. Since the paths are resolved from the package directory, in a monorepo they climb up to the root <code>node_modules</code>.</p>
+<p><strong>A separate CSS entry.</strong> If the existing Storybook entry imports the tokens with <code>url()</code>, it works for Storybook but leaves a dangling import in the compiled file. The fix is a separate entry just for the sync, with a string import.</p>
+<h2>Wrapping Up</h2>
+<ul>
+ <li>Claude Design turns a prompt into a design, and syncing gives it our real components instead of lookalikes.</li>
+ <li>The mirror is a compiled, self-rendering copy of the library and a one-way snapshot.</li>
+ <li>Before uploading, Claude compares each preview against a reference and fixes what it can.</li>
+ <li>The sync finds components through the entry file and their type definitions.</li>
+ <li>The stylesheet is compiled with the Tailwind CLI, imports the tokens with a string <code>@import</code> rather than <code>url()</code> and safelists the layout utilities with <code>@source inline(...)</code>.</li>
+ <li>A conventions file is the cheapest quality win.</li>
+</ul>
+<p>In the end, uploading the design system is the easy part - making sure every component looks right on the other side is where the real work is.</p>

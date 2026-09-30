@@ -1,0 +1,84 @@
+<p>In August, we introduced Kitesurf, a browser for the agentic age that runs entirely on Cloudflare Workers. We built it around what agents need from the web, rather than carrying all the features and bloat of a browser designed for humans. If this is the first you’re hearing about it, we highly recommend you read the blog post where we introduced Kitesurf, for all the juicy technical details of how we did it.</p>
+<p>Since then, we’ve put Kitesurf through increasingly realistic tasks and used internal and external feedback from customers to make it more capable and more efficient. Here’s what has changed, how you can try it today, and where we’re going next.</p>
+<h2>WebMCP support</h2>
+<p>Websites were not built for agents to use. Browsing today is a messy process of clicking pixels and hoping the right element loads. In a programmatic world this is slow and fragile. WebMCP helps by allowing developers to expose site functionality directly to agents, where they can call functions like <strong>searchFlights()</strong> instead of simulating clicks.</p>
+<p>Cloudflare has been supporting WebMCP since its early days; just a few weeks ago we announced that site owners can now turn on WebMCP with one switch, so browser agents can discover and use tools on their sites without changing the site’s code, and Browser Run has been supporting WebMCP when using Chrome beta for some time now.</p>
+<p>Today we are announcing that Kitesurf now supports WebMCP.</p>
+<p>You can test this by going to our public Kitesurf playground, opening Cloudflare Radar, and navigating to WebMCP on the Application tab in the DevTools panel. As you can see, Radar exposes a list of WebMCP tools like <strong>navigate-to</strong> or <strong>set-location</strong> which allow clients to interact with the page and explore Radar programmatically.</p>
+<p>If you target Kitesurf with your AI Agent:</p>
+<pre><code>\{
+  "mcp": \{
+    "kitesurf": \{
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "chrome-devtools-mcp@latest",
+        "--wsEndpoint=wss://api.cloudflare.com/client/v4/accounts/&lt;ACCOUNT_ID&gt;/browser-run/devtools/browser?browser=kitesurf",
+        "--wsHeaders=\{\"Authorization\":\"Bearer &lt;BEARER_TOKEN&gt;\"}",
+        "--category-experimental-webmcp"
+      ],
+      "enabled": true
+    }
+  }
+}</code></pre>
+<p>You can see that the AI model can interact with the exposed WebMCP tools which you can use to complete tasks more reliably.</p>
+<p>You can read more about how to use WebMCP with Kitesurf and Browser Run here.</p>
+<h2>New APIs, better WPT coverage</h2>
+<p>Since the initial announcement, we’ve been adding more browser standards so that agents can render more sophisticated pages. The list of the APIs that Kitesurf supports has grown, and now includes:</p>
+<ul>
+ <li>WebMCP</li>
+ <li>CSS Layout</li>
+ <li>CSS Object Model (CSSOM)</li>
+ <li>CSS Typed OM</li>
+ <li>Custom elements</li>
+</ul>
+<p>We added URL-based module resolution, JSON modules, and import map handling—important for sites that load JavaScript in chunks. Additionally we are using the new Cloudflare Workers’ module registry to support imports from URLs.</p>
+<p>Iframe behavior has improved as well; now they load at the right time, stay better isolated, and display text correctly across more languages and encodings.</p>
+<p>As we said at launch, running tests is how we keep the quality of both code and results under control without losing velocity while improving Kitesurf. Web Platform Tests (WPT) is a shared, open-source test suite that checks whether browsers implement web standards consistently.</p>
+<p>We now pass 730,000+ WPT subtests and are growing. That’s 500,000 more subtests than when we launched. Here you can see the evolution over time, up to the latest version since we started the project:</p>
+<h2>Efficiency optimized for agents</h2>
+<p>For an AI agent, efficiency isn’t so much about loading pages fast, but about the latency of the agentic loop. To make Kitesurf truly agentic, we’ve aggressively optimized the browser engine’s internals so that every DOM traversal, timer, and font fetch is as lightweight as possible, ensuring the agent spends its compute cycles on reasoning, not waiting for the browser to catch up.</p>
+<p>These optimizations include:</p>
+<ul>
+ <li>Improved JavaScript execution with less work crossing between Boa and the DOM, making the boundary more compatible with real Web frameworks. Common reads such as <strong>getAttribute</strong>, <strong>id</strong>, and <strong>parentNode</strong> can now be answered inside the Wasm DOM instead of making repeated Boa → JavaScript shim → Wasm trips.</li>
+ <li>Kitesurf does less repeated work when running timers and loading scripts, and releases memory from objects it no longer needs. It also handles objects and classes more consistently when code moves between its two JavaScript engines, resulting in running busy pages more efficiently.</li>
+ <li>Kitesurf now loads fonts when they’re needed, fetches fewer fonts a page won’t use, checks which characters appear on the page before fetching language-specific font files and renders synthetic italics more faithfully.</li>
+</ul>
+<p>Together, these optimizations help keep Kitesurf efficient for agents. Despite adding support for more web standards—and bringing Kitesurf closer to the capabilities of full-featured browsers like Chrome—its wall-clock time and CPU usage remain roughly in line with our launch benchmarks, and in some cases they have improved.</p>
+<h2>Plays better with Browser Run</h2>
+<p>Browser Run is our developer platform product that lets you programmatically control and run headless browser instances. When you use this API, you can select from a list of browser flavors we support, including Kitesurf.</p>
+<p>This means that we have to make sure that all of our browsers are supported across the API surface. Starting today, Kitesurf has full Browser Run API coverage. You can use Kitesurf with CDP, Playwright, Puppeteer, or MCP.</p>
+<p>One of the most popular Browser Run features, Quick Actions, provide simple interfaces for common browser tasks like capturing screenshots, extracting HTML content, generating PDFs, and more. When we launched Kitesurf, you could use Quick Actions from our REST API. Now you can also use them from inside a Worker script using the <strong>env.BROWSER.quickAction()</strong> binding:</p>
+<pre><code>interface Env \{
+	BROWSER: BrowserRun;
+}
+
+export default \{
+	async fetch(request, env): Promise&lt;Response&gt; \{
+		return await env.BROWSER.quickAction("screenshot", \{
+			url: "https://example.com",
+			browser: "kitesurf"
+		});
+	},
+} satisfies ExportedHandler&lt;Env&gt;;</code></pre>
+<h2>Kitesurf runs in the terminal now</h2>
+<p>As we detailed in the How we built it section of our announcement blog post, Kitesurf separates PageScript, the isolate that handles the page session and runs the page code, from PageRenderer, which is responsible for generating the actual pixels from the computed page objects.</p>
+<p>This not only gives great isolation and flexibility, but it also allows us to decouple and move the rendering logic to outside Kitesurf (to the client, for example, or to another Worker), while keeping the security-critical parts server-side, running in our network.</p>
+<p>If this model sounds familiar, it may be because Cloudflare has another SASE product called Cloudflare Browser Isolation, which runs all untrusted web code at the edge of our global network while it “streams” the rendering data back to the clients.</p>
+<p>We can do something similar with Kitesurf. To prove it, we moved PageRenderer to our Playground Worker and patched this version so that instead of converting scene data into an image, it outputs to Kitty—a terminal graphics protocol supported by modern terminals like Kitty itself, Ghostty, WezTerm, and others. We even went a step further and added a pure ANSI text mode for environments where Kitty isn't available.</p>
+<p>The result is that you can now quickly open and render a page using Kitesurf without leaving the comfort of your terminal application. This is super useful not only because you can now browse the modern Web at a glance without context-switching, but you can also use this tool to see how an agent using Kitesurf “sees” a page.</p>
+<p>To install the terminal version of Kitesurf, do this:</p>
+<pre><code>$ brew install cloudflare/cloudflare/kitesurf</code></pre>
+<p>From now on just type this in terminal:</p>
+<pre><code>$ kitesurf https://blog.cloudflare.com
+$ kitesurf --help</code></pre>
+<p>Here’s a demo of it working.</p>
+<p>The terminal also sends back scrolling and click events, so you use the keyboard, arrows, or the mouse normally, as if you were in a dedicated browser application window.</p>
+<p>And here is our Silent Space Marine Doom demo running in Kitesurf inside the terminal:</p>
+<h2>Where we go from here</h2>
+<p>We continue to iterate rapidly on the road to the best agentic browser for our customers and developers. Expect ever-better performance benchmarks and for the list of supported Web standards and WPT test coverage to continue to rise quickly. In fact, we’ve decided to publish the results here and here, in the open, so that you track them as we move forward, in real time.</p>
+<p>We are going to continue exploring scenarios where decoupling Kitesurf and moving PageRenderer away from PageScript is an advantage for agents, or where higher frame rates are important. We may or may not have a 30fps Doom version running in Kitesurf as we write this.</p>
+<p>We also want to address the elephant in the room: While we are currently prioritizing rapid development, we remain committed to open-sourcing Kitesurf. This is coming soon, but we want to do this right, so we are set up to support it for the long term.</p>
+<p>Kitesurf stays true to its initial design goal: It runs entirely on top of Workers just like any other customer application does; that means we only use our publicly available features and APIs and have no access to any special privileges. This is not only a great way to dogfood and prove our own platform, but also the only way to make Kitesurf very cheap and scale automatically across the Cloudflare global network.</p>
+<p>Give Kitesurf a try in the refreshed kitesurf.dev playground, and use it in your projects via Browser Run. It’s <strong>available for free while in beta</strong>, behind per-account limits. Keep an eye on our changelog and come chat with the team on Discord. Share your experience and send us feedback—we’ll be listening.</p>
