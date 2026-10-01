@@ -1,0 +1,64 @@
+<h2>Summary</h2>
+<ul>
+ <li>Lakebase Postgres now includes a built-in search engine (GA on AWS/Azure). Two extensions, lakebase_vector (ANN search) and lakebase_text (BM25), let you run semantic, keyword, and hybrid search directly in Postgres alongside operational data, eliminating the need for a separate search system + ETL pipeline.</li>
+ <li>It outperforms pgvector and dedicated search engines at scale. On a 100M-vector benchmark, Lakebase delivers 2x the throughput of the next-best system, 4x lower cost than cloud Postgres with pgvector, and 97% recall at 71ms P99 latency. It achieves this by decoupling storage from compute and using hierarchical IVF clustering + binary quantization (RaBitQ) so queries touch only the data they need.</li>
+ <li>The architecture is serverless and scales to zero. You pay for query usage, not data volume. Index builds are offloaded from the primary database, cold starts take ~1 second, and 100M vectors can be served on a single compute unit, making it purpose-built for the bursty retrieval patterns of AI agents.</li>
+</ul>
+<p>Traditional OLTP systems weren't built for the search demands of AI agents. They require low-latency, high-accuracy retrieval across all your data and often execute massive parallel searches. Until now, solving this meant duct-taping a standalone search engine to your primary database with an ETL pipeline.</p>
+<p>But what if your OLTP database could just run the search workload efficiently?</p>
+<p>Today, we are bringing a fast and scalable search engine to Lakebase Postgres via two extensions: lakebase_vector (scalable approximate neighbor search) and lakebase_text (bm25 full-text search). Both extensions are generally available on AWS and Azure.</p>
+<p>With lakebase_vector, Postgres is now at the frontier of vector search. It outcompetes the efficiency and scalability of a dedicated search engine. On the VectorDBBench 100M benchmark, it delivers twice the throughput of the next best system and is 4 times cheaper than a cloud Postgres vendor using pgvector, and that is before accounting for additional saving due to autoscaling.</p>
+<p>It maintains this performance without sacrificing accuracy. In our tests, <em>lakebase_vector</em> delivered a P99 latency of 71 milliseconds at 97% recall (successfully retrieved the true nearest neighbors 97% of the time).</p>
+<p>Lakebase Postgres now has state-of-the-art search capabilities, and we’ve seen customers like Conexiom run hybrid search with BM25 on over 100 million rows with half the compute footprint of their previous pgvector setup. They now have a database for all OLTP and search workloads that is completely serverless and scales to their needs.</p>
+<blockquote>
+ Lakebase Search gives us a whole new level of scalability over pgvector, and unlocks BM25 in the same serverless database. We use Lakebase to connect data to our agents at scale. —Jordan Voves, AI/ML Architect @ Conexiom
+</blockquote>
+<h2>Why pgvector hits a wall at scale</h2>
+<p>For most Postgres users, search starts with pgvector. It allows vector similarity search through index algorithms like HNSW and IVFFlat over data natively in Postgres, avoiding the complexity of a separate vector store. In fact, pgvector is the most installed extension in Lakebase Postgres. We saw 3 common painpoints from customers running pgvector at scale.</p>
+<h3>First, costs scale with data volume, not usage.</h3>
+<p>pgvector keeps its index in your database's memory to be fast. Because HNSW search relies on random-access graph traversal, queries execute in milliseconds only if everything fits perfectly in RAM. The moment the index spills to disk, queries turn into chains of random reads, and performance plummets by 10x to 50x.</p>
+<p>A 768-dimensional float32 vector requires roughly 3.3 KB of memory after accounting for graph links and Postgres overhead. at 100 million rows, you need ~330 GB of RAM to keep the index resident for millisecond queries. There's no notion of a 'working set'. You provision for the entire index whether you query all of it or none.</p>
+<h3>Second, index maintenance is expensive and blocks your database.</h3>
+<p>Pgvector indexes are limited by memory because the HNSW graph relies on continuous random access. When a build spills to disk, millions of random I/O operations stall performance - <strong>taking almost 50 hours to build a pgvector index on a standard cloud instance.</strong></p>
+<p>Ingestion suffers from the same bottleneck. Inserting new vectors is slow and costly because every write forces pgvector to navigate and modify multiple layers of the graph using random-access lookups.</p>
+<p>Ongoing maintenance compounds the problem. Because HNSW lacks global rebalancing, restoring search quality requires a full REINDEX, which locks the table and blocks production writes.</p>
+<h3>Third, you trade-off search quality for performance</h3>
+<p>Each pgvector query runs on a single Postgres backend process, meaning the HNSW index scan is never parallelized.</p>
+<p>To get higher recall, the engine must visit more graph nodes, triggering more random memory reads and distance comparisons. This inflates latency and drops your QPS. Because a single search can't be parallelized across cores, your only option for higher throughput is adding more connections or read-replicas.</p>
+<h2>lakebase_vector brings scalable vector search to Postgres</h2>
+<p>The main bottleneck with pgvector is that the entire index has to fit in a single machine's RAM to be fast. What if it didn't?</p>
+<p>Lakebase Postgres gives us a great starting point, because it separates storage from compute. Durable data rests in cheap cloud object storage, while RAM and local NVMe act as ephemeral caches in front of it for fast reads of the working set of data. With this architecture, an HNSW cache means a series of random object store reads.</p>
+<p>We need an index that is fast both when cached in RAM and when cold on object storage. We leverage two ideas:</p>
+<ul>
+ <li>Hierarchical IVF clustering. Vectors are grouped into clusters stored as contiguous blocks. A query scores the cluster centroids in memory, then reads only the few promising blocks — turning hundreds of random hops into a handful of large sequential reads.</li>
+ <li>Binary quantization (RaBitQ). Each vector is compressed to ~1 bit per dimension, about 32× smaller than float32. Queries scan the compact codes to shortlist candidates, then rerank that bounded shortlist against the full-precision vectors.</li>
+</ul>
+<p>When cached, search operates over a tiny footprint using quantized vectors. When cold, queries fetch only the blocks they need and don’t need to crawl the entire index. Lakebase_vector delivers:</p>
+<h3>Pay only for what you use, and scale to zero</h3>
+<p>Decoupling storage from compute makes lakebase_vector completely stateless: a node caches hot data on demand, suspends to zero when idle, and resumes on the next query.</p>
+<ul>
+ <li>At rest, you pay only for storage, giving you a low baseline cost for keeping vectors indexed in Lakebase.</li>
+ <li>Cold starts are cheap because only the quantized codes and the specific blocks a query touches hydrate. Our measured P90 for the first query after scale-to-zero is just <em>1.13 seconds</em> (100M × 768-dim).</li>
+ <li>It is even possible to serve 100M vectors on just 1 Lakebase Compute Unit (CU). Only the active working dataset needs to be cached in compute nodes, giving you a pricing model that truly mirrors actual usage and query activity.</li>
+</ul>
+<h3>Fast, offloaded Index builds</h3>
+<p>lakebase_vector builds indexes in a more parallel way. We train the centroids once on a small random sample. This is the only step that looks across the whole dataset. After that, every vector is independently assigned to its nearest centroid, quantized, and written into its cluster's block. This process can fan across as many cores as you have, scaling with compute.</p>
+<p>We take this a step further by offloading index builds from your primary database entirely. Storing data in open formats allows our LTAP architecture to delegate indexing and maintenance to distributed engines like Spark, bringing build times <strong>down to minutes</strong> with parallel compute. Stay tuned.</p>
+<h3>Fast, accurate search</h3>
+<p>lakebase_vector broadens candidate search cheaply using compact 1-bit codes, reranking only a tight shortlist at full precision. Because index blocks are independent, a single query parallelizes across CPU cores, delivering high recall and low latency simultaneously.</p>
+<p>Filtering happens directly as lakebase_vector scans cluster blocks. Applying predicates inline avoids over-fetching candidates by and keeps recall high on filtered queries.</p>
+<h2>lakebase_text: native BM25 search in Postgres</h2>
+<p>Standard Postgres text search (tsvector) lacks corpus-wide relevance context. lakebase_text brings native BM25 to Postgres by scoring terms with global inverse document frequency (IDF): heavily weighting rare, high-intent terms while penalizing common filler words.</p>
+<p>It is also faster than traditional tsvector + GIN indexes. By evaluating score upper-bounds during traversal, the engine skips entire posting blocks that cannot reach the top-K results.</p>
+<p>Combining lakebase_text with lakebase_vector unlocks native hybrid search inside Postgres. In a single query, you can fuse semantic vector search with BM25 keyword relevance, apply standard SQL filter predicates, and join directly against live operational tables.</p>
+<h2>Lakebase Postgres is built for the agentic era</h2>
+<p>Agents have pushed traditional search engines past their limits. They made vector search a core requirement of the data stack and introduced extreme burstiness, where a single workflow can trigger thousands of concurrent retrieval requests in seconds.</p>
+<p>We designed Lakebase Search specifically for this new reality. Lakebase Postgres can now handle all your operational and search workloads, backed by a serverless architecture that scales seamlessly from 1 row to 1 billion vectors and from 1 QPS to thousands without manual reprovisioning or infrastructure management.</p>
+<p>We built Lakebase Search alongside feedback from hundreds of beta customers, and the results speak for themselves:</p>
+<ol>
+ <li>3x lower database spend: Conexiom cut infrastructure costs by 3x while achieving 5x higher throughput compared to pgvector.</li>
+ <li>One SQL tool call for agents: Developers replace complex multi-system retrieval pipelines with a single SQL call for native hybrid search, governed by standard database rules.</li>
+ <li>Unified OLTP and search: Teams consolidate live operational tables and dedicated search clusters into one pay-as-you-use backend.</li>
+</ol>
+<p>Lakebase Search is generally available today on AWS and Azure. If you are already building an app or an agent on Lakebase, simply enable the extensions. If you have not tried Lakebase yet, get started today.</p>
+<p>▎ 📝 Note: Databricks AI Search is a managed search engine for high-quality retrieval out of the box — it may be the better fit when you want great results without manual tuning. Lakebase Search is the better choice when you want all your operational and search data in one database.</p>

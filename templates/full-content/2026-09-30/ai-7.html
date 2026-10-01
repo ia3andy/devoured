@@ -1,0 +1,292 @@
+<p>MCP Events lets ChatGPT subscribe to updates from your MCP server, such as new messages, content updates, or status changes. Users choose what to monitor and what ChatGPT should do when an update arrives.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Use case</th>
+   <th>User request</th>
+   <th>MCP event</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Turn feedback into pull requests</td>
+   <td>Monitor #product-feedback for bug reports and open draft pull requests with fixes and tests.</td>
+   <td><code>message.created</code>, filtered by <code>channel_id</code></td>
+  </tr>
+  <tr>
+   <td>Apply document feedback</td>
+   <td>Watch this document for review comments and implement any requested edits.</td>
+   <td><code>comment.created</code>, filtered by <code>document_id</code></td>
+  </tr>
+ </tbody>
+</table>
+<h2>Before you start</h2>
+<p>MCP Events in ChatGPT requires MCP 2.0 (protocol version <code>2026-07-28</code>). Configure your server in your plugin and provide persistent subscription storage and outbound HTTPS access to callback URLs.</p>
+<p>ChatGPT supports webhook delivery and callback verification from the draft MCP Events specification. Polling, streaming, and the draft’s <code>gap</code> and <code>terminated</code> control notifications are not supported by this integration.</p>
+<h2>How it works</h2>
+<ol>
+ <li>Your server lists the events it supports.</li>
+ <li>The user tells ChatGPT what to monitor and how to respond.</li>
+ <li>ChatGPT subscribes through your MCP server and supplies a callback URL and signing secret.</li>
+ <li>Your server sends matching events to that URL.</li>
+ <li>ChatGPT receives the event in the subscribed chat and follows the user’s instructions for how to respond.</li>
+</ol>
+<h2>Advertise event support</h2>
+<p>Event discovery starts with your server’s capabilities. Add <code>events</code> to the capabilities returned by its <code>server/discover</code> response:</p>
+<pre><code>\{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": \{
+    "resultType": "complete",
+    "supportedVersions": ["2026-07-28"],
+    "capabilities": \{
+      "tools": \{},
+      "events": \{}
+    }
+  }
+}</code></pre>
+<p>Implement these three event methods on the same authenticated MCP endpoint as your tools:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Method</th>
+   <th>Server behavior</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>events/list</code></td>
+   <td>Describe available events and their filters.</td>
+  </tr>
+  <tr>
+   <td><code>events/subscribe</code></td>
+   <td>Create or refresh a subscription.</td>
+  </tr>
+  <tr>
+   <td><code>events/unsubscribe</code></td>
+   <td>Stop a subscription.</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Define an event</h2>
+<p>An event definition tells ChatGPT what users can subscribe to and which filters are available. Return these definitions from <code>events/list</code>, including the event name, supported delivery modes, subscription arguments, and payload schema.</p>
+<pre><code>\{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": \{
+    "events": [
+      \{
+        "name": "comment.created",
+        "description": "A new review comment was added to the specified document.",
+        "delivery": ["webhook"],
+        "inputSchema": \{
+          "type": "object",
+          "properties": \{
+            "document_id": \{
+              "type": "string",
+              "description": "ID of the document to monitor for new review comments."
+            }
+          },
+          "required": ["document_id"],
+          "additionalProperties": false
+        },
+        "payloadSchema": \{
+          "type": "object",
+          "properties": \{
+            "document_id": \{ "type": "string" },
+            "comment_id": \{ "type": "string" },
+            "text": \{ "type": "string" },
+            "url": \{ "type": "string" }
+          },
+          "required": ["document_id", "comment_id", "text", "url"],
+          "additionalProperties": false
+        }
+      }
+    ]
+  }
+}</code></pre>
+<p><code>inputSchema</code> describes the arguments passed when ChatGPT subscribes, while <code>payloadSchema</code> describes the <code>data</code> object in each delivered event.</p>
+<p>Use stable event names and specific descriptions. Expose filters such as document, project, or queue IDs, and apply them on your server before delivery. Return only events the connected account is allowed to discover.</p>
+<p>If the catalog spans multiple pages, return <code>nextCursor</code> and accept it as <code>cursor</code> on the next <code>events/list</code> request.</p>
+<h2>Create a subscription</h2>
+<p>When a user asks to monitor an event, ChatGPT calls <code>events/subscribe</code> with the event name, filter arguments, and webhook destination:</p>
+<pre><code>\{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "events/subscribe",
+  "params": \{
+    "name": "comment.created",
+    "arguments": \{
+      "document_id": "doc_123"
+    },
+    "delivery": \{
+      "mode": "webhook",
+      "url": "https://receiver.example.com/mcp-events/callback_123",
+      "secret": "whsec_&lt;base64-encoded-signing-key&gt;"
+    },
+    "cursor": null
+  }
+}</code></pre>
+<p>Before accepting the subscription:</p>
+<ol>
+ <li>Check that the user is authorized for the requested event and arguments.</li>
+ <li>Validate the event name and arguments against your event definition. Require a <code>whsec_</code> signing secret whose base64 value decodes to 24–64 bytes.</li>
+ <li>Validate and verify the callback URL.</li>
+ <li>Store the subscription, its owner, filters, callback URL, signing secret, and expiration.</li>
+</ol>
+<p>Derive a deterministic subscription ID from the authenticated principal, callback URL, event name, and arguments. Return it with the granted expiration:</p>
+<pre><code>\{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": \{
+    "id": "sub_123",
+    "refreshBefore": "2026-10-02T12:00:00Z",
+    "cursor": null,
+    "truncated": false
+  }
+}</code></pre>
+<p>Set <code>refreshBefore</code> to the expiration your server grants. Return <code>cursor: null</code> for event types that do not support replay.</p>
+<p>Make subscription creation idempotent: update the existing subscription when its identity matches. Compare arguments using canonical JSON so object key order does not create duplicate subscriptions.</p>
+<h3>Verify the callback</h3>
+<p>Before sending application data, verify the callback by sending a signed request with a fresh, single-use, short-lived challenge:</p>
+<pre><code>\{
+  "type": "verification",
+  "challenge": "a-single-use-random-value"
+}</code></pre>
+<p>Assign the verification request a unique <code>webhook-id</code>, such as <code>msg_verification_123</code>, and sign its body with the subscription’s secret. Include <code>webhook-timestamp</code>, <code>webhook-signature</code>, and <code>X-MCP-Subscription-Id</code>. ChatGPT echoes the challenge in a successful response:</p>
+<pre><code>\{
+  "challenge": "a-single-use-random-value"
+}</code></pre>
+<p>Require a <code>2xx</code> response and compare the returned challenge in constant time before activating delivery. Cache successful verification by authenticated principal and callback URL for a bounded period so repeated subscription requests do not trigger repeated challenges. If verification fails, return JSON-RPC error <code>-32015</code> (<code>CallbackEndpointError</code>) with a categorized <code>data.reason</code>, such as <code>challenge_failed</code> or <code>timeout</code>.</p>
+<p>Require HTTPS for callbacks. Resolve and validate destination addresses at connection time, then connect to the validated address while preserving the original hostname for TLS verification. Block private, local, and other non-public addresses, and do not follow redirects. Apply these checks to verification requests as well as event deliveries.</p>
+<h2>Send an event</h2>
+<p>When a new comment matches an active subscription, POST one event object to that subscription’s callback URL:</p>
+<pre><code>\{
+  "eventId": "evt_456",
+  "name": "comment.created",
+  "timestamp": "2026-10-01T12:05:00Z",
+  "data": \{
+    "document_id": "doc_123",
+    "comment_id": "comment_456",
+    "text": "Can we add the rollout dates to this section?",
+    "url": "https://docs.example.com/doc_123#comment_456"
+  },
+  "cursor": null
+}</code></pre>
+<p>Use a unique event ID and preserve it across retries. Set <code>timestamp</code> to the event’s occurrence time as an ISO 8601 timestamp with a timezone. The <code>name</code> must match the subscribed event, and the <code>data</code> object must match its <code>payloadSchema</code>. Keep application fields inside <code>data</code>; a top-level <code>type</code> identifies a protocol control notification.</p>
+<p>For large records, send a summary and expose a read tool to retrieve the full record. Treat comments and other user-authored text as data; do not add instructions telling the model how to behave inside the event payload.</p>
+<h3>Sign the request</h3>
+<p>ChatGPT verifies deliveries using Standard Webhooks. Send these headers:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Header</th>
+   <th>Value</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>Content-Type</code></td>
+   <td><code>application/json</code></td>
+  </tr>
+  <tr>
+   <td><code>webhook-id</code></td>
+   <td>The same value as the body’s <code>eventId</code>.</td>
+  </tr>
+  <tr>
+   <td><code>webhook-timestamp</code></td>
+   <td>The signing time as Unix seconds.</td>
+  </tr>
+  <tr>
+   <td><code>webhook-signature</code></td>
+   <td>The Standard Webhooks HMAC signature.</td>
+  </tr>
+  <tr>
+   <td><code>X-MCP-Subscription-Id</code></td>
+   <td>The ID returned by <code>events/subscribe</code>.</td>
+  </tr>
+ </tbody>
+</table>
+<p>Sign deliveries using Standard Webhooks and the subscription’s signing secret. Because the signature covers the event ID, signing timestamp, and exact request body bytes, serialize the body once and send those same bytes.</p>
+<h3>Send a signed event with Node.js</h3>
+<p>Install the Standard Webhooks library:</p>
+<pre><code>npm install standardwebhooks</code></pre>
+<p>Pass a <code>webhookFetch</code> function with the same interface as <code>fetch</code> that validates callback addresses on each connection and blocks redirects.</p>
+<pre><code>import \{ Webhook } from "standardwebhooks";
+
+export async function sendEvent(subscription, event, webhookFetch) \{
+  const body = JSON.stringify(event);
+  if (Buffer.byteLength(body, "utf8") &gt; 256 * 1024) \{
+    throw new Error("Event payload exceeds 256 KiB");
+  }
+
+  const signedAt = new Date();
+  const signer = new Webhook(subscription.secret);
+  const response = await webhookFetch(subscription.url, \{
+    method: "POST",
+    redirect: "error",
+    signal: AbortSignal.timeout(10_000),
+    headers: \{
+      "Content-Type": "application/json",
+      "webhook-id": event.eventId,
+      "webhook-timestamp": String(Math.floor(signedAt.getTime() / 1000)),
+      "webhook-signature": signer.sign(event.eventId, signedAt, body),
+      "X-MCP-Subscription-Id": subscription.id,
+    },
+    body,
+  });
+
+  return \{ accepted: response.ok, status: response.status };
+}</code></pre>
+<p>Set <code>subscription.url</code> and <code>subscription.secret</code> from the subscription request’s <code>delivery</code> object.</p>
+<h3>Handle delivery responses</h3>
+<p>A <code>2xx</code> response acknowledges webhook receipt. ChatGPT processes the event asynchronously.</p>
+<p>Send one event per request, with a complete request body no larger than 256 KiB (262,144 bytes). ChatGPT can group separately delivered events into one task run according to the task’s batching settings.</p>
+<p>Retry transient failures with exponential backoff and bounded attempts. Preserve the event ID and generate a fresh signing timestamp and signature for each attempt. Do not retry deliveries that return <code>410</code> or <code>413</code>.</p>
+<p>Events can arrive out of order. Make write tools idempotent so repeated calls do not duplicate changes.</p>
+<h2>Manage subscriptions</h2>
+<p>Retain subscription state for the lifetime you grant, including across server restarts. Recheck the user’s access during the subscription’s lifetime and stop delivery if access is revoked.</p>
+<h3>Refresh a subscription</h3>
+<p>ChatGPT refreshes expiring subscriptions by calling <code>events/subscribe</code> before <code>refreshBefore</code>, using the same subscription identity and the last saved cursor. Update the existing subscription and return its new expiration in <code>refreshBefore</code>.</p>
+<p>When <code>ttlMs</code> is omitted, use your server’s default subscription lifetime. When provided, it specifies the requested lifetime in milliseconds. Grant no more than that duration, except when enforcing a minimum lifetime to prevent excessive refresh requests.</p>
+<p><code>ttlMs: null</code> requests a subscription without expiration. Return <code>refreshBefore: null</code> only when granting that request. Otherwise, return a finite expiration and stop delivery when it passes.</p>
+<p>When a refresh supplies a replacement signing secret, replace the stored secret. During a short rotation window, sign with both the old and new keys using Standard Webhooks’ space-separated signatures.</p>
+<p>For replayable events, use the request’s <code>cursor</code> to resume after an expired subscription or server restart. In subscription responses and event payloads, return a cursor that does not skip events still awaiting delivery. Return <code>truncated: true</code> when the requested history is no longer available. For event types without replay, return <code>cursor: null</code>; events missed during an interruption cannot be recovered through the protocol.</p>
+<h3>Stop a subscription</h3>
+<p>Handle <code>events/unsubscribe</code> using the original event name, arguments, and callback URL:</p>
+<pre><code>\{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "events/unsubscribe",
+  "params": \{
+    "name": "comment.created",
+    "arguments": \{
+      "document_id": "doc_123"
+    },
+    "delivery": \{
+      "mode": "webhook",
+      "url": "https://receiver.example.com/mcp-events/callback_123"
+    }
+  }
+}</code></pre>
+<p>Stop sending events for the matching subscription and return an empty result:</p>
+<pre><code>\{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": \{}
+}</code></pre>
+<p>Make unsubscribe idempotent and authorize it against the connected account.</p>
+<h2>Test in ChatGPT</h2>
+<p>With the event methods and webhook delivery in place, connect your MCP server to ChatGPT through a plugin and test the full subscription lifecycle:</p>
+<ol>
+ <li>Confirm your server receives <code>server/discover</code> and <code>events/list</code>, and returns the expected event definitions.</li>
+ <li>Verify that your events appear on your plugin page alongside your tools. Rescan your MCP server whenever you change its tools or events.</li>
+ <li>Start a new chat, ask ChatGPT to subscribe to one of your events, and specify what it should do when an event arrives.</li>
+ <li>Confirm your server receives <code>events/subscribe</code> with the expected event name and arguments.</li>
+ <li>Check that callback verification succeeds and the subscription is stored.</li>
+ <li>Trigger a matching event in your app and confirm that the webhook delivery receives a <code>2xx</code> response.</li>
+ <li>Verify that ChatGPT receives the expected event data and responds as instructed.</li>
+ <li>For filtered subscriptions, trigger an event that does not match the filters and confirm it is not delivered to the subscription.</li>
+ <li>Stop monitoring in ChatGPT. Confirm that your server processes <code>events/unsubscribe</code> and stops delivery.</li>
+</ol>
+<p>Also test repeated subscription requests, expiration and refresh across a server restart, account disconnection, revoked access to a subscribed resource, invalid signatures, duplicate deliveries, and bursts with batching enabled and disabled. If the requested action changes data in the source app, verify that the resulting events do not create a feedback loop.</p>
