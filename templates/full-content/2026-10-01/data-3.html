@@ -1,0 +1,83 @@
+<h1>Improving Cost Efficiency of Data Streaming Pipelines</h1>
+<h3>It's not always the data volume.</h3>
+<p>If you operate a large-scale data streaming platform, I’m guessing the cost is always on your mind.</p>
+<p>A lot of classic “Big Data” tools (think Spark, Kafka, Flink) were designed to be scalable, but they were never about efficiency. So it’s not surprising that your streaming bill can keep growing even when traffic doesn’t.</p>
+<p>After years of building and operating these systems, I’m convinced that streaming pipelines can get expensive very quickly for reasons other than data volume. They get expensive because of their <em>design</em>: how many times a message is copied, how many times it’s serialized and deserialized, and how much idle capacity sits around waiting for it.</p>
+<p>The good news is that most of it can be fixed with targeted tactical changes and configuration tuning, not rewrites. I still remember many years ago changing the batching configuration of our Kafka producers and watching broker CPU utilization drop by ~50%. So satisfying! It allowed us to keep using the same hardware for much longer.</p>
+<p>So here are a few ideas to consider.</p>
+<h3>It’s Not Always About Bytes</h3>
+<p>Kafka is incredibly good at moving large volumes of data, <em>as long as it’s batched</em>. What actually overloads brokers is the number of requests. So the most important efficiency question for any streaming component is: how many <em>requests</em> does it take to move a gigabyte?</p>
+<p>Start with producers. Until Kafka 4.0, <code>linger.ms</code> defaulted to 0. It’s 5 ms now, but <code>batch.size</code> is still just 16 KB, and plenty of fleets run older clients or “low-latency” configs copied from somewhere. A few thousand producers with no linger, each writing a trickle of data, will flood your cluster with tiny requests.</p>
+<p>There is even similarity with object storage: many streaming brokers with native object storage support (think WarpStream, RedPanda Cloud Topics, etc.) try to minimize the number of requests by batching data.</p>
+<p>Counterintuitively, adding a few milliseconds of linger frequently makes latency <em>better</em>: fewer requests mean shorter queues on the brokers. Tail latency improves the most.</p>
+<p>A few less obvious things:</p>
+<ul>
+ <li>Compression is applied per batch, so bigger batches compress better. This has second-order effects: a change in upstream batching can change your compression ratio all the way down to the Parquet files in your lakehouse.</li>
+ <li>Collect Kafka metrics and compare <code>batch-size-avg</code> with <code>batch.size</code> and watch <code>record-queue-time-avg</code>. If you increase linger and batches are still tiny, you’re adding latency for nothing. Sometimes the bottleneck is elsewhere entirely: in my CDC benchmark, bigger batches nearly doubled Debezium’s throughput but did nothing for Flink CDC.</li>
+</ul>
+<p>Consumers deserve the same treatment. With the default <code>fetch.min.bytes=1</code>, brokers answer a fetch as soon as a single byte is available, so with many consumer groups reading hot partitions, every produce request wakes all of them up. Most consumers don’t need millisecond latency: raise <code>fetch.min.bytes</code> and <code>fetch.max.wait.ms</code>, and don’t commit offsets after every poll!</p>
+<p>Exactly-once is a batching problem too. Transaction overhead is per transaction, not per message, so a short commit interval can cost you a double-digit percentage of throughput.</p>
+<p>Finally, I have to mention dealing with the object storage:</p>
+<ul>
+ <li>When it comes to file sinks, small files mean more requests, worse compression, heavier metadata and slower queries. Shuffling data by destination before the sink (so each task writes to fewer files) costs you a network shuffle, but it can drastically cut the number of requests. At Shopify, a single-line change like that solved a resource problem we debugged for weeks.</li>
+ <li>Flink’s continuous file source lists the whole directory on every discovery interval, so its request cost grows with the <em>total</em> number of files, not just the new ones.</li>
+</ul>
+<h3>Every Copy Is Paid for Several Times</h3>
+<p>When you write a message to a new topic, you don’t pay for it once. You pay for the produce request, replication (usually 3x, often across zones), storage, every consumer read, and a round of serialization and deserialization on each side. That’s why materializing every transformation into a topic is so expensive. I cannot stress this enough, I’ve seen too many times when a Flink pipeline emitted a Kafka topic as a result, only to write it to a datalake (or some other database) with another job. Do you <em>really</em> need that topic?</p>
+<p>Intermediate topics are the obvious copies. Eliminate them when possible. The less obvious ones:</p>
+<ul>
+ <li>Kafka has no server-side filtering or projection, so every consumer reads <em>everything</em>. Ten consumers that each need 5% of a topic move the whole topic ten times. Read once, route to many: one job that filters and fans out to multiple destinations, or domain-specific substreams instead of a single firehose.</li>
+ <li>A mirrored cluster is a full copy of your data. Most mirroring tools also decompress and recompress every batch, so if yours can pass compressed batches through as-is, use it. A REST proxy in front of Kafka is yet another hop.</li>
+ <li>Backfilling through Kafka means keeping (or re-producing) history in the most expensive storage you have. Tiered Storage doesn’t completely solve this. Keep history in the lakehouse and use something like Flink’s HybridSource: read the table first, then switch to the topic.</li>
+ <li>Hot standbys, blue-green deployments and “one copy of the app per region” all increase compute and reads. Sometimes that’s the right trade-off, but make it deliberately.</li>
+</ul>
+<p>But don’t overcorrect! Merging everything into one giant job means a bigger blast radius, shared restarts and shared backpressure. My rule of thumb: split jobs where interference hurts (backpressure, restarts, shared state), and merge them where fixed per-job overhead dominates (JVMs, coordinators, duplicated source reads, monitoring). Finally, keep in mind that adding new topics is always easier than removing existing ones.</p>
+<h3>Serialization Can Be a Huge Part of Your Bill</h3>
+<p>Most streaming pipelines are stateless: read, filter, route, enrich, write. For them, the most expensive thing isn’t the business logic. It’s serialization and deserialization. At Shopify, we once found Kryo eating 50%+ of CPU. When I first started using Flink CDC to extract data from Postgres, 60%+ of CPU went to JSON serdes (and the data was serialized <em>twice</em>). Business logic rarely comes close.</p>
+<p>Here’s how I approach it, from the most to the least effective:</p>
+<ul>
+ <li>If a component just moves data, treat the payload as raw bytes. Put routing and filtering metadata (and schema IDs) in message headers or a message envelope: deserializing the whole message just to skip it is very wasteful.</li>
+ <li>Project early and defer deserialization to the operator that actually needs the field.</li>
+ <li>Avoid JSON if you can. Avro and Protobuf are faster, smaller and come with strong schema support.</li>
+ <li>If you’re stuck with JSON, stop trusting the defaults. Specialized, schema-compiled Avro deserializers were ~3x faster than the standard ones. Measure everything and don’t be scared to try new tools. Also, don’t forget about JSON schemas.</li>
+ <li>Never use Kryo in Flink. It silently falls back to Kryo for types it doesn’t support (and there are many unexpected edge cases). Set <code>pipeline.generic-types: false</code> so it fails loudly instead, and enable object reuse where it’s safe.</li>
+</ul>
+<p>And compress. Compress everything you can! Streaming systems are rarely CPU-bottlenecked, so compression almost always makes a lot of sense. The Java producer’s default <code>compression.type</code> is still <code>none</code>, and JSON compresses extremely well. zstd is a great default: close to gzip’s ratio at a much lower CPU cost.</p>
+<p>Of course, I can’t avoid mentioning columnar data! I strongly believe that stream-processing should favour columnar data (think Apache Arrow) from now on. To summarize, columnar data is great for vectorization and offers better CPU cache locality, compression/encoding, and data skipping by design.</p>
+<p>Finally, send less if you can. Drop unused fields at the source, use short numeric IDs, and sample noisy events. Sampling is hugely underrated, but it’s a powerful tool, especially if you can control it with feature flags at runtime.</p>
+<h3>Pay for Latency Only Where You Need It</h3>
+<p>Cross-AZ traffic is the most famous line item in any classic cloud Kafka bill: replication, plus consumers reading from leaders in other zones. If you haven’t enabled fetch-from-follower yet (<code>broker.rack</code> and <code>replica.selector.class</code> on the brokers, <code>client.rack</code> on the consumers), do it asap.</p>
+<p>The real fix is architectural, and WarpStream was the first example of a new architecture: stateless agents, object storage for durability and replication, and clients routed to agents in their own zone. When I ran WarpStream in production, the recipe for paying $0 for inter-AZ networking end-to-end was simple: an agent group in each zone, zone-aware client configuration, and stream processors pinned to a single zone.</p>
+<p>The price is latency: around half a second at p99 by default, ~150 ms with S3 Express One Zone. But, in my experience, <em>most pipelines don’t care</em>. Populating a lakehouse, CDC into search or cache, observability, ML features: all fine. Fraud detection, trading, multi-hop user-facing flows: probably not. So stop running everything on the lowest-latency tier. Keep a small low-latency cluster for the workloads that truly need it, and move the rest to a diskless one. You should pay for latency in proportion to how much you actually need it.</p>
+<h3>State Is a Design-Time Decision</h3>
+<p>Going from a stateless pipeline to one with hundreds of millions of keys in RocksDB can cost you 30-50x in throughput per core. You can tune RocksDB all you want, but most of that cost is decided upfront, before anyone writes code.</p>
+<ul>
+ <li>Beware of join cascades. A chain of binary joins stores intermediate results again and again, so state can grow far beyond the size of the inputs.</li>
+ <li>Use pre-aggregated tiles instead of long sliding windows (which keep a copy of each record per window), and sketches like HyperLogLog instead of exact distinct counts.</li>
+ <li>Use local disks! It’s the number one advice I give teams that want to optimize large, stateful Flink pipelines. RocksDB on network-attached storage is often IOPS-bound, not CPU-bound. So, forget about EBS volumes and stick to instance-level storage. I’ve seen 5x - 10x difference in performance simply by switching disks.</li>
+</ul>
+<h4>What About Upserts?</h4>
+<p>Upserts are a special case: the answer depends on <em>where</em> they happen.</p>
+<p>At the edge of a pipeline, they’re great. An upsert-capable sink handles <em>any</em> duplicates, not just the ones caused by producer retries, and it’s often simpler and cheaper than exactly-once delivery. Partial updates can even replace joins entirely: each input writes its own columns into the same table by primary key, with zero join state.</p>
+<p>Inside a stream processor, updates can be expensive. In the case of Flink, retractions roughly double the number of records flowing through joins and aggregations, and CDC-style before/after images roughly double the bytes.</p>
+<p>So, my rule: if possible, <strong>append-only in the middle, upserts at the edge</strong>.</p>
+<h3>Idle Capacity</h3>
+<p>Fixed clusters are never right-sized: they’re too expensive when traffic is low and too slow when it spikes.</p>
+<p>Per-job overhead matters too. Flink excels at stateful computations at scale, but its fixed cost per job is real: two JVMs and a few gigabytes of memory before a single record is processed. That’s worthwhile when a job has hundreds of workers and wasteful when it has two.</p>
+<p>Finally, autoscaling. It truly works, and the savings can be dramatic for pipelines with daily traffic cycles. But do it last, not first.</p>
+<h3>Make Cost Visible</h3>
+<p>None of this works if you don’t know where the money goes. I find it useful to break the cost of each pipeline into four dimensions: compute (hours), state and checkpoints (bytes and object storage requests), network (bytes), and sink writes.</p>
+<p>Find the metric that proves which dimension dominates, and start there. Most teams watch CPU and bytes. Far fewer watch request counts or cross-AZ bytes, and these are exactly the things that are hardest to attribute on a cloud bill.</p>
+<p>Enforce client IDs, attribute cost per pipeline, and ship a shared client library (or at least a config) with sane defaults from day one.</p>
+<h3>Summary</h3>
+<p>Streaming pipelines get expensive because of their structure, not their volume. So:</p>
+<ul>
+ <li>Count requests, not bytes. Batch everything.</li>
+ <li>Minimize copies: every hop is paid for several times.</li>
+ <li>Treat serialization as your real compute bill.</li>
+ <li>Pay for latency only where you need it, and go diskless for the rest.</li>
+ <li>Design state on the whiteboard.</li>
+ <li>Append-only in the middle, upserts at the edge.</li>
+ <li>Get rid of idle capacity. Autoscale last.</li>
+ <li>Make cost visible and owned.</li>
+</ul>

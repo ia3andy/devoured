@@ -1,0 +1,184 @@
+<p>Row-level security costs nothing — if the policy is a simple comparison and the query only asks for what the policy already restricts. We measured that earlier: with the right index, the policy <em>is</em> the index lookup. But a policy can be written in many ways, and a query can ask for more than the policy knows about. One of the variants we measured made every query take 80 milliseconds or more; another took nearly two seconds; and one rule that is easy to overlook turned a 0.2 ms lookup into 34 to 45 ms — mostly for the largest customer.</p>
+<h2>What does a row-level security policy cost?</h2>
+<p>Nothing measurable, in its simplest form. On a table of 2 million invoices, the same queries with the policy <code>tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid</code> were as fast as without row-level security and an explicit <code>WHERE tenant_id = …</code>: 11.0 against 11.0 ms to count the largest tenant’s 267,023 invoices, 0.30 against 0.34 ms for a median tenant’s latest 50. The cost comes from three other places: how the policy gets the tenant, whether it looks up memberships, and which functions the query itself uses.</p>
+<h2>The setup</h2>
+<p>PostgreSQL 17.10 in a throwaway container, default settings, warm cache, median of five runs. The table from PostgreSQL indexes for multi-tenant SaaS: 1,998,794 invoices over 1,000 tenants of very unequal size — the largest has 267,023, the median 534 — with an index on <code>(tenant_id, issued_on)</code>. We added a <code>customer_email</code> column with two indexes, <code>(tenant_id, lower(customer_email))</code> and <code>(tenant_id, customer_email text_pattern_ops)</code>, and later a third on a generated column. The application connects as a role without <code>BYPASSRLS</code>; the baseline without row-level security runs as the table owner with the tenant in the <code>WHERE</code>. We recreated the policy before every series, which throws away cached plans, so every number below is for a plan made for that tenant — why that matters is at the end of the next section.</p>
+<h2>Does it matter how the policy gets the tenant?</h2>
+<p>Only when the function cannot be inlined. Many teams put the lookup in a helper function, <code>tenant_id = app.current_tenant()</code>. We measured that in five forms, for two queries: count all invoices, and the latest 50.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Policy</th>
+   <th>Largest tenant, count</th>
+   <th>Largest tenant, latest 50</th>
+   <th>Median tenant, count</th>
+   <th>Median tenant, latest 50</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>no RLS, <code>WHERE tenant_id = …</code></td>
+   <td>11.0 ms</td>
+   <td>0.39 ms</td>
+   <td>0.20 ms</td>
+   <td>0.34 ms</td>
+  </tr>
+  <tr>
+   <td><code>nullif(current_setting(…), '')::uuid</code></td>
+   <td>11.0 ms</td>
+   <td>0.37 ms</td>
+   <td>0.15 ms</td>
+   <td>0.30 ms</td>
+  </tr>
+  <tr>
+   <td>SQL function, <code>VOLATILE</code> (the default)</td>
+   <td>15.0 ms</td>
+   <td>0.29 ms</td>
+   <td>0.15 ms</td>
+   <td>0.29 ms</td>
+  </tr>
+  <tr>
+   <td>SQL function, <code>STABLE</code></td>
+   <td>15.1 ms</td>
+   <td>0.29 ms</td>
+   <td>0.15 ms</td>
+   <td>0.29 ms</td>
+  </tr>
+  <tr>
+   <td>PL/pgSQL function, <code>VOLATILE</code> (the default)</td>
+   <td><strong>1,877 ms</strong></td>
+   <td><strong>1,920 ms</strong></td>
+   <td><strong>1,860 ms</strong></td>
+   <td><strong>1,884 ms</strong></td>
+  </tr>
+  <tr>
+   <td>PL/pgSQL function, <code>STABLE</code></td>
+   <td>14.5 ms</td>
+   <td>0.29 ms</td>
+   <td>0.15 ms</td>
+   <td>0.30 ms</td>
+  </tr>
+  <tr>
+   <td><code>(select …)</code> around the PL/pgSQL <code>VOLATILE</code> function</td>
+   <td>14.6 ms</td>
+   <td>0.30 ms</td>
+   <td>0.16 ms</td>
+   <td>0.30 ms</td>
+  </tr>
+ </tbody>
+</table>
+<p>The SQL function was fast whether it was declared <code>VOLATILE</code> or <code>STABLE</code>: PostgreSQL inlined it, and <code>EXPLAIN</code> showed the <code>nullif(current_setting(…))</code> expression itself as the <code>Index Cond</code>, without the function. The PL/pgSQL function cannot be inlined. Declared <code>VOLATILE</code>, which is what you get if you declare nothing, it has to be called once for every row, so the index cannot be used and the query becomes a sequential scan over 2 million rows — for a tenant with 534 invoices too. <code>STABLE</code> fixes it, and so does wrapping the call in <code>(select …)</code>, which turns it into a value computed once per query. That is the advice you often read; it is right, and for an inlinable SQL function it is unnecessary.</p>
+<p>Inlining has conditions, and two common hardening habits break it. An SQL function declared <code>SECURITY DEFINER</code>, or with a <code>SET search_path</code> clause, is no longer inlined. Declared <code>STABLE</code> that did not matter — 14.6, 0.31, 0.18 and 0.31 ms — but a <code>VOLATILE</code> SQL function took 3,804 ms with <code>SECURITY DEFINER</code> and 4,600 ms with <code>SET search_path</code> — a sequential scan, like the PL/pgSQL one. So declare the helper <code>STABLE</code> whatever language it is in; then you do not depend on inlining.</p>
+<p>The count for the largest tenant stayed at about 15 ms instead of 11 with every function. That is parallelism: a function is <code>PARALLEL UNSAFE</code> unless you declare otherwise, and the documentation is explicit that such a function “forces a serial execution plan”. Declared <code>STABLE PARALLEL SAFE</code>, the helper got its parallel plan back: 10.2 to 10.9 ms for the SQL function, 11.2 to 11.8 ms for the PL/pgSQL one.</p>
+<p>That parallel plan has a price on a shared connection. psycopg prepares a query automatically once it has run more than five times on a connection, and a statement without parameters keeps the plan of its first tenant. With that default, on one direct connection, counting the median tenant’s invoices right after the largest tenant’s took 7.3 ms instead of 0.2 — with the parallel-safe helper and with the plain <code>current_setting()</code> policy alike, because both now had a parallel plan to hand down. With the serial plan of a parallel-unsafe helper it stayed at 0.15 ms. Behind a connection pooler this gets worse, and we measured it separately in PgBouncer and RLS.</p>
+<h2>What does a membership subquery in the policy cost?</h2>
+<p>About 80 milliseconds on every query, on this table. When users can belong to several tenants, a common policy asks the membership table directly:</p>
+<pre><code>using (tenant_id in (
+  select m.tenant_id from memberships m
+  where m.user_id = nullif(current_setting('app.user_id', true), '')::int))
+</code></pre>
+<table>
+ <thead>
+  <tr>
+   <th>Policy</th>
+   <th>Largest tenant, count</th>
+   <th>Largest tenant, latest 50</th>
+   <th>Median tenant, count</th>
+   <th>Median tenant, latest 50</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>tenant in a setting</td>
+   <td>11.0 ms</td>
+   <td>0.37 ms</td>
+   <td>0.15 ms</td>
+   <td>0.30 ms</td>
+  </tr>
+  <tr>
+   <td><code>tenant_id in (select … from memberships …)</code></td>
+   <td>83–85 ms</td>
+   <td>95–99 ms</td>
+   <td>79–81 ms</td>
+   <td>79–82 ms</td>
+  </tr>
+  <tr>
+   <td><code>tenant_id = any (array(select …))</code></td>
+   <td>14.4 ms</td>
+   <td>158 ms</td>
+   <td>0.16 ms</td>
+   <td>0.74 ms</td>
+  </tr>
+ </tbody>
+</table>
+<p>With <code>in (select …)</code> the planner no longer had a single value to look up in the index. It checked the policy row by row against the membership list, and the median tenant’s 534 invoices cost as much as the largest tenant’s 267,023: 80 ms for a list that takes 0.30 ms. Rewriting it as <code>= any (array(select …))</code> gives the planner a value list computed once, and that fixed the counts — but the largest tenant’s latest 50 got worse, 158 ms, because the plan now fetched all its rows through a bitmap and sorted them instead of walking the index backwards.</p>
+<p>The version that was fast everywhere is the first row: resolve the membership once, when the request starts, and put the chosen tenant in the setting. The policy then compares against one value. Checking that the user belongs to that tenant moves into the code that sets the tenant — one query per request instead of one per row.</p>
+<h2>Why does row-level security stop my index from being used?</h2>
+<p>Because of a rule for functions that are not <em>leakproof</em>. The PostgreSQL documentation: “The system will enforce conditions from security policies and security barrier views before any user-supplied conditions from the query itself that contain non-leakproof functions, in order to prevent the inadvertent exposure of data.” A function that could reveal something about a row — through an error message, for instance — must not see rows the policy has not yet approved.</p>
+<p><code>lower()</code> is not leakproof. Neither is <code>LIKE</code>. So a lookup that is instant without row-level security:</p>
+<pre><code>select count(*) from invoices
+where lower(customer_email) = lower($1);
+</code></pre>
+<p>— under the policy uses the index only for the tenant, then evaluates <code>lower()</code> on every one of that tenant’s rows. <code>EXPLAIN</code> for the largest tenant showed <code>Index Cond</code> on <code>tenant_id</code> only, with the email as a <code>Filter</code> and <code>Rows Removed by Filter: 89,005</code> in each of three parallel processes: all 267,015 other rows.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Query</th>
+   <th>Largest tenant (267,023 rows)</th>
+   <th>Median tenant (534 rows)</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>no RLS, <code>lower(customer_email) = lower($1)</code></td>
+   <td>0.21 ms</td>
+   <td>0.19 ms</td>
+  </tr>
+  <tr>
+   <td>RLS, the same query</td>
+   <td>34–45 ms</td>
+   <td>0.38–0.40 ms</td>
+  </tr>
+  <tr>
+   <td>RLS, with <code>tenant_id = $1</code> added to the query</td>
+   <td>44.8 ms</td>
+   <td>0.37 ms</td>
+  </tr>
+  <tr>
+   <td>RLS, stored generated column <code>customer_email_lower = lower($1)</code></td>
+   <td>0.25 ms</td>
+   <td>0.19 ms</td>
+  </tr>
+  <tr>
+   <td>no RLS, <code>customer_email like 'klant12%'</code></td>
+   <td>0.24 ms</td>
+   <td>0.20 ms</td>
+  </tr>
+  <tr>
+   <td>RLS, the same <code>LIKE</code></td>
+   <td>22–24 ms</td>
+   <td>0.25–0.28 ms</td>
+  </tr>
+  <tr>
+   <td>RLS, <code>customer_email ~&gt;=~ $1 and customer_email ~&lt;~ $2</code></td>
+   <td>0.30 ms</td>
+   <td>—</td>
+  </tr>
+ </tbody>
+</table>
+<p>This is the trap in multi-tenant form: the median tenant hardly notices, because scanning 534 rows is quick. The cost grows with the size of the tenant, so it lands entirely on your largest customer, and a test with small tenants will not show it.</p>
+<p>Adding the tenant to the query yourself does not help: <code>uuid</code> equality was already being used; the problem is the other condition. What helps is making the condition itself leakproof. The equality operator on <code>text</code> is, so a stored generated column holding <code>lower(customer_email)</code>, with an index on <code>(tenant_id, customer_email_lower)</code>, brought the lookup back to 0.25 ms. <code>lower($1)</code> on the parameter side is fine: the documentation adds that functions “which are not passed any arguments from the security barrier view or table do not have to be marked as leakproof”. For prefix searches, the <code>text_pattern_ops</code> operators <code>~&gt;=~</code> and <code>~&lt;~</code> are leakproof, and writing the range yourself brought 22 ms back to 0.30 ms.</p>
+<p>Marking <code>lower()</code> itself as leakproof is possible, but only for a superuser, and it is a promise about someone else’s function. We would not do it.</p>
+<h2>How do you find these in your own database?</h2>
+<p>Two checks. Policies whose expression calls a volatile function:</p>
+<pre><code>select p.tablename, p.policyname, pr.oid::regprocedure as function
+from pg_policies p
+join pg_proc pr
+  on position(pr.proname || '(' in coalesce(p.qual, '') || ' ' || coalesce(p.with_check, '')) &gt; 0
+where pr.provolatile = 'v'
+  and pr.pronamespace not in ('pg_catalog'::regnamespace, 'information_schema'::regnamespace)
+order by 1, 2;
+</code></pre>
+<p>This matches on the function name in the policy text, so two functions with the same name in different schemas can give a false positive. On a test table with seven policies it reported exactly the four that use a <code>VOLATILE</code> function: the PL/pgSQL one, the <code>SECURITY DEFINER</code> one, the inlined SQL one — fast, but only as long as nobody adds <code>SECURITY DEFINER</code> — and the one wrapped in <code>(select …)</code>, which is fast. Every hit is worth declaring <code>STABLE</code>. And for the leakproof rule: run <code>EXPLAIN</code> on your slowest screens as the application role, not as the owner. A condition that is an <code>Index Cond</code> as the owner and a <code>Filter</code> as the application is this problem.</p>
+<h2>What we did not measure</h2>
+<p>PostgreSQL 18, a cold cache, tables larger than memory, policies with <code>WITH CHECK</code> on writes, and more complex membership models with roles per tenant. The timings come from one machine with default settings; read them as proportions. The proportions are consistent: every slow case above lost an index condition or an index order the query needed, and every fix gave it back.</p>

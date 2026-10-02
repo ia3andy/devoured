@@ -1,0 +1,74 @@
+<p>Your application asks MySQL about <strong>now</strong>: this order, this customer, this cart. MySQL is very good at that.</p>
+<p>Then the business asks about <strong>the past</strong>:</p>
+<ul>
+ <li>Finance: <em>revenue by month, for the last three years?</em></li>
+ <li>Product: <em>who churned after the price change?</em></li>
+ <li>Support and compliance: <em>what did this account look like on 3 March?</em></li>
+</ul>
+<p>Those questions land on the same server as your application, and your primary pays for them. A full scan pushes your working set out of the buffer pool. A long read keeps old row versions alive and purge stalls behind it. A <code>GROUP BY</code> over millions of rows spills temp tables to disk. Row stores answer “now” fast. “Over time” is a different shape of question.</p>
+<p>Give those queries a copy they can’t hurt. That is what we are introducing today.</p>
+<h2>What it is</h2>
+<p><strong>DBTrail is an open-source analytical replica for MySQL.</strong> It keeps a copy of your tables made for reports, as Parquet files (an open format that stores a table column by column, so a report reads only the columns it needs) in a folder or an S3 bucket you own. It follows every change in your MySQL, updates the copy on the schedule you set, and you query it with DuckDB, a free SQL tool that runs on your laptop or a server.</p>
+<p>How it works:</p>
+<ol>
+ <li><strong>The first copy reads all your tables</strong> (with mydumper). This is the one moment DBTrail reads your data directly.</li>
+ <li><strong>After that, only the binlog.</strong> DBTrail reads it from outside, the way a MySQL replica does. Nothing is installed in MySQL: no plugin, no agent on the database host, no triggers. RDS and Aurora work.</li>
+ <li><strong>On your schedule, the copy is updated</strong> by folding the changes into a new Parquet snapshot. As often as every 5 minutes, or once a day. Your database is not read again for it, unless a table changes shape (see the limits below).</li>
+ <li><strong>You query it with DuckDB.</strong> DBTrail gives you a <code>views.sql</code> file with one view per table, so you write <code>FROM state_shop_orders</code> and get the table as of the latest snapshot.</li>
+</ol>
+<p>No ETL. No scripts or jobs to write to move data out of MySQL. No warehouse to run. One Docker Compose stack, and a folder or a bucket.</p>
+<h2>A lakehouse without the pipeline</h2>
+<p>“Lakehouse” sounds like data-engineering jargon, but for a DBA it is easy to picture: <strong>your tables as open files in cheap object storage, plus a thin layer that makes those files behave like tables, queried by whatever engine you bring.</strong> Every part of your OLTP database is still there. It just stopped living in one process: <code>.ibd</code> files become Parquet in a bucket, <code>mysqld</code> becomes DuckDB, Athena or Spark.</p>
+<p>The usual way to build one out of MySQL has three to five moving parts: a CDC tool (Debezium, Airbyte), often a stream (Kafka, Kinesis), a table format (Iceberg, Delta), a catalog (Glue, Nessie), an engine cluster. Some builds skip the stream or the catalog, but it is still a pipeline somebody owns.</p>
+<p>DBTrail has one: <strong>your MySQL, with nothing installed → DBTrail → plain Parquet in your bucket → any reader.</strong> What it gives up is listed at the end of this post, said in the same voice as the strengths.</p>
+<h2>Querying it</h2>
+<p>Four steps from nothing to a query:</p>
+<ol>
+ <li><strong>Install.</strong> You need Docker with Compose. One command starts DBTrail, its web page, and the small MySQL it keeps its own index in.</li>
+ <li><strong>Connect your MySQL.</strong> Create your login in the page the installer opens and add your server. The page shows the SQL that creates DBTrail’s user.</li>
+ <li><strong>Take the first copy and pick a schedule.</strong> On <strong>Snapshots</strong>, press <strong>Read database now</strong>. Then in <strong>Settings</strong>, pick how often and press <strong>Turn on</strong>. Left as it comes, it runs once a day.</li>
+ <li><strong>Query it.</strong> On <strong>Snapshots</strong>, press <strong>Download</strong>, then <strong>Download the data</strong>. Unpack it and run DuckDB inside the folder:</li>
+</ol>
+<pre><code>$ duckdb -init views.sql
+-- Loading resources from views.sql
+D SELECT c.tier, count(*) AS orders, round(sum(o.total), 2) AS revenue
+  FROM state_demo_orders o
+  JOIN state_demo_customers c ON c.id = o.customer_id
+  GROUP BY c.tier ORDER BY revenue DESC;
+┌──────────┬────────┬───────────────┐
+│   tier   │ orders │    revenue    │
+│ varchar  │ int64  │ decimal(38,2) │
+├──────────┼────────┼───────────────┤
+│ platinum │ 539848 │   59426197.40 │
+│ gold     │ 539752 │   59353658.54 │
+│ silver   │ 539056 │   59295443.48 │
+│ bronze   │ 538385 │   59242795.95 │
+└──────────┴────────┴───────────────┘</code></pre>
+<p>One rule worth knowing early: <strong>open the copy through <code>views.sql</code>.</strong> Another engine reading the Parquet files directly sees each table as of its last full write and can miss the changes stored beside it.</p>
+<h2>The numbers, and how we got them</h2>
+<p>We did not want to publish numbers without the method, so here is both.</p>
+<p><strong>The setup.</strong> One source: RDS MySQL 8.4 with a TPC-C dataset, 73 million rows, about 10 GB, under a sysbench-tpcc load of 180 transactions per second. Five copies attached to it, one at a time, in 30 to 60 minute windows, measured 18 to 20 September 2026: an RDS read replica, DBTrail 0.84 (refreshing every 5 minutes for this test), ClickHouse fed by Airbyte CDC every 5 minutes, MyDuck Server (binlog into DuckDB), and Redshift zero-ETL. Every default kept. Every manual fix counted as “hands”.</p>
+<p><strong>How fresh is it?</strong> In a separate measurement under about 340 transactions per second, commit to visible in DuckDB took 2.7 to 13.2 minutes, median 5.9, with a 5-minute schedule. Minutes, not seconds, and not yet repeatable, which is why it is also in the limits below.</p>
+<h2>Other engines read the same bytes</h2>
+<p>Because the copy is plain Parquet, it is not locked to DuckDB. We ran the same top-5 query over 55.6 million rows from one snapshot file in DuckDB on a laptop, in ClickHouse with <code>s3()</code> and zero configuration (3.0 s), and in Athena after a Glue crawler (2.2 s). Same answer from all three, no conversion. The caveat from before applies: an outside reader has to apply the change files next to the table, which the DuckDB views do for you.</p>
+<h2>What else comes from the same capture</h2>
+<p>The binlog DBTrail reads for the copy also carries every row change, with the row before and after. Starting the day you install it, the same install gives you:</p>
+<ul>
+ <li><strong>Row history and undo.</strong> See any row before and after a change, and get the SQL that puts it back: the <code>UPDATE</code> without a <code>WHERE</code>, the <code>DELETE</code> that cascaded. DBTrail generates the SQL; it never runs it for you.</li>
+ <li><strong>Tables as they were at a moment.</strong> Rebuild whole tables as of a past time.</li>
+ <li><strong>A row as it was, from your own MySQL client.</strong> An optional time-travel port speaks the MySQL protocol, for looking at rows, not for running reports:</li>
+</ul>
+<pre><code>mysql&gt; SELECT * FROM speakers WHERE id = 67 AS OF '2026-08-19 09:12:00';</code></pre>
+<ul>
+ <li><strong>Ask in plain English.</strong> Connect Claude and ask about your changes in words. Every tool is read-only.</li>
+</ul>
+<h2>Where it stops</h2>
+<p>A copy you can trust is one whose edges you know.</p>
+<p>The scheduled copy is for MySQL and Percona Server 8.0 and 8.4, including RDS and Aurora.</p>
+<h2>Try it</h2>
+<p>DBTrail is Apache 2.0. All of it: capture, index, console, recovery, the Parquet you open in DuckDB, and the MCP server that lets an assistant drive it.</p>
+<ul>
+ <li>Start here: Quick Start</li>
+ <li>What it is, in one page: dbtrail.com/docs</li>
+ <li>Source: github.com/dbtrail/dbtrail</li>
+</ul>

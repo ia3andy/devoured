@@ -1,0 +1,122 @@
+<p>Anthropic says Opus 5.5 fixed Claude’s writing. I tested that claim with the standard eval loop in Arize AX: build a dataset, run an experiment for each model, annotate the output by hand, then build an evaluator from the annotations and run it.</p>
+<p>The em dash really is gone: 12.9 per 1,000 words in Opus 5, and two in the entire 57,000 words of Opus 5.5 output. The rest of the Claud-isms halved. Better, but not fixed.</p>
+<p>I’m sick of Claudisms. You know the ones. You’re scrolling LinkedIn or X, and a post tells you that something “isn’t just a tool, it’s a mindset,” or that a detail “is doing a lot of work,” and that you should sit with that. Humans don’t really write like that, but Claude does, and so does everyone who pastes Claude’s output straight into a post.</p>
+<p>When Opus 5.5 came out, one of the launch details caught my eye. The Opus 5.5 announcement says, “We’ve made major improvements to the way Opus 5.5 writes and communicates, one of the most common areas of feedback we heard about Opus 5,” and that it “is less likely to use jargon or idiosyncratic phrases.” Anthropic staff went a step further. Sholto Douglas posted, “We fixed the writing,” and Tom Brown posted, “we fixed the accent.” The Decoder’s headline said Anthropic “promises less ‘Claudish’ writing.”</p>
+<p>That’s a testable claim. And I work at Arize, so when someone says a model got better at something, my first reaction is “show me the eval.” Vibes don’t count, whether they’re mine or a vendor’s.</p>
+<p>So I built claude-compare, and ran the same loop I’d use to test any change to an agent: build a dataset, run experiments on it, annotate the output, then build an evaluator and run it.</p>
+<h2>Step 1: Build a dataset</h2>
+<p>A dataset is the fixed set of inputs you test against. Every experiment runs over the same examples, so when a score moves, you know it was the thing you changed and not the inputs.</p>
+<p>For a writing test, the inputs are writing tasks. I used 20 research briefs, each one containing the notes for a blog post, so that I had long form content to review for Claudisms. The topics cover five genres (opinion, technical explainer, tutorial intro, news analysis, product announcement) and five domains (AI, travel, cooking, games, books). A dataset of AI topics alone would only tell you how Claude writes about AI.</p>
+<p>Two things make a dataset like this trustworthy:</p>
+<p>It’s frozen. Opus 5 researched each topic once, with web search, and the briefs are committed and hash-locked. The writer gets no tools and no network, so the brief is all it has to go on.</p>
+<p>The inputs don’t carry the style you’re testing for. The briefs are written as bullet fragments, so Opus 5’s style can’t leak into the input.</p>
+<p>The brief is the load-bearing part of the whole setup (sorry).</p>
+<h2>Step 2: Run an experiment for each model</h2>
+<p>An experiment is one run of your task over the whole dataset, with each output stored against the example that produced it. When you compare two experiments, you’re comparing whatever differs between them, so you want that to be one thing.</p>
+<p>If you want to compare how two models write, the first step is to just change the model. Sounds obvious, but folks often mix the model change with a prompt change as well. Changing the model first, measuring, and then changing the prompt if necessary, gives you a much clearer view on the impact of your changes.</p>
+<p>That means pinning everything else. Both models get an identical prompt. Effort is pinned to medium, because Opus 5 defaults to high and Opus 5.5 to medium, and leaving the defaults in place would have measured two different settings. The harness also checks the served model on every response, so each experiment really is the model it says it is.</p>
+<p>Model output varies from run to run, so I ran each model over the dataset twice. That gave four experiments (two models, two repeats), 80 posts and about 110,000 words. In AX the four experiments sit on the same dataset, so every evaluator I add later scores them all the same way and I can compare Opus 5 and Opus 5.5 side by side.</p>
+<h2>Step 3: Annotate the output</h2>
+<p>Annotations are human labels on experiment output. They’re your ground truth: what a perfect evaluator would say. You want them before you build the evaluator, because they tell you what you’re actually measuring and they give you something to check the evaluator against later.</p>
+<p>You should label at the level you want the evaluator to work at. A score per post would tell me which posts felt Claude-ish, but not why. Marking individual phrases tells me which sentences, and an evaluator that returns phrases can be checked line by line.</p>
+<p>The labelling tool doesn’t need to be fancy. I put all 40 Opus 5 posts into one Google Doc and read the lot, all 53,000 words, leaving a “Claudism” comment on every phrase that made me wince. That came to 153 flags across 38 of the 40 posts. The flags then went into AX as annotations on the Opus 5 runs, so they sit next to the output they describe.</p>
+<p>Then I looked at what I’d flagged, and it wasn’t what I expected.</p>
+<p>I had a hand-written list of the famous Claudisms: “load-bearing”, “delve”, “crucially”, “genuinely,” and so on. It matched just nine of my 153 flags. “Load-bearing,” the phrase everyone jokes about, appears three times in 53,000 words of Opus 5.</p>
+<p>What I’d actually flagged were rhetorical moves. The biggest group, about 48 of the 153, was the text telling me something was important instead of showing me why: “The interaction matters,” “a fact worth internalising,” “deserves a moment.” Next were contrast reframes (“It’s a topology, not a genre.”), verdict intensifiers (“the honest answer,” “the whole point”), and signposts that tease an insight instead of giving it (“Here’s the part that surprises people…”).</p>
+<p>None of those are fixed wording, so no phrase list will ever catch them reliably. It’s not a phrase problem. It’s a moves problem. 🫠</p>
+<h2>Step 4: Build an evaluator from the annotations</h2>
+<p>An evaluator scores every run in an experiment automatically, so you don’t have to read 60,000 words again each time something changes. The annotations shape how you build the evaluator.</p>
+<p>Start with the output format. My first evaluator was an LLM judge that gave each post a single 1 to 5 score for how Claude-ish it read. That’s easy to build and almost impossible to check. If it says a post is a 4, which sentences made it a 4? You can’t line a single number up against 153 human flags. So the version I kept is a span judge: it returns every Claudism it finds as an exact quote, in the same shape as my annotations, and I can match each quote against my flags to measure recall directly.</p>
+<p>The categories come from the annotations too. The judge sorts each quote into one of six moves taken from my flags: salience flag, contrast reframe, verdict intensifier, signpost, gotcha framing (“the trap is”) and stock metaphor (“load-bearing”, “earns its keep”). And the annotations double as test cases. All three “load-bearing” sentences have to be caught, or the run fails.</p>
+<p>A few other choices apply to almost any evaluator:</p>
+<ul>
+ <li>Use code when you can. Counting em dashes doesn’t need an LLM, so that’s a plain code evaluator with no wiggle room.</li>
+ <li>Don’t let a model grade its own family. The judge is OpenAI’s gpt-6-luna, so Claude isn’t marking Claude’s homework.</li>
+ <li>Normalise for length. Opus 5.5 writes about 8% longer, so the judge’s quotes become Claudisms per 1,000 words rather than raw counts.</li>
+</ul>
+<p>Both evaluators run in AX against all four experiments.</p>
+<h2>Step 5: Run it</h2>
+<p>The em dash really is gone. Opus 5 uses 12.9 em dashes per 1,000 words. Opus 5.5 used two in its entire 57,000 words of output. As Brodie Robertson put it, “The em dashes have been deleted I repeat the em dashes have been deleted.” That result comes from a code evaluator, so there’s no judge involved and no wiggle room.</p>
+<p>The other Claudisms halved. The span judge found 4.79 Claudisms per 1,000 words in Opus 5 and 2.38 in Opus 5.5, a 50% drop, and every category went down:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Category</th>
+   <th>Example</th>
+   <th>Opus 5</th>
+   <th>Opus 5.5</th>
+   <th>Change</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Salience flag</td>
+   <td>“This matters.”</td>
+   <td>1.67</td>
+   <td>0.93</td>
+   <td>−44%</td>
+  </tr>
+  <tr>
+   <td>Verdict intensifier</td>
+   <td>“The honest answer is…”</td>
+   <td>1.10</td>
+   <td>0.38</td>
+   <td>−65%</td>
+  </tr>
+  <tr>
+   <td>Signpost</td>
+   <td>“Here’s the part that…”</td>
+   <td>0.79</td>
+   <td>0.53</td>
+   <td>−33%</td>
+  </tr>
+  <tr>
+   <td>Contrast reframe</td>
+   <td>“It’s a topology, not a genre.”</td>
+   <td>0.63</td>
+   <td>0.27</td>
+   <td>−56%</td>
+  </tr>
+  <tr>
+   <td>Stock metaphor</td>
+   <td>“load-bearing”, “earns its keep”</td>
+   <td>0.43</td>
+   <td>0.13</td>
+   <td>−70%</td>
+  </tr>
+  <tr>
+   <td>Gotcha framing</td>
+   <td>“The trap is…”</td>
+   <td>0.16</td>
+   <td>0.13</td>
+   <td>−19%</td>
+  </tr>
+  <tr>
+   <td>All Claudisms</td>
+   <td></td>
+   <td>4.79</td>
+   <td>2.38</td>
+   <td>−50%</td>
+  </tr>
+ </tbody>
+</table>
+<p>Claudisms per 1,000 words, from the span judge running in Arize AX.</p>
+<p>Salience flags, the “this matters” move, are still the most common Claudism in both models. Gotcha framing is too rare to read much into, with 8 uses against 7. The gap holds in every genre and every domain I tested.</p>
+<p>Opus 5.5 also picked up some new habits. A simple scan found it uses about 2.5 times as many bold lead-in bullets as Opus 5, 35% more three-part lists, and writes 8% longer. So some of the old tics were traded in rather than dropped.</p>
+<p>My favourite detail: Anthropic’s own prompting guide for Claude Fable 5.1 warns about “mannered prose,” using “this point earns its keep” as its example. Opus 5.5 still wrote that a stand mixer “earns its counter space” and that a searing technique “earns its place.”</p>
+<p>So the claim holds up halfway. “Fixed” is too strong. “Much better” is fair.</p>
+<h2>Iterate on the judge prompt</h2>
+<p>The 50% figure came from the third version of the judge, not the first. An evaluator is a prompt like any other, and you rarely keep the first draft of a prompt. The annotations from step 3 are what let me iterate on it with numbers instead of gut feel.</p>
+<p>The first version said Claudisms fell by only 27%. Moving the judge to gpt-6-luna gave 34%. Recall against my flags was high on both runs, so the judge was finding the Claudisms I’d marked.</p>
+<p>Here’s the part that bites people. (Yes, I know, sorry.) Recall only tells you what the judge caught. It says nothing about what else it tagged. So I read a random sample of the spans it found in the Opus 5.5 posts. Plenty of them were ordinary writing. “First, a definition.” got tagged as a signpost. “Strain the context window” got tagged as a stock metaphor. “It applies to all output tokens, not only thinking.” got tagged as a contrast reframe, when it’s just being precise.</p>
+<p>Only about 40% of the Opus 5.5 spans in that sample were real Claudisms. (That spot check was done by an AI and is small, so take it as rough). The false positives weren’t random noise. Every writer uses plain transitions and ordinary metaphors, human or model, so they formed a floor under both scores and made the two models look closer than they are.</p>
+<p>Sit with that for a minute. (Sorry.)</p>
+<p>The third version gave the judge a test to run on every phrase before it tags it: imagine deleting the phrase and reread the sentence. If the post loses information, such as a fact, a number, how something works or what to do, the phrase carries information and it isn’t a Claudism. If nothing is lost, it’s filler, and it counts. Delete “This matters.” and the post says exactly the same thing, so it gets tagged. Delete “not only thinking” from “It applies to all output tokens, not only thinking.” and you lose the point of the sentence, so it doesn’t.</p>
+<p>I also added examples of what not to tag in each category and limited stock metaphors to the well-worn ones. Precision on the Opus 5.5 sample went up to about 26 in 30. Recall against my flags on held-out posts dropped from 74% to 64%, and it still caught all three “load-bearing” sentences. I’ll take that trade: an evaluator that misses a few real Claudisms beats one that counts plain English as a Claudism.</p>
+<p>Each version ran against the same annotations, so every change came with a number for what it gained and what it cost. I tuned on half the posts and held the other half back to check the result. Without the annotations, the 27% would have looked like a perfectly good answer.</p>
+<h2>What I’d tell you before you try this</h2>
+<p>If you’re writing with Claude, hunt your own drafts for the Claudisms, more than the em dash or “delve”: telling the reader something matters, knocking down a claim nobody made, teasing a point instead of making it.</p>
+<p>The code, the categories and the judge prompt are all in the claude-compare repo, along with a de-styling tool that uses the same categories as an editing brief.</p>
+<p>The bigger lesson applies well beyond Claude. When someone tells you a model got better, don’t trust the vibe, and don’t trust a vendor’s word for it. Build a dataset, run the experiment, annotate the output, build an evaluator from the annotations, and iterate on it against those annotations until you trust its numbers.</p>
+<p>For the production-trace version of that loop, see Claude’s hillclimb loop for AI agents: start with production traces.</p>
+<p>And this matters. 🙃</p>
