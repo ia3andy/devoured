@@ -1,0 +1,99 @@
+<h2>Amazon S3 Vectors now supports metadata pre-filtering for higher recall on filtered searches</h2>
+<p>Today, we’re announcing metadata pre-filtering for Amazon S3 Vectors, which delivers higher recall on filtered queries by evaluating your metadata filter before the similarity search. You can filter on attributes such as tenant, category, status, or time, and pre-filtering adds prefix matching with <code>$startsWith</code> for paths, URLs, and hierarchical keys. Each vector carries up to 2 KB of filterable metadata, and a single query supports up to 100 filter constraints. There is no additional cost, no re-ingestion, and no change to your queries.</p>
+<p>Most applications never search a whole index. They search the part of it that belongs to a particular user, account, or category, and they express that scope as a metadata filter. Semantic search, retrieval-augmented generation (RAG), and agentic applications all need the same thing from a filtered query: a similarity search that covers the vectors matching the filter, and returns the closest of them. With pre-filtering, a filtered query returns more of the relevant matches your index contains, giving you higher recall on filtered searches.</p>
+<p><strong>Common use cases</strong></p>
+<p>Pre-filtering applies wherever results have to be both relevant and correctly scoped:</p>
+<ul>
+ <li><strong>Legal and professional services</strong>: A law firm or e-discovery platform searches documents scoped to a single client, and with <code>$startsWith</code> narrows further by matter number, folder path, or document ID prefix. A single client is a small share of a firm-wide archive, and filters this narrow are where pre-filtering improves recall most.</li>
+ <li><strong>Financial services</strong>: An investment research platform searches analyst notes, filings, and call transcripts scoped by issuer, document type, and publication date.</li>
+ <li><strong>Media and entertainment</strong>: A streaming service filters by content rating and regional licensing before the semantic search, finding similar titles restricted to G and PG content licensed in one territory.</li>
+ <li><strong>Agentic applications</strong>: An agent working within a user’s session filters on fields such as owner, document set, and timestamp so its searches cover the material relevant to the task at hand. Higher recall means more of that material reaches the agent, which improves task reliability.</li>
+</ul>
+<p><strong>How pre-filtering works</strong></p>
+<p>Each vector in an S3 Vectors index can carry application-defined metadata, and a query can filter on those fields.</p>
+<p>Every vector index has an index mode. On an index whose index mode is <code>ENHANCED</code>, S3 Vectors resolves your filter first, then searches only the vectors that match. On an index whose index mode is <code>CLASSIC</code>, S3 Vectors performs the vector search and filter evaluation in tandem, validating each candidate vector against your filter as it searches. Existing indexes use <code>CLASSIC</code> until you update them.</p>
+<p>Consider a support knowledge base of 8 million tickets, where an agent searches one customer’s history for a recurring error. If that customer accounts for 400 of those tickets, resolving <code>customer_id</code> first means the similarity search runs across all 400 of them, so the agent sees that customer’s prior occurrences. Before the index was updated, the same query drew its candidates from the full 8 million, and the result set contained fewer of that customer’s matching tickets.</p>
+<p>On highly selective filters, pre-filtering returns up to 5x more of the matching vectors than the same query returned before on <code>CLASSIC</code> indexes.</p>
+<p><strong>Getting started</strong></p>
+<p>Before you start, make sure your IAM policy grants permissions for the new actions. You can get started in three steps. The walkthrough below builds a small product-catalog index and runs a selective filter against it, the same pattern you would use for a multi-tenant RAG store or a document search scoped to one client.</p>
+<p>First, create a vector index:</p>
+<pre><code>aws s3vectors create-index \ 
+  --index-name product-catalog \ 
+  --vector-bucket-name my-vector-bucket \ 
+  --dimension 1536 \ 
+  --distance-metric cosine</code></pre>
+<p>The <code>dimension</code> must match the output size of your embedding model, and <code>distance-metric</code> should match how that model was trained (cosine is common for text embeddings). Second, write vectors with the PutVectors API, attaching up to 2 KB of filterable metadata to each vector:</p>
+<pre><code>aws s3vectors put-vectors \
+  --index-name product-catalog \
+  --vector-bucket-name my-vector-bucket \
+  --vectors '[\{
+    "key": "doc-001",
+    "data": \{"float32": [0.1, 0.2, 0.3, ...]},
+    "metadata": \{
+      "tenant_id": "t-10428",
+      "category": "legal",
+      "created_date": "2026-03-15",
+      "active": true
+    }
+  }]'</code></pre>
+<p>Each vector carries the attributes your application filters on. In this example, <code>tenant_id</code> scopes results to a single customer, <code>category</code> narrows by document type, <code>created_date</code> records when the document was created, and <code>active</code> is a boolean flag. By default every metadata field is filterable, so you can query on any of them without declaring a schema up front.</p>
+<p>Third, run a filtered similarity query with the QueryVectors API. The filter uses a compact JSON syntax where a bare key-value pair is an equality match, and operators such as <code>$and</code>, <code>$or</code>, and <code>$gt</code> combine or refine conditions. Pass <code>--return-metadata</code> so the query returns each vector’s metadata:</p>
+<pre><code>aws s3vectors query-vectors \
+  --index-name product-catalog \
+  --vector-bucket-name my-vector-bucket \
+  --query-vector '\{"float32": [0.1, 0.2, 0.3, ...]}' \
+  --top-k 50 \
+  --return-metadata \
+  --filter '\{"$and": [
+    \{"tenant_id": "t-10428"},
+    \{"category": "legal"},
+    \{"active": true}
+  ]}'</code></pre>
+<p>The expected result is a single vector, <code>doc-001</code>, the only one matching all three filter conditions (tenant_id, category, and active):</p>
+<pre><code>\{
+  "vectors": [
+    \{
+      "distance": 0.9717477560043335,
+      "key": "doc-001",
+      "metadata": \{
+        "tenant_id": "t-10428",
+        "category": "legal",
+        "created_date": "2026-03-15",
+        "active": true
+      }
+    }
+  ],
+  "distanceMetric": "cosine"
+}</code></pre>
+<p>S3 Vectors first narrows the search space to vectors matching all three filter conditions, then returns the 50 most similar vectors from that subset. Because the filter is applied before the search, those results are drawn from across all the vectors that match it.</p>
+<p><strong>Prefix matching with $startsWith</strong></p>
+<p>Pre-filtering adds a prefix match operator for filtering on paths, URLs, and hierarchical keys. A document store that encodes case and folder structure into a document ID can scope a search to a subtree in one condition:</p>
+<pre><code>--filter '\{"$startsWith": \{"document_id": "matter-4417/exhibits/"}}'</code></pre>
+<p><code>$startsWith</code> joins the existing operators: equality, numeric range, set membership, existence checks, and boolean logic with <code>$and</code> and <code>$or</code>.</p>
+<p><strong>Turning on pre-filtering for existing indexes</strong></p>
+<p>Call UpdateIndexMode on an existing index to turn on pre-filtering:</p>
+<pre><code>aws s3vectors update-index-mode \
+  --vector-bucket-name my-vector-bucket \
+  --index-name product-catalog \
+  --index-mode ENHANCED</code></pre>
+<p>Pre-filtering takes effect in place. Your existing vectors are not re-ingested, your queries do not change, and the new filter operators are available immediately.</p>
+<p><strong>Rolling out across your indexes</strong></p>
+<p>Once you have validated pre-filtering on an index, set the default index mode on the vector bucket so that new indexes use <code>ENHANCED</code> without a follow-up call:</p>
+<pre><code>aws s3vectors put-vector-bucket-default-index-mode \
+  --vector-bucket-name my-vector-bucket \
+  --default-index-mode ENHANCED</code></pre>
+<p>To bring the rest of your existing indexes across, list them and check the index mode on each one, then call UpdateIndexMode on the ones still using <code>CLASSIC</code>:</p>
+<pre><code>aws s3vectors list-indexes \
+  --vector-bucket-name my-vector-bucket
+
+aws s3vectors get-index \
+  --vector-bucket-name my-vector-bucket \
+  --index-name product-catalog</code></pre>
+<p><strong>Things to know</strong></p>
+<ul>
+ <li>Indexes created in vector buckets created on or after September 30, 2026 use index mode <strong>ENHANCED</strong>. Indexes in buckets that existed before that date use <strong>CLASSIC</strong> until you set the bucket default, including indexes created in those buckets afterward.</li>
+ <li>A single query supports up to 100 filter constraints, counted per value the filter evaluates. If a query exceeds that, you can usually consolidate the filter, replacing a 300-value <strong>$in</strong> over legal cases with a single <strong>caseId</strong> field, for example, or split it into smaller queries, run them in parallel, and merge the results by distance.</li>
+</ul>
+<p><strong>Now available</strong></p>
+<p>Metadata pre-filtering is available at no additional cost in all commercial AWS Regions where Amazon S3 Vectors is available, and in the AWS China Regions. You pay standard S3 Vectors pricing for storage, PUT requests, and queries. For full pricing details, visit the Amazon S3 pricing page. For regional availability, visit Amazon S3 Vectors Regions and quotas.</p>
+<p>Whether you’re scoping a RAG application to one tenant, scoping an agent’s searches to one user’s documents, or narrowing a catalog search to a licensing window, pre-filtering lets you apply those filters without trading away recall. To learn more and get started, visit the Amazon S3 Vectors documentation. Send feedback to AWS re:Post for S3 or through your usual AWS Support contacts.</p>

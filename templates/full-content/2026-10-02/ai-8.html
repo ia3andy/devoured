@@ -1,0 +1,189 @@
+<p>Today I'm releasing Kev 1.0, a family of four open source decision models, from 0.8B to 27B parameters. This release includes a new Kev-27B and an updated Kev-9B.</p>
+<p>TypeSafe's Jev takes text, questions, and possible answers and returns a probability for each answer. I wanted that interface with weights I could run and fine-tune myself. Kev uses the same API, so applications built with TypeSafe's SDK can switch by changing the endpoint and model name.</p>
+<p>All four models have Apache-2.0 weights on Hugging Face. The code is on GitHub, including a server that runs on GPUs and on Apple Silicon through MLX. You can try Kev-4B in your browser or use the agent skills to deploy and fine-tune your own.</p>
+<h2>The Kev family</h2>
+<p>Kev-27B leads overall in my evaluations. On consumer complaints, Kev-9B and Kev-4B are within a percentage point of it; on developer-tool decisions, Kev-9B matches it. The table separates tasks excluded from Kev's fine-tuning from held-out examples of task families it trained on.</p>
+<p>Overview of accuracy across six evaluation panels for Kev-27B, Kev-9B, Kev-4B and Kev-0.8B. Kev-27B leads overall; Kev-9B and Kev-4B are within one percentage point of it on consumer complaints, and Kev-9B matches it on developer-tool decisions. All results are from the author's evaluation harness, not an independent leaderboard.</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>Kev-27B</th>
+   <th>Kev-9B</th>
+   <th>Kev-4B</th>
+   <th>Kev-0.8B</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <th>Tasks excluded from Kev's fine-tuning</th>
+   <td></td>
+   <td></td>
+   <td></td>
+   <td></td>
+  </tr>
+  <tr>
+   <th>Generalization14 public datasets, 3,089 test questions</th>
+   <td>75.7%</td>
+   <td>69.8%</td>
+   <td>69.0%</td>
+   <td>58.6%</td>
+  </tr>
+  <tr>
+   <th>Short-text decisionssources excluded from fine-tuning, 656 development questions</th>
+   <td>85.1%</td>
+   <td>82.0%</td>
+   <td>81.7%</td>
+   <td>64.8%</td>
+  </tr>
+  <tr>
+   <th>Knowledge and evidenceexams, buried facts and missing evidence, 1,046 development questions</th>
+   <td>82.0%</td>
+   <td>78.0%</td>
+   <td>77.4%</td>
+   <td>58.6%</td>
+  </tr>
+ </tbody>
+ <tbody>
+  <tr>
+   <th>Held-out examples of trained task families</th>
+   <td></td>
+   <td></td>
+   <td></td>
+   <td></td>
+  </tr>
+  <tr>
+   <th>Policy and rule reasoningpolicies, logic, numbers and missing evidence, 1,088 test questions</th>
+   <td>91.8%</td>
+   <td>83.4%</td>
+   <td>80.3%</td>
+   <td>66.5%</td>
+  </tr>
+  <tr>
+   <th>Sorting consumer complaintsproduct and issue, 936 questions</th>
+   <td>90.8%</td>
+   <td>90.0%</td>
+   <td>90.3%</td>
+   <td>85.1%</td>
+  </tr>
+  <tr>
+   <th>Developer-tool decisionscode review, commits and tools, 1,071 questions</th>
+   <td>79.0%</td>
+   <td>79.1%</td>
+   <td>75.6%</td>
+   <td>63.7%</td>
+  </tr>
+ </tbody>
+</table>
+<p>I recommend Kev-27B if you want the highest overall scores and have an 80 GB H100 for shorter inputs, or an H200 or B200 for long documents. Otherwise, start with Kev-4B and measure it on your own examples.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Model</th>
+   <th>Best for</th>
+   <th>Runs on</th>
+   <th>Req/s</th>
+   <th>GPU $ / 1M</th>
+   <th>Model time</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Kev-27B</strong></td>
+   <td>Best overall results in my evaluations</td>
+   <td>H200 (or H100, B200)</td>
+   <td>29</td>
+   <td>$44.09</td>
+   <td>67 ms</td>
+  </tr>
+  <tr>
+   <td><strong>Kev-9B</strong></td>
+   <td>Workflow accuracy close to Kev-27B on a smaller GPU</td>
+   <td>H100 (or L40S)</td>
+   <td>80</td>
+   <td>$13.80</td>
+   <td>24 ms</td>
+  </tr>
+  <tr>
+   <td>Kev-4B</td>
+   <td>A starting point for local use and fine-tuning</td>
+   <td>L40S, or a 32 GB Mac</td>
+   <td>51</td>
+   <td>$10.54</td>
+   <td>42 ms</td>
+  </tr>
+  <tr>
+   <td>Kev-0.8B</td>
+   <td>High-throughput, narrowly defined decisions</td>
+   <td>L4, or any Apple Silicon Mac</td>
+   <td>63</td>
+   <td><strong>$3.54</strong></td>
+   <td>23 ms</td>
+  </tr>
+ </tbody>
+</table>
+<p>For local use, Kev-0.8B and Kev-4B run on Apple Silicon through MLX. On a 32 GB M5, Kev-4B answers five questions about a short text in 721 ms, or 136 ms when the text is cached; Kev-0.8B takes 149 ms for new text. Kev-9B is expected to fit a 32 GB Mac, and Kev-27B a 96–128 GB Mac. I haven't measured those two on Macs yet.</p>
+<h2>How Kev works</h2>
+<p>Kev adds a pointer head, a layer that scores the supplied answer options, to a language model. It supports yes/no questions, multiple choice, and ordered scales. The document is processed once, and each question uses that cached computation without seeing the other questions.</p>
+<ol>
+ <li>A generated answer: A chat model generates a sequence of tokens, even when its output is constrained to JSON.</li>
+ <li>Kev scores options directly: A pointer head returns probabilities without generating answer tokens.</li>
+ <li>Kev reads the text once: The document prefix is computed once and cached.</li>
+ <li>Every question branches off that one read: Ask three questions or thirty: the ticket is still read once.</li>
+ <li>A probability for every answer: Each &lt;decide&gt; token scores the options. A softmax turns those scores into probabilities.</li>
+ <li>Your code sets the threshold: Here, only billing clears the illustrative 80% threshold. The other decisions take the fallback path.</li>
+</ol>
+<p>Caching saves more work on longer documents. On an H200, Kev-27B takes about 9.4 seconds of model time to read a new 64k-token document and about 0.7 seconds for subsequent questions using its cached state.</p>
+<h2>Training the new models</h2>
+<h3>What's new in Kev-27B</h3>
+<p>The smaller Kevs use Qwen3.5 backbones with LoRA adapters: small sets of additional weights trained while the backbone stays fixed. For the new Kev-27B, I used Qwen3.8-27B, Qwen's post-trained release, and fine-tuned every weight of its text backbone.</p>
+<p>Training the whole backbone on the previous Kev-27B's data did no better than the adapter-trained version. The new release also uses a broader corpus: about 146,000 examples and 337,000 questions, with documents up to 32k tokens. It combines Kev's existing data with licensed public tasks, synthetic decisions written by open-weight models, and documents and agent logs generated by code with exact answers.</p>
+<p>I added examples for tone, grounding, prompt injection, and personal-data detection, and screened the training records against the frozen evaluation sets for exact and near matches. No Jev outputs were used. The model card documents the data sources and training recipe, including the final weight blend with the previous checkpoint. The full training corpus is not public.</p>
+<h3>What's new in Kev-9B</h3>
+<p>Kev-9B had fallen behind Kev-4B on policy and rule reasoning, developer tools, and consumer complaints because it hadn't received the same additional training. One more fine-tuning pass, about three hours on one GPU, closes that gap.</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>Kev-9B (previous)</th>
+   <th><strong>Kev-9B (new)</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Policy and rule reasoning</td>
+   <td>58%</td>
+   <td><strong>83%</strong></td>
+  </tr>
+  <tr>
+   <td>Developer-tool decisions</td>
+   <td>64%</td>
+   <td><strong>79%</strong></td>
+  </tr>
+  <tr>
+   <td>Sorting consumer complaints</td>
+   <td>83%</td>
+   <td><strong>90%</strong></td>
+  </tr>
+  <tr>
+   <td>Generalization index (0–100)</td>
+   <td>40</td>
+   <td>41</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Evaluation</h2>
+<h3>Generalization</h3>
+<p>To test tasks excluded from Kev's fine-tuning, I assembled 14 public datasets spanning intent classification, retrieval, language understanding, tool selection, knowledge, and subjective judgments. They include choosing among 150 customer intents and deciding whether a contract supports a claim.</p>
+<h3>Calibration</h3>
+<p>Calibration measures whether a model's probabilities match how often its answers are correct. On the pooled 14-dataset test, Kev-27B's answers in the roughly 85%-confidence bin are correct about 85% of the time.</p>
+<h2>Fine-tuning on your data</h2>
+<p>I packaged that workflow into an official <code>kev-finetune</code> skill. Your coding agent helps define the questions, prepares labelled data or generates examples, fine-tunes a released Kev, fits its temperature on a separate calibration split, and compares the result with the starting checkpoint before deployment.</p>
+<p>The companion <code>kev-deploy</code> skill makes it easy to deploy Kev to Modal behind an authenticated HTTPS endpoint.</p>
+<h2>Limitations</h2>
+<p>Kev only scores the options you supply. It doesn't generate explanations or retrieve missing facts. You need to supply the relevant policy or evidence and handle the possibility that none of the options is correct. Answer order can also shift probabilities slightly.</p>
+<h2>Get started</h2>
+<p>The weights are on Hugging Face, and the code, model cards, and serving instructions are on GitHub. You can try Kev-4B in your browser before setting anything up.</p>
+<pre><code>npx skills add jaredpalmer/kev@kev-deploy
+npx skills add jaredpalmer/kev@kev-finetune
+</code></pre>
