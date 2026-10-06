@@ -1,0 +1,94 @@
+<h1>Faster String Aggregations with Dimension Tables</h1>
+<p><em>TL;DR: When a query groups on long, repeated strings, move the strings into a small dimension table with sorted, narrow integer keys. Aggregate on the keys, then join the strings back in at the very end. The query works as before, though on small fixed-width integers instead of variable-length text.</em></p>
+<p>Analytical workloads are full of repeated strings: product names, country names, station names, user agents, category labels. Take DuckDB's public train services dataset, which has one row for every stop a Dutch railway train makes. The data comes from the open datasets published by the Rijden de Treinen (Are the trains running?) application. You can query it straight from its URL:</p>
+<pre><code>SELECT departure_time, station_name, type
+FROM 'https://blobs.duckdb.org/train_services.parquet'
+LIMIT 5;</code></pre>
+<p>The table has 380,959 rows but only 537 distinct station names, so each name is stored again in thousands of rows: <code>Amsterdam Centraal</code> (18 bytes) alone appears in 7,591 of them. Load it into a table to follow along, in the web shell or the DuckDB CLI:</p>
+<pre><code>CREATE TABLE train_services AS
+    FROM 'https://blobs.duckdb.org/train_services.parquet';</code></pre>
+<p>When you <code>GROUP BY</code> the station name, DuckDB has to process the full string for every row. For example, this query counts how many trains call at each station:</p>
+<pre><code>SELECT station_name, count(*) AS calls
+FROM train_services
+GROUP BY station_name;</code></pre>
+<p>The string work repeats for every row, even though there are only two distinct stations here, and only 537 across the whole table.</p>
+<p>This post shows how to do that work on small integers instead, by giving each distinct string a number and looking up the strings only at the end.</p>
+<h2>Background</h2>
+<p>The approach is the star schema from data warehousing, used here for query performance. It came up when we looked at a user report of heavy memory use in a high-cardinality grouping.</p>
+<p>That report turned out not to involve strings, but Richard Wesley pointed out that in his own work, building dimension tables and joining the strings back at the end made a large difference to string-heavy aggregations.</p>
+<h2>Why Strings Are Expensive to Group On</h2>
+<p>DuckDB computes a <code>GROUP BY</code> with a hash aggregation, keeping one hash table entry per group. The aggregation uses the hash of each group key to find the key's slot in a hash table, then compares the key with the one stored in that slot. For integers, this takes a few CPU instructions. For strings, the cost grows with the length of the string.</p>
+<p>In DuckDB, a string value is a 16-byte structure. Strings of up to 12 bytes are stored inline. Longer strings store a 4-byte prefix plus a pointer to the actual characters. That design keeps short strings cheap, but many real-world labels are longer than 12 bytes.</p>
+<p>For these longer strings, hashing reads every byte of every string in every row. A match can't be confirmed from the prefix alone, so DuckDB follows the pointer and compares the full string. When a new group appears, its string is copied into the hash table's own memory, which makes the table larger than it would be with fixed-width keys.</p>
+<p>Copying strings also affects memory use. A wider hash table fits less well into CPU caches, and in larger-than-memory aggregations it reaches the memory limit sooner and has to spill more data to disk. DuckDB does apply dictionary encoding to string columns on disk, but that is a storage optimization: once a column is read into an aggregation, each group key is a full string again.</p>
+<p>Integer keys avoid these costs, as their fixed width makes hashing and comparing them cheap. When the key range is small, DuckDB can avoid hashing altogether: if the statistics show that the keys fit in a small enough domain, the optimizer picks a perfect hash aggregate, controlled by the <code>perfect_ht_threshold</code> setting, which uses the key value directly as an index into an array.</p>
+<h2>Building a Dimension Table with Sorted, Narrow Keys</h2>
+<p>The examples build on the <code>train_services</code> table loaded above. Each row records one stop: a <code>service_id</code>, the <code>date</code>, the service <code>type</code>, the <code>train_number</code>, the <code>station_code</code> and <code>station_name</code>, and the <code>departure_time</code> and <code>arrival_time</code>. The repeated string we want to encode is <code>station_name</code>.</p>
+<h3>Step 1: Measure the Cardinality</h3>
+<p>First, find out how many distinct values the column has, since that count sets how narrow the key can be.</p>
+<pre><code>SELECT count(DISTINCT station_name) AS num_stations
+FROM train_services;</code></pre>
+<p>This returns 537, and that count decides how wide the key needs to be. You want the narrowest integer type whose range still covers every distinct value, because a narrower key means fewer bytes per row in the fact table and a smaller entry in the hash table you group on.</p>
+<p>The keys come from <code>row_number()</code>, which starts at 1 and only counts upward, so an unsigned type is the right fit, spending none of its range on negative values. <code>UTINYINT</code> (1 byte) holds up to 255 distinct values, <code>USMALLINT</code> (2 bytes) up to 65,535, and <code>UINTEGER</code> (4 bytes) up to about 4.3 billion.</p>
+<h3>Step 2: Build the Dimension Table</h3>
+<p>Next, assign each distinct string an integer key. The important detail is the <code>ORDER BY</code> <code>station_name</code> inside the window: the keys are assigned in string order.</p>
+<pre><code>CREATE OR REPLACE TABLE stations AS
+    SELECT
+        station_name,
+        (row_number() OVER (ORDER BY station_name))::USMALLINT AS station_id
+    FROM (SELECT DISTINCT station_name FROM train_services WHERE station_name IS NOT NULL);</code></pre>
+<h3>Step 3: Store the Key in the Fact Table</h3>
+<p>Finally, replace the string column in the fact table with its key, a rewrite of the table that you pay for once. The dimension table leaves out <code>NULL</code>, so the <code>LEFT JOIN</code> keeps the rows without a station and gives them a <code>NULL</code> key.</p>
+<pre><code>CREATE OR REPLACE TABLE train_services_encoded AS
+    SELECT ts.* EXCLUDE (station_name), s.station_id
+    FROM train_services ts
+    LEFT JOIN stations s USING (station_name);</code></pre>
+<p>The fact table now stores the 2-byte <code>USMALLINT</code> key, so grouping on it is cheap. With a key range this small and dense, DuckDB can use a perfect hash aggregate, indexing directly by the key instead of hashing.</p>
+<h2>Querying the Encoded Table</h2>
+<p>With the key in place, the query aggregates on integers and only looks up the strings once the result is small.</p>
+<pre><code>WITH rollup AS (
+    SELECT
+        station_id,
+        date,
+        count(*) AS calls
+    FROM train_services_encoded
+    GROUP BY ALL
+)
+SELECT s.station_name, rollup.* EXCLUDE (station_id)
+FROM rollup
+LEFT JOIN stations s USING (station_id)
+ORDER BY station_id, date;</code></pre>
+<p>For top-N queries, apply the <code>LIMIT</code> before the join, so that only ten strings are looked up:</p>
+<pre><code>WITH top_stations AS (
+    SELECT station_id, count(*) AS calls
+    FROM train_services_encoded
+    GROUP BY station_id
+    ORDER BY calls DESC
+    LIMIT 10
+)
+SELECT s.station_name, top_stations.calls
+FROM top_stations
+LEFT JOIN stations s USING (station_id)
+ORDER BY calls DESC;</code></pre>
+<h2>Variations</h2>
+<h3>Comparison with ENUM</h3>
+<p>DuckDB's <code>ENUM</code> type is dictionary encoding built into the type system: values are stored as small integers, and DuckDB picks the integer width for you. The dimension table is the better choice when:</p>
+<ul>
+ <li><strong>New values keep arriving.</strong> An <code>ENUM</code>'s values are fixed when the type is created. A dimension table can grow.</li>
+ <li><strong>You need attributes.</strong> A dimension table can carry extra columns, such as the station's city or the line it sits on.</li>
+ <li><strong>The data leaves DuckDB.</strong> Integer keys and a lookup table can be exported to Parquet or CSV and used in other tools.</li>
+</ul>
+<h3>Several String Columns</h3>
+<p>The pattern applies per column: build one dimension table for each high-repetition string column. Each key gets its own integer type, sized to the cardinality of its column, and a query only joins back the dimensions it needs.</p>
+<h3>Keeping the Dimension Up to Date</h3>
+<p>When new data arrives, add unseen strings with keys that continue after the current maximum using an <code>ANTI JOIN</code> to identify new records, then encode the new fact table rows and append them.</p>
+<h2>When the Pattern Does Not Help</h2>
+<p>Don't use it when:</p>
+<ul>
+ <li><strong>The strings are short.</strong> Values of up to 12 bytes are already stored inline.</li>
+ <li><strong>The column is nearly unique.</strong> If most values are distinct, the dimension table has almost as many rows as the fact table and little is saved.</li>
+ <li><strong>You query the data once.</strong> Building the dimension table and rewriting the fact table costs a full pass over the data.</li>
+ <li><strong>You don't aggregate on the column.</strong></li>
+</ul>
+<h2>Conclusion</h2>
+<p>Grouping on repeated strings is expensive. By moving them into a small dimension table with sorted, narrow integer keys, DuckDB can aggregate on fixed-width integers and keep its hash tables compact. The strings come back in a final join against a result that is already small.</p>

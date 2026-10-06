@@ -1,0 +1,196 @@
+<h1>Jev Plays Pokémon Red</h1>
+<p><a href="https://en.wikipedia.org/wiki/Jev_(AI_model)">Jev</a>, TypeSafe AI's decision model, plays Pokémon Red. There are no scripts or cheats: the harness reads the game's memory, lists the legal options with some facts about each, and Jev picks one.</p>
+<p>Landing page: <a href="https://jev-pokemon.vercel.app">jev-pokemon.vercel.app</a></p>
+<h2>Result</h2>
+<p>Jev beat the game. The live stream ran on YouTube from Sep 25 to Sep 26, 2026 and has ended. The highlights are on the landing page.</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Total time</td>
+   <td>37h 40m</td>
+  </tr>
+  <tr>
+   <td>Decisions made</td>
+   <td>16,150</td>
+  </tr>
+  <tr>
+   <td>Input tokens</td>
+   <td>~39.2M</td>
+  </tr>
+  <tr>
+   <td>Total Jev cost</td>
+   <td>~$1.65</td>
+  </tr>
+  <tr>
+   <td>Median decision time</td>
+   <td>~0.4s</td>
+  </tr>
+  <tr>
+   <td>Team wipes</td>
+   <td>16 (14 at the Elite Four)</td>
+  </tr>
+  <tr>
+   <td>Elite Four attempts</td>
+   <td>15</td>
+  </tr>
+  <tr>
+   <td>Final team</td>
+   <td>Charizard 83, Graveler 62, Nidoqueen 45, Beedrill 44, Haunter 39, Primeape 29</td>
+  </tr>
+ </tbody>
+</table>
+<blockquote>
+ <p>You need your own legally obtained copy of Pokémon Red. No ROM is included or distributed here.</p>
+</blockquote>
+<h2>How it works</h2>
+<pre><code> Game Boy emulator (Node) ──► read RAM ──► game state (map, party, battle, on-screen text)
+          ▲                                          │
+          │ button presses                           ▼
+   harness mechanics ◄── Jev picks one ◄── legal options + facts
+   (A* pathfinding, menus)                (type matchups, damage estimates,
+                                           "2 areas toward the objective", ...)
+</code></pre>
+<ul>
+ <li><strong>Jev decides:</strong>
+  <ul>
+   <li>every menu answer (names, starter, YES/NO, shop, heal, learn/forget moves)</li>
+   <li>what to focus on (progress, heal, train, catch, shop, explore, team)</li>
+   <li>which Pokémon to catch, and which to swap in and out of the team at the PC</li>
+   <li>where to go and who to talk to</li>
+   <li>every battle action (move, switch, item, ball, run)</li>
+  </ul></li>
+ <li><strong>The harness never decides:</strong>
+  <ul>
+   <li>It only reads memory and presses buttons. It never writes to game memory.</li>
+   <li>Game knowledge is limited to the story milestones (what the next goal is and where it happens). Progress is checked against the game's real event flags.</li>
+   <li>Hidden items aren't shown to Jev, since a human wouldn't know where they are.</li>
+  </ul></li>
+ <li><strong>House rules:</strong>
+  <ul>
+   <li>Text speed FAST and battle animations OFF, set once in the Options menu at boot.</li>
+   <li>The player is named JEV and the rival BLUE.</li>
+   <li>Every caught Pokémon gets a nickname: Jev spells it one letter at a time (A–Z or DONE). It has to be a made-up name, not a species name or a nickname already in use.</li>
+  </ul></li>
+ <li><strong>Loop protection:</strong>
+  <ul>
+   <li>Options that were already tried without anything changing get tagged, and Jev is told to try something new.</li>
+   <li>If the same failing choice keeps coming back, the harness samples an alternative.</li>
+   <li>As a last resort, it reloads the latest milestone checkpoint.</li>
+  </ul></li>
+</ul>
+<h2>Setup</h2>
+<p>Requirements: macOS or Linux, Node 20+, and git.</p>
+<pre>git clone https://github.com/christianmat/jev-pokemon &amp;&amp; cd jev-pokemon
+npm install
+npm run setup                 # installs rgbds (via brew), clones + builds pret/pokered, generates symbol data
+cp /path/to/your/pokered.gb roms/red.gb   # your own dump of Pokémon Red (US/EU)
+cp .env.example .env          # then fill it in</pre>
+<p>The ROM must be the US/EU release. Its SHA-1 is <code>ea9bcae617fdf159b045185467ae58b2e4a48b9a</code>, the same build pret/pokered produces. The harness reads RAM addresses from that disassembly, so other versions won't work.</p>
+<h3><code>.env</code></h3>
+<table>
+ <thead>
+  <tr>
+   <th>Variable</th>
+   <th>What it does</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>JEV_MODE</code></td>
+   <td><code>gateway</code> for real Jev via Vercel AI Gateway, <code>mock</code> for a free, dumb stand-in (the default)</td>
+  </tr>
+  <tr>
+   <td><code>AI_GATEWAY_API_KEY</code></td>
+   <td>Vercel AI Gateway key (<code>VERCEL_AI_GATEWAY_API_KEY</code> also works)</td>
+  </tr>
+  <tr>
+   <td><code>JEV_MIN_INTERVAL_MS</code>, <code>JEV_MAX_PER_MIN</code></td>
+   <td>Throttling (defaults 300 ms and 90 per minute)</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Run</h2>
+<pre>npm start -- --speed 1                         # real-time; local viewer at http://localhost:8787
+npm start -- --speed 1 --resume                # continue from the latest milestone checkpoint
+npm start -- --speed 1 --load &lt;save-name&gt;      # load a specific save from saves/
+npm run headless -- --steps 3000               # max speed, logs only
+npx tsx scripts/tools/save.ts                  # save the running game (writes saves/manual-*.json)</pre>
+<h3>Logs</h3>
+<ul>
+ <li><code>logs/jev-calls.jsonl</code> has every Jev call: the full state, the options with their facts, the probabilities, and the latency.</li>
+ <li><code>logs/events.jsonl</code> has maps, milestones, saves and errors.</li>
+</ul>
+<h2>Cost</h2>
+<ul>
+ <li><strong>Price:</strong> Jev costs $0.042 per million input tokens, and output is free. A typical call is about 1,200 tokens.</li>
+ <li><strong>Rate:</strong> at real-time speed the bot makes about 800–1,300 calls an hour. That comes to <strong>about $1–1.70 per 24 hours</strong>.</li>
+ <li><strong>Ceiling:</strong> the throttle's worst case, 90 calls a minute nonstop, is about $7 a day.</li>
+</ul>
+<h2>Project layout</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Path</th>
+   <th>What</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>src/emu/</code></td>
+   <td>emulator wrapper (serverboy / GameBoy-Online core), save states, audio tap</td>
+  </tr>
+  <tr>
+   <td><code>src/game/</code></td>
+   <td>ROM tables, RAM reader, collision grid + A*, region graph</td>
+  </tr>
+  <tr>
+   <td><code>src/jev/</code></td>
+   <td>Jev client (throttle, cache, log), AI SDK gateway backend, mock</td>
+  </tr>
+  <tr>
+   <td><code>src/agent/</code></td>
+   <td>mode detection, dialog and menus, overworld, battle, field moves and items</td>
+  </tr>
+  <tr>
+   <td><code>src/knowledge/</code></td>
+   <td>story milestones</td>
+  </tr>
+  <tr>
+   <td><code>src/server/</code></td>
+   <td>runner + local WebSocket viewer</td>
+  </tr>
+  <tr>
+   <td><code>web/</code></td>
+   <td>local viewer page</td>
+  </tr>
+  <tr>
+   <td><code>site/</code></td>
+   <td>public landing page (static; deploy with Vercel, root directory <code>site</code>)</td>
+  </tr>
+  <tr>
+   <td><code>scripts/</code></td>
+   <td>setup, data generation, debug tools</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Deploying the landing page</h2>
+<p><code>site/</code> is plain static HTML with no build step:</p>
+<ol>
+ <li>Create a Vercel project from this repo.</li>
+ <li>Set <strong>Root Directory</strong> to <code>site</code>.</li>
+ <li>Deploy.</li>
+</ol>
+<h2>Legal</h2>
+<ul>
+ <li><strong>No ROM included.</strong> This repo doesn't contain or link to Pokémon Red, and you need your own legally obtained copy. <code>roms/</code> is gitignored.</li>
+ <li><strong>No Nintendo assets.</strong> Game data (symbols, names, maps, font) is read at runtime from <em>your</em> ROM. The symbol file is generated locally from the <a href="https://github.com/pret/pokered">pret/pokered</a> disassembly. That disassembly isn't redistributed here.</li>
+ <li><strong>Not affiliated.</strong> Pokémon is a trademark of Nintendo, Creatures Inc. and GAME FREAK inc. This is a fan experiment, not affiliated with or endorsed by Nintendo, Game Freak, The Pokémon Company or TypeSafe AI.</li>
+ <li><strong>License.</strong> GPL-2.0-or-later, because it builds on the GPL-licensed <a href="https://gitlab.com/piglet-plays/serverboy.js">serverboy</a> / GameBoy-Online emulator core.</li>
+</ul>
+<p>Made by Christian Mathiesen at Frigade.</p>

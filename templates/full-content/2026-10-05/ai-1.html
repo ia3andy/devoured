@@ -1,0 +1,80 @@
+<h1>Prime Inference: Fast, Reliable Serving for Frontier Open Models</h1>
+<p>Prime's mission is to build frontier open models and the open superintelligence stack for continuously improving agents. We already provide end-to-end post-training infrastructure, from prime-rl and verifiers to sandboxes and RL environments. But the continual learning loop is not complete until a trained model can serve real users, generate new experience, and feed those production traces back into training.</p>
+<p>We're excited to release Prime Inference today. It covers both serverless endpoints and reserved capacity and offers resilient serving of frontier open-source models on our GPU infrastructure across multiple datacenters.</p>
+<p>Prime Inference began as the serving platform we needed ourselves. Long before public release, it powered large-scale RL rollouts, synthetic data generation, evaluations, and long-running coding agents, processing nearly a trillion tokens every day just internally. Beyond our own workloads, we've also been serving large-scale customer deployments in production since January. This scale pushed us to optimize for sustained performance, quality, and reliability, rather than benchmark speed alone.</p>
+<p>Our first public deployment, GLM-5.3, went live on OpenRouter on September 22. It currently ranks among the fastest GLM-5.3 endpoints on OpenRouter, with a near-zero tool-call error rate and 100% uptime since launch.</p>
+<p><strong>Prime Inference at a glance</strong></p>
+<ul>
+ <li><strong>Low-latency:</strong> Our GLM-5.3 endpoint on OpenRouter is continuously evaluated for quality, with production SLAs, security, and privacy built in from the start.</li>
+ <li><strong>Premium infrastructure across data centers:</strong> Prime-hosted models run on NVIDIA Blackwell today, with Vera Rubin coming soon.</li>
+ <li><strong>Uptime:</strong> Automatic failover across data centers keeps traffic moving to healthy deployments.</li>
+ <li><strong>OpenAI compatible:</strong> Connect your existing tools and SDKs using a Prime endpoint and API key.</li>
+ <li><strong>Scaling:</strong> Serverless endpoints for variable demand, with reserved capacity for sustained workloads.</li>
+ <li><strong>Cost:</strong> Unified billing and team-level usage tracking across models, making inference spend easier to manage.</li>
+ <li><strong>Robust open-source infrastructure:</strong> Our stack combines NVIDIA Dynamo, vLLM, Mooncake, and FlashInfer, developed in close partnership with Inferact and NVIDIA, with improvements contributed upstream.</li>
+</ul>
+<h2>Get started</h2>
+<pre><code>prime inference chat 'z-ai/glm-5.3' "Write a haiku about KV caches."</code></pre>
+<p>Or point any OpenAI SDK at <code>https://api.pinference.ai/api/v1</code>. See the docs for the full API reference.</p>
+<h2>Built for production SLAs</h2>
+<p>Prime Inference separates the public API from the model fleet, so capacity can move, fail, or scale without changing the client endpoint.</p>
+<p>Our shared circuit breakers let every gateway replica react to failures consistently, while lease-based admission control prevents overload and automatically recovers capacity when a process disappears.</p>
+<p>Below the software layer, every cluster is continuously monitored, with health checks that reach all the way down to NVLink and InfiniBand. Alerts go to an on-call team staffed 24/7, so GPU failures are caught and repaired quickly instead of slowly degrading service. And because Prime maintains significant overflow capacity, we can reroute traffic and bring up new deployments whenever more capacity is needed.</p>
+<h2>How we serve production agent traffic</h2>
+<h3>Workload</h3>
+<p>A typical agent turn adds about 6K tokens to a 140K-token prompt, reusing most of the conversation history. Under load, these returning sessions run alongside new requests with long, uncached prompts.</p>
+<p>We benchmark this mix with AgentX from SemiAnalysis, which replays multi-turn agent sessions. Our benchmark harness also injects cold arrivals with long prompts. We measure end-to-end tokens per second per user for interactivity and output tokens per second per GPU for efficiency.</p>
+<h3>Prefill/decode disaggregation</h3>
+<p>On shared GPUs, processing a long prompt can interrupt token generation for existing sessions. Chunked prefill limits these interruptions, but both workloads still compete for GPU time.</p>
+<p>We run prefill and decode on separate GPU groups. NVIDIA Dynamo handles routing and orchestration, while vLLM runs the model on each group. Once prefill finishes, the decoder pulls the computed KV through NIXL and adds the request to its batch.</p>
+<p>With Dynamo coordinating separate prefill and decode pools, we reduced p90 inter-token latency by nearly 40% in our tests.</p>
+<h3>Caching and routing</h3>
+<p>Dynamo's KV-aware router chooses a prefill worker based on how much of the prompt it already has cached and how much work is queued there. Workers publish cache updates so the router can track where prefixes are available. We also keep sessions on the same decoder between turns to support KV reuse.</p>
+<p>Mooncake provides a second cache tier in host DRAM. Prefixes offloaded from GPU memory can be retrieved instead of recomputed, allowing us to retain more conversation history.</p>
+<h2>Performance: GLM-5.3 on GB200 NVL72</h2>
+<p>Long-context agentic serving is as much a cache-management problem as a compute problem. Performance therefore depends on retaining that history, scheduling new work promptly, and moving cached state without interrupting ongoing generation.</p>
+<p>Our interactivity target was 100 end-to-end tokens per second per user. We tune for the number of concurrent sessions we can support at that speed.</p>
+<p>We optimized these paths separately: prefill topology and scheduling to reduce time to first token; compressed KV and a fused attention kernel to support low-latency decoding; and a transfer-friendly cache layout to reduce the overhead of moving KV between workers.</p>
+<h2>Technical deep dive</h2>
+<p>The sections below cover our work on topology, scheduling, compressed attention, and KV transfer:</p>
+<ol>
+ <li><strong>Choosing the right topology for prefill and decode</strong></li>
+ <li><strong>Reducing the scheduler bubble on prefill</strong></li>
+ <li><strong>NVFP4 KV compression on FlashInfer</strong></li>
+ <li><strong>Faster NIXL transfers on NVLink with the BLHNC layout</strong></li>
+</ol>
+<h2>Prefill: time to first token</h2>
+<h3>Choosing the right topology</h3>
+<p>We chose DEP8: eight data-parallel attention ranks with expert parallelism across the group. DEP8 distributes requests across eight attention workers while sharing the model's experts across the group. With the MLA cache layout we used, TEP8 replicated each request's KV across all eight ranks, while DEP8 let the ranks cache different requests. Even after accounting for the extra weight memory this requires, we had roughly five times more usable prefix-cache capacity on the same hardware compared to a topology like TEP8, which was also benchmarked.</p>
+<h3>Scheduler bubble and the token budget</h3>
+<p>Cache capacity does not eliminate scheduling delays. We found that a request's cached KV could already be available while the request still waited to enter the running batch.</p>
+<p>Workers check for completed loads between forward passes. Results then pass through a batch queue and scheduler, where a ready request can miss the current decision and wait another step. Under load, requests already in progress can fill the next prefill batch, delaying admission even when the cached history is ready. This creates a scheduler bubble.</p>
+<p>To reduce this bubble, we halved the number of prompt tokens processed in each prefill step, from 8K to 4K per GPU. Shorter steps let waiting requests start sooner. On our configuration, median queue wait fell from 550ms to 110ms, reducing median time to first token by roughly 20%.</p>
+<h2>Decode: NVFP4 KV compression</h2>
+<h3>Making room for low-latency decode</h3>
+<p>We compressed the 512-value MLA latent using NVFP4: four bits per value, with an FP8 scale for each group of 16 values. The 64-value positional component remained FP8. Including scales, each MLA cache row shrank from 576 to 352 bytes.</p>
+<p>With the indexer and other state unchanged, total cache capacity increased by roughly 50%, from 1.09 million to 1.63 million cached tokens per decoder at the same memory budget.</p>
+<h3>A native NVFP4 sparse-MLA decode kernel</h3>
+<p>We built a native sparse-MLA kernel to remove that intermediate buffer. It consumes the positions selected by the sparse indexer, loads the compressed rows, and unpacks them on-chip as attention needs them. NVFP4 is the storage format; the attention computation uses FP16 operands with FP32 accumulation.</p>
+<p>For each query token, a cluster of cooperating thread blocks divides the selected rows. In the GB200 configuration, each cluster spans three to eight SMs. The blocks combine their partial results through distributed shared memory, without a second kernel launch.</p>
+<h3>NVFP4 KV accuracy</h3>
+<p>We ran a rigorous evaluation suite, with particular emphasis on long-context tasks, to ensure that NVFP4 KV compression does not degrade accuracy.</p>
+<h2>KV transfer: reducing copy overhead on NVLink</h2>
+<p>We use vLLM's NIXL connector to let each decoder pull KV from the prefill workers over multi-node NVLink. In an early comparison, the NVLink configuration added roughly 292 ms to time to first token relative to InfiniBand. The faster interconnect was not translating into faster serving.</p>
+<p>The bottleneck was transfer fragmentation.</p>
+<h3>Changing the layout to reduce fragmentation</h3>
+<p>We tested BLHNC, a block-major layout recently introduced by the vLLM community. It places a block's data from multiple layers together in memory, allowing NIXL to transfer those contiguous regions with fewer, larger copy operations.</p>
+<h2>Reliable tool calls</h2>
+<p>Performance is only part of production agent serving. Agents also need reliable tool calls to read files, run commands, and make edits. If the model calls the wrong tool or produces unusable arguments, the agent must retry or stop.</p>
+<p>We contributed a structural-tag builder to Dynamo to translate tool definitions into rules that restrict the names and arguments the model can generate.</p>
+<p>vLLM uses xgrammar to enforce those rules during decoding, masking tokens that would violate the tool-call grammar. We also fixed errors introduced during parsing: literal strings such as <code>&lt;</code> were being converted into <code>&lt;</code>, altering code or file contents, while some schema references and nullable argument types were interpreted incorrectly.</p>
+<h2>Built on open source, with great partners</h2>
+<ul>
+ <li><strong>vLLM and Inferact.</strong> Our stack runs on the vLLM inference engine. We thank Inferact for their deep collaboration on performance and production serving, and vLLM contributors around the world for continually advancing the engine.</li>
+ <li><strong>NVIDIA Dynamo.</strong> The operating system beneath our LLM inference platform coordinates disaggregated workers, routes requests and KV state, and turns a distributed GPU fleet into one resilient serving system.</li>
+</ul>
+<h2>On the roadmap</h2>
+<ul>
+ <li><strong>Batch and async inference</strong> for large offline jobs at lower prices.</li>
+ <li><strong>Dedicated and 1-click deployments</strong> on your own reserved capacity, including your fine-tuned models from Prime training runs.</li>
+</ul>

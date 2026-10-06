@@ -1,0 +1,79 @@
+<h1>One Language, Every Chip</h1>
+<p>Vx is a systems programming language for heterogeneous computing. CPU, GPU, NPU and accelerator memory are part of the type system — so a host thread dereferencing a device pointer is a <em>compile error</em>, not a segfault at three in the morning.</p>
+<pre><code>curl -fsSL https://vxlang.org/install.sh | sh</code></pre>
+<p>macOS on Apple Silicon and Linux x86_64.</p>
+<p>Heterogeneity belongs in the type system, not in the runtime.</p>
+<h2>Where data lives is part of its type</h2>
+<p>Most languages treat the accelerator as infrastructure: you write math, and a large opaque runtime decides how to ship it. Vx treats it as semantics. A tensor pinned to NPU high-bandwidth memory has a different type from one in host DRAM, and crossing between them takes an explicit <code>transfer()</code> — <strong>even when the hardware boundary is free.</strong></p>
+<p>On Apple's unified memory that transfer compiles to almost nothing. It is still written down, because data locality should be provable by reading the source rather than by profiling the binary.</p>
+<pre><code>// Two matrices already resident in NPU memory.
+fn custom_matmul(
+    a: Pinned&lt;Tensor&lt;f32, [4, 4]&gt;, Topology::NPU[0]&gt;,
+    b: Pinned&lt;Tensor&lt;f32, [4, 4]&gt;, Topology::NPU[0]&gt;)
+    -&gt; Verified&lt;Tensor&lt;f32, [4, 4], Memory::NPU_HBM&gt;&gt; \{
+
+    let mut result =
+        Tensor&lt;f32, [4, 4], Memory::NPU_HBM&gt;::uninit();
+
+    // Dispatch the computation to the accelerator.
+    spawn on(Topology::NPU[0]) \{
+        for i in 0..4 \{
+            for j in 0..4 \{
+                result[i][j] = 0.0;
+                for k in 0..4 \{
+                    result[i][j] += a[i][k] * b[k][j];
+                }
+            }
+        }
+    }
+
+    return Verified(result);
+}</code></pre>
+<h2>What the compiler rules out</h2>
+<p>Vx front-loads into type checking a class of bug that normally surfaces as a runtime crash, silent corruption, or an out-of-memory at training step 1200.</p>
+<h3>Address-space typing</h3>
+<p>Dereferencing a device pointer from the host. A <code>Pinned&lt;T, NPU_SRAM&gt;</code> escaping into a host expression.</p>
+<h3>Capacity admission</h3>
+<p>A placement whose working set cannot fit the memory space it targets — checked against the declared machine, before a binary exists.</p>
+<h3>Seam contracts</h3>
+<p>Reading a buffer whose asynchronous <code>transfer</code> has not been made visible. Discharged by an SMT prover.</p>
+<h3>Linear types</h3>
+<p>Use-after-move of a consumed buffer, alongside a borrow checker with variance and region tracking.</p>
+<h3>Topology reachability</h3>
+<p>A transfer between two memory spaces with no declared path between them.</p>
+<h3>Autodiff</h3>
+<p>Differentiating through a region whose adjoint is not defined.</p>
+<h2>The machine is declared, not assumed</h2>
+<p>Most compilers hard-code a cost model. Vx reads one. A <strong>machine file</strong> describes the memory hierarchy and interconnect of a real part, and the compiler admits or rejects placements against it.</p>
+<p>Units are exact integer conversions, never floats: SI prefixes are decimal (<code>GB</code> = 109), IEC are binary (<code>GiB</code> = 230). A figure copied off a vendor sheet means what the sheet meant.</p>
+<p>The repository ships machine files for H100, H200, B200, A100, MI300X, Apple M4 and multi-GPU nodes — each citing its sources, and marking unverified figures as unverified.</p>
+<pre><code>Memory HBM  \{ capacity: 80 GiB, bandwidth: 3.35 TB/s,
+              managed: explicit, scope: device }
+
+Memory L2   \{ within: Memory::HBM, capacity: 50 MiB,
+              bandwidth: 12 TB/s, managed: cached }
+
+Memory SMEM \{ within: Memory::L2, capacity: 228 KiB,
+              bandwidth: 128 B/cyc, clock: 1.98 GHz,
+              replicas: 132, granule: 1 KiB, scope: sm }
+
+Topology Device \{
+    arch: nvptx64,
+    memory: Memory::HBM,
+    transfer Memory::CPU_DRAM -&gt; Memory::HBM : 63 GB/s,
+}</code></pre>
+<h2>How it compiles</h2>
+<h3>A data-oriented parallel frontend</h3>
+<p>Every symbol, nominal type and monomorphized variant is a flat 256-bit identifier. A nominal type system plus mandatory boxing for recursive types decouples modules, so the pipeline runs parallel across cores with no query engine and no lock contention. Compilation walks flat arrays rather than pointer-chased trees.</p>
+<p>The same source compiles to byte-identical MLIR whether it is built serially or in parallel. That is asserted in the test suite rather than hoped for — at benchmark scale, at one thread, at four, and with the thread pool taken off the path entirely, plus a corpus recompiled in fresh processes so each run gets its own hash seed. The claim is about the MLIR the frontend emits; everything downstream of it belongs to LLVM.</p>
+<h3>Backends</h3>
+<ul>
+ <li><strong>CPU (x86-64, arm64):</strong> MLIR → LLVM IR → native, AOT or JIT</li>
+ <li><strong>NVIDIA GPU:</strong> MLIR → NVVM → PTX → SASS</li>
+ <li><strong>Apple AMX / ANE:</strong> CoreML primitive dispatch via plugin</li>
+ <li><strong>Distributed:</strong> Manifest-driven remote regions over a wire protocol</li>
+</ul>
+<p>Vendors extend the compiler through MLIR pass plugins rather than by patching it.</p>
+<h2>Where Vx is the wrong tool</h2>
+<p>PyTorch users mutate architecture mid-loop, print a tensor shape, branch on it, and carry on. In Vx — ahead-of-time, data-oriented, statically regioned — that same dynamism takes real work.</p>
+<p>Vx is the right language for the thing that must be correct and fast across ten kinds of silicon. It is not the right language for the thing you are still figuring out.</p>

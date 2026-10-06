@@ -1,0 +1,47 @@
+<p>Today we release Whistle, a speech recognition model for mobiles, wearables, robots, smart home, automotive and microcontrollers. It is one 16.9 MB file, runs on the CPU with no dependencies, and loads into the same C++ engine as Needle, from the same container and the same quantisation.</p>
+<p>Whistle does three jobs, all of them on the device:</p>
+<ul>
+ <li><strong>Transcription.</strong> 16 kHz mono audio, up to 30 seconds in one pass, in English, German, French, Spanish, Italian, Dutch and Polish. The language is detected unless you name it.</li>
+ <li><strong>Word timestamps.</strong> Every word with its start, end and probability, aligned from the decoder's attention.</li>
+ <li><strong>Speech embedding.</strong> The encoder output, one row per 80 ms frame, without decoding a transcript.</li>
+</ul>
+<h2>The model</h2>
+<p><strong>The front end.</strong> 16 kHz mono audio is framed at a 25 ms window and a 10 ms hop into 80 log-mel bins, band-limited to 250-3500 Hz and normalised per channel. Thirty seconds is 3,000 frames. A convolutional stem of 128 channels and kernel 9 halves that count three times, leaving 375 frames at one per 80 ms. Every stage after this runs at that rate, and <code>embed</code> returns one row per frame.</p>
+<p><strong>The encoder.</strong> Eight Simple Attention blocks: four mHC residual lanes and a Monarch Hadamard MLP in place of the feed-forward network, the same blocks Needle uses. The attention is not causal. A frame at 3 s attends to a frame at 12 s.</p>
+<p><strong>The decoder.</strong> Eight Laddered Simple Attention blocks at width 512, 8 query heads to 2 KV heads, 48-dimensional queries and keys, 64-dimensional values, a 3-tap causal convolution on Q, K and V, and engram lookups at layers 3 and 7 over 18,432 slots. That is Needle's block list with a different layer count.</p>
+<p>The speech-specific part is one addition per layer. Each decoder layer reads the encoder through a gated cross attention, <code>x ← x + σ(g) · softmax(q̂ K̂ᵀ/√d) V</code>, with a gate learned per layer and K and V taken from the clip. Those projections run once when the clip arrives, 375 frames across 8 layers, and are then held for the whole decode. Five beams therefore cost five short transcript caches, not five passes over the audio.</p>
+<p><strong>Decoding.</strong> Five beams scored by length-normalised log probability. Keyword biasing walks an Aho-Corasick automaton over the phrases you pass in, alongside the beams, and lifts their log probability as the automaton advances. The transcript is capped at 320 tokens. The vocabulary is 8,192 text pieces plus seven language tokens, one per language, so the detected language is emitted as a token rather than returned out of band.</p>
+<p><strong>The ladder is on the decoder.</strong> Every depth from 2 layers up was trained as a model of its own, and <code>--audio-depth</code> selects one at load time. The encoder is never sliced: all eight blocks run at every depth.</p>
+<p><strong>Silence.</strong> The engine measures the clip's loudness range before the decoder starts. Below the threshold it returns an empty transcript and an empty language, and never enters the beam search.</p>
+<h2>Benchmarks</h2>
+<p>Whistle is ahead on LibriSpeech test-clean and test-other, on SPGISpeech, on Earnings-22 and on the FLEURS average. Whisper base is ahead on TED-LIUM, on AMI and on the MLS average, at 145.3 MB against 16.9.</p>
+<p>Each model ran on its official runtime at its defaults: Whistle's C++ engine at 5 beams, <code>openai-whisper</code>, and <code>moonshine-voice</code> non-streaming over whole audio. Time to first token is audio in to first token. Decode is tokens divided by the wall time after it, so the encoder is not counted twice. Whisper pads every input to 30 seconds, so its time to first token is flat across clip lengths. Whistle's tracks the clip: 5.9 ms at 5 seconds, 11.1 ms at 10, 36.3 ms at 30.</p>
+<p>Word error rates are scored with the Whisper normalizers. Whistle's are measured over 86,174 utterances. Whisper's and Moonshine's are the figures their authors published, from the multilingual checkpoints rather than the English-only ones. No test audio appears in Whistle's training or validation data, verified by comparing audio checksums and speaker IDs across every reported test set.</p>
+<h2>One engine, three ways to load it</h2>
+<p><code>needle_load</code> reads whichever model a <code>.cact</code> file holds, so the same binary does speech, text, or both:</p>
+<pre><code>needle --model whistle.cact --audio clip.wav
+
+needle --model needle3.cact --tools tools.json --prompt "turn off the kitchen lights"
+
+needle --model needle3.cact --model whistle.cact --tools tools.json --audio clip.wav</code></pre>
+<p>On the third line <code>needle_complete</code> takes the clip directly. The engine transcribes it, answers the transcript against your tools, and returns one JSON object with the calls and the speech fields, the speech ones prefixed <code>audio_</code>. No transcript is handled by the caller.</p>
+<pre><code>\{"function_calls":[\{"name":"set_lights","arguments":\{"room":"kitchen","on":false}}],
+ "confidence":0.94,
+ "audio_text":"turn off the kitchen lights",
+ "audio_language":"en"}</code></pre>
+<h2>Get started</h2>
+<pre><code>pip install cactus-needle</code></pre>
+<pre><code>import needle
+
+print(needle.transcribe("clip.wav")["text"])
+# turn off the kitchen lights</code></pre>
+<p>A 16 kHz WAV or raw samples need nothing beyond the base install. Other sample rates and microphone capture need the <code>[mic]</code> extra, which adds <code>soxr</code> and <code>sounddevice</code>.</p>
+<p>Every call returns the text, the language, the milliseconds to the first token and the decoder's tokens per second after it. <code>word_timestamps=True</code> adds each word with its times and probability. <code>keywords=["Siobhan", "Krzysztof"]</code> raises the log probability of those phrases during the search. <code>language="de"</code> forces the language instead of detecting it. <code>needle.Whistle()</code> is the same model as an object, for <code>embed(audio)</code> or to hold one tuned <code>.cact</code>.</p>
+<p><code>needle whistle playground</code> transcribes from the microphone in the terminal, and <code>needle whistle compare</code> runs the same clip through Whistle, Whisper and Moonshine side by side with their timings.</p>
+<h2>Deploy</h2>
+<p>The engine ships prebuilt for seventeen targets, from macOS and Linux through Android, iOS, watchOS, Windows on ARM, RISC-V, MIPS, the browser and a WASI component. Every folder holds a <code>needle</code> binary, <code>libneedle.a</code> and <code>needle.h</code>, and loads any <code>.cact</code> you hand it.</p>
+<pre><code>needle download macos-arm64
+needle download whistle
+./macos-arm64/needle --model whistle.cact --audio clip.wav --audio-word-timestamps</code></pre>
+<p><code>needle_load</code>, <code>needle_transcribe</code> and <code>needle_embed</code> are the whole speech C API. The engine reads no environment variables. Every behaviour is a compiled default or an explicit flag.</p>
+<p>Weights are on Hugging Face, the engine and its platform folders are in Cactus-Compute/needle3, and the source is on GitHub.</p>
