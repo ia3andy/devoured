@@ -1,0 +1,49 @@
+<h1>Training AI to Paint with Code</h1>
+<h4>March 2026 · Research, Design, Development.</h4>
+<p>When you make an image with an AI model, the only way to participate is the prompt. You cannot edit the image directly. To change anything you go back to the model and prompt again. That limitation is what started this project. My friend Cameron and I trained a language model to make images by writing code, using reinforcement learning. The code is the artefact, and the code is editable. You can change what the model produced more granularly without going to prompt.</p>
+<p>The deeper question this project asks is how to do reinforcement learning on creative and design tasks. RL works when the reward is verifiable. A math problem is right or wrong. A game is won or lost. Aesthetic quality is neither. The design problem becomes the reward function and the criteria a judge is asked to apply. Too rigid, and the model converges. Too loose, and the model drifts.</p>
+<p><a href="https://vimeo.com/1190839818">[Video of my thesis presentation, for the context behind this project.]</a></p>
+<h3>My contributions</h3>
+<ul>
+ <li>Design</li>
+ <li>Development</li>
+ <li>RL Research</li>
+</ul>
+<h3>The team</h3>
+<ul>
+ <li>Surya</li>
+ <li>Cameron Franz</li>
+ <li>Alex Wang</li>
+</ul>
+<p>A Watercolour painting of a Hibiscus flower made in code.</p>
+<h1>How it works</h1>
+<p>The system is a four-step loop, run thousands of times during training.</p>
+<p>The model receives a prompt, something like <em>draw a peach hibiscus in watercolour</em>, and writes a complete p5.brush JavaScript sketch. The sketch is rendered in a sandboxed Puppeteer environment, which produces a PNG. The PNG is judged against two random reference paintings sampled from a hand-rated pool, with a separate judge model picking the better watercolour. The judgment is converted into a reward signal, GRPO updates the model, and the loop runs again.</p>
+<p>The non-obvious choices live in what is being judged, how the judgment is made, what is in the reference pool, and how the system prompt is written. Each is the subject of a section below.</p>
+<h1>Reward Functions</h1>
+<p>The first rubric had nine separate signals. A compilation gate. A check that the code actually used p5.brush rather than native p5. A code length ramp targeting around 3,000 tokens. HPSv3, a human preference model. Prompt adherence, judged by a council of GPT-5.4 and Gemini. And four more quality judges: recognisability, aesthetics, technique, depth.</p>
+<p>The model plateaued around 0.65 reward and stayed there. Every rollout looked the same. A flat, clip-art flower with five rounded petals. The reward kept going up but the capabilities didn't seem to improve.</p>
+<p>The diagnosis came from looking at the sub-rewards in isolation. The four quality judges plus prompt adherence were correlated with each other at 0.85 to 0.95. They were measuring the same thing five times. Code length, contributing roughly a third of the total reward, had saturated by step thirty and was producing zero gradient afterward. HPSv3, the one signal showing real variance, was weighted at 0.10. The rubric we made was telling the model the same thing over and over again.</p>
+<p>The fix had two halves.</p>
+<ol>
+ <li><strong>Replace absolute scoring with pairwise judgment.</strong> The original rubric asked the judge to score each rollout from zero to ten. The scores came back compressed near zero. Pairwise scoring asks a different question. The judge is shown the rollout, two references from the pool, and a single prompt: <em>which of these is the better hibiscus watercolour?</em> The reward is the fraction of comparisons it wins. The dynamic range opens up. The judge model handles a relative question more reliably than an abstract scale.</li>
+ <li><strong>Build a reference pool of hand-rated examples.</strong> 1,664 images, rated one at a time into love, okay, and nope. The 117 love-tier examples seeded the comparison pool. Every rollout from that point onward was being judged against the things I had decided were good. The next step, which we did not get to, would have been training a small reward model on the ratings themselves, (proper RLHF) so the model's sense of <em>good</em> could be applied without needing to compare against the pool every time.</li>
+</ol>
+<p>The new rubric collapsed all of it into four components: a binary compile-and-uses-brush gate (0.05), a binary length check (0.05), HPSv3 (0.30), and the pairwise judge against the reference pool (0.60). Same base model, same training data. The next run reached the previous plateau three times faster, kept climbing past it, and produced code that compressed from 13,500 tokens to under 2,000. The model learned that winning compositions did not need verbose code.</p>
+<h1>The reference pool</h1>
+<p>The pool has 581 reference paintings. all of which were hand rated from 1664 generations into 117 love-tier, 266 are okay, and 198 are supplements from a separate generation run used to widen the comparison set in colours where hand-rated examples were thin.</p>
+<p>Every image in the pool is model output. As we could not source enough human made examples since the library is a niche tool artists use. The generation work ran through two pipelines. AutoResearch, with Opus 4.6, GPT-5.4, and Gemini 3.1 Pro iterating against reference photographs under a VLM judge giving scores and feedback. And a larger batch run on Gemini 3.1 Pro. Both pipelines fed a system prompt that had itself been evolved through GEPA, covered in the next section.</p>
+<p>A slice of the reference pool, grouped by colour.</p>
+<h1>System prompt evolution</h1>
+<p>The system prompt also needed work. Early versions included a 400-line p5.brush API reference. The model produced confident, well-formatted code that invented APIs that did not exist.</p>
+<p>The fix was done using GEPA, a prompt-optimisation library that evolves a prompt against a scoring function. We ran 200 iterations against a taste-anchored 7-shot judge. The optimisation converged on a prompt with a strict allowlist of eight brush methods, no API documentation, no examples. The first time three out of three generations produced visible hibiscus blobs was on the version written after throwing the 400-line reference out entirely.</p>
+<p>The findings generalised. Long reference documentation in a system prompt made the models hallucinate APIs. A short, opinionated allowlist constrains output better than the original spec.</p>
+<h1>Progression</h1>
+<p>Model's output across training steps.</p>
+<p>First training run progression</p>
+<p>A selection of generations from the trained model. Each was produced by the model writing JavaScript that renders into the image.</p>
+<h1>Closing</h1>
+<p>Reinforcement learning needs a verifiable reward. A math problem is right or wrong. A game is won or lost. Aesthetic preference is neither. To do RL on subjective work, you have to author the reward by hand, and then design it carefully enough that it generalises. Too specific, and the model only learns to copy the examples you rated. Too loose, and it learns nothing in particular. RL for creative tasks is a design problem for creating structure that lets taste generalise to users preferences.</p>
+<p>I don't think this is a better way to make images. It is, in fact, much slower. But when I started this project I was frustrated that the only way to participate in image creation with AI was through the prompt. This project let me put attention and effort across the prompt, the model, and the artefact. The project is ongoing, with one final training run aimed at fixing the issues we discovered along the way. A full technical report will be published in June 26.</p>
+<p>What is possible within the medium</p>
+<p>A huge thank you to Cameron Franz, who was a core collaborator and helped build the entire training infrastructure, and to Alex Wang for his enthusiasm and helping guide us through the process. Conversations with Evan Casey also shaped how I think about reward functions as a creative artefact.</p>
