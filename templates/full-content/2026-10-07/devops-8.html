@@ -1,0 +1,131 @@
+<h1>The Shift to cgroup v2 in Kubernetes: What You Need to Know</h1>
+<p>In Linux, <em>cgroups</em> (control groups) are a kernel feature used for managing system resources. Kubernetes uses cgroups to allocate resources like CPU and memory to containers, ensuring that applications run smoothly without interfering with each other. With the release of Kubernetes v1.31, support for v1 cgroup management moved into maintenance mode. Support for v2 cgroup management has been stable since Kubernetes v1.25.</p>
+<p>Compared with cgroup v1, cgroup v2 provides a single unified hierarchy, a more consistent interface, and a stronger foundation for resource isolation and modern resource-management features.</p>
+<h2>Deprecation of cgroup v1</h2>
+<p>Kubernetes has deprecated cgroup v1. Starting with Kubernetes v1.35, <code>failCgroupV1</code> defaults to <code>true</code>, so the kubelet does not start on a cgroup v1 node by default. Administrators can temporarily set <code>failCgroupV1: false</code> in the kubelet configuration file, but removal will follow the Kubernetes deprecation policy. Further removal work is tracked in KEP-5573: Remove cgroup v1 support.</p>
+<p>If you are still on a release older than v1.35, migrate every Linux node to cgroup v2 before upgrading, or plan to set the temporary <code>failCgroupV1: false</code> override. If you are already on v1.35 or later, confirm that every Linux node runs cgroup v2 (or that you intentionally keep the override). Under the default configuration, a remaining cgroup v1 node fails during kubelet startup.</p>
+<p>For kubeadm-managed clusters, Kubernetes v1.35 also makes this an earlier, stricter check. The <code>SystemVerification</code> preflight check, provided by <code>k8s.io/system-validators</code>, returns an error during <code>kubeadm init</code>, <code>kubeadm join</code>, and <code>kubeadm upgrade</code> when it detects cgroup v1 with kubelet v1.35 or later; with an older kubelet, the check remains a warning.</p>
+<p>The top FAQs cover three main areas: why to migrate, the benefits and drawbacks, and key points to keep in mind when using cgroup v2.</p>
+<h2>Limitations of cgroup v1 and Improvements with cgroup v2</h2>
+<p>The Linux kernel documentation describes both interfaces:</p>
+<ul>
+ <li>cgroup v1 documentation</li>
+ <li>cgroup v2 documentation</li>
+</ul>
+<p>Let's enumerate some known issues.</p>
+<h3><code>active_file</code> memory is not considered available memory</h3>
+<p>The kubelet treats <code>active_file</code> memory as not reclaimable. For I/O-intensive workloads, a large page cache can therefore make the kubelet report memory pressure and evict Pods. This is a known kubelet issue; migrating to cgroup v2 does not by itself change that calculation. The documented workaround is to set equal memory requests and limits for containers that perform intensive I/O, after measuring an appropriate value.</p>
+<h3>Memory QoS updates in Kubernetes v1.36</h3>
+<p>Memory QoS was introduced as an alpha feature in Kubernetes v1.22 and updated in v1.27. It remains alpha in v1.36, but now separates memory throttling from memory reservation and adds tiered memory protection:</p>
+<p>Memory QoS is available <strong>only</strong> on Linux nodes that use cgroup v2. It relies on the cgroup v2 memory controller: <code>memory.high</code> provides throttling, while <code>memory.min</code> and <code>memory.low</code> provide hard and soft protection when tiered reservation is enabled. cgroup v1 cannot provide this protection model.</p>
+<ul>
+ <li>Enabling the <code>MemoryQoS</code> feature gate applies <code>memory.high</code> throttling to Burstable containers. The threshold is derived from the request, limit, and <code>memoryThrottlingFactor</code> (default <code>0.9</code>).</li>
+ <li><code>memoryReservationPolicy: None</code> is the default. It does not write <code>memory.min</code> or <code>memory.low</code>.</li>
+ <li><code>memoryReservationPolicy: TieredReservation</code> maps Guaranteed Pod memory requests to <code>memory.min</code> (hard protection) and Burstable Pod requests to <code>memory.low</code> (soft protection). BestEffort Pods receive neither protection.</li>
+ <li>The kubelet exposes Alpha metrics for the total <code>memory.min</code> and <code>memory.low</code> reservations on a node.</li>
+ <li>Kernel 5.9 or later is recommended. On older kernels, <code>memory.high</code> reclaim can trigger a known livelock; from v1.36 the kubelet logs a warning when Memory QoS is enabled on an affected kernel.</li>
+</ul>
+<p>For example, to opt in to tiered protection:</p>
+<pre><code>apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+featureGates:
+  MemoryQoS: true
+memoryReservationPolicy: TieredReservation
+memoryThrottlingFactor: 0.9
+</code></pre>
+<p>The overall Kubernetes recommendation is not to enable Alpha features in production; however, if you judge that memory QoS with tiered reservations is useful for your platform in production, make sure to test the configuration <strong>and</strong> account for hard-reserved memory before you enable the <code>TieredReservation</code> feature gate.</p>
+<h3>Container-aware OOM handling</h3>
+<p>On cgroup v2 nodes, the kubelet defaults <code>singleProcessOOMKill</code> to <code>false</code>. It therefore sets <code>memory.oom.group</code> for each container cgroup so that an OOM event kills all processes in that container together, rather than leaving a partially functioning multi-process container. Set <code>singleProcessOOMKill: true</code> only if you need the cgroup v1-compatible behavior where the kernel may kill one process at a time.</p>
+<p>This behavior is scoped to a container cgroup, not the whole Pod. Also, <code>cgroup.kill</code> is a separate administrative interface: writing <code>1</code> to it sends <code>SIGKILL</code> to every process in that cgroup and its descendants; it does not configure OOM behavior. The cgroup v2 memory controller additionally provides <code>memory.events</code> counters that monitoring systems and userspace OOM managers can observe.</p>
+<h3>Rootless support</h3>
+<p>In cgroup v1, delegating controllers to less privileged containers may be dangerous. Unlike cgroup v1, cgroup v2 officially supports delegation. Most implementations of rootless containers rely on systemd for delegating v2 controllers to non-root users.</p>
+<p>This delegation mechanism is separate from Kubernetes Pod user namespaces, which map container users to unprivileged host users.</p>
+<h3>What else?</h3>
+<ol>
+ <li>eBPF stories: 
+  <ul>
+   <li>In cgroup v1, device access controls are exposed through interface files.</li>
+   <li>The cgroup v2 device controller has no interface files, and is implemented on top of cgroup BPF.</li>
+   <li>Cilium attaches BPF cgroup programs for socket-based load balancing.</li>
+  </ul></li>
+ <li>Pressure Stall Information (PSI) reports CPU, memory, and I/O contention at node, Pod, and container level. On supported clusters, the kubelet exposes PSI by default. PSI requires cgroup v2, Linux 4.20 or later, <code>CONFIG_PSI=y</code>, and a kernel not booted with <code>psi=0</code>.</li>
+ <li>When migrating, update software that reads the cgroup filesystem directly.</li>
+</ol>
+<h3>CPU weight conversion in newer OCI runtimes</h3>
+<p>cgroup v1 uses <code>cpu.shares</code>, whereas cgroup v2 uses <code>cpu.weight</code>. Newer OCI runtimes use an improved non-linear conversion that preserves the default priority and gives small CPU requests more usable granularity. The change is implemented in the OCI runtime rather than Kubernetes: it is available in crun v1.23 and runc v1.3.2. After upgrading a runtime, monitoring or policy tools that predict exact <code>cpu.weight</code> values may need updates.</p>
+<h3>In-place resource updates</h3>
+<p>In-place Pod vertical scaling graduated to stable in Kubernetes v1.35. The kubelet coordinates changes between the Pod-level and container cgroups so that increases create headroom before container limits grow, while decreases constrain containers before shrinking the Pod-level boundary. Accurate aggregate enforcement for this feature requires cgroup v2.</p>
+<h2>Adopting cgroup version 2</h2>
+<h3>Requirements</h3>
+<ul>
+ <li>You need at least one Linux node.</li>
+ <li>Your OS install must run with cgroup v2 enabled.</li>
+ <li>The kernel version must be 5.8 or later (5.9 or later is recommended when using memory QoS).</li>
+ <li>The container runtime must support cgroup v2.</li>
+ <li>The kubelet and the container runtime must both be configured to use the correct cgroup driver.</li>
+</ul>
+<p>For now, you can opt back in to use cgroup v1; the Kubernetes project recommends using cgroup v2, but in Kubernetes 1.36 the cgroup v1 option remains supported as a fallback. That fallback is scheduled for removal in Kubernetes v1.38.</p>
+<h4>kernel updates around cgroup v2</h4>
+<ul>
+ <li>In Linux 4.5, the cgroup v2 <code>io</code>, <code>memory</code>, and <code>pids</code> controllers were supported.</li>
+ <li>Linux 4.15 added support for the cgroup v2 <code>cpu</code> controller.</li>
+ <li>Pressure Stall Information (PSI) support began with Linux 4.20.</li>
+ <li>The Kubernetes project does not recommend using cgroup v2 with a Linux kernel older than 5.2 due to lack of cgroup-level task freezer support.</li>
+ <li>Kubernetes documents 5.8 as the minimum kernel version for cgroup v2; the root cgroup's system-level <code>cpu.stat</code> file was added in Linux 5.8.</li>
+ <li>The <code>memory.high</code> livelock fix used by Memory QoS is present in Linux 5.9 and later.</li>
+ <li><code>memory.peak</code> was added in Linux 5.19.</li>
+</ul>
+<h3>cgroup driver configuration</h3>
+<p>If you use <code>kubeadm</code> to manage your cluster, Kubernetes recommends that you use the <code>systemd</code> cgroup driver. If you can pick either option, I recommend using the systemd driver.</p>
+<p>Whatever tooling you've chosen, the kubelet automatically tries to detect the runtime's recommended cgroup driver. If you're using a container runtime that supports cgroup v2 but doesn't support automatic cgroup driver detection, you can manually configure an override by editing the kubelet configuration file.</p>
+<pre><code>apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+</code></pre>
+<h3>Tools and commands for troubleshooting</h3>
+<ul>
+ <li><code>stat -fc %T /sys/fs/cgroup/</code>: Check whether cgroup v2 is enabled.</li>
+ <li><code>systemctl list-units 'kube*' --type=slice</code> or <code>--type=scope</code>: List Kubernetes-related units.</li>
+ <li><code>bpftool cgroup list /sys/fs/cgroup/*</code>: List all programs attached to the cgroup CGROUP.</li>
+ <li><code>systemd-cgls /sys/fs/cgroup/*</code>: Recursively show control group contents.</li>
+ <li><code>systemd-cgtop</code>: Show top control groups by their resource usage.</li>
+ <li><code>tree -L 2 -d /sys/fs/cgroup/kubepods.slice</code>: Show Pods' related cgroups directories.</li>
+</ul>
+<h4>How to check if a Pod CPU or memory limit is successfully applied to the cgroup file?</h4>
+<p>Work from the API object down to the node. Identify the node, then compare desired resources in the spec with the enacted values in status.</p>
+<pre><code>kubectl get pod &lt;pod-name&gt; -n &lt;namespace&gt; \
+  -o jsonpath='\{.spec.nodeName}\{"\n"}'
+
+kubectl get pod &lt;pod-name&gt; -n &lt;namespace&gt; \
+  -o jsonpath='\{range .spec.containers[*]}\{.name}\{" spec\t"}\{.resources}\{"\n"}\{end}'
+
+kubectl get pod &lt;pod-name&gt; -n &lt;namespace&gt; \
+  -o jsonpath='\{range .status.containerStatuses[*]}\{.name}\{" status\t"}\{.resources}\{"\n"}\{end}'
+</code></pre>
+<p>On that node, as root, with the systemd cgroup driver and cgroup v2:</p>
+<pre><code>CONTAINER_ID=$(crictl ps \
+  --label io.kubernetes.pod.namespace=&lt;namespace&gt; \
+  --label io.kubernetes.pod.name=&lt;pod-name&gt; \
+  --name &lt;container-name&gt; -q | head -n1)
+
+# OCI view
+crictl inspect "$CONTAINER_ID" | jq '.info.runtimeSpec.linux.resources'
+
+# Kernel cgroup path for this container
+PID=$(crictl inspect "$CONTAINER_ID" | jq -r '.info.pid')
+CGROUP="/sys/fs/cgroup$(awk -F: '$1=="0"\{print $3}' /proc/$PID/cgroup)"
+
+cat "$CGROUP/cpu.weight"   # request.cpu → shares → weight
+cat "$CGROUP/cpu.max"      # limit.cpu
+cat "$CGROUP/memory.max"   # limit.memory
+
+# Pod-level cgroup
+cat "$(dirname "$CGROUP")/cpu.max" "$(dirname "$CGROUP")/memory.max"
+
+# Present when MemoryQoS is enabled
+cat "$CGROUP/memory.high" "$CGROUP/memory.min" "$CGROUP/memory.low"
+
+SCOPE=$(basename "$CGROUP")
+systemctl show "$SCOPE" \
+  -p CPUWeight -p CPUQuotaPerSecUSec -p CPUQuotaPeriodUSec -p MemoryMax
+</code></pre>

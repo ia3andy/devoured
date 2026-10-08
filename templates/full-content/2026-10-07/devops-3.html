@@ -1,0 +1,74 @@
+<h2>Scaling Kubernetes Workloads with Node Swap</h2>
+<p>Memory is often the first hard limit a Kubernetes cluster hits. Nodes run out of RAM long before they run out of CPU, and the new wave of agentic AI workloads makes this worse. These workloads demand large memory footprints to start up and run untrusted code, then sit idle waiting for the next prompt. That idle but resident memory is expensive, and it caps how many pods a node can hold. This is where swap helps. Kubernetes support for running nodes with swap enabled reached General Availability in v1.34, and by backing that swap with fast NVMe solid state drives (SSDs), a node can page out dormant memory and pack in far more pods. This post explains how we benchmarked that approach across three workloads, including CI/CD kernel builds, sandboxed headless browsers, and isolated Python runtimes; we found density gains of up to 3×, often with little or no latency cost.</p>
+<h2>The node density problem</h2>
+<p>The Kubernetes ecosystem has reached a fundamental physical resource constraint: the strict limits of hardware memory versus the growing demand for dynamic, bursty workloads in the new agentic era.</p>
+<p>Historically, administrators provisioning memory-intensive workloads encountered a persistent dilemma: set memory limits too high and you waste expensive infrastructure on idle RAM; set them too low and you risk Out-Of-Memory (OOM) kills.</p>
+<p>This conflict is amplified when deploying autonomous AI agents using secure execution environments like the <code>agent-sandbox</code> framework. These agentic pods require large memory footprints to initialize and execute untrusted code. However, after their burst of activity, they typically enter long-tail idle phases waiting for user prompts. Keeping this idle state in physical RAM caps cluster density and makes AI infrastructure expensive to run.</p>
+<h2>The solution: Kubernetes node swap</h2>
+<p>With the introduction of Kubernetes' support for running nodes with swap enabled (which reached General Availability in v1.34), this paradigm shifts. By enabling the Linux kernel to page out anonymous memory to disk, <em>node swap</em> acts as a shock absorber during traffic spikes or periods of heavy memory oversubscription.</p>
+<p>Historically, swap was discouraged in Kubernetes for two reasons. The first was memory accounting. Under cgroup v1, the controls treated memory and swap as a single combined limit rather than letting operators set an independent limit for disk swap. Without independent tracking, a process could page large amounts of anonymous memory out to disk, which made a container's real memory usage unpredictable and hard to isolate. Kubernetes' swap support resolves this by relying on cgroup v2, whose separate swap accounting tracks disk swap on its own. The second reason was the latency penalty of paging to slow spinning disks, which fast NVMe Local SSDs largely eliminate. Together, these make it practical to increase pod density and buffer against memory spikes without sacrificing cluster stability.</p>
+<h2>The benchmark data</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Workload Profile</th>
+   <th>Baseline Capacity (No Swap)</th>
+   <th>Local SSD Swap Capacity</th>
+   <th>Density Improvement</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Linux CI/CD Kernel Build</strong></td>
+   <td>600 MB RAM Limit</td>
+   <td>300 MB RAM Limit</td>
+   <td><strong>-50% RAM Footprint</strong></td>
+  </tr>
+  <tr>
+   <td><strong>Headless Chrome (Kata)</strong></td>
+   <td>40 Concurrent Pods</td>
+   <td>50 Concurrent Pods</td>
+   <td><strong>+25% Pod Density</strong></td>
+  </tr>
+  <tr>
+   <td><strong>Headless Chrome (gVisor)</strong></td>
+   <td>80 Concurrent Pods</td>
+   <td>160 Concurrent Pods</td>
+   <td><strong>+100% Pod Density</strong></td>
+  </tr>
+  <tr>
+   <td><strong>Python Sandbox (gVisor)</strong></td>
+   <td>80 Concurrent Pods</td>
+   <td>240 Concurrent Pods</td>
+   <td><strong>+200% Pod Density</strong></td>
+  </tr>
+ </tbody>
+</table>
+<h3>1. Traditional workload: Linux kernel build</h3>
+<p>Before exploring specialized agentic architectures, swap was validated against classic batch workloads by running a complete Linux 6.1.1 kernel build. The kernel compilation process leverages concurrent worker threads, balloons in memory to hold compiled object files, and requires a large memory spike during the brief linking phase.</p>
+<p>This workload mirrors the memory behavior of enterprise CI/CD pipelines. Because earlier compiled objects sit inactive in memory while the pipeline progresses, CI/CD jobs frequently hoard unused physical RAM, which makes them well suited to node swap compression.</p>
+<p>On a baseline node without swap, the minimum memory limit to prevent an OOM crash during compilation was 600 MB. Routing swap to a Local SSD cut the container memory limit by 50% to 300 MB without incurring any execution slowdown (in fact, it ran cleanly in 374s vs the baseline 433s). However, as an explicit tradeoff, compressing the limit further to 200 MB forced the active working set into swap, causing long I/O wait times and increasing execution time by over 40%. This reinforces that swap serves as an insurance policy for burst memory, not a replacement for active RAM.</p>
+<h3>2. High-density agent workloads: headless browser runtimes</h3>
+<p>AI agent workloads frequently require manipulating headless browsers via Chromium. However, trusting external code execution often requires stricter security isolation than standard Linux namespaces. This benchmark cross-evaluated several container runtime environments.</p>
+<ul>
+ <li><strong>Unsandboxed baseline limits (<code>runc</code>):</strong> To test the limits of the environment without the overhead of security runtimes, plain runc containers were swept on a c4-standard-32 node (32 vCPU, 120 GB RAM). Without swap, the node exhausted physical memory and failed past 512 pods. Enabling Local SSD swap allowed the node to support 768 concurrent pods.</li>
+ <li><strong>Advanced security runtimes (for example: gVisor, Kata Containers):</strong> Enabling strict security sandboxing increases memory overhead and normally reduces pod density. However, memory swap naturally absorbs this overhead penalty. Without swap, a gVisor environment hit a hard limit at 80 pods. Local SSD swap doubled that capacity, which allowed 160 concurrent gVisor pods on a single node. Similarly, Kata Containers microVMs exhausted physical RAM at 40 concurrent pods without swap, but using GCP Local SSD swap expanded this to 50 stable Kata microVMs before CPU saturation.</li>
+</ul>
+<p>At these maximum densities, the per-pod latency increase is driven mainly by pods competing for CPU, not by swap I/O. An operator tuning for a specific latency target would run at a lower density than the peak numbers here and see a proportionally smaller latency cost.</p>
+<h3>3. Beyond browsers: sandboxed Python runtimes</h3>
+<p>The advantages of node swap also extend to untrusted, isolated code-execution environments. This sweep deployed simultaneous Python sandbox sessions analyzing 5 million rows of data from the MovieLens 20M dataset, requiring a ≃375 MiB resident memory footprint per execution.</p>
+<p>Without swap, heavy concurrent bursts exhausted physical memory, causing the node to hit a hard RAM limit and fail at 80 concurrent sessions. Enabling Local SSD swap offloaded dormant anonymous memory, freeing up physical RAM and preserving the node's page cache. This allowed the node to scale to 240 concurrently isolated Python sandboxes—a 3× density improvement. As with the browser workloads, the latency rise at peak density comes mainly from the sandboxes competing for CPU rather than from swap itself.</p>
+<h2>How to use it</h2>
+<p>If you manage Kubernetes infrastructure for developer environments, browser testing farms, JVM applications, or AI execution runtimes, leveraging Local SSD swap can multiply your density efficiency.</p>
+<p>In Kubernetes v1.34+, node swap is Generally Available. You enable it via the kubelet configuration:</p>
+<pre><code>kind: KubeletConfiguration
+apiVersion: kubelet.config.k8s.io/v1beta1
+failSwapOn: false
+memorySwap:
+  swapBehavior: LimitedSwap
+</code></pre>
+<p>Pairing this upstream configuration with your cloud provider's high-speed local disk gives you dynamic memory balancing. For example, this is natively supported on Google Kubernetes Engine via Node Memory Swap configured on Local SSD profiles.</p>
+<p>To get the benefits, configure your workloads with Burstable QoS: set your container's memory limits higher than its requests. The node automatically rations fast swap space based on idle application memory usage while keeping active processes responsive.</p>
+<h2>Conclusion</h2>
+<p>As the Kubernetes ecosystem transitions into the agentic era, administrators face a growing conflict between finite hardware memory limits and the bursty behavior of AI workloads. Frameworks like Agent Sandbox provide the security isolation required for running untrusted agents, but that isolation traditionally demands large amounts of idle memory overhead.</p>
+<p>By configuring the kubelet with <code>LimitedSwap</code> and routing it to Local SSDs, you can mitigate this conflict. Fast swap offloads the dormant states of idle agents, allowing you to increase pod density and node utilization on the same infrastructure without compromising security boundaries.</p>

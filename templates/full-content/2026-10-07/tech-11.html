@@ -1,0 +1,95 @@
+<p>On October 11, 2026, the DNS root is scheduled to change its key-signing key (KSK) for only the second time ever. This key anchors DNSSEC’s chain of trust, which lets DNS resolvers authenticate answers using cryptographic signatures. The change is called a KSK rollover. Validating resolvers need to trust the new key before the switch, as otherwise healthy websites could become unreachable.</p>
+<p>When we <a href="https://blog.cloudflare.com/its-hard-to-change-the-keys-to-the-internet-and-it-involves-destroying-hsms/">wrote about the first root KSK rollover in 2018</a>, we had seen resolvers lose their learned trust in the new key during software upgrades or moves between machines. Publishing the key well in advance was only part of the job. We also needed to know whether resolvers had retained it, and we couldn’t give users a practical way to check.</p>
+<p>Most website operators do not need to make any changes for this rollover. If you run a DNSSEC-validating resolver, check that it trusts the new root key, KSK-2024, and follow your software vendor’s instructions to update its trust anchors if the key is missing. If you use Cloudflare for your domain's DNS or rely on 1.1.1.1 and Gateway DNS, you do not need to take any action — our systems already trust KSK-2024.</p>
+<p>To check ahead of time, visit our <a href="https://dnstest.dev/ksk-2024/">rollover readiness test</a>. It asks the resolver your browser uses whether it trusts the new key. The test uses <a href="https://datatracker.ietf.org/doc/html/rfc8509">RFC 8509: A Root Key Trust Anchor Sentinel for DNSSEC</a>, which we’ve implemented in 1.1.1.1 ahead of the rollover.</p>
+<h2>Where DNSSEC trust begins</h2>
+<p>A DNS resolver looks up the addresses of websites and other services for your device. DNSSEC lets it check digital signatures on DNS records to verify that they are authentic and have not been changed. The resolver also needs to check that the public keys used to verify those signatures belong to the right domains.</p>
+<p>For <code>cloudflare.com</code>, this follows a chain of trust from the DNS root to <code>.com</code>, then to <code>cloudflare.com</code>. Each parent publishes a Delegation Signer (DS) record containing a fingerprint of its child’s public key. For example, <code>.com</code> publishes the DS record for <code>cloudflare.com</code>, allowing the resolver to check that domain’s key.</p>
+<p>That chain needs a starting point. The root, however, has no parent to confirm which keys belong to it. Instead, a resolver checking DNSSEC starts with a root public key, or its fingerprint, that it already trusts. This is called a trust anchor.</p>
+<p>The root’s signing keys have two different jobs. The zone-signing key (ZSK) signs the root’s DNS records, including the DS records for top-level domains such as <code>.com</code>. The key-signing key (KSK) signs the list of public keys published by the root, called the DNSKEY record set. The resolver uses its trusted KSK to verify that list, then uses the ZSK from the list to verify the root’s other records.</p>
+<p>The diagram below shows the arrangement for a typical signed zone. For the root, trust comes from the resolver’s trust anchor rather than a DS record in a parent zone.</p>
+<p>Our posts about the <a href="https://blog.cloudflare.com/de-tld-outage-dnssec/">.de</a> and the <a href="https://blog.cloudflare.com/dnssec-nta-ede-33/">.al</a> rollover failures showed the consequence of failed DNSSEC checks: websites can be working normally but still be unreachable. The root KSK rollover changes the starting point of those checks. If a resolver does not trust the replacement key, its users may be unable to reach websites under <strong>any</strong> top-level domain.</p>
+<p>The new key is <a href="https://www.icann.org/resources/pages/ksk-rollover-en">KSK-2024</a>, identified by key tag <code>38696</code>. It will replace KSK-2017, key tag <code>20326</code>, as the signer of the root’s DNSKEY set. Validating resolvers need to trust the new key before that switch.</p>
+<h2>How resolvers get the new root key</h2>
+<p><a href="https://datatracker.ietf.org/doc/html/rfc5011">RFC 5011</a> lets resolvers learn a new root trust anchor automatically. The root publishes the new KSK alongside the existing one in its DNSKEY set. The existing KSK continues signing that set, so a resolver can use the key it already trusts to verify the records containing the replacement.</p>
+<p>Before accepting the new key as a trust anchor, the resolver waits at least 30 days and keeps checking the root’s signed DNSKEY records. The new key must remain in the records it checks during that period. After the wait, the resolver must successfully verify the records containing the new key again before accepting it.</p>
+<p>For this rollover, <a href="https://www.iana.org/dnssec/files">KSK-2024 has been published in the root’s DNSKEY set since January 11, 2025</a>. That gave resolvers with automatic trust-anchor updates time to discover and accept it ahead of the scheduled October 11, 2026 signing change. Each resolver’s waiting period starts when it first sees and verifies the new key.</p>
+<p>For our resolver, we added KSK-2024 directly to the software’s built-in trust anchors in July 2024, alongside KSK-2017. A resolver running the updated software therefore has the new anchor available from startup.</p>
+<p>We chose this approach because of our experience during preparations for the first rollover. As described in <a href="https://blog.cloudflare.com/its-hard-to-change-the-keys-to-the-internet-and-it-involves-destroying-hsms/#operational-reality-vs-the-protocol-design">our 2018 post</a>, software upgrades and moves between machines caused some resolvers to lose their learned trust-anchor state. We fixed that by updating the software to include the new anchor by default. Including KSK-2024 in the software likewise avoids depending on each resolver retaining a key it learned automatically.</p>
+<p>Even though we added KSK-2024 to our resolver’s built-in trust anchors in July 2024, users of 1.1.1.1 and <a href="https://www.cloudflare.com/products/gateway/">Gateway DNS</a> had no direct way to check whether the resolver answering their queries trusted the new key.</p>
+<h2>This time, ask the resolver</h2>
+<p><a href="https://datatracker.ietf.org/doc/html/rfc8509">RFC 8509</a> defines the root key trust anchor sentinel, a way to ask a supporting resolver whether it trusts a particular root key. It uses ordinary DNS queries with specially named domains.</p>
+<p><a href="https://dnstest.dev/ksk-2024/">Our readiness test website</a> uses this protocol to check for KSK-2024. Two names ask opposite questions: <code>is-ta-38696</code> asks whether the key is trusted, <code>not-ta-38696</code> asks whether it is not trusted.</p>
+<p>Both names have valid DNSSEC-signed address records. A resolver that supports the sentinel first validates those records, then either returns the response directly or replaces the answer with <code>SERVFAIL</code>, depending on whether it trusts the key.</p>
+<p>For a validating resolver with sentinel support, the expected results are:</p>
+<table>
+ <tbody>
+  <tr>
+   <td>
+    <p>Query</p></td>
+   <td>
+    <p>KSK-2024 is trusted</p></td>
+   <td>
+    <p>KSK-2024 is not trusted</p></td>
+  </tr>
+  <tr>
+   <td>
+    <p><code>is-ta-38696</code></p></td>
+   <td>
+    <p>Returns a valid response</p></td>
+   <td>
+    <p>Returns <code>SERVFAIL</code></p></td>
+  </tr>
+  <tr>
+   <td>
+    <p><code>not-ta-38696</code></p></td>
+   <td>
+    <p>Returns <code>SERVFAIL</code></p></td>
+   <td>
+    <p>Returns a valid response</p></td>
+  </tr>
+ </tbody>
+</table>
+<p>For a validating resolver with sentinel support, <code>SERVFAIL</code> for <code>not-ta-38696</code> is expected when KSK-2024 is trusted. The resolver deliberately rejects the “not trusted” query.</p>
+<p>Sentinel labels such as <code>root-key-sentinel-is-ta-38696</code> can be used under any DNSSEC-signed domain. We use <code>dnstest.dev</code> for our tests. You can run the two queries directly against 1.1.1.1:</p>
+<pre><code>$ dig @1.1.1.1 root-key-sentinel-is-ta-38696.dnstest.dev. A +noall +comments +answer
+
+; &lt;&lt;&gt;&gt; DiG 9.10.6 &lt;&lt;&gt;&gt; @1.1.1.1 root-key-sentinel-is-ta-38696.dnstest.dev. A +noall +comments +answer
+; (1 server found)
+;; global options: +cmd
+;; Got answer:
+;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, status: NOERROR, id: 44476
+;; flags: qr rd ra ad; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1
+
+;; OPT PSEUDOSECTION:
+; EDNS: version: 0, flags:; udp: 1232
+;; ANSWER SECTION:
+root-key-sentinel-is-ta-38696.dnstest.dev. 300 IN A 104.18.6.197
+root-key-sentinel-is-ta-38696.dnstest.dev. 300 IN A 104.18.7.197
+
+$ dig @1.1.1.1 root-key-sentinel-not-ta-38696.dnstest.dev. A +noall +comments +answer
+
+; &lt;&lt;&gt;&gt; DiG 9.10.6 &lt;&lt;&gt;&gt; @1.1.1.1 root-key-sentinel-not-ta-38696.dnstest.dev. A +noall +comments +answer
+; (1 server found)
+;; global options: +cmd
+;; Got answer:
+;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, status: SERVFAIL, id: 3285
+;; flags: qr rd ra; QUERY: 1, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 1
+
+;; OPT PSEUDOSECTION:
+; EDNS: version: 0, flags:; udp: 1232</code></pre>
+<p>The website also checks that an ordinary signed name resolves, that a deliberately invalid DNSSEC name is rejected, and that the resolver responds to a sentinel query for the current root key. These controls help distinguish a meaningful result from a failed lookup or unsupported protocol. If sentinel support cannot be established, the result is inconclusive; it does not mean the new key is missing.</p>
+<p>The browser test checks the resolver your browser uses, which may be affected by Secure DNS or a VPN. The <code>dig</code> commands above explicitly query 1.1.1.1. Both provide a snapshot of the resolver path answering those requests.</p>
+<h2>New key, same algorithm</h2>
+<p>KSK-2017 and KSK-2024 both use RSA/SHA-256. The rollover replaces the key pair while keeping the same method for creating and verifying signatures.</p>
+<p>In <a href="https://blog.cloudflare.com/its-hard-to-change-the-keys-to-the-internet-and-it-involves-destroying-hsms/#why-are-we-rolling-the-root-key-trust-anchor">our 2018 post</a>, we wrote that a successful rollover would open the door to discussing an algorithm change. Eight years later, the root still uses RSA.</p>
+<p>Replacing the key remains useful. It limits how long a single private key stays in use and exercises the process of distributing new trust anchors, updating resolvers, and retiring old keys. As the first rollover showed, those steps can fail even when the cryptography itself works correctly.</p>
+<p><a href="https://www.iana.org/dnssec/files">The Internet Assigned Numbers Authority (IANA) plans an idealized three-year rollover interval</a>, balancing regular practice against the work and risk of changing the root key too frequently. The gap since 2018 has been longer. <a href="https://www.icann.org/en/blogs/details/preparing-for-the-root-zone-ksk-rollover-what-you-need-to-know-27-07-2026-en">The Internet Corporation for Assigned Names and Numbers (ICANN) attributes the delay</a> to pandemic disruption and upgrades to the hardware that protects the private signing keys.</p>
+<p>Changing algorithms means resolvers need both a new trust anchor and software that can verify the new signatures. Regular key rollovers let operators test the trust-anchor updates while keeping the algorithm the same.</p>
+<h2>What comes after October</h2>
+<p>The October 11 switch changes which KSK signs the root’s DNSKEY set. The rollover continues into 2027, when <a href="https://www.icann.org/en/system/files/files/root-zone-ksk-rollover-faq-22may26-en.pdf">ICANN plans to revoke KSK-2017, remove it from the root zone, and delete its private key</a>. Stopping a key from signing and removing trust in that key are separate steps.</p>
+<p>ICANN has also <a href="https://itp.cdn.icann.org/en/files/domain-name-system-dns-engineering/proposal-for-root-zone-ksk-algorithm-rollover-03-02-2026-en.pdf">proposed a future root algorithm rollover to ECDSA P-256</a>. <a href="https://www.cloudflare.com/learning/dns/dnssec/ecdsa-and-dnssec/">ECDSA</a> produces smaller keys and signatures than the RSA algorithm used today. That proposal is separate from this October’s key replacement, and ECDSA is not a post-quantum algorithm.</p>
+<p><a href="https://blog.cloudflare.com/post-quantum-dnssec-1111/">1.1.1.1 now validates ML-DSA-44 signatures</a>, which are designed to remain secure against attacks using quantum computers. For DNSSEC’s whole chain of trust to become post-quantum secure, signed domains, their parent zones, and the root must adopt post-quantum cryptography too. At the root, that means introducing a post-quantum KSK and getting resolvers to trust it.</p>
+<p>That will require another root key rollover. The rollovers we perform now let operators test how they distribute replacement trust anchors, check that resolvers have accepted them, and retire the old keys. This October’s rollover keeps RSA, but exercises the trust-anchor updates we will need when the root moves to post-quantum cryptography. The sentinel gives us a way to check whether resolvers followed those updates.</p>
+<p>We encourage DNS providers and resolver developers to support <a href="https://datatracker.ietf.org/doc/html/rfc8509">RFC 8509 trust anchor sentinels</a>. If your resolver does not support them, ask your provider or software vendor to add support. Users should be able to check whether their resolver trusts the next root key before a rollover.</p>
+<p>For now, the next deadline is October 11. You can check your resolver’s readiness at <a href="https://dnstest.dev/ksk-2024">https://dnstest.dev/ksk-2024</a>. If you operate a DNSSEC-validating resolver, confirm that it trusts KSK-2024, key tag <code>38696</code>, and follow <a href="https://www.icann.org/resources/pages/ksk-rollover-en">ICANN’s guidance</a> and your software vendor’s instructions if the key is missing.</p>
