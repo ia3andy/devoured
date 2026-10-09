@@ -1,0 +1,36 @@
+<p>My tool tells you things like “this index cuts the query’s cost by 91%”. Before releasing it, I wanted to know what that number is actually worth.</p>
+<p>The tool is PgLens, a Postgres index advisor I’m building. Like several other advisors, it checks each suggestion with HypoPG: create a hypothetical index, run <code>EXPLAIN</code> again, and keep the suggestion if the planner’s estimated cost drops by at least 15%.</p>
+<p>That’s an estimate, not a timing. So I built every index for real and timed the queries.</p>
+<h2>The setup</h2>
+<ul>
+ <li>The Join Order Benchmark: 113 queries over the real IMDB data, 7 GB loaded. It was made to catch the planner getting row counts wrong, so it’s a hard test.</li>
+ <li>PostgreSQL 16, hypopg 1.4.</li>
+ <li>PgLens made 214 planner-validated recommendations for those queries. They name only 10 distinct indexes, because one foreign-key index helps many queries.</li>
+ <li>I wrote down the metrics and what counts as a win before the first run: 15% faster is a win, 5% slower is a loss.</li>
+</ul>
+<h2>What happened</h2>
+<ul>
+ <li><strong>128 of 179</strong> made their query at least 15% faster.</li>
+ <li><strong>32 of 179</strong> made it at least 5% slower. <strong>7</strong> made it more than twice as slow.</li>
+ <li><strong>34</strong> couldn’t be measured, because the index can’t be built.</li>
+</ul>
+<p>The worst one was query 10c with an index on <code>cast_info (movie_id)</code>. Estimated: 91% cheaper. Measured: <strong>0.93 s before, 7.3 s after</strong>. I ran it again by hand to be sure: about 1 s became about 9 s.</p>
+<p>With the index there, the planner picked a nested loop that probes <code>cast_info</code> once per row of a join. It underestimated how many rows that join returns, so the loop ran far more often than it planned for: the query read 71 times as many buffers. HypoPG can’t catch this, because it asks the same planner with the same wrong row counts. Every advisor built on hypothetical indexes has this blind spot, mine included.</p>
+<p>The 34 are one index, PgLens’s #2 suggestion, <code>movie_info (info)</code>:</p>
+<pre><code>ERROR:  index row requires 9392 bytes, maximum size is 8191
+</code></pre>
+<p>1,182 of 14.8 million values are too long for a B-tree entry. A hypothetical index never writes an entry, so it can’t know.</p>
+<h2>What the planner got right</h2>
+<p>The ranking. PgLens’s #1 index saved <strong>364 s of the 424 s</strong> its queries took, and the order of the indexes by estimated saving was close to the order by measured saving (Spearman 0.83). Per query, the estimated percentage told me almost nothing.</p>
+<p>So “which index matters most?” is a fair question for the planner. “How much faster will this query get?” isn’t.</p>
+<h2>What I changed</h2>
+<ul>
+ <li>Every planner number in PgLens is labelled as an estimate, and never shown as a speedup.</li>
+ <li><code>pglens confirm</code> builds the index on a copy of your database and times your own queries with and without it. On the same data it flagged 10c as about ten times slower.</li>
+ <li>Once you build an index, PgLens shows each query’s measured time before and after.</li>
+ <li>It now warns when an index’s column may hold values too long for a B-tree.</li>
+</ul>
+<h2>Try it</h2>
+<p>PgLens is open source (Apache-2.0), self-hosted, and only ever reads from your database. It ranks your queries by the time they actually took, suggests a planner-checked index for each, lets you time it on a copy first, and shows the measured before and after once you build it. Four <code>make</code> commands from the README start a demo with a slow workload in about three minutes: github.com/Prateek-Arora/pglens. It’s a release candidate, so bug reports are very welcome.</p>
+<p>The method, the tables and the scripts are in docs/benchmarks.md, and <code>make accuracy-job</code> reruns the whole thing. If you run <code>pglens confirm</code> on a copy of your own database, I’d like to see the numbers, especially the ones that make my tool look bad.</p>
+<p>I built PgLens with Claude Code as a pair. The benchmark design, the rules written down before the run, and every raw number are in the repo, so you don’t have to take my word for any of it.</p>

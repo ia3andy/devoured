@@ -1,0 +1,139 @@
+<p>A software engineer at WHOOP adds a new column to a Postgres table on Monday morning. By that afternoon, the column is queryable in Snowflake and available to any downstream model or dashboard, alongside every other column on that table. Nobody filed a ticket. No data engineer touched anything.</p>
+<p>Change Data Capture (CDC) is the pattern that makes this possible: every insert, update, and delete on a source table is streamed out as an event, and downstream systems consume that stream to stay in sync. That workflow is the point of the CDC platform we run today, and getting there meant deliberately avoiding the streaming-upsert pattern most CDC-to-lake pipelines converge on.</p>
+<h2>The system it replaced</h2>
+<p>Debezium captured row changes from Postgres and published them to Kafka as JSON, with no schema registry sitting in front of it, so downstream consumers were reading loosely typed payloads. A Spark Structured Streaming job then upserted those events into Iceberg tables on a thirty-minute trigger. It worked. It also had four problems that got worse as WHOOP grew:</p>
+<ol>
+ <li><strong>The upserts were expensive.</strong> We ran one Spark Structured Streaming job per table, so hundreds of long-running streaming jobs sat continuously reconciling their targets on a thirty-minute cadence. These tables were queried heavily and there was real value in keeping them fresh, but the compute cost of continuously running one streaming job per table was the dominant issue: we were paying a lot for freshness that most consumers did not strictly need.</li>
+ <li><strong>Schema changes were manual.</strong> A new Postgres column would not appear downstream until someone filed a ticket, and the fix usually meant backfilling the entire table. Every schema change turned into a coordination problem across teams.</li>
+ <li><strong>Observability was thin.</strong> We had Spark job metrics and Postgres-side replication slot lag, but nothing meaningful from Debezium itself. No per-connector throughput, no per-connector lag, no visibility into what the source connector was actually doing.</li>
+ <li><strong>Per-table configuration lived in the wrong place.</strong> Kafka partitioning, topic settings, and the list of replicated tables did live in the owning service's own repo, but they lived separately from the normal Postgres config and Liquibase migrations that engineers touched day to day. So they got forgotten. New tables would land in Postgres and quietly not make it into CDC, sometimes for months.</li>
+</ol>
+<p>The pipeline itself was fine. Its operating model wasn't. Every design choice put Data Platform on the critical path for something a service team should have owned.</p>
+<h2>The core idea: split streaming from upserts</h2>
+<p>Most CDC-to-lake systems merge two concerns into one job. They take a stream of change events and, in real time, produce a materialized replica of the source table. That is a legitimate goal, but it forces continuous upserts, which are expensive to run at scale.</p>
+<p>We split them apart.</p>
+<ul>
+ <li>A <strong>Bronze</strong> layer captures every CDC event exactly as Debezium emits it. It is append-only. Small files, cheap writes, no reconciliation.</li>
+ <li>A <strong>Silver</strong> layer materializes the actual Postgres replica. It reads Bronze and upserts into Iceberg, but only every four hours.</li>
+</ul>
+<p>For consumers, this gives two clean options. If you need the latest state of a table and can tolerate a few hours of staleness, you query Silver, and the table looks exactly like the Postgres source. If you need lower latency or you specifically want change semantics (inserts, updates, deletes), you query Bronze and filter by the CDC timestamp.</p>
+<p>Very few consumers actually need the latter, so continuous upserts were the wrong default.</p>
+<h2>Debezium and Postgres publications</h2>
+<p>We run one Debezium connector per Postgres database. Each connector reads from a Postgres publication using logical replication, serializes each event as Avro against the AWS Glue Schema Registry, and publishes one Kafka topic per table using the convention <code>postgres_cdc.&lt;service&gt;.&lt;schema&gt;.&lt;table&gt;</code>.</p>
+<p>The set of replicated tables is driven by the Postgres publication itself, and the publication is managed with Liquibase migrations that live inside the service team's own GitHub repository. Adding a table looks like this:</p>
+<pre><code>-- Liquibase migration in the service repo
+ALTER PUBLICATION cdc_publication ADD TABLE new_feature_table;</code></pre>
+<p>Some services skip the per-table dance entirely and declare the publication as <code>FOR ALL TABLES</code>, so anything they add to Postgres is automatically replicated. New tables just appear.</p>
+<p>That is the entire ceremony. Debezium picks up publication changes on the next poll. The Flink job downstream discovers the new topic within a minute and starts writing it to Bronze. Silver picks it up on its next run and backfills from the latest snapshot. No PRs on our side, no tickets. The service team owns the decision and the migration is code-reviewed in the same repo as the schema change that motivated it.</p>
+<p>The other property that falls out of this design is automatic schema evolution. When Debezium sees a new column, it registers a new Avro schema in Glue. The Flink sink writes the new column to Bronze on the next commit. Silver sees the new field on its next run and adds it to the Iceberg schema. A single <code>ALTER TABLE</code> in Postgres propagates through the entire stack with no human involvement. Supported type changes work the same way: widening a <code>decimal(10,2)</code> to <code>decimal(12,2)</code>, for example, flows through Avro's schema evolution rules and Iceberg's promotion rules without breaking any downstream reads.</p>
+<p>Each connector deploys through an internal Terraform module that standardizes the operational plumbing: IAM, secrets, Datadog monitors, and the Glue registries. We also build our own Debezium container image, which bundles a small JMX metrics exporter alongside the upstream Debezium jars. That exporter surfaces connector-level metrics in Datadog: replication lag (<code>MilliSecondsBehindSource</code>), events seen, errored tasks, and restarts. Those metrics route to the owning team's oncall, not ours, which was a specific goal. If a service's connector is falling behind, the team that owns the database is the first to know.</p>
+<h2>Flink: one job per database, fan-in and fan-out</h2>
+<p>Bronze is written by Flink. Bronze tables follow the convention <code>bronze.&lt;service&gt;.&lt;schema&gt;.&lt;table&gt;</code>, so the Postgres source and its Iceberg replica are directly identifiable from each other's names.</p>
+<p>There is one Flink job per Postgres database, and each job uses a fan-in / fan-out pattern: it subscribes to every Kafka topic under that database's prefix, then routes each record to the correct Iceberg table based on the topic name.</p>
+<p>A naive design would run one Flink job per table, which means N deployments, N sets of checkpoints, and N connectors to Kafka. For a service with fifty tables, that is fifty jobs to autoscale, monitor, and upgrade. The fan-in/fan-out pattern collapses that to one job per database, regardless of how many tables live in it.</p>
+<p>The routing itself is handled by the Dynamic Iceberg Sink introduced in Iceberg 1.10.0. Each record carries its Iceberg table name derived from the source Kafka topic, and the sink handles the rest, including creating new tables when they appear. We rediscover Kafka topics every 60 seconds, so new tables added to a Postgres publication start flowing to Bronze within a minute of the publication change. No job restart is required.</p>
+<p>Each Bronze record is the row plus five CDC metadata columns:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Column</th>
+   <th>Meaning</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>cdc_op</code></td>
+   <td><code>c</code> (create), <code>u</code> (update), or <code>d</code> (delete)</td>
+  </tr>
+  <tr>
+   <td><code>cdc_ts</code></td>
+   <td>Source database event timestamp</td>
+  </tr>
+  <tr>
+   <td><code>cdc_processed_at</code></td>
+   <td>When Flink processed the record</td>
+  </tr>
+  <tr>
+   <td><code>cdc_source_lsn</code></td>
+   <td>Postgres WAL log sequence number</td>
+  </tr>
+  <tr>
+   <td><code>cdc_source_tx_id</code></td>
+   <td>Postgres transaction ID</td>
+  </tr>
+ </tbody>
+</table>
+<p>Bronze tables partition by <code>day(cdc_ts)</code>. Compaction runs nightly against the last two days and sorts by <code>cdc_ts DESC</code>, which optimizes for the most common access pattern: "give me the recent changes to this table." Older partitions are already fine.</p>
+<p>Jobs deploy through the Flink Kubernetes Operator in Application Mode on our EKS clusters. The operator manages lifecycle, autoscaling, and savepoint-based restarts. An auto-discovery runner scans Glue for new CDC topic prefixes and posts to Slack if it spots a new service without a matching Flink deployment. We deliberately do not fully automate that step today because a handful of services carry PHI and need to be routed to a separate Iceberg catalog. Deciding which catalog a new service belongs in is currently a human call, but it is the kind of thing we plan to automate, with service owners declaring their routing intent at onboarding time rather than pinging us for a decision.</p>
+<p><strong>Why Flink instead of the MSK Connect Iceberg sink?</strong> We prototyped the MSK Connect option early and it did not hold up at our scale. The connector was still relatively immature, and we hit ceilings on throughput, checkpointing behavior, and observability that were hard to work around. Flink was more operational work to run, but it gave us autoscaling based on backlog, better checkpointing semantics, richer Prometheus metrics, and the ability to add custom routing logic.</p>
+<h2>Silver: making upserts cheap</h2>
+<p>Silver is where the actual Postgres replicas live, and it is where the two-layer architecture pays for itself.</p>
+<p>Every four hours, a Spark job runs per service. It does three things: figures out what to process, runs MERGE INTO for tables that already exist, and backfills tables that just appeared.</p>
+<p><strong>Discovery.</strong> The job queries the Glue Schema Registry to find every CDC-enabled table for the service and derives the primary key for each one from the Avro key schema. No manual PK configuration lives anywhere, though we do allow overrides for edge cases (for example, a table with a mutable primary key needs its logical merge key to be declared explicitly).</p>
+<p><strong>Backfill (new tables only).</strong> For a table that has no Silver counterpart, the job takes the latest automated Aurora snapshot, exports it to S3 in Parquet using Aurora's built-in snapshot export, and merges it into a fresh Silver table. There is one subtle guard here: if the snapshot predates the moment the table was first added to CDC (which we know because Glue records schema creation time), we defer the backfill until a newer snapshot is available. Otherwise we would be seeding from a snapshot that misses events already in Bronze, and the reconciliation from there onward would look correct but silently miss rows.</p>
+<p><strong>Incremental (existing tables).</strong> The job reads Bronze events since the last watermark, groups by primary key to pick the latest state per row, and executes MERGE INTO on the Silver table. Deletes propagate the same way (via <code>cdc_op = 'd'</code>).</p>
+<p>Tables get batched into groups of five per Spark job to balance parallelism against resource cost. Each service's Silver flow is independently scheduled.</p>
+<p>Four layered optimizations inside the Silver Iceberg table are what let MERGE INTO run in minutes rather than hours. They turn each merge from a full-table shuffle into a targeted, well-pruned operation, and without them Silver would not be cost-viable at our scale.</p>
+<h3>Bucket partitioning on primary key</h3>
+<p>Silver tables partition by <code>bucket(N, primary_key)</code>, where <code>N</code> is picked per table to target roughly consistent file sizes. Bucket partitioning distributes rows evenly across a fixed number of buckets regardless of PK distribution. That evenness is not just aesthetic. It is a prerequisite for the write-side optimization below.</p>
+<h3>Sort order and bloom filters within each bucket</h3>
+<p>Data within each bucket sorts by primary key, and bloom filter indexes are configured on the PK columns. Together they give Spark tight file-level pruning during MERGE: skip any file whose min/max range excludes the incoming PKs, and within a matching file, skip any Parquet row group whose bloom filter says the PK is definitely not present.</p>
+<p>The read-side benefit for Snowflake is more limited. Snowflake's Iceberg reader uses min/max file statistics for pruning (which is why sorting matters) but doesn't currently use Parquet bloom filters. So the bloom filters are a Spark-side win; the sort order helps both.</p>
+<h3>Bucket pruning and Storage Partitioned Join</h3>
+<p>Two related optimizations do most of the write-side work. They're often talked about together but they are technically distinct.</p>
+<p>The first is bucket pruning. When Spark plans a MERGE INTO between an incoming CDC micro-batch and the Silver table, it hashes the incoming primary keys, figures out which buckets they map to, and reads only those buckets from the target. No full table scan.</p>
+<p>The second is Storage Partitioned Join. Because both sides of the merge share the same bucketing scheme, Spark can co-locate rows from the incoming batch with the rows already in the target and skip the shuffle that a normal join would need. Without SPJ, Spark would have to hash-repartition the entire target table to line it up with the incoming batch, which is often the largest single cost of a merge at scale.</p>
+<p>Both optimizations depend on the same thing: an evenly bucketed target table. Skewed data breaks both, because a single hot bucket dominates the read on one side and the shuffle-avoidance on the other. That is why bucket partitioning is the foundation for everything else in this section.</p>
+<p>SPJ plus bucket pruning are what made Silver viable. Merge jobs that would otherwise scan and reshuffle terabytes now touch a small fraction of the target table, and the runtime savings are order-of-magnitude.</p>
+<h3>Merge-on-Read</h3>
+<p>Silver tables use Iceberg's Merge-on-Read mode. Instead of rewriting entire Parquet files when a row updates, Iceberg writes a position delete file that marks which rows are stale. That skips the file rewrite on the write path, which is where most of the MERGE cost would otherwise land. Reads pay a small tax at query time to reconcile data and delete files, which we resolve during nightly compaction. Silver compaction sorts data back by primary key, which restores clean read performance and keeps future SPJ merges efficient.</p>
+<p>We can afford these Silver optimizations because Silver runs every four hours rather than continuously. Larger batches amortize the fixed overhead of MERGE planning, and a job that runs six times a day is one we can actually tune, rather than firefight.</p>
+<p>For teams that need lower latency, they read Bronze directly and filter on <code>cdc_ts</code>. Recent changes are cheap to scan there because Bronze compaction sorts by <code>cdc_ts DESC</code> and prunes small files aggressively for the last two days.</p>
+<h2>Audit trails from the same pipeline</h2>
+<p>CDC turned out to be a natural place to solve a problem that would otherwise need its own audit system.</p>
+<p>Services that need audit trails on sensitive tables can opt into emitting audit context alongside their writes. When enabled, the service calls <code>pg_logical_emit_message(true, 'audit', ...)</code> inside the same transaction as the data change, embedding metadata like the acting user ID and the SQL query. The <code>true</code> argument matters: it makes the message transactional, so the message and the row change share the same <code>xid</code> and either commit together or not at all.</p>
+<p>Debezium captures both. Flink writes row changes to their normal Bronze table and logical messages to a dedicated <code>pg_logical_messages</code> Iceberg table partitioned by <code>day(cdc_ts)</code> and the source table name. In Snowflake, a complete audit trail is a join:</p>
+<pre><code>select data.*, audit.user_id, audit.sql_query
+from   postgres_cdc_prod.svc.sensitive_table as data
+join   postgres_cdc_prod.svc.pg_logical_messages as audit
+  on   data.cdc_source_tx_id = audit.cdc_source_tx_id
+where  data.cdc_ts  &gt;= dateadd(day, -30, current_timestamp())
+  and  audit.cdc_ts &gt;= dateadd(day, -30, current_timestamp());</code></pre>
+<p>Both sides get filtered by <code>cdc_ts</code> so partition pruning fires on the audit table as well as the data table. Postgres's transactional guarantees do the rest: every write to an audited table shares its transaction ID with any audit message emitted in the same commit, so the join gives you the transaction-level context (who, when, why) for any change. What the pipeline itself buys us: no separate audit system, and no risk of the audit trail drifting from the data.</p>
+<h2>The responsibility model this creates</h2>
+<p>The technical architecture reflects an organizational choice. Service teams own their data. Data Platform owns the infrastructure.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Component</th>
+   <th>Owner</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Debezium connector (via Terraform module)</td>
+   <td>Service team</td>
+  </tr>
+  <tr>
+   <td>Publication contents (via Liquibase migration)</td>
+   <td>Service team</td>
+  </tr>
+  <tr>
+   <td>Flink Bronze jobs</td>
+   <td>Data Platform</td>
+  </tr>
+  <tr>
+   <td>Silver Spark jobs, backfills, maintenance</td>
+   <td>Data Platform</td>
+  </tr>
+  <tr>
+   <td>Snowflake catalog integration</td>
+   <td>Data Platform</td>
+  </tr>
+ </tbody>
+</table>
+<p>Adding a table to CDC involves editing exactly one file, in the service's own repo. Everything downstream follows automatically. When a schema changes, no ticket is filed, because there is nothing for us to do. If we did our jobs right, Data Platform's involvement in the average CDC operation is zero.</p>
+<h2>What this all buys</h2>
+<p>The two-layer split was about cost, not elegance. Continuous upserts were expensive, most consumers did not need the freshness they were paying for, and separating Bronze from Silver let us make the expensive operation infrequent and the cheap operation continuous. That in turn made the Silver optimizations worth investing in, because a job that runs six times a day can absorb serious tuning work.</p>
+<p>Publication-driven self-service came out of the same accounting. Data Platform was the bottleneck for every schema change across every service, so we moved the source of truth into the service's own Liquibase migrations. New tables and new columns propagate downstream without our involvement.</p>
+<p>The engineer from the opening paragraph doesn't need us. That is the whole design.</p>

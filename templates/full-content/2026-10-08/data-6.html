@@ -1,0 +1,111 @@
+<h1>5 Jev use cases for analytics, with real queries and datasets</h1>
+<p>Classifying text 30 times faster than gpt-5-nano, for about 1% of a frontier model's bill? It sounds crazy, but that's what we showed in the first post about Jev for analytics: 100,000 complaints classified in 82 seconds.</p>
+<p>Jev is a new type of decision model. It picks its answer from a closed list you define (yes or no, a label, a score) and returns a typed column with a confidence, fast enough to run on every row. On MotherDuck, you call it directly from SQL with the <code>prompt_jev()</code> function.</p>
+<p>In this post, I'll go through 5 practical use cases on real datasets, with real results and shares you can attach to play around yourself.</p>
+<h2>1. AI agent logs: which turns worked, and which took the long way?</h2>
+<p>If you run an agent, your trace logs already say what happened: every model step, tool call, token and dollar. What they don't say is whether the turn did what the user asked, or whether it took the long way to get there. Making that kind of judgment call is where <code>prompt_jev()</code> shines.</p>
+<p>Every turn emits OpenTelemetry spans and writes them into a MotherDuck table.</p>
+<p>We run a daily pipeline (Flight) which grades every production turn with a handful of questions, in SQL, next to the spans:</p>
+<table>
+ <thead>
+  <tr>
+   <th>question</th>
+   <th>asked on</th>
+   <th>Jev returns</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>completed</code>: did the agent do what the visitor asked?</td>
+   <td>every turn</td>
+   <td>score: fails, partially, fully</td>
+  </tr>
+  <tr>
+   <td><code>failure_mode</code>: why did it fall short?</td>
+   <td>turns that scored below 1.5</td>
+   <td>choice: budget exhausted, tool or SQL error, wrong answer, ...</td>
+  </tr>
+  <tr>
+   <td><code>error_cause</code>: what broke this tool call?</td>
+   <td>each failed tool call</td>
+   <td>choice: model wrote invalid SQL or Python, wrong guess about the data, platform error, tool bug</td>
+  </tr>
+  <tr>
+   <td><code>efficiency</code>: how many tool calls were unnecessary?</td>
+   <td>turns with tool calls</td>
+   <td>score: many, a few, none wasted</td>
+  </tr>
+  <tr>
+   <td><code>main_waste</code>: where did the waste come from?</td>
+   <td>turns that scored below 1.2</td>
+   <td>choice: repeated failure, redundant read, polling, unneeded exploration, tool gap</td>
+  </tr>
+ </tbody>
+</table>
+<pre><code>prompt_jev(
+  'USER REQUEST: ' || left(request, 1500) || chr(10) ||
+  'TIMELINE (what the model wrote and the tool calls it made, in order):' || chr(10) || left(timeline, 8000) || chr(10) ||
+  'FINAL ANSWER (start): ' || left(coalesce(answer, ''), 1200),
+  questions := \{
+    efficiency: \{
+      type: 'score',
+      instructions: 'How many tool calls in the TIMELINE were unnecessary to answer the USER REQUEST?
+        These are required by the product and never waste:
+        - reading each guide once before first using its tools
+        - view_dive right after save_dive
+        - one wait_for_flight_run after each run_flight
+        A failed call followed by one corrected retry is not waste.',
+      criteria: ['many wasted (4 or more)', 'a few wasted (1 to 3)', 'none wasted']
+    }
+  }
+)
+</code></pre>
+<p>Two interesting design choices:</p>
+<ul>
+ <li>A cheap score on every turn, and the "why" questions only on the turns that score low. That keeps the cost down.</li>
+ <li>Facts and judgments never mix: exact counts (repeated calls, extra waits) come from plain SQL on the spans. Jev only answers what needs judgment.</li>
+</ul>
+<h2>2. Social listening: what does Hacker News think of each AI lab?</h2>
+<p>Sentiment analysis is another big use case for text. It's hard to get right because people say the same thing in a hundred ways (hello, sarcasm). With Jev, you ask a simple question, "is this comment negative about X?", and get a clean classification back.</p>
+<p>Tech adds its own problem: a lot of product names are ambiguous. "Claude" is also Claude Shannon, and "Gemini" is also a zodiac sign, an internet protocol, a NASA program and a crypto exchange. Good news: a prompt solves this one too.</p>
+<p>I looked at four AI labs: OpenAI (ChatGPT and the GPT models), Anthropic (Claude), Google (Gemini, formerly Bard) and DeepSeek.</p>
+<p>The first step is the one a regex would do: find every item that names one of them. The date goes into the input, because Google's Gemini and Bard chatbots and Anthropic's Claude models didn't exist before 2023.</p>
+<pre><code>-- input = 'DATE: 2020-06' || chr(10) || 'NAMED PRODUCT: Google Gemini (formerly Bard)' || chr(10) || 'TEXT: ' || comment
+SELECT id, lab,
+       prompt_jev(input,
+         'Does the TEXT use that name to mean the NAMED PRODUCT, the AI company or its AI models or chatbot (even if only in passing)? Use the DATE: Google''s Gemini and Bard chatbots and Anthropic''s Claude models did not exist before 2023. Answer no when the name means something else, such as the Gemini internet protocol, the NASA Gemini program or the zodiac sign, Claude Shannon or another person named Claude, the anthropic principle, a bard as in a poet, or GPT disk partitions.') AS refers
+FROM mentions;
+</code></pre>
+<p>The cool thing is that we can ask 4 questions in one call per comment: the name check above, whether the comment is really about the lab, whether it's negative, and what it's about.</p>
+<h2>3. Sales calls: which conversations match the use cases we serve?</h2>
+<p>Typically, the CRM knows the account size and the contact's title. The call transcript knows what they're trying to do. Joining the two is where lead scoring gets interesting. Say <code>sales_calls</code> has <code>call_id</code>, <code>account_id</code> and <code>transcript</code>, and <code>accounts</code> holds your firmographic enrichment. Ask a narrow yes/no question about a documented product fit, for example whether the prospect needs to analyze lots of customer conversations or reviews.</p>
+<h2>4. Job postings: which cloud does each market actually run on?</h2>
+<p>The catch is that titles don't say which cloud, and keyword counts lie. Plenty of postings list "AWS, Azure or GCP" as a nice-to-have, and "AWS is a plus" doesn't mean the stack runs on AWS. So instead of counting keywords, I asked Jev one question per posting.</p>
+<pre><code>SELECT source, job_id, country_code,
+       prompt_jev(snippet,
+         'Which cloud platform is this data job''s stack primarily built on?',
+         choice := ['aws', 'azure', 'gcp', 'ovhcloud', 'scaleway', 'ionos', 'stackit',
+                    'hetzner', 'open telekom cloud', 'oracle cloud', 'ibm cloud',
+                    'alibaba cloud', 'multi-cloud, no clear primary',
+                    'cloud only mentioned in passing']) AS r
+FROM jev_candidates;
+</code></pre>
+<h2>5. Skip the hand-written parser: is this job remote?</h2>
+<p>This one is more technical, but it pays off in maintenance and speed. To turn a text column into a category, you write a parser. Usually that's a <code>CASE WHEN</code> (or worse, a custom UDF) with a few regexes that someone wrote once and keeps patching.</p>
+<p>The Jev version is one question, with the definitions written down:</p>
+<pre><code>SELECT job_id,
+       prompt_jev('TITLE: ' || title || chr(10) || 'LOCATION: ' || location || chr(10) ||
+                  'DESCRIPTION: ' || left(description, 8000),
+         'Where does this job expect the person to work?',
+         choice := [
+           \{label: 'remote',     description: 'Fully remote: work from home or anywhere all the time, possibly limited to a country or time zone'},
+           \{label: 'hybrid',     description: 'A mix of home and office: some days a week in the office, or remote work, home office or télétravail offered as a regular option or benefit'},
+           \{label: 'on-site',    description: 'The posting says the work is at the office, a site or a client site, with no regular remote work'},
+           \{label: 'not stated', description: 'The posting does not say whether the work is remote, hybrid or in the office'}
+         ]) AS work_mode
+FROM jev_use_cases.job_postings_sample;
+</code></pre>
+<p><code>prompt_jev()</code> is about 20 times faster than the LLM call, and asking the LLM for JSON didn't help much. The regex is still the fastest, but Jev is fast enough to replace it without the fragility, and it skips the slow LLM detour.</p>
+<p>So should you use Jev everywhere you have text? A regex is still nice for structure: things that have a format. Use Jev for meaning: is this about X, is it negative, which one is the main one. And use both together: a cheap <code>ILIKE</code> or regex to build the shortlist, then <code>prompt_jev()</code> to decide.</p>
+<h2>A good first experiment</h2>
+<p>Pick a text column you already have and a business question you couldn't answer from it (or only the hard way). Write down the answers you'd accept. Label a small sample by hand, run <code>prompt_jev()</code> on it, and look at both the winners and the uncertain rows. Once the question holds up, materialize the result so your dashboard doesn't pay to classify the same text twice.</p>

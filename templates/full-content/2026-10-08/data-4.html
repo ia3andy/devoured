@@ -1,0 +1,62 @@
+<h1>I benchmarked Databricks against my iPhone</h1>
+<p>The device in your pocket easily runs most practical analytics workloads.</p>
+<p>Big data is dead. Those of us who have spent the last decade working on data management systems know that real-world business data sets are much smaller than the ones that get talked about in benchmarks. What is less well understood is just how much faster everyday hardware has gotten. Workloads that once required a distributed system can now run on an iPhone. To prove that this isn't hyperbole, I went ahead and did just that.</p>
+<p><em>My iPhone 17 Pro. Holds a lot of pictures of my dog, tackles giant datasets with ease.</em></p>
+<p>The workload I chose was TPC-H. TPC-H is a set of 22 analytical queries against the database of an imaginary wholesale supplier.</p>
+<p>TPC-H can be generated at different scales. I wanted to choose a scale that is representative of the high end of realistic business-user workloads. Snowflake and Amazon have published statistics about the real-world distribution of query sizes, which we can use to calibrate our benchmark. I ran at 4 scales, 25, 50, 100, and 200 GB, to approximate the high end of the real-world distribution.</p>
+<p>I ran the queries on my phone using DuckDB, and on 3 different sizes of Databricks cluster, XS, S, and M, using Databricks Serverless SQL. DuckDB on my iPhone was faster than the Databricks clusters at all but the largest scale, and even there it was competitive.</p>
+<p>This is surprising: even the smallest Databricks cluster has more CPU cores than an iPhone:</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>Databricks XS</th>
+   <th>Databricks S</th>
+   <th>Databricks M</th>
+   <th>iPhone 17 Pro</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>CPUs</td>
+   <td>24</td>
+   <td>40</td>
+   <td>80</td>
+   <td>6</td>
+  </tr>
+  <tr>
+   <td>Memory (GB)</td>
+   <td>128</td>
+   <td>224</td>
+   <td>448</td>
+   <td>12</td>
+  </tr>
+  <tr>
+   <td>Cost / Hour ($)</td>
+   <td>4.20</td>
+   <td>8.40</td>
+   <td>16.80</td>
+   <td>N/A</td>
+  </tr>
+ </tbody>
+</table>
+<p>There are 2 reasons for these results. First, even though this workload is large by the standards of real-world business analytics, it's quite small compared to what modern CPUs can do. So the fixed costs of query planning and compilation are large in this benchmark. DuckDB's design excels at running small queries fast.</p>
+<p>Second, DuckDB is a single-node database, while even a Databricks XS is a multi-node system. On every large <code>JOIN</code> and <code>GROUP BY</code>, Databricks has to perform a shuffle to distribute the data across nodes.</p>
+<p>If your query can fit on a single node, it is more efficient to avoid these costs. There are very few queries that don't fit on a single node anymore: the AWS c9 series is available with 192 Graviton5 cores.</p>
+<p>The most important implication of this finding is about cost. If you are using a system like Databricks or Snowflake simply to run SQL queries or Python dataframes against business data, you are paying a very high markup on the underlying compute.</p>
+<p>Over the last 10 years, the cost of cloud compute has plummeted 10x, and the margins of the major data infrastructure providers have grown, resulting in the huge markups we see today.</p>
+<p>Running TPC-H on an iPhone is a fun stunt. Most companies aren't going to adopt an iPhone as their data warehouse — though if you do, I recommend you put it in an ice pack, or you'll lose about 30% of your performance to thermal throttling.</p>
+<p>What this stunt shows us is that realistic business workloads are not at all challenging for modern computers. Most real-world workloads could run on single machines using execution engines like DuckDB and Polars that are designed to take advantage of the efficiencies of non-distributed execution. Importantly, using a single-node execution engine doesn't mean your entire company's workload has to run on a single machine. Queries from many users can be distributed across many workers.</p>
+<p>This is how our Lake Compute service works: we have a large pool of worker nodes, but each worker node only works on one customer dbt model at a time. It's easy to assess whether your workload is a good fit for single-node execution engines: all the major data platforms now have built-in conversational analytics, so just ask!</p>
+<blockquote>
+ "Show me a histogram of the size of data read by queries in my production data warehouse, with the x-axis on a log scale, units of GB."
+</blockquote>
+<p>I promise you will be shocked how small the vast majority of your queries are. We are all using expensive distributed execution engines for queries that could run on an iPhone. The way we are going to take advantage of cheaper compute is by moving to a new architecture where all the participants in the lakehouse talk directly to the storage layer.</p>
+<p>You adopt this architecture in a stepwise, layer-by-layer process.</p>
+<ol>
+ <li>Change your ingest to write to Iceberg tables. If you're a Fivetran user, you can use our Managed Data Lake migration workflow to convert your existing tables, including historical data, to Iceberg. The existing tables in your data warehouse will be transparently migrated into external tables so your queries continue to work.</li>
+ <li>Reconfigure your transformations to output to Iceberg. All the major compute engines support outputting to Iceberg, so this is mainly a matter of changing a setting. If you're a dbt user, you can use our Lake Compute service to execute dbt models. It uses DuckDB and single-node execution in its implementation.</li>
+ <li>Move selected read workloads, like notebooks and ad-hoc queries, to use local compute. The cheapest CPU is the one on your desk!</li>
+</ol>
+<p>Leveraging cheap and free compute isn't just about saving money. It means you no longer need to ration compute to your users. AI agents have given everyone their own analyst who can answer any question they can think of, but only if they aren't bottlenecked by sharing a small, expensive compute cluster. If we're going to connect AI to data, we're going to need open data infrastructure that leverages the cheap compute that's all around us, even in our pockets.</p>
+<p><em>Details to reproduce this benchmark are in <a href="http://github.com/fivetran/iphone_benchmark">github.com/fivetran/iphone_benchmark</a></em></p>
