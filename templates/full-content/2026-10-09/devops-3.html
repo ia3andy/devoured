@@ -1,0 +1,107 @@
+<p>A worker node pages with NodeFilesystemFilesFillingUp. It’s on course to run out of inodes. You check the disk first, because that’s what everyone checks first, and it reads 83% used: 103G used, 22G available. Then you check inodes: 67% used, 11M used, 5.3M free.</p>
+<p>The disk is the fuller of the two, and the inode table is the one that paged. That’s not a contradiction. NodeFilesystemFilesFillingUp is a trajectory alert built on predict_linear, so it fires on the slope, not on the level. Nothing was wrong with 67%. What was wrong was how fast it was getting there, and the fact that the only mechanism in kubelet that would have intervened is the one that evicts pods.</p>
+<p>Two notes on what follows. I no longer have access to that cluster, so I can’t paste the original df, du or tune2fs captures. Where a number comes from the incident record I say so, and where I’ve reconstructed something from arithmetic I show the arithmetic. The ext4 demonstrations further down you can run yourself in about two seconds.</p>
+<p>If you want to compare your own node before reading on:</p>
+<pre><code>df -h / &amp;&amp; df -i /</code></pre>
+<h2>What kubelet actually watches</h2>
+<p>Kubelet’s defence against images filling a node is image garbage collection. Once the image filesystem passes imageGCHighThresholdPercent (85 by default), it deletes unused images, oldest first, until usage drops to imageGCLowThresholdPercent (80).</p>
+<p>Both of those are percentages of bytes. Image GC never looks at file counts.</p>
+<p>Kubelet isn’t blind to inodes, though, and it’s worth being exact here, because the detail changes the conclusion. On Linux the default hard eviction set is five signals (pkg/kubelet/eviction/defaults_linux.go, quoted here at tag v1.37.0):</p>
+<pre><code>var DefaultEvictionHard = map[string]string\{
+   "memory.available":   "100Mi",
+   "nodefs.available":   "10%",
+   "nodefs.inodesFree":  "5%",
+   "imagefs.available":  "15%",
+   "imagefs.inodesFree": "5%",
+}</code></pre>
+<p>Both filesystems get an inode threshold, and both sit at 5% free. That’s a Linux-only file. The two next to it are shorter: defaults_windows.go and defaults_others.go each carry three signals, memory.available, nodefs.available and imagefs.available, with no inode thresholds at all. On Linux the coverage is there. Check it against whatever version you’re running, because these files do change.</p>
+<p>So kubelet will act on inodes. The question is when. 5% free means 95% used, and that’s the hard eviction floor: the point where kubelet reclaims what it can and starts evicting pods to save the node. Image garbage collection, the mechanism that runs quietly in the background before anything is on fire, triggers at 85% and stops at 80%, and both of those are bytes.</p>
+<p>Count the mechanisms watching each resource. Bytes get two: background image GC at 85%, and hard eviction at 10% free on nodefs or 15% free on imagefs. Inodes get one, and it’s the eviction floor. There is no early trigger on inodes, so the first thing that happens when you run low is also the most disruptive thing that can happen.</p>
+<h2>Why small files hit a wall the disk doesn’t</h2>
+<p>Quick question before the numbers. Fill a filesystem with nothing but one-byte files. What percentage of the disk is used by the time you run out of inodes? Take a guess.</p>
+<p>ext4 decides how many inodes a filesystem gets at creation time, and that number never changes afterwards. It comes from inode_ratio: one inode per N bytes of capacity. The stock /etc/mke2fs.conf uses 16384. And any file that isn’t empty takes at least one 4 KiB block, no matter how small it is.</p>
+<p>You can see the ratio on a throwaway image file. No root needed:</p>
+<pre><code>$ truncate -s 1G img &amp;&amp; mkfs.ext4 -q -F -i 16384 img
+$ tune2fs -l img | grep -E '^(Inode count|Block count|Block size):'
+Inode count:             65536
+Block count:             262144
+Block size:              4096</code></pre>
+<p>262,144 blocks × 4,096 bytes ÷ 16,384 is 65,536 inodes. If every file uses one block, all 65,536 inodes are gone after 256 MiB. That’s 25% of the disk. If you guessed higher, most people do.</p>
+<h3>Watch it fail</h3>
+<p>You don’t have to take the arithmetic on trust. mkfs.ext4 -d builds a filesystem straight from a directory, so you can pack small files into an image without mounting anything and without root:</p>
+<pre><code>mkdir files
+for i in $(seq 1 4000); do printf x &gt; files/f$i; done
+truncate -s 64M img
+mkfs.ext4 -q -F -i 16384 -d files img
+dumpe2fs -h img 2&gt;/dev/null | grep -E ‘^(Inode count|Free inodes|Block count|Free blocks):’</code></pre>
+<p>Inode count: 4096<br>
+  Block count: 16384<br>
+  Free blocks: 11040<br>
+  Free inodes: 84</p>
+<p>97.9% of inodes used, 32.6% of blocks. The files themselves account for only 24.4 of those 32.6 points: 4,000 files at one 4 KiB block each is 15.6 MiB, and 15.6 MiB of 64 MiB is 24.4%. The remaining 8.2 points are the journal and filesystem metadata.</p>
+<p>Add 200 more files and it stops being theoretical:</p>
+<pre><code>$ for i in $(seq 4001 4200); do printf x &gt; files/f$i; done
+$ truncate -s 64M img2 &amp;&amp; mkfs.ext4 -q -F -i 16384 -d files img2
+mkfs.ext4: Could not allocate inode in ext2 filesystem while populating file system</code></pre>
+<p>Yes, it says ext2. That’s the underlying library’s error string, not a mistake. The image that worked had 84 inodes left and two thirds of its blocks free. Somewhere around file 4,085 the inodes run out, and from there the free blocks stop mattering. On e2fsprogs 1.47.2 the whole sequence runs in under two seconds.</p>
+<h2>Reverse-engineering the node’s mkfs parameter</h2>
+<p>Back to the real node, and this part is arithmetic rather than a capture, because I can’t re-run anything on that cluster.</p>
+<p>11M inodes used plus 5.3M free is about 16.3 million inodes in total. The filesystem is roughly 124-133 GiB, working from 103G used plus 22G available and allowing for ext4’s reserved blocks. At the stock 16,384 bytes per inode, a filesystem that size only gets 8.1-8.7 million inodes. This one already had 11 million in use, which is more than the stock ratio can even allocate. So it wasn’t formatted at 16384.</p>
+<p>Divide the size by the inode count and you get roughly 7,500-9,000 bytes per inode, which lines up with 8192. At that ratio the all-small-files case exhausts inodes at 50% of the disk instead of 25%. I can’t confirm it directly, but the arithmetic constrains it to about 8192, and on your own nodes tune2fs -l on the root device settles it in one command.</p>
+<p>A real node is never all small files. Layer blobs and logs are big, which is why disk was the higher number here. But image GC was waiting for 85%, the file count was climbing at its own pace, and nothing in kubelet compares one against the other.</p>
+<h2>Finding the millions of files</h2>
+<p>Knowing the inodes are going doesn’t tell you where they went. This does:</p>
+<pre><code>du --inodes -xS /var | sort -rh | head -n 20</code></pre>
+<p>Both flags earn their place. -x stops du at filesystem boundaries, so it doesn’t wander into the tmpfs and volume mounts kubelet sets up under /var/lib/kubelet/pods. -S counts each directory on its own instead of adding in its subdirectories. Leave it off and /var, /var/lib and every other parent sit at the top of the list, above the directory you’re actually looking for.</p>
+<p>On this node the top of that list wasn’t logs and it wasn’t pod volumes. It was containerd’s snapshot store, /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/, where each numbered directory is one unpacked image layer. Several of those snapshots held the same path: app/node_modules/@mui/icons-material, at 21,553 files each.</p>
+<p>That’s one package directory out of one image. The image as a whole carried more than 40,000 files: the icon package is over half of it on its own, and the remainder is the rest of the dependency tree, the application source, and the build output, all of which shipped in the same image. Multiply 40,000 by every version a node is still holding, and millions of inodes stop looking mysterious.</p>
+<p>It’s 21,553 per snapshot, not across all of them. containerd’s content store dedupes compressed layers by digest, but the overlayfs snapshotter unpacks each distinct layer into its own directory and shares nothing between them. Two builds that put an identical node_modules into layers with different digests leave two full copies on disk.</p>
+<p>node_modules is the well-known offender, but it isn’t the only one. Any image that ships a dependency tree full of small files behaves the same way, whether that’s a Python virtualenv, vendored PHP packages or a pile of Ruby gems.</p>
+<h2>The problem was the image, not the cluster</h2>
+<p>Nothing on the cluster was set up wrong. Kubelet, containerd and the node image were all running on defaults.</p>
+<p>The image was a single-stage build, so everything the build needed ended up in what shipped: the source, the build output, and all of node_modules, dev dependencies included, since npm install pulls those in by default.</p>
+<p>Now look at that COPY . . and ask whether the repo has a .dockerignore. If node_modules isn’t excluded, COPY . . puts a second copy of it into a layer that changes on every single commit. That’s the fastest way to multiply snapshots, and it’s easy to miss because the build still works.</p>
+<p>Even with a .dockerignore, a CI pipeline that builds without a warm layer cache reruns npm install every time. That produces a new layer digest even when package.json hasn’t changed, because the files inside the layer carry new timestamps. Every new digest becomes a new snapshot on every node that pulls it. containerd keeps those snapshots until the image is removed, and kubelet only removes unused images when image GC runs, which brings you straight back to that 85% byte threshold.</p>
+<p>It went unnoticed because the number most people watch, disk usage, never crossed the line.</p>
+<h2>Fixing it</h2>
+<p>The first fix belongs in the build: a multi-stage Dockerfile. One stage installs dependencies and builds. The final image is a small web server that only receives the compiled output.</p>
+<p>That should take the deployed image from more than 40,000 files down to the compiled assets plus the base image, which for a React build is typically a few dozen files rather than tens of thousands. If you try it, docker run –rm &lt;image&gt; find / -xdev -type f | wc -l on each will give you the real before-and-after.</p>
+<p>The second fix is monitoring, and credit where it’s due: the upstream alert did its job here. NodeFilesystemFilesFillingUp ships with the node_exporter mixin, and it’s what caught this at 67%. It’s a prediction, though, and predictions go quiet when growth pauses for a while. I’d add a flat threshold alongside it that fires well before kubelet’s 95% eviction point:</p>
+<pre><code>1 - node_filesystem_files_free\{mountpoint="/"}
+  / node_filesystem_files\{mountpoint="/"}
+  &gt; 0.80</code></pre>
+<p>Give it for: 30m so a burst of image pulls during a rollout doesn’t page anyone. The 80% line is a judgement call; pick whatever leaves you enough room to act before 95%. You won’t find anything like it tied to image garbage collection upstream, and that’s the distinction worth holding on to: image GC’s thresholds are percentages of bytes, and the inode thresholds kubelet does have belong to eviction. They’re separate mechanisms, and only one of them runs early.</p>
+<p>If you run Prometheus, this one is worth having on a dashboard. It subtracts disk usage from inode usage per node, so anything near the top is burning through inodes faster than bytes, and those are the nodes where the byte thresholds will fail you:</p>
+<pre><code>sort_desc(
+  (1 - node_filesystem_files_free\{mountpoint="/"} / node_filesystem_files\{mountpoint="/"})
+  -
+  (1 - node_filesystem_avail_bytes\{mountpoint="/"} / node_filesystem_size_bytes\{mountpoint="/"})
+  )</code></pre>
+<p>Adjust the mountpoint label if your node_exporter reports the root filesystem differently.</p>
+<p>Neither fix does anything about what’s already sitting on your nodes. Old snapshots stay until their images go. crictl rmi –prune removes every image no container is currently using, and those images simply get pulled again the next time something needs them. You’ll also see crictl rm –all suggested for this kind of cleanup. It clears every stopped container and takes kubectl logs –previous with it for anything that restarted recently. Fine in an emergency. I wouldn’t put it in a cron job.</p>
+<p>If you only remember one thing from this: kubelet’s background cleanup runs on bytes, so a workload that’s heavy on files rather than bytes gets no early intervention at all. Something does eventually fire, at 5% inodes free, and it fires by evicting pods. That’s the emergency brake, not the fix.</p>
+<h2>Check your own cluster in five minutes</h2>
+<p><strong>Step one.</strong> Run the fleet query above and look at anything positive.</p>
+<p><strong>Step two.</strong> On the worst node, find the directories holding the most files:</p>
+<pre><code>du --inodes -xS /var/lib/containerd | sort -rh | head -n 20</code></pre>
+<p><strong>Step three.</strong> If node_modules shows up under the snapshot store, list the images on that node:</p>
+<pre><code>crictl images</code></pre>
+<p>Then go and look at how those images are built.</p>
+<h2>Reproduce it</h2>
+<p><strong>The inode ratio.</strong> No root needed.</p>
+<pre><code>truncate -s 1G img16 &amp;&amp; mkfs.ext4 -q -F -i 16384 img16
+truncate -s 1G img8  &amp;&amp; mkfs.ext4 -q -F -i 8192  img8
+tune2fs -l img16 | grep -E ‘^(Inode count|Block count):’
+tune2fs -l img8  | grep -E ‘^(Inode count|Block count):’</code></pre>
+<p>You’ll get 65,536 and 131,072 inodes, both on 262,144 blocks.</p>
+<p><strong>Running out of inodes with most of the disk free.</strong> No root needed.</p>
+<pre><code>mkdir files &amp;&amp; for i in $(seq 1 4200); do printf x &gt; files/f$i; done
+truncate -s 64M img &amp;&amp; mkfs.ext4 -q -F -i 16384 -d files img</code></pre>
+<p>That fails with Could not allocate inode. Drop the loop to 4,000 files and it succeeds with 84 inodes free and two thirds of the blocks unused.</p>
+<p><strong>Snapshot duplication on a node.</strong> You’ll need a registry and a cluster you can deploy to.</p>
+<pre><code>docker build --no-cache -t &lt;registry&gt;/app:v1 .
+docker build --no-cache -t &lt;registry&gt;/app:v2 .
+docker push &lt;registry&gt;/app:v1 &amp;&amp; docker push &lt;registry&gt;/app:v2
+# deploy v1, then v2, onto the same node, then on that node:
+sudo du --inodes -xS /var/lib/containerd | sort -rh | head -n 20</code></pre>
+<p>You should see two node_modules/@mui/icons-material directories with the same file count under two different snapshot IDs.</p>

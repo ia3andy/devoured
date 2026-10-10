@@ -1,0 +1,120 @@
+<h1>The RAD Debugger Project</h1>
+<p><em><strong>NOTE:</strong> This README does not document usage instructions and tips for the debugger itself, and is intended as a technical overview of the project. The debugger's README, which includes usage instructions and tips, can be found packaged along with debugger releases, or within the <code>build</code> folder after a local copy has been built. You can find pre-built release binaries here.</em></p>
+<p>The RAD Debugger is a native, user-mode, multi-process, graphical debugger. It currently only supports local-machine Windows x64 debugging with PDBs, with plans to expand and port in the future. In the future we'll expand to also support native Linux debugging and DWARF debug info.</p>
+<p>The debugger is currently in <em>ALPHA</em>. In order to get the debugger bullet-proof, it'd greatly help out if you submitted the issues you find here, along with any information you can gather, like dump files (along with the build you used), instructions to reproduce, test executables, and so on.</p>
+<p>In addition to the debugger, we aim to further improve the toolchain with two additional related technologies: <strong>(1)</strong> the RAD Debug Info (RDI) format, and <strong>(2)</strong> the RAD Linker.</p>
+<h2>The RAD Debug Info (RDI) Format</h2>
+<p>The RAD Debug Info (RDI) format is our custom debug information format, which the debugger parses and uses, rather than the debug information natively produced by toolchains, like PDB or DWARF. To work with these existing toolchains, we convert PDB (and eventually PE/ELF files with embedded DWARF) into the RDI format on-demand.</p>
+<p>The RDI format is currently specified in code, in the files within the <code>src/lib_rdi</code> folder. In <code>rdi.h</code> and <code>rdi.c</code>, the types and functions which define the format itself are specified. In <code>rdi_parse.h</code> and <code>rdi_parse.c</code>, helpers for parsing the format are included.</p>
+<p>We also have an in-progress library for constructing and serializing RDI data, located within the <code>src/lib_rdi_make</code> folder.</p>
+<p>Our <code>radbin</code> utility (accessible through the debugger too, via the <code>--bin</code> command line argument) is capable of converting native debug information formats to RDI, and of producing textual dumps of contents stored within RDI files.</p>
+<h2>The RAD Linker</h2>
+<p>The RAD Linker is a new performance linker for generating x64 PE/COFF binaries. It is designed to be very fast when creating gigantic executables. It generates standard PDB files for debugging, but it can also (optionally) natively create RAD Debug Info too, which is useful both to eliminate on-demand conversion time when debugging, but also for huge executables that otherwise create broken PDBs that overflow internal 32-bit tables.</p>
+<p>The RAD Linker is primarily optimized to handle huge linking projects. In our test cases (where debug info is multiple gigabytes), we see 50% faster link times.</p>
+<p>The command line syntax is fully compatible with MSVC; you can get a full list of implemented switches from <code>/help</code>.</p>
+<p>Our current designed-for use case for the linker is to help with the compile-debug cycle of huge projects. We don't yet have support for link-time-optimizations, but this feature is on the road map.</p>
+<p>By default, the linker spawns as many threads as there are cores, so if you plan to run multiple linkers in parallel, you can limit the number of thread workers via <code>/rad_workers</code>.</p>
+<p>We also have support for large memory pages, which, when enabled, reduce link time by another 25%. To link with large pages, you need to explicitly request them via <code>/rad_large_pages</code>. Large pages are off by default, since Windows support for large pages is a bit buggy; we recommend they only be used in Docker or VM images where the environment is reset after each link. In a standard Windows environment, using large pages otherwise will fragment memory quickly, forcing a reboot. We are working on a Linux port of the linker that will be able to build with large pages robustly.</p>
+<hr>
+<h1>Project Development Setup / Local Build Instructions</h1>
+<p>The project is actively developed both on Windows x64 and Linux x64 development machines.</p>
+<h2>Windows x64</h2>
+<h3>1. Installing the Required Tools (MSVC &amp; Windows SDK)</h3>
+<p>First, you'll need the Microsoft C/C++ Build Tools v15 (2017) or later, for the Windows SDK, and the MSVC compiler and linker.</p>
+<p>If the Windows SDK is installed (e.g. via installation of the Microsoft C/C++ Build Tools), you may also build with Clang.</p>
+<h3>2. Build Environment Setup</h3>
+<p>Building the codebase can be done in a terminal which is equipped with the ability to call either MSVC or Clang from command line.</p>
+<p>This is generally done by calling <code>vcvarsall.bat x64</code>, which is included in the Microsoft C/C++ Build Tools. This script is automatically called by the <code>x64 Native Tools Command Prompt for VS &lt;year&gt;</code> variant of the vanilla <code>cmd.exe</code>. If you've installed the build tools, this command prompt may be easily located by searching for <code>Native</code> from the Windows Start Menu search.</p>
+<p>You can ensure that the MSVC compiler is accessible from your command line by running:</p>
+<pre><code>cl</code></pre>
+<h3>3. Building</h3>
+<p>Within this terminal, <code>cd</code> to the root directory of the codebase, and just run the <code>build.bat</code> script:</p>
+<pre><code>build</code></pre>
+<p>If everything worked correctly, there will be a <code>build</code> folder in the root level of the codebase, and it will contain a freshly-built <code>raddbg.exe</code>.</p>
+<p>To produce a <strong>release mode executable</strong>, run <code>build.bat</code> with a <code>release</code> argument:</p>
+<pre><code>build release</code></pre>
+<h2>Linux x64</h2>
+<h3>1. Installing the Required Tools (GCC or Clang, Libraries)</h3>
+<p>First, you'll need either GCC or Clang. They can be obtained by running one of the following commands, depending on your toolchain of choice and distribution:</p>
+<h4>GCC on Ubuntu / Debian / Mint</h4>
+<pre><code>sudo apt update &amp;&amp; sudo apt install build-essential</code></pre>
+<h4>Clang on Ubuntu / Debian / Mint</h4>
+<pre><code>sudo apt update &amp;&amp; sudo apt install clang llvm</code></pre>
+<h4>GCC on Arch / Manjaro</h4>
+<pre><code>sudo pacman -S base-devel</code></pre>
+<h4>Clang on Arch / Manjaro</h4>
+<pre><code>sudo pacman -S clang llvm</code></pre>
+<h3>2. Installing Dependencies</h3>
+<p>The debugger project relies on a few dynamically linked libraries being present on the system:</p>
+<ul>
+ <li><code>libfreetype</code></li>
+ <li><code>libx11</code></li>
+ <li><code>libxext</code></li>
+ <li><code>libxfixes</code></li>
+ <li><code>libxrandr</code></li>
+ <li><code>libgl</code></li>
+ <li><code>libegl</code></li>
+</ul>
+<h3>3. Building</h3>
+<p>To build, <code>cd</code> to the root directory of the codebase, and run the <code>build.sh</code> script:</p>
+<pre><code>./build.sh</code></pre>
+<hr>
+<h1>Project Roadmap</h1>
+<h3>The Initial Alpha Battle-Testing Phase</h3>
+<p>The first priority for the project is to ensure that the most crucial components are functioning extremely reliably for local, x64, Windows development.</p>
+<h3>Local x64 Linux Debugging Phase</h3>
+<p>The next priority for the project is to take the rock solid x64 Windows debugging experience, and port all of the relevant pieces to support local x64 Linux debugging also.</p>
+<h3>And Beyond!</h3>
+<p>There are several directions we might take after these two major phases, like remote debugging, porting to different architectures, further improving the debugger's features, and so on.</p>
+<hr>
+<h1>Codebase Introduction</h1>
+<h2>Top-Level Directory Descriptions</h2>
+<ul>
+ <li><code>data</code>: Small binary files which are used when building.</li>
+ <li><code>src</code>: All source code.</li>
+</ul>
+<h2>Layer Descriptions</h2>
+<p>The codebase is organized into <em>layers</em>. Layers are separated either to isolate certain problems, and to allow inclusion into various builds without needing to pull everything in the codebase into a build.</p>
+<ul>
+ <li><code>artifact_cache</code> (<code>AC_</code>): Asynchronously-filled cache of computation artifacts.</li>
+ <li><code>base</code>: Universal, codebase-wide constructs.</li>
+ <li><code>codeview</code> (<code>CV_</code>): Parsing and writing the CodeView format.</li>
+ <li><code>coff</code> (<code>COFF_</code>): Parsing and writing the COFF format.</li>
+ <li><code>content</code> (<code>C_</code>): Cache for general data blobs.</li>
+ <li><code>ctrl</code> (<code>CTRL_</code>): Asynchronous process control, stepping, and breakpoints.</li>
+ <li><code>dbg_engine</code> (<code>D_</code>): Core debugger system without graphical components.</li>
+ <li><code>dbg_info</code> (<code>DI_</code>): Asynchronous debug info conversion and loading.</li>
+ <li><code>demon</code> (<code>DMN_</code>): Abstraction layer for low-level process control.</li>
+ <li><code>disasm</code> (<code>DASM_</code>): Disassembly generation.</li>
+ <li><code>draw</code> (<code>DR_</code>): High-level graphics drawing API.</li>
+ <li><code>dwarf</code> (<code>DW_</code>): Parsing the DWARF format.</li>
+ <li><code>eh</code> (<code>EH_</code>): Parsing the EH frame format.</li>
+ <li><code>elf</code> (<code>ELF_</code>): Parsing the ELF format.</li>
+ <li><code>eval</code> (<code>E_</code>): Compiler for expression language evaluation.</li>
+ <li><code>eval_visualization</code> (<code>EV_</code>): Non-graphical evaluation visualization engine.</li>
+ <li><code>file_stream</code> (<code>FS_</code>): Asynchronous file streaming.</li>
+ <li><code>font_cache</code> (<code>FNT_</code>): Cache of rasterized font data.</li>
+ <li><code>font_provider</code> (<code>FP_</code>): Abstraction layer for font rasterization.</li>
+ <li><code>lib_raddbg_markup</code> (<code>RADDBG_</code>): Standalone library for marking up user programs.</li>
+ <li><code>lib_rdi</code> (<code>RDI_</code>): Core RDI types and helpers.</li>
+ <li><code>lib_rdi_make</code> (<code>RDIM_</code>): Constructing RDI debug info.</li>
+ <li><code>linker</code> (<code>LNK_</code>): RAD Linker implementation.</li>
+ <li><code>mdesk</code> (<code>MD_</code>): Parsing Metadesk files.</li>
+ <li><code>metagen</code> (<code>MG_</code>): Metaprogram for generating code and data tables.</li>
+ <li><code>msf</code> (<code>MSF_</code>): Parsing and writing the MSF format.</li>
+ <li><code>msvc_crt</code> (<code>MSCRT_</code>): MSVC CRT specific parsing.</li>
+ <li><code>mule</code>: Test executables for battle testing.</li>
+ <li><code>mutable_text</code> (<code>MTX_</code>): Cache for mutable text buffers.</li>
+ <li><code>natvis</code>: Type visualization for other debuggers.</li>
+ <li><code>os/core</code> (<code>OS_</code>): Core OS abstraction.</li>
+ <li><code>os/gfx</code> (<code>OS_</code>): Graphical OS abstraction.</li>
+ <li><code>pdb</code> (<code>PDB_</code>): Parsing and writing the PDB format.</li>
+ <li><code>pe</code> (<code>PE_</code>): Parsing and writing the PE format.</li>
+ <li><code>radbin</code> (<code>RB_</code>): <code>radbin</code> binary utility.</li>
+ <li><code>raddbg</code> (<code>RD_</code>): Graphical debugger frontend.</li>
+ <li><code>regs</code> (<code>REGS_</code>): Register metadata and helpers.</li>
+ <li><code>render</code> (<code>R_</code>): Abstract rendering API.</li>
+ <li><code>text</code> (<code>TXT_</code>): Text processing functions.</li>
+ <li><code>third_party</code>: External code.</li>
+ <li><code>ui</code> (<code>UI_</code>): GUI building machinery.</li>
+</ul>

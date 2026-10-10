@@ -1,0 +1,239 @@
+<h2>Quicksand</h2>
+<p>Quicksand is an async Python API to launch, control, and snapshot QEMU virtual machines with a particular focus on sandboxing AI agents. Quicksand provides pre-built Linux VMs for Ubuntu and Alpine distros and supports x86_64 and ARM64 across macOS, Linux, and Windows. Running sandboxes needs no root privileges or Docker; install the QEMU and image extras for a bundled runtime on supported platforms.</p>
+<h2>Installation</h2>
+<pre><code>pip install 'quick-sandbox[qemu,alpine]'</code></pre>
+<p>Or install the core package and add QEMU/images separately:</p>
+<pre><code>pip install quick-sandbox
+quicksand install qemu alpine</code></pre>
+<h2>Usage</h2>
+<h3>Hello, World!</h3>
+<pre><code>import asyncio
+from quicksand import Sandbox
+
+async def main():
+    async with Sandbox(image="ubuntu") as sb:
+        result = await sb.execute("echo 'Hello from the sandbox!'")
+        print(result.stdout)
+
+asyncio.run(main())</code></pre>
+<h3>Run commands</h3>
+<pre><code>result = await sb.execute("apt update &amp;&amp; apt install -y python3")
+print(result.stdout, result.exit_code)</code></pre>
+<h3>Mount host directories</h3>
+<p>Share host directories into the VM at boot or on the fly.</p>
+<pre><code># At boot
+async with Sandbox(
+    image="ubuntu",
+    mounts=[Mount("./workspace", "/mnt/workspace")],
+) as sb:
+    ...
+
+# Or dynamically on a running sandbox
+handle = await sb.mount("/tmp/data", "/mnt/data")
+await sb.execute("ls /mnt/data")
+await sb.unmount(handle)</code></pre>
+<h3>Configure networking</h3>
+<p>Sandboxes are network-isolated by default. Opt in to internet access and port forwarding with <code>NetworkMode.FULL</code>.</p>
+<pre><code>async with Sandbox(
+    image="ubuntu",
+    network_mode=NetworkMode.FULL,
+    port_forwards=[PortForward(host=8080, guest=80)],
+) as sb:
+    ...</code></pre>
+<h3>Multiple Linux users</h3>
+<p>Give multiple agents independent Linux user accounts in a single sandbox VM.</p>
+<pre><code>async with Sandbox(image="ubuntu") as sb:
+    alice = await sb.create_user("alice")
+    bob = await sb.create_user("bob")
+
+    await alice.execute("cat &gt; hello.txt", stdin="Hello from Alice!\n")
+    await bob.execute("cat &gt; hello.txt", stdin="Hello from Bob!\n")
+
+    for user in (alice, bob):
+        result = await user.execute("whoami &amp;&amp; pwd &amp;&amp; cat hello.txt")
+        print(result.stdout)
+        await sb.delete_user(user.name)</code></pre>
+<h3>Save and load</h3>
+<p>Save the VM's disk state to a directory. Load it later, even on a different machine.</p>
+<pre><code>await sb.execute("pip install numpy pandas")
+await sb.save("my-env")  # VM keeps running
+
+# Load later
+async with Sandbox(image="my-env") as sb:
+    await sb.execute("python3 -c 'import numpy; print(numpy.__version__)'")</code></pre>
+<h3>Checkpoint and revert</h3>
+<p>Capture the full VM state and roll back if something goes wrong.</p>
+<pre><code>await sb.checkpoint("before-experiment")
+await sb.execute("apt install -y something-risky")
+await sb.revert("before-experiment")  # the VM snaps back to the checkpoint</code></pre>
+<h3>Control a desktop</h3>
+<p>Desktop images provide a full Xfce4 graphical environment with a browser. Install one with <code>quicksand install ubuntu-desktop</code> or <code>quicksand install alpine-desktop</code>.</p>
+<pre><code>async with Sandbox(image="ubuntu-desktop", enable_display=True) as sb:
+    await sb.screenshot("screen.png")
+    await sb.type_text("hello world")
+    await sb.press_key(Key.RET)
+    await sb.mouse_move(500, 300)
+    await sb.mouse_click("left")</code></pre>
+<h3>Configuration</h3>
+<p>Here are all of the Sandbox configuration options:</p>
+<pre><code>Sandbox(
+    # Image or save name to boot
+    image="ubuntu",
+    # Guest RAM (default: "512M")
+    memory="2G",
+    # Virtual CPU cores (default: 1)
+    cpus=4,
+    # Host directories shared into the VM at boot
+    mounts=[Mount("/host", "/guest")],
+    # NONE, MOUNTS_ONLY (default), or FULL internet access
+    network_mode=NetworkMode.FULL,
+    # Forward host TCP ports into the guest
+    port_forwards=[PortForward(host=8080, guest=80)],
+    # Expand the guest filesystem on boot
+    disk_size="10G",
+    # Attach virtual GPU, keyboard, and mouse for screenshot/type_text/mouse control
+    enable_display=True,
+    # Auto-save VM state on stop
+    save="my-save-name",
+)</code></pre>
+<h2>Available images</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Image</th>
+   <th>Type</th>
+   <th>Wheel size</th>
+   <th>Install command</th>
+   <th>What is it</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>ubuntu</code></td>
+   <td>Base</td>
+   <td>~309-357 MB</td>
+   <td><code>quicksand install ubuntu</code></td>
+   <td>Ubuntu 24.04 headless</td>
+  </tr>
+  <tr>
+   <td><code>alpine</code></td>
+   <td>Base</td>
+   <td>~82-85 MB</td>
+   <td><code>quicksand install alpine</code></td>
+   <td>Alpine 3.23 headless (faster boot)</td>
+  </tr>
+  <tr>
+   <td><code>ubuntu-desktop</code></td>
+   <td>Overlay (<code>ubuntu</code>)</td>
+   <td>~273-281 MB</td>
+   <td><code>quicksand install ubuntu-desktop</code></td>
+   <td>Ubuntu 24.04 + Xfce4 + Firefox</td>
+  </tr>
+  <tr>
+   <td><code>alpine-desktop</code></td>
+   <td>Overlay (<code>alpine</code>)</td>
+   <td>~346-363 MB</td>
+   <td><code>quicksand install alpine-desktop</code></td>
+   <td>Alpine 3.23 + Xfce4 + Chromium</td>
+  </tr>
+  <tr>
+   <td><code>quicksand-agent</code></td>
+   <td>Overlay (<code>ubuntu</code>)</td>
+   <td>~306-335 MB</td>
+   <td><code>quicksand install quicksand-agent</code></td>
+   <td>Ubuntu + Python 3.12, uv, build-essential, requests, pyyaml, ddgs, markitdown</td>
+  </tr>
+  <tr>
+   <td><code>quicksand-cua</code></td>
+   <td>Overlay (<code>quicksand-agent</code>)</td>
+   <td>~489-500 MB</td>
+   <td><code>quicksand install quicksand-cua</code></td>
+   <td>Agent Sandbox + Xvfb, x11vnc, noVNC, Playwright, Chromium</td>
+  </tr>
+ </tbody>
+</table>
+<p>Sizes are approximate full image-wheel downloads for the September 14, 2026 releases and vary by architecture. Overlay sizes exclude their base images.</p>
+<h2>Building from source</h2>
+<pre><code>git clone https://github.com/microsoft/quicksand.git
+cd quicksand
+uv sync
+uv run uvr build --all-packages</code></pre>
+<h2>Documentation</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Topic</th>
+   <th>Guide</th>
+   <th>Under the Hood</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Installation</td>
+   <td>Installing packages</td>
+   <td>QEMU binaries, kernels, qcow2 disks</td>
+  </tr>
+  <tr>
+   <td>Sandbox Lifecycle</td>
+   <td>Creating and configuring sandboxes</td>
+   <td><code>-m</code>, <code>-smp</code>, <code>-accel</code>, machine types</td>
+  </tr>
+  <tr>
+   <td>Running Commands</td>
+   <td><code>execute()</code>, streaming, exit codes</td>
+   <td>Kernel boot, agent tokens, <code>hostfwd</code></td>
+  </tr>
+  <tr>
+   <td>File Exchange</td>
+   <td>Mounts, hot-mounts, getting data in/out</td>
+   <td>CIFS via <code>guestfwd</code>, 9p via <code>-fsdev</code></td>
+  </tr>
+  <tr>
+   <td>Save and Rollback</td>
+   <td>Checkpoints, reverts, persistent saves</td>
+   <td>qcow2 overlays, <code>savevm</code>, <code>blockdev-snapshot-sync</code></td>
+  </tr>
+  <tr>
+   <td>Desktop Control</td>
+   <td>Screenshots, keyboard, mouse</td>
+   <td>VNC, GPU, USB tablet, QMP input injection</td>
+  </tr>
+  <tr>
+   <td>Network and Isolation</td>
+   <td>Network modes, port forwarding</td>
+   <td>SLIRP NAT, <code>restrict=on</code>, <code>guestfwd</code></td>
+  </tr>
+  <tr>
+   <td>Performance</td>
+   <td>What makes it fast</td>
+   <td><code>io_uring</code>, IOThreads, TCG vs KVM</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Contributing</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Guide</th>
+   <th>When to use</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Creating Images</td>
+   <td>Build a new base or overlay image package</td>
+  </tr>
+  <tr>
+   <td>Extending the Sandbox</td>
+   <td>Add a method, OS, architecture, or QEMU flag</td>
+  </tr>
+  <tr>
+   <td>Testing</td>
+   <td>Run or write tests</td>
+  </tr>
+  <tr>
+   <td>Releasing</td>
+   <td>Cut a release</td>
+  </tr>
+ </tbody>
+</table>

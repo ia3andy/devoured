@@ -1,0 +1,168 @@
+<p>Every SaaS company has the same uncomfortable question after a major incident: <strong>who noticed first, the monitoring or the customers?</strong> For a long time our honest answer was “it depends”. This post describes how a small team rebuilt the detection platform behind our automated incident creation (“AutoHOT”, where HOT is our internal name for a high-severity incident) on <strong>Apache Kafka, Apache Flink on Kubernetes and OpenTelemetry</strong>, what we measured month by month for eighteen months, and what we would do differently.</p>
+<p>It is not a success story with a bow on it. In-scope recall went from about 60% to a peak of 86%, then fell back to 64% in a bad month. Precision is still below where we want it. We think the numbers are more useful than the slogans.</p>
+<h2><strong>The use case</strong></h2>
+<p>We run more than ten cloud products for millions of tenants. Each product emits <strong>client-side operational telemetry</strong> for every user action: an event when a task starts, and one when it succeeds, fails or is abandoned, tagged with tenant, user, the named “experience” (view issue, edit page, view board) and the HTTP status. Across all products, there are billions of events a day, and it is the closest thing we have to ground truth about whether customers can actually do their work.</p>
+<p>The job of central monitoring is to turn that stream into three answers, fast:</p>
+<ol>
+ <li><strong>Is something wrong?</strong> An error rate or a volume drop that a human would call an incident.</li>
+ <li><strong>How big is it?</strong> Distinct users and tenants impacted, and where: which tenant, database shard, region, or globally.</li>
+ <li><strong>Who should be woken up, at what severity, with what evidence?</strong></li>
+</ol>
+<p>The first-generation system did this with a Node.js aggregator fed from the event bus through a cloud queue, with an in-memory cache for de-duplication and task pairing, running on roughly 90 virtual machines. It worked, and it taught us the domain. It also had three problems we could not tune away:</p>
+<ul>
+ <li><strong>Latency.</strong> Event-to-metric took more than 40 seconds on a good day. Detectors then needed several minutes of windowed data on top of that.</li>
+ <li><strong>Noisy neighbours.</strong> The queue was shared infrastructure. Two incidents in one year were caused by <em>another</em> tenant’s lag on the same queue, which is a bad property for the system that is supposed to detect incidents.</li>
+ <li><strong>Cost that scaled with onboarding.</strong> Adding products and experiences took the run cost from roughly $120K to $230K a year, and the cache tier hit 100% CPU during a routine change.</li>
+</ul>
+<p>We also had a correctness problem that only became visible once we had better data. Client-side telemetry only exists when a page loads. A hard-down database shard produces <strong>silence</strong>, not errors. Any design that only looks for failures will read silence as health.</p>
+<h2><strong>Design goals</strong></h2>
+<p>We wrote down five goals before choosing technology, and they are worth stating because they explain most of the trade-offs below.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Goal</th>
+   <th>Concrete target</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Latency</td>
+   <td>Event to metric under 10 seconds; detector decision on the next minute boundary</td>
+  </tr>
+  <tr>
+   <td>Isolation</td>
+   <td>A dedicated consumer path; no shared queue in the critical path</td>
+  </tr>
+  <tr>
+   <td>Correctness under replay</td>
+   <td>Idempotent writes so that a restart or replay never double-counts impact</td>
+  </tr>
+  <tr>
+   <td>Cost</td>
+   <td>Run cost that grows with event volume, not with the number of onboarded experiences</td>
+  </tr>
+  <tr>
+   <td>Operability</td>
+   <td>One configuration source for filters, transforms, thresholds and sinks; onboarding an experience should be a pull request, not a deploy</td>
+  </tr>
+ </tbody>
+</table>
+<p>Reading left to right:</p>
+<p><strong>Upstream.</strong> Products emit operational events through an analytics gateway into the company event bus, which is built on Apache Kafka. Rather than consume the whole firehose, we register a <strong>server-side subscription filter, kept as code</strong>: an allow-list of products and experiences, with experiment and synthetic traffic dropped at the bus. The matching fraction lands on a <strong>dedicated Kafka topic</strong> with a seven-day retention that doubles as our replay window. Two side inputs feed the pipeline: a tenant-context service (tenant to shard, region, edition, licence count) and a configuration repository.</p>
+<p><strong>Stream processing.</strong> One Apache Flink 1.20 job, deployed through the Flink Kubernetes Operator, does the work. Details in the next section.</p>
+<p><strong>Storage and signal plane.</strong> Metrics go to a Prometheus-compatible time-series database via OpenTelemetry, and to a commercial metrics service where our detectors currently run. Per-minute impact aggregates go to a multi-region key-value store and to Apache Parquet files in object storage, from where a lakehouse builds the contractual SLA tables. A small Go GraphQL service, the Impact API, serves “who is impacted and how many” questions from those stores.</p>
+<p><strong>Decision plane.</strong> The AutoHOT engine (Go, active-active in two regions) turns detector alerts into anomalies, quantifies impact every minute through the Impact API, applies a scoped severity matrix, suppresses blips, creates the incident ticket, pages the right teams and keeps re-evaluating until the impact clears.</p>
+<p><strong>Downstream.</strong> Responders, the tenant health dashboard, enterprise SLA reporting, status and comms tooling, product-team SLO dashboards, and post-incident analytics that feed thresholds back into configuration.</p>
+<h2><strong>What we built</strong></h2>
+<h3><strong>1. Let the bus do the filtering</strong></h3>
+<p>The first decision was to stop being a “direct consumer of everything”. Operational events are about 55% of all traffic on the bus. Our subscription filter is a ~770-line YAML file generated from the same product configuration that drives everything else, so the pipeline only sees the products and experiences it is responsible for. This alone removed a whole class of scaling work and made the topic small enough that seven days of retention is cheap.</p>
+<h3><strong>2. One Flink job, deliberately</strong></h3>
+<p>We run a single job rather than one per product. The graph is:</p>
+<pre><code>kafka-source
+  -&gt; filter-and-parse            (drop events &gt; 15 min old, 401s, no-user events)
+  -&gt; apply-transformations       (config-driven regex/rule transforms)
+  -&gt; keyBy(product, subproduct, tenant)
+  -&gt; event-enricher              (async, tenant-context sidecar, cache, bulkhead + circuit breaker)
+  -&gt; fan-out:
+       metrics       -&gt; OpenTelemetry (OTLP) exporter -&gt; Prometheus-compatible TSDB
+                     -&gt; StatsD (legacy metric names preserved)
+       logs          -&gt; log analytics
+       user-dedup    -&gt; 30 s keyed TTL state -&gt; distinct-user counters
+       aggregate     -&gt; 60 s tumbling windows keyed (product, subproduct, experience, tenant)
+                        carrying HyperLogLog sketches
+                     -&gt; key-value store (idempotent PutItem on (PK, SK))
+                     -&gt; Parquet FileSink (committed on checkpoint)
+       side streams  -&gt; 4xx impact, error-message impact, taskStart&lt;-&gt;terminal pairing (timers)
+       detectors     -&gt; per-minute tallies -&gt; thresholds -&gt; alert queue   (shipped dark)</code></pre>
+<ul>
+ <li><strong>Async enrichment with a bulkhead and a circuit breaker.</strong> The tenant-context lookup is the one external call in the hot path. It runs through a sidecar with a 500k-entry in-memory cache, a baked read-only tenant map as the first-level lookup, a semaphore bulkhead that fails fast at 50 in-flight calls, and a circuit breaker that opens on a 50% failure or slow-call rate. Before this, a slow dependency back-pressured the whole job. After it, we have not had an enrichment-induced stall.</li>
+ <li><strong>HyperLogLog instead of user IDs.</strong> “Distinct impacted users” has to be mergeable across minutes, tenants, shards and regions. Summing per-row counts double-counts. Each 60-second window carries an HLL sketch; the Impact API unions sketches at read time for any grouping the caller asks for. The cost is format coupling between the Java producer and the Go consumer (we shipped one hotfix when the sketch precision parameter drifted) and about 1.5% error, which nobody has noticed.</li>
+ <li><strong>Idempotent sinks, at-least-once metrics.</strong> The key-value store key is (product, day, hour, job) plus (window, tenant, subproduct, experience), so replaying the topic rewrites identical rows. Parquet files roll on checkpoint, so they are exactly-once. Metrics are fire-and-forget: a restart produces a two to three minute dip followed by a replay surge, and we accept that because detectors read the pre-aggregated store, not the raw counters.</li>
+ <li><strong>Preserve the old metric names.</strong> The StatsD path emits under the legacy metric names. Product teams’ SLO dashboards and detectors did not have to change on cutover day, which is the only reason cutover day was boring.</li>
+ <li><strong>RocksDB, 30-second checkpoints, savepoint upgrades.</strong> State lives in RocksDB, checkpoints go to object storage every 30 seconds, and upgrades restore from savepoints keyed by stable operator UIDs. We learned the hard way that a topology change deployed with “undeploy and redeploy” discards state silently; we now treat operator UIDs as an API.</li>
+ <li><strong>Autoscaler tuning is a reliability feature.</strong> Early on every rescale was a full job restart and we saw around eight restarts a day. Setting the operator autoscaler to a 0.7 target utilisation, a 0.3 boundary, vertex parallelism between 18 and 25 and a three-hour scale-down interval took that to zero. Our production deploy pipeline now fails if the job restarts more than three times in ten minutes.</li>
+ <li><strong>Configuration as the control plane.</strong> A single products.yaml with a CUE schema generates the Kafka subscription filter, the transforms, the detector thresholds and the sink routing. Since mid-2026 the job hot-loads a runtime bundle of that config from object storage, so onboarding an experience no longer needs a redeploy.</li>
+</ul>
+<h3>Operator design: knowing when to merge and when to split</h3>
+<p>One of the more nuanced lessons from building this job was that operator granularity isn’t a one-time architectural decision — it’s something you revisit as the job matures under real load. We learned this in both directions.</p>
+<p>Merge when you’re doing redundant work. Early on, the pipeline had a filter followed by a map: the filter would parse the JSON to decide if a message was worth processing, and then the map would parse it again to deserialize it into a typed Payload. Combining these into a single flatMap — parse once, emit only if valid — eliminated the redundant deserialization entirely. The same principle led us to use Flink side outputs for fan-out to log analytics, StatsD, and OpenTelemetry rather than separate operators: one pass through the graph, three destinations.</p>
+<p>Split when operators have different scaling needs. The opposite lesson came later, under production load. We had our JSON parsing and transformation logic running in a single operator, but the enrichment step — doing async lookups to resolve tenant metadata — was pegging at 100% CPU and becoming a bottleneck for the entire pipeline. The fix was to explicitly separate “Phase 1: parse and filter (I/O bound)” from “Phase 2: apply transformations (CPU bound)” so each could be assigned its own parallelism independent of the other. What looks like one logical step on a whiteboard can become two distinct operators in Flink the moment they have different resource profiles under real traffic.</p>
+<h3><strong>3. The decision engine</strong></h3>
+<p>Detectors fire on the metrics. The alert travels through the paging service, a pub/sub topic and one queue per engine region. Both regions consume every alert; correctness comes from a lock row in a multi-region table keyed by a business de-duplication ID, never the queue message ID, with a five-minute takeover if the owning region stalls. The incident-manager API adds a second, authoritative lock, which is the last line of defence against replication lag.</p>
+<p>Every minute, the engine asks the Impact API for the window from fifteen minutes before the anomaly to now, raw and noise-filtered, and applies a scoped severity matrix. Tenants with two or fewer impacted users are treated as noise. A blip check watches the per-minute unique-user series for fifteen minutes before a lower-severity ticket is cut — this blip detection alone prevented paging people ~300 times for false positives in FY26. When a ticket is created, the engine pages the top five dependent services by tier, opens the chat channel, triggers automated comms, provides details on which tenants need to be notified of potential impact, initiates an AI-assisted first investigation, and continually monitors impact for severity upgrades and re-evaluates until the impact clears.</p>
+<h3><strong>4. Watching the watcher with OpenTelemetry</strong></h3>
+<ul>
+ <li><strong>OpenTelemetry end to end.</strong> The Flink job exports metrics over OTLP to a Prometheus-compatible TSDB (Grafana Mimir), and the engine emits OpenTelemetry traces and OTLP metrics. That gives us one vendor-neutral view across a Java stream job and a Go control plane.</li>
+ <li><strong>A synthetic deep-check every 15 minutes</strong> injects a fake alert and drives it through anomaly, impact analysis, ticket creation and closure. If any hop breaks, we know within a quarter of an hour, not at the next real incident.</li>
+ <li><strong>Self-monitoring detectors on the platform:</strong> divergence between the new pipeline and the legacy path during the migration, zero writes to the impact store, enrichment error burn rate, and a per-message good/bad SLO on the engine.</li>
+</ul>
+<h2>Results</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Metric</th>
+   <th>Before</th>
+   <th>After</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Event-to-metric latency</td>
+   <td>more than 40 s</td>
+   <td>under 10 s</td>
+  </tr>
+  <tr>
+   <td>Sustained throughput</td>
+   <td>roughly 500M events/day</td>
+   <td>more than 1B events/day at 50% sampling; 10k+ events/s tested</td>
+  </tr>
+  <tr>
+   <td>Job restarts</td>
+   <td>about 8 per day</td>
+   <td>0 in steady state</td>
+  </tr>
+  <tr>
+   <td>Compute footprint</td>
+   <td>about 90 VMs plus queue and cache tiers</td>
+   <td>4 Kubernetes pods</td>
+  </tr>
+  <tr>
+   <td>Monthly run cost</td>
+   <td>about $20,000</td>
+   <td>about $650 (roughly 97% lower)</td>
+  </tr>
+  <tr>
+   <td>Recovery from a stall</td>
+   <td>manual</td>
+   <td>about 20 minutes via Kafka replay, no data loss</td>
+  </tr>
+  <tr>
+   <td>Impact query latency for the dashboard</td>
+   <td>about 10 s</td>
+   <td>about 1 s</td>
+  </tr>
+  <tr>
+   <td>Data parity vs legacy during shadow run</td>
+   <td>not measurable</td>
+   <td>99.9% over two weeks</td>
+  </tr>
+ </tbody>
+</table>
+<h2><strong>What did not work</strong></h2>
+<ul>
+ <li><strong>Silence still looks like health.</strong> The two worst misses of the period were a database shard that went hard-down (no page load, no events) and a stall in our own upstream event pipeline that left the detector starved.</li>
+ <li><strong>Quantification lagged detection.</strong> In one Sev1 the ticket was raised early but the impact count showed about two thousand users when the real number was over eighty thousand.</li>
+ <li><strong>Read-time aggregation collapsed under concurrency.</strong> The Impact API unions minute-grain sketches on every request with no roll-up and no shared cache.</li>
+ <li><strong>The detection input is single-region.</strong> The engine is active-active, but the event gateway, the bus subscription and the Flink job live in one region.</li>
+ <li><strong>Rejection hygiene is a data-quality problem.</strong> Almost half of rejected tickets had no recorded reason.</li>
+</ul>
+<h2><strong>What we would tell another team</strong></h2>
+<ol>
+ <li><strong>Filter at the bus, not in the job.</strong> Subscription filters as code kept the topic small, the job simple and the cost linear in the events you care about.</li>
+ <li><strong>Design the sink keys before the topology.</strong> Idempotent (partition, sort) keys are what make Kafka replay a recovery tool instead of a double-counting hazard.</li>
+ <li><strong>Sketches, not IDs.</strong> Distinct counts that must merge across dimensions belong in HyperLogLog.</li>
+ <li><strong>Treat operator UIDs and autoscaler settings as production configuration.</strong></li>
+ <li><strong>Report recall and coverage separately.</strong> Recall is your detector’s quality; coverage is your instrumentation decision.</li>
+ <li><strong>Instrument the detector with the same rigour as the product.</strong></li>
+ <li><strong>Be honest about silence.</strong> Client-side telemetry is a superb signal for degradation and a useless one for hard-down. Pair it with something that emits when nothing else does.</li>
+</ol>

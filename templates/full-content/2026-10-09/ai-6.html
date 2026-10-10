@@ -1,0 +1,53 @@
+<p>Today we’re previewing <strong>ATLAS</strong>, a new benchmark designed to grade the accuracy and completeness of agent responses to challenging real-world workflows that heavily utilize web search. ATLAS pairs queries grounded in real search demand with verified golden answers, using an automated pipeline that lets us refresh both as the web and models evolve.</p>
+<p>Some of our takeaways from our runs of ATLAS to date:</p>
+<ul>
+ <li>Comprehensive search at a reasonable cost is far from solved. Max-effort search agents consistently outperformed their lower-compute counterparts, but no agent run costing less than $1 per task achieved a row F1 over 0.5.</li>
+ <li>Even the most expensive search agents miss about 1/3 of the golden results, indicating substantial room for web search to improve performance in use cases where completeness is critical.</li>
+ <li>When holding the model harness fixed, Exa defines the cost-performance Pareto frontier, with scores ranging 16% across different search backends.</li>
+</ul>
+<h2>What does a good benchmark look like?</h2>
+<p>When language models first started using web search, they would often get stuck managing long contexts or reasoning across multiple documents. Even the order of search results could throw them off. In short, agentic search was bottlenecked by intelligence. Now, frontier models handle these tasks much more reliably and at a fraction of the cost, so the bottleneck to completing deep and wide research tasks is whether your search backend can actually find relevant information in the world.</p>
+<p>Recent bake-offs between agentic search configurations reflect the increasingly urgent need to rigorously evaluate web search efficacy. These evaluations seek to elucidate which combinations of harness, model, and search provider work best on challenging and economically valuable research tasks.</p>
+<p>To support rigorous comparisons, we think an agentic search benchmark should:</p>
+<ol>
+ <li><strong>Require search.</strong> Answers must depend upon retrieving information from sources beyond what models already have memorized.</li>
+ <li><strong>Reward search quality and effort.</strong> High-quality search results and additional search volume should meaningfully improve scores.</li>
+ <li><strong>Represent real-world search tasks.</strong> Tasks must reflect what humans and agents actually search for.</li>
+</ol>
+<p>These requirements may sound obvious, but today’s popular agentic-search benchmarks each fail one or more of them. Newer benchmarks stay fresh by grading with an LLM judge, which makes runs expensive to grade and highly sensitive to grader design.</p>
+<p>These benchmarks tend to lose value over time as search providers optimize for them and the knowledge they require gets added to the latest frontier models. These issues are all downstream of the fundamental challenge that building new, high-quality search evals is slow and expensive. Therefore, agentic search benchmarks often go stale faster than they are replaced with fresh, up-to-date ones.</p>
+<h2>Designing ATLAS</h2>
+<p>We address these shortcomings with a new benchmark, <strong>ATLAS</strong> (<strong>A</strong>gentic <strong>T</strong>asks for <strong>L</strong>arge <strong>A</strong>ggregation + <strong>S</strong>earch), consisting of 547 deep and wide research tasks. Tasks are generated from seed topics drawn from clustering of anonymized search demand. Each task asks a system to discover every entity (e.g. a person, place or company) that meets precise conditions, and then to enrich each entity with 2–10 multi-hop attributes.</p>
+<p>Following a growing trend of synthetically generated benchmark data, we expend extensive inference-time compute within a structured pipeline to generate tasks and golden answers. Our pipeline includes a committee of frontier models and search providers which spend a median of 8 agent-hours and 1,200 searches per task to find answers, independently verify them against sources, and resolve disagreements or ambiguities until confident in their correctness. Because the pipeline is automated, we can regenerate the ATLAS dataset using topics based on recent search trends, keeping the benchmark aligned with what agents actually search for as the web updates.</p>
+<p>Given the large amount of inference-time compute deployed at eval generation time, the challenge we pose for this benchmark is <em>efficient search</em>: solve each task in under a minute and for under $1, a budget at which no current system reaches even 0.5 row F1.</p>
+<h2>Results</h2>
+<p>Based on a suite of ablations and experiments, we believe that ATLAS rectifies the multitude of flaws present in current popular agentic search evals, providing a benchmark that truly measures search and distinguishes various systems by search quality and effort.</p>
+<p>ATLAS strongly differentiates search providers.</p>
+<h3>ATLAS rewards search quality</h3>
+<p>ATLAS depends on search quality far more than existing benchmarks: when we severely degrade the quality of search by hiding the top 7 of every 10 search results, the same searcher loses roughly half of its ATLAS score. In contrast, on other benchmarks, the searcher retains 81–89% of its original score, indicating that these benchmarks do not actually measure search quality.</p>
+<h3>ATLAS is unmemorized</h3>
+<p>We measure memorization of evals by checking the percent of tasks whose full answer set is recalled by at least one of the major frontier models. Nearly 50% or more of other popular benchmarks are memorized.</p>
+<p>In contrast, ATLAS’s older rows are less memorized, and it includes fresh information past current frontier model knowledge cutoffs, where frontier models almost never answer correctly without search. As a result, adding search to frontier models gives a much bigger lift in performance over a no-search baseline than current popular evals.</p>
+<h3>ATLAS requires wide and deep search</h3>
+<p>74% of ATLAS’s tasks ask for 10 or more entities, and each entity needs 2–10 attributes. Moreover, these wide and deep tables actually require multi-hop searches as opposed to retrieval from a single URL or domain. We estimate, based on our dataset construction logs, that discovery of entities requires a median of 4 different domains per task and full discovery + enrichment requires a median of 18 different domains per task.</p>
+<h2>Construction and validation</h2>
+<p>Two agents from different model families do the construction: Codex with GPT-6 Astra and Claude Code with Opus 5.5. To ensure the gold is not biased towards any one search index, every agent searches through a provider-neutral tool we built.</p>
+<h3>1. Topic seeding</h3>
+<p>Each task starts from a topic in Exa’s aggregate, anonymized search demand. Seeding from real demand spreads ATLAS across more than 300 topics and increases the likelihood that proposed tasks are unmemorized.</p>
+<h3>2. Entity discovery</h3>
+<p>The two construction agents search independently over several passes to construct a golden list of entities. A verifier agent then point-wise checks every row, including its cited pages, with additional searches on a separate index. Any unsettled rows go to targeted repair.</p>
+<h3>3. Row enrichment</h3>
+<p>After the discovery entity list is established, an agent proposes enrichment columns. The two construction agents fill every cell independently, saving each value with a page citation and a verbatim quote. Verification, repair and a final checker then settle any disagreements.</p>
+<h2>Grading</h2>
+<p>We grade returned tables against golden answers using three F1 metrics, computed per task and averaged over tasks. Each F1 is the harmonic mean of precision and recall.</p>
+<ul>
+ <li><strong>Discovery F1</strong> counts just row discovery.</li>
+ <li><strong>Item F1</strong> counts cells, including both discovery and enrichment.</li>
+ <li><strong>Row F1</strong> counts rows, where a row is correct only when every cell in the row is. This is our headline metric.</li>
+</ul>
+<p>The grader aligns returned rows to the key by entity name and a set of aliases, falling back to an LLM aligner on misses. Grading is both cheap and consistent.</p>
+<h2>Driving future innovation</h2>
+<p>We believe that ATLAS provides a much more faithful signal than existing benchmarks of which agentic search configurations actually work on hard, economically valuable research. As reflected in initial runs on ATLAS, efficient agentic search remains far from solved.</p>
+<p>Exa will continue to push the frontier of efficient search toward solving wide and deep research at low latency and cost. We view ATLAS as a first step toward a new generation of continuously refreshed search evals, and we hope it helps measure progress on the workflows for which people actually rely on agentic web search.</p>
+<h2>Citation</h2>
+<pre><code>@online\{exa2026atlas,  author = \{Alexander Goldberg and Joshua Ahn and Scott Langille},  title = \{\{ATLAS: Evaluating Agents on Search-Intensive Tasks}},  date = \{2026-10-08},  url = \{https://exa.ai/blog/atlas-benchmark}}</code></pre>

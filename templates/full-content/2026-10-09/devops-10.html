@@ -1,0 +1,140 @@
+<h1>How Mirelo AI brought sound design to the IDE with MCP and Kiro powers</h1>
+<p>Mirelo AI set out to fix how sound design works in the integrated development environment (IDE). For most developers, sound design has always meant leaving the IDE: opening a browser, digging through stock libraries, and trimming and syncing clips by hand. Sound is the last creative layer most developers reach, and the one they most often get wrong without specialist help. For teams building games, apps, and interactive products, digital audio workstations (DAWs) live outside the development workflow, so most ship with placeholder audio or nothing at all.</p>
+<p>Mirelo AI, a Europe-based generative AI lab, builds models that turn a text prompt or a video clip into production-ready sound effects, synced to the picture when video is provided. Feed a video clip to the model and it returns audio matched to the action on screen. Mirelo built a hosted server on the Model Context Protocol (MCP), the open standard that lets AI assistants discover and call external tools. With Mirelo’s hosted MCP server, developers can reach those models from the tools they already use.</p>
+<p>In this post, we describe how that MCP server became a power in Kiro, the agentic development environment from AWS. We also cover how Mirelo’s AWS Enterprise Support account team helped bring it to the Kiro powers marketplace. The result: Developers using Kiro can generate sound design from a natural-language prompt without leaving their editor.</p>
+<h2>Solution overview</h2>
+<p>With a Kiro power, you get Mirelo’s hosted MCP server bundled with Agent Skills that tell the AI assistant when and how to use it. When a developer’s prompt mentions sound, audio, or effects, Kiro activates the power, connects to Mirelo’s server, and loads its tools into the conversation. The developer describes the sound they want. Kiro calls Mirelo’s models and returns a finished audio file into the project.</p>
+<p>The design has three parts:</p>
+<ul>
+ <li>Mirelo’s audio models, exposed through their existing HTTP API.</li>
+ <li>The hosted MCP server (https://mcp.mirelo.ai/mcp), which wraps that API as callable tools.</li>
+ <li>The Kiro power, which bundles the MCP configuration with an Agent Skill and publishes it to the marketplace for one-action install.</li>
+</ul>
+<h2>The problem: Sound is the last mile of creative development</h2>
+<p>Visual assets have mature tooling inside IDEs and design systems. Audio does not. A game developer prototyping a level generates textures, writes shaders, and tests physics in the editor. But the moment they need a matching footstep sound, the flow breaks. They open a browser, search a stock library, download candidates, trim them to length, and manually sync timing.</p>
+<p>Content creators working with generative video hit the same wall from the other side. AI models now produce visual content in seconds, but each clip ships silent, so adding sound means switching tools, breaking flow, and spending more time on audio than the video itself took to create.</p>
+<p>Mirelo’s thesis: Sound generation should live where developers already work, not in a separate application.</p>
+<h2>From API to agent tool: The Mirelo MCP server</h2>
+<p>Mirelo already had an API powering their Studio product. The question was how to make those capabilities reachable inside AI-powered development environments without asking developers to write integration code.</p>
+<p>MCP answers that. By wrapping their API as an MCP server, Mirelo exposed their full audio generation pipeline to any compatible AI assistant. The Mirelo MCP is hosted and remote: developers add a single URL, authenticate through their browser, and start generating audio from conversation. There’s no local install and no API key to manage.</p>
+<p>The server covers the full sound design loop:</p>
+<ul>
+ <li>Generate from text: describe a sound effect in natural language and receive a finished audio file.</li>
+ <li>Generate from video: pass a video clip and get synced sound effects for every action.</li>
+ <li>Extend: lengthen an audio clip that is too short for the scene.</li>
+ <li>Inpaint: replace a selected region of a clip while leaving the rest untouched.</li>
+</ul>
+<p>A preflight tool estimates credits and runtime before generation runs, which matters when an agent works through a batch of files rather than a single effect.</p>
+<h2>Comparing direct API access with a Kiro power</h2>
+<p>Without the power, a developer who wants a sound effect works against the API directly. For anything longer than a short clip, that means the asynchronous path: submit the job, get a job ID back, poll for status, then download the result once it completes.</p>
+<pre><code># 1. Submit the job
+JOB=$(curl -s https://api.mirelo.ai/v2/text-to-sfx/v1.6/jobs \
+  --request POST \
+  --header 'Authorization: Bearer sk-&lt;your-api-key&gt;' \
+  --header 'Content-Type: application/json' \
+  --data '\{
+    "prompt": "Heavy rain on a metal roof with distant thunder",
+    "duration_ms": 45000,
+    "output_format": "mp3"
+  }' | jq -r '.job_id')
+
+# 2. Poll until the job leaves the "processing" state
+while true; do
+  STATUS=$(curl -s "https://api.mirelo.ai/v2/text-to-sfx/v1.6/jobs/$JOB" \
+  --header 'Authorization: Bearer sk-&lt;your-api-key&gt;' | jq -r '.status')
+  [ "$STATUS" = "succeeded" ] &amp;&amp; break
+  [ "$STATUS" = "failed" ] &amp;&amp; echo "generation failed" &amp;&amp; exit 1
+  sleep 3
+done
+
+# 3. Fetch the result URL and download the clip
+curl -s "https://api.mirelo.ai/v2/text-to-sfx/v1.6/jobs/$JOB" \
+  --header 'Authorization: Bearer sk-&lt;your-api-key&gt;' \
+  | jq -r '.result_urls[0]' \
+  | xargs curl -o rain.mp3</code></pre>
+<p>This works, but the developer owns every step. They store the API key, choose the sync endpoint for short clips and the async endpoint for longer ones, and call preflight to estimate credits. They also run the poll loop with sensible backoff, handle the failure state, download the result, and retry on transient errors. Each surface, whether a web app, a game editor, or a batch script, reimplements the same glue.</p>
+<p>With the power, the developer describes the sound and the agent assembles that same request. Kiro authenticates through browser sign-in and reads the tool schema Mirelo published. It fills in prompt, duration_ms, and output_format from the conversation, runs the preflight tool when the job is large, and waits on the async job when generation runs long. The developer writes:</p>
+<blockquote>
+ <p><em>Generate 45 seconds of heavy rain on a metal roof with distant thunder, as an mp3.</em></p>
+</blockquote>
+<p>The file is added to the project. The underlying API call is the same. What changes is who assembles and operates it.</p>
+<table>
+ <thead>
+  <tr>
+   <th><strong>Concern</strong></th>
+   <th><strong>Direct API</strong></th>
+   <th><strong>Kiro power/MCP tool call</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Authentication</td>
+   <td>Store and send Bearer sk-… on every call</td>
+   <td>Browser sign-in, managed by Kiro</td>
+  </tr>
+  <tr>
+   <td>Cost check</td>
+   <td>Call /preflight yourself</td>
+   <td>Agent calls the preflight tool when the job warrants it</td>
+  </tr>
+  <tr>
+   <td>Sync compared to async</td>
+   <td>You choose the endpoint and implement polling</td>
+   <td>Agent selects based on job size</td>
+  </tr>
+  <tr>
+   <td>Response handling</td>
+   <td>Parse result_urls and download</td>
+   <td>Agent returns the file into the project</td>
+  </tr>
+  <tr>
+   <td>Reuse across tools</td>
+   <td>Reimplement the glue per surface</td>
+   <td>One power, available in any Kiro session</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Why package it as a Kiro power</h2>
+<p>Mirelo’s MCP server already worked in several AI assistants. With a Kiro power, you get discoverability, so you find the integration while browsing the marketplace, and automatic activation, so there is no URL to paste or configuration to write.</p>
+<p>A power bundles an MCP server with Agent Skills, the structured instructions that guide an AI assistant through a specific workflow. The AI assistant learns what tools exist and when to reach for them. Just as important is how a power loads. A traditional MCP setup registers every tool definition upfront. Connecting a handful of servers can burn tens of thousands of tokens, a large share of the context window, before your first prompt. Kiro powers load dynamically instead. Installed powers sit dormant until your conversation mentions relevant keywords, at which point Kiro activates only that power’s tools and skills and deactivates them when you move on. Skills load the same way, on-demand, so the AI assistant pulls in a specific workflow’s instructions only when it’s working on that task. The result is near-zero baseline context cost and a Mirelo integration that surfaces its sound-design tools exactly when they’re needed, without crowding out the rest of your work.</p>
+<p>The structure of a power is small. The following layout shows the three files that define it:</p>
+<pre><code>example-power/
+|-- plugin.json          # Manifest: name, keywords, and metadata
+|-- mcp.json             # Remote MCP server configuration
++-- skills/
+    +-- sound-design/
+        +-- SKILL.md     # Guides the agent through audio workflows</code></pre>
+<p>The <code>plugin.json</code> manifest declares the keywords that trigger activation. The <code>mcp.json</code> file points to the provider’s hosted server. The skill teaches the agent the difference between generating a one-shot effect and sound-designing an entire sequence.</p>
+<h2>The path from idea to marketplace</h2>
+<p>The Kiro powers connection came from Mirelo’s AWS Enterprise Support account team. The team spotted the fit between Mirelo’s MCP server and the powers marketplace. They built a proof-of-concept power to show how the integration would work and connected Mirelo with the submission process. Mirelo then packaged their official hosted server as the published power.</p>
+<p>From the first conversation to a live power took about two weeks, most of it marketplace review. The engineering itself fit into a single afternoon. The impact is easiest to see in the developer’s workflow. Finding a single sound effect that matches the video is slow, manual work. That includes searching a stock library, auditioning candidates, trimming, and syncing. With the power, a single prompt returns a usable, synced clip, replacing a lengthy manual workflow with one step.</p>
+<h2>What developers can do with it</h2>
+<p>After the Mirelo power is active, sound design becomes part of the conversation. A developer polishing a web app might ask:</p>
+<blockquote>
+ <p><em>Generate a soft, satisfying click for this submit button. Short, no metallic ring.</em></p>
+</blockquote>
+<p>On a game prototype, the request could be:</p>
+<blockquote>
+ <p><em>Here’s my gameplay clip. Generate footstep and impact sounds that match the character’s movement.</em></p>
+</blockquote>
+<p>For a video project that needs a longer bed:</p>
+<blockquote>
+ <p><em>Extend this forest ambience to forty-five seconds so it covers the full scene transition.</em></p>
+</blockquote>
+<p>And to fix a single moment:</p>
+<blockquote>
+ <p><em>The glass-break sound at 0:03 is too harsh. Inpaint that region with something more subtle, like thin crystal.</em></p>
+</blockquote>
+<p>Each request calls Mirelo’s models and returns audio ready to use, without the developer leaving the editor.</p>
+<h2>A distribution channel for AI model companies</h2>
+<p>For Mirelo, the Kiro powers marketplace is a new kind of distribution. API businesses have historically reached developers through documentation sites, SDKs, and marketing. A power puts the capability inside the tool developers already use. Developers reach it by intent rather than by integration work.</p>
+<p>The model fits AI services that augment creative workflows. Developers don’t plan to use a sound API the way they plan to use a database. They need sound the moment they realize their project is silent. A power meets them at that point of intent.</p>
+<h2>Conclusion</h2>
+<p>In this post, we described how Mirelo AI turned a hosted MCP server into a Kiro power, and how AWS Enterprise Support helped move it into the marketplace. For developers, sound design is now a prompt away inside Kiro. For AI model companies, the same path turns an existing MCP server into a distribution channel that reaches developers at the point of intent.</p>
+<p>To get started:</p>
+<ul>
+ <li>Install the Mirelo power from the Kiro powers marketplace.</li>
+ <li>Try Mirelo and connect the hosted MCP server to your AI assistant.</li>
+ <li>Read the Kiro powers creation guide to package your own MCP server.</li>
+ <li>Review the Agent Plugins specification to build portable, vendor-neutral plugins.</li>
+</ul>

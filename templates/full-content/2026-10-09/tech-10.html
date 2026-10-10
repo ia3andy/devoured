@@ -1,0 +1,134 @@
+<h2>zerobrew</h2>
+<p><strong>zerobrew brings uv-style architecture to Homebrew packages on macOS and Linux.</strong></p>
+<h2>Install</h2>
+<pre>curl -fsSL https://zerobrew.rs/install | bash</pre>
+<p>The installer updates your shell config. After it finishes, restart your terminal or run the <code>source</code> command it prints.</p>
+<p>Or via Homebrew:</p>
+<pre>brew install zerobrewhq/zerobrew/zerobrew</pre>
+<h2>Update zerobrew</h2>
+<p>If you used the standalone installer, rerun it:</p>
+<pre>curl -fsSL https://zerobrew.rs/install | bash
+zb --version</pre>
+<p>If you installed with Homebrew:</p>
+<pre>brew update &amp;&amp; brew upgrade zerobrew</pre>
+<p>If you installed from the old <code>lucasgelfond/zerobrew</code> tap, it's no longer updated. Switch to the new one:</p>
+<pre>brew uninstall zerobrew
+brew untap lucasgelfond/zerobrew
+brew install zerobrewhq/zerobrew/zerobrew</pre>
+<h2>Quick start</h2>
+<pre>zb install jq                   # install one package
+zb install wget git             # install multiple
+zb bundle                       # install from Brewfile
+zb bundle install -f myfile     # install from custom file
+zb bundle dump                  # export installed packages to Brewfile
+zb bundle dump -f out --force   # dump to custom file (overwrite)
+zb uninstall jq                 # uninstall one package
+zb outdated                     # list packages with newer versions
+zb upgrade                      # upgrade all outdated packages
+zb upgrade jq wget              # upgrade specific packages
+zb reset                        # uninstall everything
+zb gc                           # garbage collect unused store entries
+zbx jq --version                # run without linking</pre>
+<h2>Performance snapshot</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Package</th>
+   <th>Homebrew (cold)</th>
+   <th>ZB (cold)</th>
+   <th>Cold speedup</th>
+   <th>Homebrew (warm)</th>
+   <th>ZB (warm)</th>
+   <th>Warm speedup</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Overall (100 packages)</strong></td>
+   <td>776s</td>
+   <td>117s</td>
+   <td><strong>6.6x</strong></td>
+   <td>638s</td>
+   <td>9.3s</td>
+   <td><strong>68x</strong></td>
+  </tr>
+  <tr>
+   <td>python@3.14</td>
+   <td>16.99s</td>
+   <td>1.97s</td>
+   <td>8.6x</td>
+   <td>14.37s</td>
+   <td>207ms</td>
+   <td>69.4x</td>
+  </tr>
+  <tr>
+   <td>node</td>
+   <td>29.31s</td>
+   <td>3.16s</td>
+   <td>9.3x</td>
+   <td>28.24s</td>
+   <td>232ms</td>
+   <td>121.7x</td>
+  </tr>
+  <tr>
+   <td>tesseract</td>
+   <td>34.63s</td>
+   <td>2.16s</td>
+   <td>16.0x</td>
+   <td>32.37s</td>
+   <td>476ms</td>
+   <td>68.0x</td>
+  </tr>
+  <tr>
+   <td>openjdk</td>
+   <td>32.09s</td>
+   <td>5.17s</td>
+   <td>6.2x</td>
+   <td>26.86s</td>
+   <td>448ms</td>
+   <td>60.0x</td>
+  </tr>
+  <tr>
+   <td>llvm</td>
+   <td>18.22s</td>
+   <td>9.14s</td>
+   <td>2.0x</td>
+   <td>9.66s</td>
+   <td>183ms</td>
+   <td>52.8x</td>
+  </tr>
+ </tbody>
+</table>
+<p>Measured on 2026-10-08 with zerobrew 0.3.5 (development release) and Homebrew 7.0.8 on macOS 26.6.2, MacBook Pro (M3 Pro, 18 GB RAM), ~318 Mbit/s download bandwidth. Homebrew started with nothing installed.</p>
+<ul>
+ <li><strong>Cold</strong>: the package and all of its dependencies uninstalled, empty download cache.</li>
+ <li><strong>Warm</strong>: the package and all of its dependencies uninstalled, downloads from the cold run still cached.</li>
+ <li>The median package was 5.3x faster cold and 56x faster warm. Per package, cold ranged from 1.6x (go) to 20x (ca-certificates) and warm from 18x (go) to 252x (ca-certificates). 24 of the 100 packages installed 100x faster or more warm, which is what the asterisk on the tagline refers to.</li>
+ <li>Cold installs are bound by the link. The same run on a ~69 Mbit/s connection came out at 3.3x cold and 69x warm. Big bottles like go and llvm spend nearly all of their cold time downloading, so both tools land close together there.</li>
+ <li>zerobrew doesn't run post-install steps yet. Homebrew did in these runs, so for the 13 formulae here that have them (ca-certificates, fontconfig, gcc, glib, gnupg, gnutls, llvm, node, openssl@3, python@3.13, python@3.14, ruby, unbound) Homebrew is doing work we aren't. ca-certificates is the obvious one, its step rebuilds the cert bundle. Next run gets <code>--skip-post-install</code> on the brew side until we run them too.</li>
+ <li>Warm installs use more disk. After an uninstall brew keeps the bottle, we keep the bottle and the unpacked keg in the store. That's the whole reason a reinstall is a clone and not a rebuild.</li>
+</ul>
+<h2>A note on how we are achieving these speeds</h2>
+<p>WRT Homebrew, I want it to be clear that both <code>brew</code> and <code>zerobrew</code> install the same bottles from <em>Homebrew's build farm</em>.</p>
+<p>The difference is what happens after the download: Homebrew runs Ruby to evaluate the formula, unpacks, rewrites paths with <code>install_name_tool</code>, and re-signs each binary one at a time, while zerobrew <strong>does the relocation in-process</strong> and links from a content-addressed store, so it pays for the download once and almost nothing after.</p>
+<p><strong>I want it to be clear that we are basically nothing without Homebrew's bottle build farm</strong>. Every package zerobrew installs is one they built, tested and published. We don't compile anything, we don't maintain formulae, and none of these numbers exist without that work. The speed comes from how the artifacts are installed, not from what's in them.</p>
+<h2>Relationship with Homebrew</h2>
+<p>zerobrew is more of a performance-optimized client for the Homebrew ecosystem. We rely on:</p>
+<ul>
+ <li>Homebrew's formula definitions (homebrew-core)</li>
+ <li>Homebrew's pre-built bottles when available</li>
+ <li>Homebrew's package metadata and infrastructure</li>
+</ul>
+<p>Our innovations focus on:</p>
+<ul>
+ <li>Content-addressable storage for deduplication</li>
+ <li>APFS clonefiles for zero-overhead copying</li>
+ <li>Source build fallback using Homebrew's Ruby DSL</li>
+</ul>
+<p>zerobrew is experimental. We recommend running it alongside Homebrew rather than as a replacement, and do <em>not</em> recommend purging homebrew and replacing it with zerobrew unless you are absolutely sure about the implications of doing so.</p>
+<h2>Project status</h2>
+<ul>
+ <li><strong>Status:</strong> Experimental, but quite useful. I (@cachebag) daily drive it myself.</li>
+ <li><strong>Feedback:</strong> If you hit incompatibilities, please open an issue or PR.</li>
+ <li><strong>License:</strong> Dual-licensed under Apache 2.0 OR MIT, at your choice. The source build shim is derived from Homebrew and is covered by its BSD 2-Clause license.</li>
+</ul>

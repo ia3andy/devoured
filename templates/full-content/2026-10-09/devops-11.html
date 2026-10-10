@@ -1,0 +1,168 @@
+<p>Crossplane providers have always paid a memory tax that grows with the size of the cluster they run in, not with the number of resources they manage. A provider watching ten managed resources on a cluster with two thousand CRDs and a few thousand Secrets could sit at well over a gigabyte of RSS while doing almost nothing. With crossplane-runtime v2.4.0, released on 2026-08-20 alongside Crossplane v2.4, and the provider releases that consume it, that tax is largely gone: on a cluster with ~2,000 CRDs, provider memory drops by roughly 80-95% depending on the provider.</p>
+<p>The crossplane-runtime side of this story is a community contribution. Rafał Jan (@rafal-jan) debugged where provider memory was going, wrote it up in crossplane-runtime#1056, implemented the fix in crossplane-runtime#1058 and carried it into provider-template. Thank you, Rafał.</p>
+<h2>Where the Memory Went</h2>
+<p>Every provider reads its own control plane through controller-runtime informer caches, and two of those caches were far bigger than intended:</p>
+<ul>
+ <li><strong>The CRD cache.</strong> Providers that implement safe-start watch CustomResourceDefinitions, and the default cache stores every CRD in the cluster in full, complete OpenAPI schema included. The safe-start gate only needs the CRD's group, kind and Established condition. With the Upjet AWS family installed that is 2,045 CRDs of schema held by every provider pod, whether or not it owns any of them.</li>
+ <li><strong>The Secret cache.</strong> The first Secret read through the manager client starts a cluster-wide Secret informer that caches every Secret in the cluster, most of which the provider will never look at again.</li>
+</ul>
+<p>All figures below come from a reconcile load test: a kind cluster with the provider-upjet-aws CRD set (~2,000 CRDs) and 3,000 Secrets, 300 managed resources (Certificate.applications.azuread.m.upbound.io) each referencing a Secret and publishing a connection Secret, three update rounds, averaged over the settle phase and the rounds. <strong>baseline</strong> is v2.4.0 release before the crossplane-runtime update and <strong>runtime v2.4</strong> adds the runtime v2.4.0 defaults (CRD schema strip on, Secret cache off).</p>
+<p><em>Figure 1. provider-upjet-azure, baseline versus the runtime v2.4 defaults. Peak heap in use falls by 83% and peak RSS by 78%; requests per round grow by 12-18% because Secret reads leave the informer.</em></p>
+<h2>What Changed in crossplane-runtime v2.4</h2>
+<p>The CRD fix is a cache transform, <code>customresourcesgate.TransformStripCRDSchema</code>, that drops the schema, <code>managedFields</code> and the last-applied annotation from every CRD before it enters the informer cache. A provider opts in with one entry in its manager's cache options:</p>
+<pre><code>Cache: cache.Options\{
+    ByObject: map[client.Object]cache.ByObject\{
+        &amp;apiextensionsv1.CustomResourceDefinition\{}: \{
+            Transform: customresourcesgate.TransformStripCRDSchema,
+        },
+    },
+},
+</code></pre>
+<p>On a cluster with 2,045 Upjet AWS CRDs that alone takes a provider from ~630 MiB to ~83 MiB. The one thing to remember is that a CRD read through this cache is stripped: never write it back with a full-object <code>Update</code>.</p>
+<p>The Secret cache is a trade-off, so it stays on by default and each provider gains a flag, <code>--enable-secret-cache</code>. With <code>--no-enable-secret-cache</code>, Secret reads through the manager client become live API calls: memory stops scaling with the number of Secrets in the cluster, and the provider issues one extra request per Secret read per reconcile. Turn it off when the cluster holds thousands of Secrets the provider never touches; leave it on if the API server is already busy.</p>
+<h2>provider-kubernetes and provider-helm: Caching Target-Cluster Clients</h2>
+<p>provider-kubernetes and provider-helm also build a client per ProviderConfig to talk to the <em>target</em> cluster, and they build it fresh on every reconciliation. Since controller-runtime v0.20.0 (kubernetes-sigs/controller-runtime#2901) a new client's first lookup primes its RESTMapper with full aggregated discovery, which on a cluster with 1,500-2,000 CRDs is a multi-megabyte download per managed resource per reconcile. provider-kubernetes#541 measured the result: ~2.1 GiB peak and ~1,000m of CPU for 300 Objects, against ~0.6 GiB on v1.2.1, with the API server serving 614 discovery requests per round where v1.2.1 made 3.</p>
+<p>provider-kubernetes#543 caches the built clients, keyed by a digest of the credential material so that ProviderConfigs sharing a kubeconfig share a client and a rotated credential gets a fresh one. provider-kubernetes#560 sizes the cache automatically: at startup the provider lists its ProviderConfigs, counts the distinct credential sets and bounds the cache at that number plus headroom, so there is no knob to tune. The cache reports provider_kubernetes_client_cache_size, provider_kubernetes_client_cache_entries and provider_kubernetes_client_cache_events_total (hit, miss, evict); a sustained eviction rate is the signal that more credential sets appeared than the cache was sized for and a restart will re-size it. provider-helm imports the same package and inherits all of it on its next dependency bump.</p>
+<p>All provider-kubernetes figures come from a reconcile load test: a kind cluster with the provider-upjet-aws CRD set (~2,000 CRDs) and 3,000 Secrets, 300 Objects each managing a ConfigMap and publishing a connection Secret, three update rounds, averaged over the settle phase and the rounds. <strong>baseline</strong> is v1.3.0 before either change, <strong>client cache</strong> adds #543, and <strong>client cache + runtime v2.4</strong> adds the runtime v2.4.0 defaults (CRD schema strip on, Secret cache off).</p>
+<p><em>Figure 2. Memory and requests per configuration. The client cache removes the discovery traffic and cuts allocation per round tenfold; the runtime v2.4 defaults then take peak heap from 450 MiB to 72 MiB, paid for with ~200 live Secret reads per round.</em></p>
+<h2>What You Need to Do</h2>
+<ul>
+ <li><strong>Operators.</strong> Upgrade to a provider release with the runtime v2.4.0 wiring and the CRD saving comes with no configuration. Add --no-enable-secret-cache through your DeploymentRuntimeConfig if the cluster holds many Secrets the provider does not own and API server load is not your constraint. On provider-kubernetes and provider-helm there is nothing to size; watch provider_kubernetes_client_cache_events_total\{event="evict"}.</li>
+ <li><strong>Provider authors.</strong> Follow provider-terraform#320: bump crossplane-runtime/v2, crossplane-tools and crossplane/apis/v2 to v2.4.0, register apiextensionsv1 in the manager scheme, add the ByObject transform and the flag. If your provider builds clients for other clusters on Connect, cache them.</li>
+</ul>
+<h2>Rolling It Out Across the Ecosystem</h2>
+<p>Neither change does anything until a provider wires it into its <code>main.go</code>, so the runtime release was followed by the same three-part change across the official and community providers: bump <code>crossplane-runtime/v2</code>, <code>crossplane-tools</code> and <code>crossplane/apis/v2</code> to v2.4.0, build the scheme explicitly before the manager, and add the <code>ByObject</code> transform plus the the flag. The reference implementation is provider-terraform#320; the release notes point at provider-helm#392. Both templates carry the wiring too, so a provider generated from provider-template or upjet-provider-template starts with it.</p>
+<h3>Upjet-based Providers</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Provider</th>
+   <th>PR</th>
+   <th>Release*</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>provider-upjet-aws</td>
+   <td>#2208</td>
+   <td>&gt;v2.7.0</td>
+  </tr>
+  <tr>
+   <td>provider-upjet-azure</td>
+   <td>#1293</td>
+   <td>&gt;v2.7.0</td>
+  </tr>
+  <tr>
+   <td>provider-upjet-azuread</td>
+   <td>#376</td>
+   <td>&gt;v2.4.0</td>
+  </tr>
+  <tr>
+   <td>provider-upjet-azapi</td>
+   <td>#182</td>
+   <td>&gt;v2.1.3</td>
+  </tr>
+  <tr>
+   <td>provider-upjet-gcp</td>
+   <td>#1010</td>
+   <td>&gt;v3.0.0</td>
+  </tr>
+  <tr>
+   <td>provider-upjet-gcp-beta</td>
+   <td>#137</td>
+   <td>&gt;v1.1.3</td>
+  </tr>
+  <tr>
+   <td>provider-upjet-databricks</td>
+   <td>#51</td>
+   <td>&gt;v0.1.11</td>
+  </tr>
+  <tr>
+   <td>provider-upjet-oci</td>
+   <td>#36</td>
+   <td>&gt;v0.1.12</td>
+  </tr>
+  <tr>
+   <td>provider-upjet-nebius</td>
+   <td>#20</td>
+   <td>&gt;v1.0.1</td>
+  </tr>
+  <tr>
+   <td>provider-upjet-f5xc</td>
+   <td>#15</td>
+   <td>&gt;v0.1.3</td>
+  </tr>
+  <tr>
+   <td>provider-upjet-vultr</td>
+   <td>#4</td>
+   <td>&gt;v1.0.0</td>
+  </tr>
+  <tr>
+   <td>provider-vault</td>
+   <td>#163</td>
+   <td>&gt;v4.0.3</td>
+  </tr>
+  <tr>
+   <td>upjet-provider-template</td>
+   <td>#193</td>
+   <td>main branch</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Native Providers</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Provider</th>
+   <th>PR</th>
+   <th>Release*</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>provider-terraform</td>
+   <td>#320</td>
+   <td>&gt;=v1.2.0</td>
+  </tr>
+  <tr>
+   <td>provider-helm</td>
+   <td>#392</td>
+   <td>&gt;v1.4.0</td>
+  </tr>
+  <tr>
+   <td>provider-kubernetes</td>
+   <td>#549</td>
+   <td>&gt;v1.3.1</td>
+  </tr>
+  <tr>
+   <td>provider-opentofu</td>
+   <td>#149</td>
+   <td>&gt;v1.1.7</td>
+  </tr>
+  <tr>
+   <td>provider-upbound</td>
+   <td>#36</td>
+   <td>&gt;v1.0.0</td>
+  </tr>
+  <tr>
+   <td>provider-template</td>
+   <td>#169</td>
+   <td>main branch</td>
+  </tr>
+ </tbody>
+</table>
+<ul>
+ <li>Release: next major/minor release will contain the performance improvements</li>
+</ul>
+<p>Two things bit during the rollout and are worth knowing if you maintain a provider. The pinned crossplane-tools commit raises <code>k8s.io/client-go</code> to v0.36.x through minimal version selection, and controller-runtime v0.23.x does not build against it (<code>cache.ResourceEventHandlerRegistration</code> gained <code>HasSyncedChecker</code>); bump controller-runtime to v0.24.1 in the same change. That bump in turn deprecates <code>sigs.k8s.io/controller-runtime/pkg/scheme.Builder</code>, so hand-written <code>register.go</code> files move to <code>runtime.NewSchemeBuilder</code> + <code>metav1.AddToGroupVersion</code>.</p>
+<h2>Get Involved</h2>
+<ul>
+ <li>Crossplane website</li>
+ <li>GitHub</li>
+ <li>Slack</li>
+ <li>LinkedIn</li>
+ <li>YouTube</li>
+ <li>Reddit</li>
+ <li>Email</li>
+ <li>Attend a community meeting</li>
+</ul>

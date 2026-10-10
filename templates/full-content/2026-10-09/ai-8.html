@@ -1,0 +1,161 @@
+<h1>🎬 LongLive 2.0: An NVFP4 Parallel Infrastructure for Long Video Generation</h1>
+<p><a href="https://arxiv.org/abs/2605.18739">Paper</a> <a href="https://github.com/NVlabs/LongLive">Code</a> <a href="https://www.youtube.com/watch?v=7oQALy32fiU">Video</a> <a href="https://huggingface.co/Efficient-Large-Model/LongLive-2.0-5B">Models</a> <a href="https://huggingface.co/Efficient-Large-Model/LongLive-2.0-5B-NVFP4-S4">Models</a> <a href="https://nvlabs.github.io/LongLive/LongLive2/">Demo</a> <a href="https://nvlabs.github.io/LongLive/LongLive2/docs/">Docs</a></p>
+<h2>💡 TLDR: Infra with NVFP4 and parallelism for both training and inference</h2>
+<h2>News</h2>
+<ul>
+ <li>🔥 [2026.05.13] We release <strong>LongLive 2.0</strong>, infra with NVFP4, parallelism and multi-shot for AR training, DMD distillation, and inference (⚡45.7 FPS). The original LongLive 1.0 is now in the <a href="https://github.com/NVlabs/LongLive/tree/v1.0">v1.0</a> branch.</li>
+ <li>🔥 [2026.04.12] LongLive supports kv cache compression with <a href="https://github.com/WeianMao/triattention">TriAttention</a>, with 50% KV reduction and no quality drop. Check it <a href="https://github.com/WeianMao/triattention/tree/main/longlive">here</a></li>
+ <li>🎉 [2026.1.27] LongLive is accepted by <strong>ICLR-2026</strong>.</li>
+ <li>🔥 [2026.1.11] LongLive supports adapting LongLive's original RoPE into KV-cache relative RoPE and generates infinite long videos!</li>
+ <li>🔥 [2025.11.3] We implement LongLive on linear attention model <a href="https://nvlabs.github.io/Sana/Video/">SANA-Video</a>! Now SANA-Video can generate 60s interactive videos in real-time.</li>
+ <li>🔥 [2025.9.29] We release <a href="https://arxiv.org/abs/2509.22622">Paper</a>, this GitHub repo <a href="https://github.com/NVlabs/LongLive">LongLive</a> with all training and inference code, the model weight <a href="https://huggingface.co/Efficient-Large-Model/LongLive-1.3B">LongLive-1.3B</a>, and demo page <a href="https://nvlabs.github.io/LongLive">Website</a>.</li>
+</ul>
+<h2>Introduction</h2>
+<p><strong>LongLive 1.0</strong>: Real-time Interactive Long Video Generation. <a href="https://github.com/NVlabs/LongLive/tree/v1.0">You can find it here</a> in our V1.0 branch.</p>
+<p><strong>LongLive 2.0</strong>: an NVFP4 Parallel Infrastructure for Long Video Generation</p>
+<ul>
+ <li>For training, it supports 
+  <ul>
+   <li>Balanced sequence parallel for AR training (teacher-forcing).</li>
+   <li>AR training on multi-shot (or single-shot) videos.</li>
+   <li>NVFP4 (or BF16) for both AR training and few-step distillation.</li>
+  </ul></li>
+ <li>For inference, it supports 
+  <ul>
+   <li>NVFP4 inference (W4A4) and NVFP4 KV Cache.</li>
+   <li>Multi-shot attention sink.</li>
+   <li>Sequence parallel inference.</li>
+   <li>Async decoding.</li>
+  </ul></li>
+</ul>
+<p><strong>LongLive 1.0</strong>: Real-time Interactive Long Video Generation. It accepts sequential user prompts and generates corresponding videos in real time, enabling user-guided long video generation. The key insights are attention sink, KV-recache, and streaming long tuning.</p>
+<h2>Getting Started</h2>
+<ul>
+ <li><a href="https://nvlabs.github.io/LongLive/LongLive2/docs/">Full Documentation</a></li>
+ <li><a href="https://nvlabs.github.io/LongLive/LongLive2/docs/#installation">Installation</a></li>
+ <li><a href="https://nvlabs.github.io/LongLive/LongLive2/docs/#nvfp4-installation">NVFP4 Setup</a></li>
+ <li><a href="https://nvlabs.github.io/LongLive/LongLive2/docs/#training">Training</a></li>
+ <li><a href="https://nvlabs.github.io/LongLive/LongLive2/docs/#inference">Inference</a></li>
+ <li><a href="https://nvlabs.github.io/LongLive/LongLive2/docs/#training-data">Data Organization</a></li>
+</ul>
+<h3>Quick Start</h3>
+<h4>BF16</h4>
+<pre>import torch
+from omegaconf import OmegaConf
+
+from pipeline import CausalDiffusionInferencePipeline
+from utils.config import normalize_config
+from utils.inference_utils import (
+    load_generator_checkpoint,
+    place_vae_for_streaming,
+    prepare_single_prompt_inputs,
+    save_video,
+)
+
+prompt = "A compact silver robot walks through a clean robotics lab."
+merged_checkpoint_path = "LongLive-2.0-5B/model_bf16.pt"
+
+config = normalize_config(OmegaConf.load("configs/inference.yaml"))
+device = torch.device("cuda")
+
+torch.set_grad_enabled(False)
+pipe = CausalDiffusionInferencePipeline(config, device=device)
+load_generator_checkpoint(pipe.generator, merged_checkpoint_path)
+pipe = pipe.to(device=device, dtype=torch.bfloat16)
+place_vae_for_streaming(pipe, config)  # honor streaming_vae + vae_device when set
+pipe.generator.model.eval().requires_grad_(False)
+
+noise, prompts = prepare_single_prompt_inputs(config, prompt, device)
+video = pipe.inference(noise=noise, text_prompts=prompts)
+save_video(video[0], "videos/quickstart/sample.mp4", fps=24)</pre>
+<p><code>place_vae_for_streaming</code> is a no-op unless <code>inference.streaming_vae</code> is true and <code>inference.vae_device</code> is set, so toggling streaming-pipeline decode in your yaml is enough — the script does not need to change.</p>
+<h4>NVFP4</h4>
+<p>Point <code>checkpoints.generator_ckpt</code> in <code>configs/nvfp4/inference_nvfp4.yaml</code> at the downloaded checkpoint and set <code>model_quant_use_transformer_engine</code> according to the backend you are using:</p>
+<ul>
+ <li>TransformerEngine checkpoint (<code>model_te.pt</code>): <code>model_quant_use_transformer_engine: true</code></li>
+ <li>FourOverSix checkpoint (<code>model_4o6.pt</code>): <code>model_quant_use_transformer_engine: false</code></li>
+</ul>
+<p><code>setup_nvfp4_pipeline</code> handles checkpoint loading, NVFP4 module wrapping, weight materialization, dtype/device placement, and the streaming-pipeline VAE relocation for both backends — the bf16 <code>pipe.to(...)</code> shortcut is unsafe here because it would cast the quantized buffers.</p>
+<pre>import torch
+from omegaconf import OmegaConf
+
+from pipeline import CausalDiffusionInferencePipeline
+from utils.config import normalize_config
+from utils.inference_utils import prepare_single_prompt_inputs, save_video, setup_nvfp4_pipeline
+
+prompt = "A compact silver robot walks through a clean robotics lab."
+
+config = normalize_config(OmegaConf.load("configs/nvfp4/inference_nvfp4.yaml"))
+device = torch.device("cuda")
+
+torch.set_grad_enabled(False)
+pipe = CausalDiffusionInferencePipeline(config, device=device)
+setup_nvfp4_pipeline(pipe, config, device)
+pipe.generator.model.eval().requires_grad_(False)
+
+noise, prompts = prepare_single_prompt_inputs(config, prompt, device)
+video = pipe.inference(noise=noise, text_prompts=prompts)
+save_video(video[0], "videos/quickstart/sample_nvfp4.mp4", fps=24)</pre>
+<h2>Models</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Model</th>
+   <th>FPS ↑</th>
+   <th>Params</th>
+   <th>VBench ↑</th>
+   <th>Multi-shot</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><a href="https://huggingface.co/Efficient-Large-Model/LongLive-1.3B">LongLive-1.3B</a></td>
+   <td>20.7</td>
+   <td>1.3B</td>
+   <td>84.87</td>
+   <td></td>
+  </tr>
+  <tr>
+   <td><a href="https://huggingface.co/Efficient-Large-Model/LongLive-2.0-5B">LongLive-2.0-5B</a></td>
+   <td>24.8</td>
+   <td>5B</td>
+   <td>85.06</td>
+   <td>✅</td>
+  </tr>
+  <tr>
+   <td><a href="https://huggingface.co/Efficient-Large-Model/LongLive-2.0-5B-NVFP4-S4">LongLive-2.0-5B-NVFP4-4Step</a></td>
+   <td>29.7</td>
+   <td>5B</td>
+   <td>84.51</td>
+   <td>✅</td>
+  </tr>
+  <tr>
+   <td><a href="https://huggingface.co/Efficient-Large-Model/LongLive-2.0-5B-NVFP4-S2">LongLive-2.0-5B-NVFP4-2Step</a></td>
+   <td>45.7</td>
+   <td>5B</td>
+   <td>83.14</td>
+   <td>✅</td>
+  </tr>
+ </tbody>
+</table>
+<h2>License</h2>
+<p>This repository is released under the Apache 2.0 license. See <a>LICENSE</a> for details.</p>
+<h2>Citation</h2>
+<p>Please consider citing our work if you find them useful:</p>
+<pre>@article\{longlive_2.0,
+  title=\{LongLive2.0: An NVFP4 Parallel Infrastructure for Long Video Generation},
+  author=\{Chen, Yukang and Wang, Luozhou and Huang, Wei and Yang, Shuai and Zhang, Bohan and Xiao, Yicheng and Chu, Ruihang and Mao, Weian and Hu, Qixin and Liu, Shaoteng and Zhao, Yuyang and Mao, Huizi and Chen, Ying-Cong and Xie, Enze and Qi, Xiaojuan and Han, Song},
+  journal=\{arXiv preprint arXiv},
+  year=\{2026}
+}</pre>
+<pre>@inproceedings\{longlive,
+    title=\{Longlive: Real-time interactive long video generation}, 
+    author=\{Yang, Shuai and Huang, Wei and Chu, Ruihang and Xiao, Yicheng and Zhao, Yuyang and Wang, Xianbang and Li, Muyang and Xie, Enze and Chen, Yingcong and Lu, Yao and others},
+    booktitle=\{ICLR},
+    year=\{2026},
+}</pre>
+<h2>Acknowledgement</h2>
+<ul>
+ <li><a href="https://github.com/guandeh17/Self-Forcing">Self-Forcing</a>: the AR training codebase and formulation we build upon.</li>
+ <li><a href="https://github.com/Wan-Video/Wan2.2">Wan2.2</a>: the base video diffusion model components used in this release.</li>
+</ul>
