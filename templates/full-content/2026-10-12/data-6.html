@@ -1,0 +1,74 @@
+<h1>Five PostgreSQL queries that did more work than I asked for</h1>
+<p>Most slow queries I have looked at are not doing anything clever. They are doing extra work that nobody asked for, because one word in the SQL told PostgreSQL to.</p>
+<p>I took five of those words and measured each one against the version without it, on the same table. The biggest gap was UNION: 13.6 seconds, against 0.68 seconds for UNION ALL on the same two halves of the table.</p>
+<h2>Setup</h2>
+<p>One table, <code>u</code>, with 2,000,000 rows: a <code>bigint</code> identity key, an email, a status, a <code>timestamptz</code> and an md5 note.</p>
+<p>PostgreSQL 18.6, default settings (<code>work_mem</code> 4MB, <code>shared_buffers</code> 128MB, up to two parallel workers per query). Machine: 2020 13-inch MacBook Pro, Intel i5-8257U, 8 GB RAM. Every time below is the execution time from <code>EXPLAIN (ANALYZE, TIMING OFF)</code>, warm cache, first run thrown away, median of the rest.</p>
+<h2>Results</h2>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>without</th>
+   <th>with</th>
+   <th></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>UNION ALL / UNION</td>
+   <td>0.68 s</td>
+   <td>13.6 s</td>
+   <td>two halves that cannot overlap</td>
+  </tr>
+  <tr>
+   <td>CTE inlined / MATERIALIZED</td>
+   <td>0.24 ms</td>
+   <td>1,973 ms</td>
+   <td>filter on the primary key</td>
+  </tr>
+  <tr>
+   <td>TABLESAMPLE / ORDER BY random()</td>
+   <td>0.3 ms</td>
+   <td>1,313 ms</td>
+   <td>one random row</td>
+  </tr>
+  <tr>
+   <td>one column / SELECT *</td>
+   <td>32.8 ms</td>
+   <td>64.8 ms</td>
+   <td>about 100,000 rows by date range</td>
+  </tr>
+  <tr>
+   <td>expression index / no index</td>
+   <td>0.5 ms</td>
+   <td>623 ms</td>
+   <td><code>WHERE lower(email) = ...</code></td>
+  </tr>
+ </tbody>
+</table>
+<h2>UNION</h2>
+<p>I split the table at <code>id = 1,000,000</code> and put the halves back together. With <code>UNION ALL</code> that is just reading the rows. With <code>UNION</code>, PostgreSQL has to make sure no email appears twice, so it deduplicates two million values before it can count them. It has no way to know the halves cannot overlap. I do, so I should have written ALL.</p>
+<h2>CTE with MATERIALIZED</h2>
+<p><code>WITH x AS (SELECT * FROM u) SELECT * FROM x WHERE id = 777777</code> took 0.24 ms. PostgreSQL 12 and later fold a CTE like this into the outer query, so the filter reaches the primary key index.</p>
+<p>Add <code>MATERIALIZED</code> and it builds the whole CTE first, then filters it: 1,973 ms and every page of the table. The keyword is there for the cases where you want that fence. Here I did not.</p>
+<h2>One random row</h2>
+<p><code>ORDER BY random() LIMIT 1</code> reads all two million rows and sorts them by a random key to return one: 1,313 ms.</p>
+<p><code>TABLESAMPLE SYSTEM (0.01) LIMIT 1</code> read one page and took 0.3 ms. It is not the same thing, though. SYSTEM picks whole pages, so rows that sit together come back together, and a sample this small can come back empty. For a quick look at some data it is fine. For anything that has to be fair, it is not.</p>
+<h2>SELECT *</h2>
+<p>About 100,000 rows by a <code>created_at</code> range, ordered by the same column, with an index on it. Asking for only <code>created_at</code> let PostgreSQL answer from the index alone: 279 buffers, 32.8 ms. <code>SELECT *</code> had to visit the table for every row: 1,718 buffers, 64.8 ms.</p>
+<p>EXPLAIN ANALYZE does not send rows to the client, so none of this is network time. It is the table visits.</p>
+<h2>A function in WHERE</h2>
+<p><code>WHERE lower(email) = '...'</code> with no matching index read the whole table in parallel: 623 ms. <code>CREATE INDEX ON u (lower(email))</code> brought it to 0.5 ms and 4 buffers. An index on plain <code>email</code> would not have helped; the index has to be on the same expression the query uses. This one was 81 MB.</p>
+<h2>What surprised me</h2>
+<p>How small the fixes are. Four of the five are one keyword or one column list. The fifth is one index.</p>
+<p>And how forgiving the slow versions look in development. On a table of a few thousand rows every one of these finishes in a few milliseconds, and the difference only appears when the table grows.</p>
+<h2>What I did not test</h2>
+<ul>
+ <li>Larger <code>work_mem</code>. UNION would have deduplicated in memory with more of it, and the gap would be smaller.</li>
+ <li>Tables bigger than RAM. Everything here was in the OS cache.</li>
+ <li>Fair random sampling. <code>TABLESAMPLE BERNOULLI</code> samples rows rather than pages, which means reading every page; I did not time it.</li>
+ <li>Other hardware. Compare the ratios, not the seconds.</li>
+</ul>
+<h2>Reproduce it</h2>
+<p>The script and the raw numbers: run2.py, results2.json. The same script also measures the next two posts in this series.</p>

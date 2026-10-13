@@ -1,0 +1,119 @@
+<h2>pplx-decider-v1.1-27b</h2>
+<p>pplx-decider-v1.1-27b is an update of our pplx-decider-v1-27b model, that boost the Decision Index score from 56.4 to 61.56, now outperforming Jev by more than 3.5 points, while using the same backbone. Most of the gains are driven by the lifting of the causal mask and training on more data, including data from tasksource.</p>
+<h2>Evaluation</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Decision Index category</th>
+   <th>Jev</th>
+   <th>pplx-decider-v1-27b</th>
+   <th>pplx-decider-v1.1-27b</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Knowledge</td>
+   <td><strong>51.4</strong></td>
+   <td>40.9</td>
+   <td>48.18</td>
+  </tr>
+  <tr>
+   <td>Language</td>
+   <td>62.0</td>
+   <td>63.5</td>
+   <td><strong>69.45</strong></td>
+  </tr>
+  <tr>
+   <td>Retrieval</td>
+   <td>55.4</td>
+   <td>54.9</td>
+   <td><strong>61.26</strong></td>
+  </tr>
+  <tr>
+   <td>Tools</td>
+   <td>75.1</td>
+   <td><strong>79.3</strong></td>
+   <td>78.88</td>
+  </tr>
+  <tr>
+   <td>Arts</td>
+   <td>37.7</td>
+   <td>39.4</td>
+   <td><strong>44.66</strong></td>
+  </tr>
+  <tr>
+   <td><strong>Overall Decision Index</strong></td>
+   <td>57.9</td>
+   <td>56.4</td>
+   <td><strong>61.56</strong></td>
+  </tr>
+ </tbody>
+</table>
+<p>The overall score uses the suite's weighting, not a simple category average.</p>
+<h2>Checkpoint format and serving</h2>
+<p>This is the <strong>native decision-checkpoint layout</strong>: a <code>Qwen3_5Model</code> backbone plus <code>readout.safetensors</code> containing a BF16 <code>[255, 5120]</code> decision head. The Transformers class name does not change the base model identity, Qwen3.8-27B.</p>
+<p>Use the included inference implementation to preserve the evaluated behavior:</p>
+<ul>
+ <li>Full-attention layers use the saved <strong>noncausal</strong> attention mode. The model's linear-attention layers retain their native behavior. Default causal inference does not reproduce this checkpoint's evaluated setup.</li>
+ <li>The supplied <code>DecisionModel.predict</code> applies the saved calibration temperature. When using logits directly, apply it exactly once and normalize over the valid candidates for the current decision.</li>
+ <li>This artifact has a separate readout, <strong>not a full-vocabulary <code>lm_head</code></strong>. A serving system requiring <code>Qwen3_5ForConditionalGeneration</code> needs a separate export, mapping readout row <code>i</code> into vocabulary row <code>decision_config.json["token_ids"][i]</code>. Such an export must also preserve the attention behavior. If the frontend applies temperature, use the value above.</li>
+</ul>
+<h2>Usage</h2>
+<p>Use Python 3.12+, authenticated Hugging Face access to this private repository, and a CUDA GPU with room for roughly 49 GiB of weights plus working memory. Download the repository and install its pinned <code>requirements.txt</code> dependencies.</p>
+<pre><code>import sys
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+checkpoint = Path(snapshot_download("perplexity-ai/pplx-decider-v1.1-27b"))
+sys.path.insert(0, str(checkpoint / "source" / "src"))
+from autojev.model import DecisionModel, answer
+
+model = DecisionModel(checkpoint, device="cuda")
+question = \{
+    "type": "choice",
+    "instructions": "Which team should handle this request?",
+    "criteria": \{
+        "billing": "Charges and refunds",
+        "support": "Technical integration errors",
+        "sales": "Questions about buying a product",
+    },
+}
+row = \{"state": "My integration keeps failing. Please help.", "question": question}
+probabilities = model.predict([row])[0]
+print(answer(question, probabilities))
+</code></pre>
+<h3>Images</h3>
+<p>Pass images as file paths, PIL images, or <code>data:image/...;base64</code> URLs in <code>row["images"]</code>. The processor resizes them <strong>while preserving aspect ratio</strong>. Each side is rounded to a multiple of 32 px, and the total area is kept between 256×256 (65,536 px) and <code>max_image_pixels</code>. Each 32×32 patch costs one visual token, so an image uses about <code>width * height / 1024</code> tokens.</p>
+<p><code>max_image_pixels</code> defaults to 2048×2048 (4,194,304 px, ≤4,096 tokens per image). Larger images are downscaled automatically, so you don't need to resize them yourself. To lower or raise the cap:</p>
+<pre><code>model = DecisionModel(checkpoint, device="cuda", max_image_pixels=1600 * 1000)
+</code></pre>
+<p>Keep in mind:</p>
+<ul>
+ <li>The text and all images of a decision must fit in <code>prepare</code>'s 8,192-token limit. Inputs are rejected rather than truncated. With several images per decision, lower <code>max_image_pixels</code> or downscale the images first.</li>
+ <li>Training and the reported evaluation capped images at 512×512 (262,144 px, ≤256 tokens). Higher resolutions keep more detail but fall outside the training distribution, and they cost more memory and latency. To reproduce the evaluated setup exactly, use <code>max_image_pixels=512 * 512</code>.</li>
+ <li>If you resize images yourself, scale both sides by the same factor <code>min(1, sqrt(max_image_pixels / (width * height)))</code> to keep the aspect ratio.</li>
+</ul>
+<p><code>source/src/autojev/model.py</code> is the evaluated training-run code, with one change: the image-size cap is now the configurable <code>max_image_pixels</code>. It was previously hardcoded at 512×512 pixels. <code>release-manifest.json</code> records file checksums and checkpoint provenance.</p>
+<h2>Acknowledgment</h2>
+<p>A large part of the gains are thanks to the tasksource data. If you also use this data, consider citing the corresponding article</p>
+<pre><code>@inproceedings\{sileo-2024-tasksource,
+    title = "tasksource: A Large Collection of \{NLP} tasks with a Structured Dataset Preprocessing Framework",
+    author = "Sileo, Damien",
+    booktitle = "Proceedings of the 2024 Joint International Conference on Computational Linguistics, Language Resources and Evaluation (LREC-COLING 2024)",
+    month = may,
+    year = "2024",
+    address = "Torino, Italia",
+    publisher = "ELRA and ICCL",
+    url = "https://aclanthology.org/2024.lrec-main.1361",
+    pages = "15655--15684",
+}
+</code></pre>
+<p>Our data pipeline also builds on Bespoke Nimble by Bespoke Labs. The data pipeline of pplx-decider-v1-27b was built around human-labelled public datasets that we converted into Choice and Noul decisions with Nimble's converters. v1.1 adds a lot of new data, so Nimble-converted data is now only a small share of the training set. We also use Nimble's published benchmark subsets, pinned by record ID and checksum, to keep those benchmark records and related examples out of training. Nimble is downloaded at a pinned revision when the data is built and is not redistributed here. If you use this part of the pipeline, please also cite Nimble:</p>
+<pre><code>@misc\{nimble2026,
+  author = \{\{Bespoke Labs} and Sathiamoorthy, Maheswaran},
+  title = \{Nimble},
+  year = \{2026},
+  howpublished = \{\url\{https://github.com/bespokelabsai/nimble}},
+  note = \{Model: https://huggingface.co/bespokelabs/Bespoke-Nimble-9B}
+}
+</code></pre>

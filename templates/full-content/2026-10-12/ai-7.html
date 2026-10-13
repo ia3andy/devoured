@@ -1,0 +1,112 @@
+<p>Both OpenAI and Anthropic now ship native multi-agent support: a lead agent can spawn subagents, hand each of them part of a task, and assemble what they return. We wanted to measure what that buys, what it costs, and which kinds of work it helps, on tasks that resemble real software projects.</p>
+<p>We used Vibe Code Bench, our benchmark for building complete web applications from a product spec, as a test bed. Each app is deployed with Docker Compose and graded by browser agents that click through its workflows. The work splits naturally into a database, an API, an interface, and deployment, and bugs at the seams between those pieces show up directly in the score. We ran GPT 6 Sol and Claude Opus 5.5 on 50 apps, each as a single agent and as a team, at medium and max reasoning effort.</p>
+<p>In a team, the lead agent can hand parts of the build to subagents, up to five at once, and subagents cannot spawn their own. Both leads received the same short instruction: split the work into independent parts, delegate each one, then integrate and verify the result; the task prompt, sandbox, and grader were otherwise identical. Score is the share of an app’s UI tests that pass, averaged over the 50 apps. Each of the eight setups ran once.</p>
+<h2>Key findings</h2>
+<ul>
+ <li><strong>Teams cost 1.8 to 5.1 times as much as single agents, and only one difference in score was statistically significant.</strong> Sol’s medium-effort team gained 7.3 points over its single agent (p = 0.005). The other three differences, from −0.3 to +3.4 points, were not statistically significant.</li>
+ <li><strong>For Sol, higher effort raised the score more than a team did; for Opus, neither higher effort nor a team made a significant difference.</strong> Higher effort came at a higher price, though: Sol’s max-effort single agent cost 1.6 times as much as its medium-effort team ($4.82 vs. $3.07 per app) and took three times as long.</li>
+ <li><strong>Teams finished faster for Sol but not for Opus, and the two leads orchestrated differently.</strong> Sol’s lead split the app across parallel subagents within the first minutes and tested the result itself; at max effort, its runtime fell from 38 to 28 minutes. Opus’s lead usually first wrote a shared contract for how the app’s parts would fit together, then delegated in sequential waves of builders and testers, and its teams took up to 2.3 times as long as its single agents.</li>
+</ul>
+<p>These observations come from one benchmark of full-stack web apps and may not carry over to other kinds of work.</p>
+<h2>Cost, runtime, and score</h2>
+<p>We compared each pair on the same 50 apps with a paired t-test. Only Sol’s medium-effort gain, 7.3 points, is statistically significant (p = 0.005; 95% interval +2.3 to +12.4 points). The other three are not (p = 0.16 to 0.81): +1.4 points for Sol at max effort, −0.3 for Opus at medium, and +3.4 for Opus at max, with intervals of −1.7 to +4.5, −3.2 to +2.5, and −1.4 to +8.3 points.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Model</th>
+   <th>Setup</th>
+   <th>Score</th>
+   <th>Mean cost per app</th>
+   <th>Median runtime</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>GPT 6 Sol</td>
+   <td>medium effort, single agent</td>
+   <td>77.6%</td>
+   <td>$1.22</td>
+   <td>12.4 min</td>
+  </tr>
+  <tr>
+   <td>GPT 6 Sol</td>
+   <td>medium effort, team</td>
+   <td>84.9%</td>
+   <td>$3.07</td>
+   <td>11.9 min</td>
+  </tr>
+  <tr>
+   <td>GPT 6 Sol</td>
+   <td>max effort, single agent</td>
+   <td>89%</td>
+   <td>$4.82</td>
+   <td>38.4 min</td>
+  </tr>
+  <tr>
+   <td>GPT 6 Sol</td>
+   <td>max effort, team</td>
+   <td>90.4%</td>
+   <td>$8.54</td>
+   <td>27.6 min</td>
+  </tr>
+  <tr>
+   <td>Claude Opus 5.5</td>
+   <td>medium effort, single agent</td>
+   <td>91.5%</td>
+   <td>$4.08</td>
+   <td>20.3 min</td>
+  </tr>
+  <tr>
+   <td>Claude Opus 5.5</td>
+   <td>medium effort, team</td>
+   <td>91.2%</td>
+   <td>$9.10</td>
+   <td>26.6 min</td>
+  </tr>
+  <tr>
+   <td>Claude Opus 5.5</td>
+   <td>max effort, single agent</td>
+   <td>89.8%</td>
+   <td>$23.77</td>
+   <td>74.7 min</td>
+  </tr>
+  <tr>
+   <td>Claude Opus 5.5</td>
+   <td>max effort, team</td>
+   <td>93.2%</td>
+   <td>$122</td>
+   <td>174.1 min</td>
+  </tr>
+ </tbody>
+</table>
+<p>At medium and max effort respectively, teams cost 2.5 and 1.8 times as much as the single agent for Sol, and 2.2 and 5.1 times as much for Opus. Most of the extra spend is cached input: each subagent has its own context holding the spec and its working state, and that context is re-sent on every model call. At max effort, Opus’s subagents read a median of 224 million cached tokens per app, against 17 million for the lead and 55 million for the single agent. One Opus max-effort team ran out of time while still verifying; its cost of about $189 is estimated from its token counts and included in the mean.</p>
+<p>Parallelism saved time for Sol at both efforts, slightly at medium: its team finished in 11.9 minutes against 12.4 for its single agent at medium effort, and in 28 against 38 at max.</p>
+<p>Opus’s teams took longer, up to 2.3 times the single agent’s runtime at max effort. They worked in sequential waves, described below, with each wave waiting for its slowest member, and at max effort the median subagent ran for 46 minutes, against 7 at medium.</p>
+<p>The extra time was subagent work, not idle time, and longer runs did not score higher. Across apps, the Opus max team’s runtime had no correlation with its gain over the single agent. Four of its runs took more than four hours, and one hit the 5.25-hour limit.</p>
+<h3>Higher effort or a team</h3>
+<p>A team and higher effort both raise cost, and their effects on score differed. For Sol, max effort raised the single agent’s score by 11.4 points (p &lt; 0.001), more than the 7.3 points a team added at medium effort. The max-effort single agent also scored 4.1 points above the medium-effort team (89.0% vs. 84.9%), a difference that was not statistically significant (p = 0.08), at 1.6 times the cost and three times the runtime.</p>
+<p>For Opus, max effort alone did not raise the score: the single agent scored 89.8% for $23.77, against 91.5% for $4.08 at medium (p = 0.48). Max effort combined with a team produced the highest score in the study, 93.2%, at thirty times the cost of the medium-effort single agent; its 1.6-point lead over that agent was not statistically significant (p = 0.36). Across models, Sol’s max-effort team (90.4%, $8.54) came within about a point of Opus’s medium-effort single agent, at twice the price.</p>
+<p>Neither option was a clear default: higher effort gave Sol the larger gain at a higher price, while Opus’s cheapest setup scored about as well as its most expensive one on this set of tasks.</p>
+<h2>How the leads worked</h2>
+<p>The two leads received the same instruction and divided the work differently.</p>
+<h3>Sol’s lead split the app and did the testing itself</h3>
+<p>At medium effort, Sol’s lead split the work along architectural lines (database and seed data, API, interface, and deployment) and created all of its subagents within about a minute. At max effort it more often split the interface into separate feature areas (13 of 50 opening plans, against 7 at medium) and kept adding subagents later in the run. It also spawned slightly more subagents (5.1 vs. 4.2) and sent them almost twice as many follow-up requests (31 vs. 18 per app).</p>
+<p>Sol’s logs record the lead’s commands but not its file edits, so we can’t tell how much code it wrote; its recorded actions were mostly coordinating, building, and testing. It drove a headless browser through the app in 46 of 50 runs at both efforts, running about twice as many browser tests as the single agent, mostly at the app’s public URL rather than at localhost inside the sandbox. At medium effort, the single agent browser-tested only at localhost in 18 of 50 runs, against 4 for the team lead. In its notes, the lead reported catching bugs that only appear when separately built pieces meet, such as an interface sending fields that didn’t match the database schema, or a total computed one way in the interface and another in the database. Each fix went back to the subagent that owned the file.</p>
+<h3>Opus’s lead wrote a contract first and delegated in waves</h3>
+<p>Before spawning any agents, Opus’s lead wrote a shared document, usually <code>CONTRACT.md</code>, describing the schema, API routes, and file ownership (42 of 50 runs at medium, 40 at max; the single agents almost never did). It spawned subagents in waves. At medium effort, it usually spawned builders and then, in most runs, a subagent dedicated to end-to-end testing. At max effort, it added a wave: first subagents that built the foundation, then subagents that built features on top of it, then subagents that tested and reviewed the app. It wrote the READMEs itself in most runs and edited application code in 10 of 50 runs at medium effort and 26 at max.</p>
+<p>At max effort, the Opus team was larger: 6.8 subagents per app instead of 4.2, a testing subagent in all 50 runs, and about 1,140 subagent tool calls per app, against about 270 for the max-effort single agent. Its subagents ran 36 browser tests per app, six times as many as the max-effort single agent.</p>
+<h3>Where the time went</h3>
+<p>Teams and single agents reached their first deploy (the first <code>docker compose up</code>) at similar times. At medium effort, both models’ teams were within a minute of their single agents. At max effort, Sol’s team deployed about five minutes earlier and Opus’s about six minutes later. Opus’s max-effort team then spent two thirds of its run after the first deploy, against under a third for its single agent. Over that stretch, its lead and subagents put a median of 68 agent-minutes (time summed across the lead and its subagents) into testing, against 10 for the single agent.</p>
+<h2>Where team gains came from</h2>
+<p>To check whether teams helped more on harder apps, we grouped apps using a run outside each comparison. For the medium-effort comparison, an app counts as harder if the same model’s max-effort single agent scored below 90% on it; for the max-effort comparison, we use the medium-effort single agent. This keeps chance results in the compared runs from deciding an app’s group.</p>
+<p><strong>Sol’s medium-effort team gained on about half the apps, most on harder ones.</strong> It scored higher than its single agent on 24 apps, lower on 11, and the same on 15. On harder apps it added about 15 points; on easier ones, about 1. At max effort, Sol’s smaller team gain was spread evenly across harder and easier apps.</p>
+<p><strong>Where Sol’s medium-effort team gained 20 points or more, it built and checked what the single agent skipped.</strong> On these nine apps, the single agents reported that testing had passed even when some features were never built and whole workflows were never tried. The team covered more of the spec and checked its work more carefully: it built those features, and its lead reviewed the separately built parts against each other, catching mismatches such as a form that didn’t fit the database schema or a permission rule that blocked a step.</p>
+<p><strong>Opus’s gains and losses were closer to balanced and did not favor harder apps.</strong> Its team scored higher on 14 apps and lower on 15 at medium effort, and higher on 13 and lower on 8 at max. At medium effort, it lost about four points on harder apps and gained about two on easier ones; at max effort, it added about three to four points on both.</p>
+<p><strong>Other properties we checked had no consistent effect.</strong> Apps with more distinct user roles gained 15 points from Sol’s medium-effort team, but no other configuration showed this. Spec length, the number of UI tests, and single-user versus multi-user apps showed no consistent effect either.</p>
+<h2>Future work</h2>
+<p>On this benchmark, the effect of a team depended on the model, the reasoning effort, and the app. The open question is which tasks teams handle reliably better than single agents. A team should gain the most when the work splits into parts that can proceed side by side, and the lead can combine them without spending the time it saved on coordination. Tasks with many independent parts and long stretches of separable work, such as large codebases, broad research questions, or analyses spanning many documents, are where we would look next.</p>
+<h2>Methodology and limitations</h2>
+<p>GPT 6 Sol ran through the OpenAI Agents API, with the API’s <code>multi_agent</code> mode off for single agents and on for teams, and with commands executed in a Vals sandbox. Claude Opus 5.5 ran through the Claude Code CLI in headless mode, with the subagent tools removed for single agents and available for teams. Opus’s team runs also disabled Claude Code’s ten-minute limit on background subagents. Reasoning effort, medium or max, was set through OpenAI’s <code>reasoning.effort</code> parameter and Claude Code’s <code>CLAUDE_CODE_EFFORT_LEVEL</code>. Apps were scored by the standard Vibe Code Bench UI test suite.</p>
+<p>Behavioral counts come from each lead’s event stream, and from subagents’ streams for Opus. OpenAI’s Agents API emits two <code>subagent.created</code> events per subagent, so we counted unique subagent IDs for Sol. Browser tests count commands that launch or navigate a headless browser. Runtime is the agent’s wall-clock time in the sandbox. The harnesses expose different amounts of detail. Claude Code logs every subagent’s tool calls. OpenAI’s Agents API event stream contains only the lead’s turn, so for Sol we can see when the lead created, messaged, and waited on subagents, but not what it told them or what they did. Sol’s costs assume that its reported token usage includes the subagents.</p>
+<p>Sol’s costs apply OpenAI’s base-tier list prices ($2 per million input tokens, $0.20 cached, $10 output) to reported token usage. Requests above the 272K-token long-context threshold are billed higher, which we could not evaluate because usage is reported per run rather than per request. Opus’s costs are the list-price totals Claude Code reports.</p>
+<p>Because each setup ran once, the intervals and p-values in this post reflect variation across apps, not between repeated runs. The team runs also received the delegation instruction, so each comparison is between “subagents plus a delegation prompt” and neither. The two models ran through different harnesses, so comparisons across models mix the model with its harness.</p>

@@ -1,0 +1,70 @@
+<p>How do you know that the action an agent performed did as well as expected? Did it hallucinate a workflow and therefore the output? Was it performant? Did it follow safety best practices that all agents should abide by? Organizations have heard the whole "hallucination from LLMs" bit and various other issues with agentic output, so having a tool that can evaluate what actually happens is within an agent run key.</p>
+<p>That's where a new concept from Anthropic, agentic evaluations, comes into play.</p>
+<p>In this blog post, you'll learn about agentevals and how to use/implement a tool that you can use to run AI evaluations across any agent workflow.</p>
+<h2>Prequisites</h2>
+<p>To follow along with this blog post, you should have the following:</p>
+<ul>
+ <li>A k8s cluster. This can be a cluster running anywhere, even locally.</li>
+ <li>kagent installed, and you can find the instructions <a href="https://kagent.dev/docs/kagent/0.x/introduction/installation/">here</a>.</li>
+</ul>
+<p>If you don’t, that’s totally fine! You can still follow along from a theoretical perspective and implement the hands-on piece at a later time.</p>
+<h2>What Are Agentic Evaluations?</h2>
+<p><strong><em>Tldr</em></strong>; a benchmark/end-to-end test to ensure that your agent did what it was supposed to do based on human instruction.</p>
+<p>When you run an agent, you have zero idea what it's actually going to end up doing (hence the constant conversations around non-deterministic workflows). You can give it a close-to-perfect prompt, agent Skills for a tightly defined task, and use the best instructions possible (e.g- a <code>CLAUDE.md</code> file, <code>AGENTS.md</code>, etc.), but despite the effort that you put into perfecting the output, that still doesn't mean your agent is going to do what it's supposed to because there are far too many variables in an agent run. With evaluations (evals), you can take a trace (the end-to-end agent workflow) that already occurred or look at an agent running live to see what it did/does and how it did/does it. The trace can then be graded. For example, if the agent hallucinated 25% of the output, that means the grade may be lower than “perfect” as the agent did not do exactly what it was supposed to do. The purpose of an evaluation is to see how well your agent did the job you tasked it with.</p>
+<h3>Where Evals Need Assistance</h3>
+<p>Because of the non-deterministic nature of agentic workflows defined in the previous section, that means by definition, the evaluation set may not be the same every time. For example, you can run an agent three times and get three different results. That's why specifying what you want to evaluate and how you want to grade an agent workflow is so crucial. Example: if you run an eval and you care about latency, focus on latency. Run it 3-5 times and take an average. Don't worry about the other output, just focus on one key area of the overall evaluation.</p>
+<h3>Setting Up an agent</h3>
+<p>With the “why” of why you’d want to use agentevals defined, let's dive into the hands-on piece of evals. First things first - for you to get a trace to benchmark/grade, you need an agent. An agent that’s used, at a high level, will most likely look like the following:</p>
+<ol>
+ <li>A set of specific tools that your agent uses based on the task it needs to perform. These tools typically come from an MCP Server.</li>
+ <li>A gateway that’s specialized for both LLM, MCP, and agentic traffic.</li>
+ <li>An agent setup and configured.</li>
+</ol>
+<p>Because it's a fair amount of code and configuration to get all of the above up and running, instead of having a full page of code on this blog post, you can a sample configuration <a href="https://github.com/AdminTurnedDevOps/agentic-demo-repo/blob/main/production-demos/kagent-start/setup.md">on GitHub that you can use</a>.</p>
+<h3>Deploying agentevals</h3>
+<p>To deploy agentevals, there are two choices for installation:</p>
+<ol>
+ <li>From source</li>
+ <li>One-line installation</li>
+</ol>
+<p>The one-line install is via a Python package:</p>
+<pre><code>pip install agentevals-cli</code></pre>
+<p>If you decide to go with from source, you can clone the repo from <a href="https://github.com/agentevals-dev/agentevals">here</a> and then run:</p>
+<pre><code>make dev-bundle</code></pre>
+<p>You’ll then see agentevals running within your terminal.</p>
+<h3>Planning The Collection Of A Trace</h3>
+<p>The first step is to collect a trace. Luckily, the majority of agentic frameworks and AI gateways will expose traces. If you used kagent and agentgateway via the <strong>Setting Up an agent</strong> section, you'll definitely have traces available within your agent run.</p>
+<ol>
+ <li>Ensure that you run your agent from the <strong>Setting Up an agent</strong> section after you get it created. That way, a trace is generated.</li>
+ <li>Prompt Claude to collect traces for your agent that you ran in the previous section. Ensure that it knows agentevals can look at a trace via a JSON file and have it write a plan for you.</li>
+</ol>
+<p>As an example, here's a plan that it came up with for me.</p>
+<pre><code>Here is Claude's plan:
+Plan: Export Gemini agent Traces from Kubernetes to Jaeger JSON
+...
+(Plan implementation details omitted for brevity)
+</code></pre>
+<ol>
+ <li>With the plan in place to generate a JSON file with your trace, run it in your framework (e.g - Claude Code) on the terminal.</li>
+</ol>
+<h3>Collecting and Building EvalSets</h3>
+<p>When Claude is done running from the previous section, ensure that it saves a <code>JSON</code> file for you somewhere that's accessible via agentevals. For example, you'll see that Claude created a file called <code>gemini_agent.json</code> that was then saved to the desktop.</p>
+<p>Once you have your trace output, you can feed it into the EvalSet Builder. The EvalSet Builder is a feature in the agentevals Web UI that lets you create evaluation sets (EvalSets) from existing agent traces.</p>
+<p>With the EvalSet and your trace, you can now run your benchmarks/tests via agentevals.</p>
+<h3>Obtaining Eval Results</h3>
+<p>After you generate a trace <code>JSON</code> and use the EvalSet Builder with said <code>JSON</code> trace, you can begin to drill into how your agent performed. This will allow you to get an understanding of what to expect from an output quality perspective for a particular workflow.</p>
+<ol>
+ <li>Within the <strong>Evaluations</strong> tab, upload your trace and EvalSet.</li>
+ <li>Once it's uploaded, you will be able to select what you want to get results (e.g- how well the response of the agent was, the safety of the agent, output quality, etc.).</li>
+ <li>As the evaluation is running, you will begin to see various scores and results. Please note, some results take longer than others to see the output depending on what it is (e.g - a benchmark running to test an agent's response).</li>
+ <li>One of the first you'll most likely see is one of the conversations that you had with your agent during the run that you obtained the trace of. You can see that the agent was asked "What can you do?" during the run and therefore, that shows up within the trace, so you can benchmark it.</li>
+</ol>
+<p>Drill into the first result that is complete. With the completed result, you can see everything from the overall latency/performance of the run, what went wrong (e.g - hallucinations), and the overall score of how the agent operated during that run.</p>
+<h3>agentevals CLI</h3>
+<p>Aside from using the UI, you can also use the agentevals CLI to see results.</p>
+<pre><code>uv run agentevals run samples/helm.json \
+  --eval-set samples/eval_set_helm.json \
+  -m tool_trajectory_avg_score</code></pre>
+<p>There are several examples that you can find on the <a href="https://aevals.ai/docs/integrations/">docs page</a>.</p>
+<h3>Conclusion</h3>
+<p>The two top priorities for just about every organization are security and observability around the end-to-end agentic workflow and how to ensure that the output you're receiving from an agent is as good as expected. Agentic quality and output performance will become increasingly crucial as agents become more autonomous and adopted across various teams within an organization.</p>

@@ -1,0 +1,125 @@
+<p>Understanding why an application is using more resources than expected, whether that is CPU or memory, can be challenging. Logs and aggregate metrics can only get you so far. Thankfully there is a better way: CPU or memory profiling can show you the exact function where your application is using CPU or allocating memory.</p>
+<p>Today we are happy to announce support for CPU and memory profiling of Workers and Durable Objects. From the Workers Observability page, you can now request an on-demand CPU or memory profile of an active Worker, inspect it as an interactive flamegraph, and download the profile file for further analysis.</p>
+<p>This method of profiling gives you a useful perspective into what your code is doing and how you can improve it in a real-world setting. That’s because the best way to understand your application is to profile it in production.</p>
+<p>To try this on one of your Workers, you have a choice of using the CLI or the Cloudflare Dashboard.</p>
+<p>To use the CLI, make sure you <a href="https://developers.cloudflare.com/cf/">have the cf package installed</a>, then simply run:</p>
+<pre><code>cf workers versions profile latest \
+     --worker-id "$WORKER_ID_OR_NAME" \
+     --duration-ms 5000 \
+     --profile-type cpu &gt; worker-cpu.pprof</code></pre>
+<p>To use the dashboard, head to the <a href="https://dash.cloudflare.com">Cloudflare dashboard</a> and then access the list of Workers on your account by navigating through Build → Compute → Workers &amp; Pages.</p>
+<p>Select your Worker and navigate to its Observability tab. You can then use the drop down to select “Flamegraph”:</p>
+<p>You can then request both CPU and memory profiles for your Worker on this page. The duration determines how long the profiler should run for on your Worker. You can also select different versions of your Worker to be profiled. Your Worker needs plenty of traffic to be successfully profiled, so make sure you choose a version that has enough traffic.</p>
+<p>Once you click the Capture Profile button, the profiler will run for the duration that you have selected, and you will then see a flamegraph representing the results of the profile being rendered. Each rectangle in the flamegraph represents a function call, with the width representing the amount of CPU time or memory being used by that function. You can click on different functions to focus on and hover to see more details about them:</p>
+<p>Don’t be afraid to capture a couple of profiles, then look for the widest functions to determine what is using the most resources in your Worker. You might also find that the table view is useful to get a quick sense of which functions are most commonly seen in the profile.</p>
+<p>If your Worker is implemented in TypeScript, then you should <a href="https://developers.cloudflare.com/workers/observability/source-maps/">make sure that you have source maps enabled for your project</a>, otherwise your profile may show obfuscated function names that aren’t easy to understand.</p>
+<p>We have already seen multiple teams at Cloudflare using CPU and memory profiling to identify opportunities for optimizing memory and CPU usage, fixing out-of-memory (OOM) errors, and improving performance. Below are some examples of this.</p>
+<h3>Using CPU profiling to find optimizations</h3>
+<p>Let’s look at a real example of how you can use CPU profiling to optimize your Workers. We will look at a CPU profile of the Worker that implements the R2 binding. This Worker receives a lot of traffic and so eliminating even the smallest amount of wasted CPU cycles can have a massive impact on its performance.</p>
+<p>We set up the profiler to capture CPU traces, with a duration of 50 seconds. Once we received the rendered profile, we saw this:</p>
+<p>As mentioned previously, the widest boxes are those which are using up most of the CPU time. Some of them aren’t surprising, for example <code>decryptBlock</code> is R2 decrypting object data on the way out, and <code>fillResponse</code> is just moving bytes. There weren’t any clear ways to optimize these functions.</p>
+<p>As some of the boxes are less visible, it can be a good idea to take a look at the table view. Sorting by Samples points us at <code>genericR2JsonReplacer</code>:</p>
+<p>This function represented over 5% of the CPU time, but what caught our attention was the function calling itself recursively. This looked like wasted work, and it was.</p>
+<p>Even though the replacer was being called by <code>JSON.stringify</code> on every node in the JSON tree, the replacer itself was also walking the tree. This meant that a value nested five levels deep was processed five times. Fixing this enabled us to eliminate the duplicate work and make the <code>genericR2JsonReplacer</code> function 2.7x faster.</p>
+<p>The second candidate in the profile that we looked at was a duplicate call to <code>metrics</code>.</p>
+<p>When looking at the code, we saw something close to this:</p>
+<pre><code>function ship() \{
+  if (!registry.metrics().length) \{
+    return;
+  }
+
+  // ... more code here ...
+
+  return Response(registry.metrics());
+}</code></pre>
+<p>The <code>metrics</code> call was heavy enough that just one call represented 1% of the CPU time in the profile. So storing the result of the first call in a variable and then not calling it again saved us a fair chunk of CPU time.</p>
+<h3>How we used Worker profiling internally to fix memory problems</h3>
+<p>Internally we had a Worker with a memory problem. P999 memory sat around 133 MB against the 128 MB Worker memory limit. This caused the Worker to be evicted frequently with an “Exceeded Memory” error.</p>
+<p>The image above shows a screenshot of the “Errors by invocation status” graph, with the number of “Exceeded Memory” errors clearly dropping as a result of the fixes identified through profiling.</p>
+<p>What was hard to work out was what was causing these errors. The errors and metrics pointed at memory as the source of the problem, but it didn’t explain which part of the code caused it.</p>
+<p>The team took a heap profile of one of the Workers running in production and opened it with <code>pprof</code>. They saw that their Prometheus code accounted for roughly 66.7% of allocations in the profile. This code was supposed to be disabled, but enough of it was still running that it created a problem. Because it was instrumenting a lot of the code paths in the Worker, it ended up using a lot of its memory, even though the collected data never actually left the Worker.</p>
+<p>This code wasn’t suspected as a culprit of the memory issues, because it was thought to have been disabled. The profiler showed that the code was only partially disabled, with the memory cost still being paid as if it was fully enabled.</p>
+<p>The team removed the Prometheus code path completely. This quickly improved the memory usage of the Worker:</p>
+<table>
+ <tbody>
+  <tr>
+   <td>
+    <p>Percentile</p></td>
+   <td>
+    <p>Before (MB)</p></td>
+   <td>
+    <p>After (MB)</p></td>
+  </tr>
+  <tr>
+   <td>
+    <p>P50</p></td>
+   <td>
+    <p>70</p></td>
+   <td>
+    <p>54</p></td>
+  </tr>
+  <tr>
+   <td>
+    <p>P90</p></td>
+   <td>
+    <p>94</p></td>
+   <td>
+    <p>79</p></td>
+  </tr>
+  <tr>
+   <td>
+    <p>P99</p></td>
+   <td>
+    <p>113</p></td>
+   <td>
+    <p>97</p></td>
+  </tr>
+  <tr>
+   <td>
+    <p>P999</p></td>
+   <td>
+    <p>133</p></td>
+   <td>
+    <p>118</p></td>
+  </tr>
+ </tbody>
+</table>
+<p>This gave the P999 about 10 MB of headroom below the 128 MB limit.</p>
+<h3>Following a profiling request to the edge</h3>
+<p>Workers have supported local profiling through Chrome DevTools for a while, but it has not been possible to start a profiling session on Workers running in production. While profiling a Worker locally is useful, the Worker does not receive the same kinds nor number of requests as one does in production. So how do we profile a Worker or a Durable Object running there?</p>
+<p>One of the best features of Workers is that their requests are routed to the data center that is nearest to the requesting client. This reduces latency, but it does mean that Workers must be replicated across different data centers and metals (physical servers). In addition, when a Worker is receiving a lot of requests in a particular data center, it can be replicated in a particular metal multiple times to handle all the traffic.</p>
+<p>Durable Objects add another layer of indirection: they can be placed dynamically and can move.</p>
+<p>This and a few other features of Workers means that before we can start a profiling session, we need to first answer a few questions:</p>
+<ul>
+ <li>Which version does the developer want to profile?</li>
+ <li>In which data center has that version run recently?</li>
+ <li>Is the Worker’s isolate still loaded in that data center?</li>
+ <li>Does the isolate belong exclusively to the requesting account?</li>
+ <li>For a Durable Object, where is the exact live primary actor?</li>
+</ul>
+<p>A few of these questions are answered by the client making the profiling request. In most cases this will be the dashboard, but you can also send these requests yourself (or have your coding agent do it for you). An example request might look something like this:</p>
+<pre><code>curl 'https://api.cloudflare.com/client/v4/accounts/&lt;account_id&gt;/workers/workers/&lt;worker_name&gt;/versions/latest/profile' \
+  --data-raw '\{"duration_ms":5000,"profile_type":"cpu"}'</code></pre>
+<p>Notably, this specifies both the script name and version that should be profiled as part of the request URL.</p>
+<p>Right now, a new isolate is not started to produce a profile, because the goal is to observe real production execution. This means that if your Worker is receiving very little traffic, you may find that it is hard to profile. So it’s important you pick a version of your Worker that is deployed.</p>
+<h3>Profiling an isolate without stopping the Worker</h3>
+<p>A profile is useful only if the application can continue to execute while samples are collected. The Workers Runtime therefore holds the isolate lock only for profiler lifecycle operations. For a CPU profile, the process looks like this:</p>
+<ol>
+ <li>Acquire the isolate and its lock.</li>
+ <li>Create a V8 CPU profiler and begin sampling at a one millisecond interval.</li>
+ <li>Release the lock so normal requests can run.</li>
+ <li>Wait for the requested duration.</li>
+ <li>Reacquire the lock and stop profiling.</li>
+ <li>Release the lock and serialize the result outside the critical section.</li>
+</ol>
+<p>Holding the lock through the duration of the profile would prevent JavaScript execution from continuing, which would make the profile useless.</p>
+<h3>Durable Objects</h3>
+<p>Durable Objects are different from Workers. Regular Workers are stateless: no one Worker is special or different from the rest, and we pick a running isolate of the requested Worker at random. Durable Objects are stateful, and they have a name. That provides us with the very helpful ability to grab a profile of a specific isolate and a specific object anywhere in the world. When profiling a Durable Object, you can choose by name which object to profile. The runtime will then route the profiling request to the right metal that owns the specific actor and provide a profile of the specific isolate running that object.</p>
+<h3>What’s next?</h3>
+<p>On-demand profiling is just the start. It enables you to explore your Workers performance in ways that have not been possible before. But it does have some limitations worth noting:</p>
+<ul>
+ <li>You must explicitly start the profiling session. This can mean that you miss important time periods in which your Worker is misbehaving, and where you would like to see a profile to understand what went wrong.</li>
+ <li>The memory profiler can only show you allocations that occurred during the profiling window. So if your Worker is allocating a lot during start-up, you will not see it.</li>
+</ul>
+<p>In order to resolve this we are already working on something new: continuous profiling. The idea is that we will capture profiling samples for your Worker automatically, so that you can simply explore the profiles in the dashboard. This should make it easier to capture more rare events.</p>
+<p>To learn more about profiling in Workers, including the feature presented in this blog post, <a href="https://developers.cloudflare.com/workers/observability/profiling-in-production/">check out our documentation</a>.</p>

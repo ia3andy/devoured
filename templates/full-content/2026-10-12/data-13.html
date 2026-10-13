@@ -1,0 +1,172 @@
+<h1>How we’re building a context engine to cut agent token use by 71%</h1>
+<p>With a context engine, the same agent and model answered in 64 seconds using 9 tool calls. The baseline took 213 seconds, 33 calls, and missed a key relationship entirely.</p>
+<p>Agent Builder is available now GA. Get started with an Elastic Cloud Trial, and check out the documentation for Agent Builder here.</p>
+<p>Agents that query enterprise data burn most of their tokens on discovery: working out schemas, what fields mean, and how entities relate across complex and potentially large documents and data sources. Then they do it all again on the next query, even when nothing has changed.</p>
+<p>A <em>context engine</em> understands your data ahead of the question. It reads your sources and stores what it learns as small structured units of context, so when a task arrives, an agent gets the relevant ones and shortcuts discovery. We built one on Elasticsearch, and every stage of it turned out to be a search problem. Automations search and precompute knowledge, storing it in a specialized <em>AI index</em> with native hybrid search and retrieval enabled over it. With a context engine, agents pull what they need rather than digging through raw data. In an example, with the same model and data, tool calls dropped from 33 to 9, and input tokens fell 71%. Plus, latency went from 213s to 64s, and the agent’s response was more complete, surfacing relationships that would otherwise be missed.</p>
+<h2>What an agent does without a context engine</h2>
+<p>Ask a data agent a strategic business question like: <em>Give me a summary of the issues hitting our largest customers.</em> Without help, a capable agent starts by listing indices to see what data exists. It reads mappings to work out which fields mean "customer" and which mean "issue." It scans contracts to figure out account value and find the largest accounts. Along the way, it misses that five accounts roll up under the same parent company, so it undercounts one of your biggest relationships. It also doesn't know that <code>account_id</code> is sometimes null in the tickets index, so part of its query quietly returns the wrong rows.</p>
+<p>The model's reasoning was fine, but the agent spent most of its budget working out what the data is before it could reason about what the data says, and it will repeat all of that on the next question.</p>
+<p>Provided with the right context however, the agent can be much more efficient. A context engine built on Elasticsearch precomputes knowledge from the raw data sources like tickets and contracts, and surfaces it to the agent upfront so it avoids the costly steps before actually reasoning about an answer. The table below demonstrates this benefit for that business question above, with the same system prompt, model, and data. The only difference is whether the agent had a context engine to read from. We’ll explore what it means to build a context engine and how it provided this benefit through this post.</p>
+<table>
+ <thead>
+  <tr>
+   <th><strong>Same prompt and model*</strong></th>
+   <th><strong>Without Context Engine</strong></th>
+   <th><strong>With Context Engine</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Tool calls</td>
+   <td>33</td>
+   <td>9</td>
+  </tr>
+  <tr>
+   <td>Input tokens</td>
+   <td>2,279,253</td>
+   <td>653,511</td>
+  </tr>
+  <tr>
+   <td>Latency</td>
+   <td>213s</td>
+   <td>64s</td>
+  </tr>
+  <tr>
+   <td>Found parent-company relationship</td>
+   <td>No</td>
+   <td>Yes</td>
+  </tr>
+  <tr>
+   <td>Cost</td>
+   <td>Baseline</td>
+   <td>71% lower</td>
+  </tr>
+ </tbody>
+</table>
+<p><em>Across multiple dimensions, Context Engine improves agent performance. The agent reduces tool calls, tokens, and latency, while finding more complete answers. </em></p>
+<p><em>* Runtime model: claude-sonnet-5, using LangChain Deep Agent Harness, precompute ~636K input tokens with claude-haiku-4-6.</em></p>
+<h2>Why AI agents need a context layer</h2>
+<p>Most context engineering work so far has been about what goes into one agent's context window: prompts, tool definitions, conversation history, compaction. That work matters, but when we worked with customers building on Elastic Agent Builder, the context that decided whether an agent succeeded usually wasn't in the conversation at all. It was business knowledge, like what each data source is for, how data sources relate across systems, what trends or anomalies exist in the data, and how to build efficient queries against that data.</p>
+<p>When there's nowhere to keep that knowledge, the same problems show up in production, including:</p>
+<ul>
+ <li><strong>Per-query discovery cost.</strong> Agents pay a discovery cost on every query, spending tokens to work out what data exists, what fields mean, and how sources relate, even when nothing has changed.</li>
+ <li><strong>Context drift.</strong> Whatever context someone does write down in markdown files or catalog entries drifts out of date as data and usage change.</li>
+ <li><strong>Siloed knowledge.</strong> What one agent learns never helps another, so quality doesn't compound and costs don't fall. Plus, the gap between demo and production stays open.</li>
+</ul>
+<h2>What a context engine does</h2>
+<p>A context layer sits between your raw data and your agents. It does the work of understanding your data ahead of time and stores the results as small structured units of context. Then hands agents the relevant ones when they need them.</p>
+<p>We call these units Knowledge Indicators (KIs). A KI might describe:</p>
+<ul>
+ <li>An entity and its relationships, such as "LongHaul (ACC-1007) is a subsidiary of Orion Holdings".</li>
+ <li>A data source profile, such as "the tickets index holds customer support issues; search it semantically on the issue description".</li>
+ <li>A data quirk, such as "<code>account_id</code> is not always present, so filter out nulls".</li>
+ <li>A fact, anomaly, or pattern that would otherwise take a full scan to find, such as “what is the peak and median query load over the last 30 days”.</li>
+</ul>
+<p>The layer creates and serves KIs in a continuous loop:</p>
+<ol>
+ <li><strong>Gather.</strong> Read each source, and learn its shape. Find the content that matters for what your agents need to do.</li>
+ <li><strong>Build.</strong> Turn that content into KIs (metadata, entities, relationships, anomalies, facts, and query guidance), and store them.</li>
+ <li><strong>Retrieve.</strong> When an agent gets a task, it pulls a small, ranked set of relevant KIs instead of doing schema discovery and document scans itself.</li>
+ <li><strong>Improve.</strong> Every agent interaction produces a trace, and traces feed back in as a new source, so context keeps up with how agents are actually used.</li>
+</ol>
+<h2>Why every stage of context engineering is a search problem</h2>
+<p>Search usually comes up in these discussions as the retrieval step at the end. In practice, each stage of the loop depends on finding the right information.</p>
+<table>
+ <thead>
+  <tr>
+   <th><strong>Stage</strong></th>
+   <th><strong>The search problem</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Gather</td>
+   <td>You're working with gigabytes to petabytes of data and can't reprocess all of it continuously. Narrowing to what matters takes high recall and high precision: agentic search to understand intent, lexical search for precision, semantic search for recall, and workflows to automate it.</td>
+  </tr>
+  <tr>
+   <td>Build</td>
+   <td>KIs precompute what an agent would otherwise work out at runtime. What to keep and what to throw away depends on how the KI will be retrieved, so KIs need embeddings, metadata fields, and combined fields designed for retrieval.</td>
+  </tr>
+  <tr>
+   <td>Retrieve</td>
+   <td>What goes into the context window has to be relevant and complete, as well as concise. If it's noisy, the agent ignores it and goes back to exploring the raw source. Tuning this is a relevance problem.</td>
+  </tr>
+  <tr>
+   <td>Improve</td>
+   <td>Traces and transcripts are unstructured. To surface recurring failures and the patterns they share, you need hybrid search.</td>
+  </tr>
+ </tbody>
+</table>
+<p>We built the context layer on Elasticsearch because its stages rely on hybrid search, Elasticsearch Query Language (ES|QL), and vector search, often within the same request. Earlier blog posts covered each of these individually, and this post shows how Context Engine runs them together.</p>
+<h2>How this compares to approaches like agentic RAG and longer context windows</h2>
+<p>Context engineering isn’t a new practice, and there are many existing approaches to help manage the same challenges. Creating context, through the loop above, augments and helps address many of the tradeoffs and challenges with existing approaches today.</p>
+<table>
+ <thead>
+  <tr>
+   <th><strong>Approach</strong></th>
+   <th><strong>What happens at query time</strong></th>
+   <th><strong>Tradeoff</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Static context files or catalogs</td>
+   <td>Agent reads hand-written descriptions</td>
+   <td>Goes stale and doesn't learn from use</td>
+  </tr>
+  <tr>
+   <td>Agentic retrieval augmented generation (RAG)</td>
+   <td>Agent searches raw chunks and loops until satisfied</td>
+   <td>Reassembles knowledge on every task and misses relationships that span documents</td>
+  </tr>
+  <tr>
+   <td>Coding agent with grep</td>
+   <td>Agent navigates files directly</td>
+   <td>Slow and token-hungry; struggles to tell which match is the right one</td>
+  </tr>
+  <tr>
+   <td>Longer model context window</td>
+   <td>Agent loads data directly into the context window to reason over</td>
+   <td>Longer context windows struggle with problems of context rot and attention, and as context builds, each subsequent turn becomes more expensive.</td>
+  </tr>
+ </tbody>
+</table>
+<p>A context layer trades the cost of precomputing and processing data for the benefits of improved efficiency at runtime. Because precomputation can be defined ahead of time, it can be more prescribed and use smaller, cheaper models, making this tradeoff much more manageable while addressing many of the efficiency and effort concerns of the approaches above.</p>
+<h2>Building a context engine</h2>
+<p>Context Engine consists of five components: sources, automations, AI index, agent memory (agents), and the feedback loop.</p>
+<h3>Sources</h3>
+<p>Context can come from any Elasticsearch index or data stream, so you build it where your data already lives. It can also come from external applications and data sources, through connectors, and from agent traces captured in Agent Builder or sent from other agent frameworks over OpenTelemetry (OTel).</p>
+<h3>How automations build context</h3>
+<p>Automations populate the AI index. They're Elastic Workflows with specialized steps that search raw content, process results with a large language model (LLM) or other models, structure the output for retrieval, verify provenance, apply access control, track state, and write KIs to the AI index.</p>
+<p>You don't have to write them from scratch. A setup agent looks at your connected sources and suggests automations. They can run on small, inexpensive models or plain ES|QL, which keeps build costs low while the savings show up on every query afterward.</p>
+<h3>The AI index, built on the Elasticsearch vector database</h3>
+<p>The AI index is the context store. It runs on Elasticsearch as a vector database and includes ES|QL and hybrid search. It holds the KIs that automations produce. Its schema and mappings are designed for agents to retrieve from.</p>
+<h3>How agent memory works</h3>
+<p>As users complete tasks, agents can store and retrieve memories with remember, recall, and forget tools. Memory consolidation and organization-wide sharing are next on the roadmap.</p>
+<h3>How agent traces feed back into context</h3>
+<p>Every agent interaction produces a trace that records how the agent worked through the task, including where it succeeded and where it got stuck, in addition to where it spent tokens. The feedback loop looks for inefficiencies in these traces and suggests changes to your automations, so KIs improve from real usage as well as from any test set you wrote up front.</p>
+<h2>From raw data to a better answer with a context engine</h2>
+<p>Here’s how the context engine was used to achieve the results at the top of this post. We evaluated a simulated account analysis agent on questions like the one above. It had to pull from several sources:</p>
+<ul>
+ <li>Four Elasticsearch indices holding customer tickets, subscribers, an internal knowledge base, and support page search query logs.</li>
+ <li>A Google Drive folder with about 50 simulated contracts between the enterprise and its customers or vendors.</li>
+</ul>
+<p>Automations created two kinds of KIs from these sources. <em>Index profiles</em> describe what each source is for and how to query it. <em>Account entities</em> pull accounts, projects, and people, along with their relationships to other entities, out of raw contract and ticket text. That produced about 80 KIs, each holding the extracted content plus metadata that tracks provenance, lifecycle, and how to query the context. The automations ran on smaller, cheaper LLMs, so extraction cost stayed low.</p>
+<p>We connected the AI index to two agent frameworks, Elastic Agent Builder and LangChain Deep Agents, both over Model Context Protocol (MCP).</p>
+<h3>How the baseline agent spent 33 tool calls</h3>
+<p>By using the following request, <em>Give me a summary of the issues hitting our largest customers</em>, the baseline agent:</p>
+<ol>
+ <li>Ran discovery, looking at each data source, its fields, and sample documents to learn the structure.</li>
+ <li>Worked out what "customer" means in the data (there are subscribers and contracted accounts) and how to define "largest" (there are fields for annual contract value [ACV] and monthly recurring revenue [MRR]).</li>
+ <li>Queried the tickets index to find problems.</li>
+ <li>Pulled the full text of every contract that mentioned an affected customer, looking for relationships to other organizations.</li>
+</ol>
+<p><em>The baseline spends 18 calls reconciling tickets against accounts and 13 more fetching contracts one at a time. The Context Engine Agent reads the account relationships once and then spends seven calls checking the raw tickets.</em></p>
+<p>The discovery and contract reads are the expensive part, and they account for most of the token cost in the baseline run.</p>
+<h3>What changed with the context layer</h3>
+<p>With the AI index, the agent started with knowledge that automations had precomputed. It already knew which fields identify customers and which define the largest ones. The entity KIs also captured relationships from the raw contract text, such as one parent company sitting over several smaller ones. Reading the KIs up front let the agent skip the expensive queries and full document scans, and run lightweight checks against the original data instead. As a result, the run used 71% fewer input tokens, and the context window stayed free of noise.</p>
+<h2>Why context engineering for agents is a search problem</h2>
+<p>The first wave of context engineering was about the context window: what to put in the prompt and what to compact, along with what to drop. That's still important, but for agents that work across enterprise data, the harder problem is building the context in the first place. Business knowledge has to be gathered, shaped, kept current before a conversation starts, and shared across agents so each one doesn't rebuild it.</p>
+<p>A context layer does that job, and it changes how agents work. Agents get consistent guidance on where to look and how to query, so answers still come from live data without the dead ends. Context refreshes from the source, so it adapts to changes in data, user behavior, and use cases without someone maintaining it by hand. Every agent run also shows what was missing, so the knowledge base gets better with use and every agent that shares it benefits.</p>
+<p>All of this depends on search. Finding the signal in large datasets, shaping context so it can be found again, retrieving only what's relevant, and spotting patterns across thousands of traces are all search problems. If you're designing the context layer for your agents, build it on search.</p>
+<p><em>We're actively partnering with developers who want to optimize their agents in production. If you're interested in exploring Context Engine for your agents, you can request access here.</em></p>

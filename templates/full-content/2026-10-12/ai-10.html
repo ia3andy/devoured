@@ -1,0 +1,211 @@
+<p>Following last week’s release of Clef and Clef-flash, Cloudflare’s open-weight decision models, we decided to bring forth more gifts. Today, we’re releasing Clef-omni, which takes in audio and video input alongside text and image. We also cut the price of Clef-flash so it is now cheaper than Jev, and we made Clef faster.</p>
+<p>Although the model game is still early for Cloudflare, innovation and iteration is in our DNA, and we apply these principles to everything we do. In fact, the story of Clef came together over the course of less than a week. We decided we wanted to do something in the decision model space on a Friday evening, trained the model over the weekend, and launched it on Thursday. Even with such a short timeline, we were able to ship performant, high-quality, open-weight models for the community — imagine what more we can do in the future.</p>
+<p>For today, we’re excited to keep up the momentum with new additions and improvements to our Clef family of models. This is just the beginning, and we’ll continue to get better, faster, cheaper, and more innovative.</p>
+<h2>Clef-omni takes audio, video, image, and text input</h2>
+<p>Our new Clef-omni model is able to take audio, video, image, and text input. This changes the paradigm for decision models, which have been largely text-only since the debut of Jev from TypeSafe. With Clef, we supported images and video frame arrays, but Clef-omni is able to take in audio (wav or mp3) and video (mp4 or webm) alongside text and images.</p>
+<p>Instead of setting up cascading pipelines of models that transcribe speech-to-text, or splitting audio and image channels from video, you can just call one model to make decisions across any modality. We are now one step closer to a model that is able to interact with the world as we experience it — through audio, visual, and textual communication, all in one.</p>
+<p>Check out our developer docs for the new <a href="https://developers.cloudflare.com/workers-ai/models/clef-omni">Clef-omni</a> model. We also released the model <a href="https://huggingface.co/Cloudflare/clef-omni">open-weights on HuggingFace</a>. For a quick start, here’s how you can send new modality inputs to Clef-omni:</p>
+<pre><code>curl https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/ai/run/@cf/cloudflare/clef-omni \
+  -X POST \
+  -H "Authorization: Bearer $CLOUDFLARE_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '\{
+    "model": "clef-omni",
+    "state": "Review the installation: a photo of the unit, an audio recording of it running, and a video of the fan.",
+    "images": ["data:image/png;base64,&lt;base64-png&gt;"],
+    "audio": ["data:audio/mpeg;base64,&lt;base64-mp3&gt;"],
+    "videos": ["data:video/mp4;base64,&lt;base64-mp4&gt;"],
+    "questions": \{
+      "label_visible": \{"type": "noul", "instructions": "Is the model and serial number label visible in the photo?"},
+      "sounds_normal": \{"type": "noul", "instructions": "Does the unit sound like it is running smoothly, without rattling or grinding?"},
+      "fan_running": \{"type": "noul", "instructions": "Is the fan running in the video?"}
+    }
+  }'</code></pre>
+<p>Clef-omni expands our open-weight decision architecture to natively handle multimodal workflows. We built this on a Qwen3-Omni-30B-A3B-Instruct mixture-of-experts (MoE) foundation, where the model was already capable of processing text, imagery, audio, and video directly within a single pipeline. However, we adopt the primary comprehension backbone while discarding the text-to-speech output components. In production, Clef-omni executes a quick prefill pass across the complete payload, scoring all modalities and valid parameter options simultaneously.</p>
+<p>Because we skip output token generation since Clef models are not Large Language Models (LLMs), we remove the overhead of transcribing or captioning incoming files. Media elements map straight into the unified sequence, where video and audio are synced with visual frames for joint processing. Clef-omni then pulls candidate values directly from internal embeddings using our two-stage attention routing: every valid option gathers key evidence from the input (regardless if they are buried in text snippets, visual elements, or audio streams) before field vectors cross-attend across the full context to compute confidence scores. We add a built-in lexical grammar that preserves option semantics, so that we can deliver fast, schema-constrained scoring across every input type.</p>
+<p>We train the model with the same techniques as we did with Clef — freezing the Qwen3 backbone, training low-rank adapters (LoRA), and applying our standard post-training approach: combining label-smoothed cross-entropy loss with Brier score calibration. The result is a model that is resilient and designed to succeed regardless of schema variations, field ordering, and prompt structures.</p>
+<p>This brings several core upgrades to the Clef model family. Calibrated, schema-bound decisions now seamlessly handle text, images, audio, and synchronized video in a single API call. It's also fast. Text-only decisions return in about 130 ms at the median, image inputs in about 150 ms, and audio clips in a few hundred milliseconds. Even a full 21-second video clip with sound is scored in about 1.5 seconds, all in a single API call.</p>
+<p>Our benchmarking shows strong performance across benchmarks, even with new modalities and MoE architecture.</p>
+<table>
+ <tbody>
+  <tr>
+   <td><strong>Benchmark</strong></td>
+   <td><strong>Clef-omni</strong></td>
+   <td><strong>Clef</strong></td>
+   <td><strong>Clef-flash</strong></td>
+   <td><strong>Jev</strong></td>
+  </tr>
+  <tr>
+   <td>BFCL · case exact</td>
+   <td>98.2</td>
+   <td>98.47</td>
+   <td><strong>98.76</strong></td>
+   <td>95.75</td>
+  </tr>
+  <tr>
+   <td>ToolRet · nDCG@10</td>
+   <td>66.6</td>
+   <td><strong>69.19</strong></td>
+   <td>66.43</td>
+   <td>65.28</td>
+  </tr>
+  <tr>
+   <td>API-Bank · accuracy</td>
+   <td>92.7</td>
+   <td>91.93</td>
+   <td><strong>93.11</strong></td>
+   <td>88.19</td>
+  </tr>
+  <tr>
+   <td>Home appliances · case exact</td>
+   <td>69.3</td>
+   <td>82.95</td>
+   <td><strong>97.73</strong></td>
+   <td>52.27</td>
+  </tr>
+  <tr>
+   <td>When2Call · accuracy</td>
+   <td>63.3</td>
+   <td>72.37</td>
+   <td>65.58</td>
+   <td><strong>80.97</strong></td>
+  </tr>
+  <tr>
+   <td>BANKING77 · macro-F1</td>
+   <td><strong>94.8</strong></td>
+   <td>94.20</td>
+   <td>90.93</td>
+   <td>79.74</td>
+  </tr>
+  <tr>
+   <td>CLINC150+OOS · macro-F1</td>
+   <td><strong>97.7</strong></td>
+   <td>97.43</td>
+   <td>66.77</td>
+   <td>89.27</td>
+  </tr>
+  <tr>
+   <td>BRIGHT · nDCG@10</td>
+   <td>42.0</td>
+   <td>45.91</td>
+   <td>39.26</td>
+   <td><strong>47.52</strong></td>
+  </tr>
+  <tr>
+   <td>Amazon ESCI · macro-F1</td>
+   <td><strong>57.8</strong></td>
+   <td>57.48</td>
+   <td>57.39</td>
+   <td>55.21</td>
+  </tr>
+  <tr>
+   <td>PhishNChips · accuracy</td>
+   <td>73.2</td>
+   <td><strong>79.60</strong></td>
+   <td>75.05</td>
+   <td>62.55</td>
+  </tr>
+ </tbody>
+</table>
+<p>We also benchmarked against the <a href="https://evals.typesafe.ai/">TypeSafe evals to show how Clef-omni performs</a>.</p>
+<table>
+ <thead>
+  <tr>
+   <th><strong>Workflow</strong></th>
+   <th><strong>Metric</strong></th>
+   <th><strong>Clef-Omni</strong></th>
+   <th><strong>Clef</strong></th>
+   <th><strong>Clef-flash</strong></th>
+   <th><strong>Jev</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Invoice processing</td>
+   <td>Exact actions</td>
+   <td>60.2</td>
+   <td><strong>64.7</strong></td>
+   <td>57.1</td>
+   <td>61.8</td>
+  </tr>
+  <tr>
+   <td>Invoice processing</td>
+   <td>Primary action</td>
+   <td>82.0</td>
+   <td><strong>86.2</strong></td>
+   <td>73.3</td>
+   <td>83.1</td>
+  </tr>
+  <tr>
+   <td>Customer service</td>
+   <td>Exact actions</td>
+   <td>71.6</td>
+   <td>76.3</td>
+   <td><strong>77.0</strong></td>
+   <td>76.0</td>
+  </tr>
+  <tr>
+   <td>Security incidents</td>
+   <td>Exact actions</td>
+   <td>61.7</td>
+   <td><strong>62.9</strong></td>
+   <td>61.7</td>
+   <td>61.7</td>
+  </tr>
+  <tr>
+   <td>Agent trace observability</td>
+   <td>Primary action</td>
+   <td>65.8</td>
+   <td>68.5</td>
+   <td>69.8</td>
+   <td><strong>71.6</strong></td>
+  </tr>
+ </tbody>
+</table>
+<h2>Clef-flash model is now cheaper</h2>
+<p>We heard your feedback — you want a decision model affordable enough to incorporate into any workflow. We’ve made a few optimizations and can now offer Clef-flash at cheaper prices. We want Clef to be able to make decisions that scale for you across all your agentic workflows, and now our pricing also incentivizes that.</p>
+<p>We were able to optimize the model to the point where Clef-flash is now <em>cheaper</em> than Jev while still being performant and high-quality. Check out the <a href="https://developers.cloudflare.com/ai/models/">developer docs</a> for the most up-to-date pricing information at all times, including more detail on how image and audio modalities are converted to input tokens for pricing.</p>
+<ul>
+ <li>Clef-flash – originally $0.09 per M input tokens, now <strong>$0.038 per M input tokens</strong></li>
+ <li>Clef – remains at <strong>$0.24 per M input tokens</strong></li>
+ <li>Clef-omni – launched today at <strong>$0.15 per M input tokens</strong></li>
+</ul>
+<p>However, one trade-off we have to make in order to have cheaper pricing is to cut the context window of Clef-flash. The hosted version of Clef-flash now has a context window of 24k, instead of 64k as previously advertised. The model weights on Hugging Face are untouched and were trained to support a 256k context window should you choose to self-host it.</p>
+<p>From our usage data, we see that only 0.24% of requests exceed 24k input tokens. Based on this data, we decided to make the call to drop the context window to 24k for Clef-flash in order to price it at a more accessible entry point. Our Clef model remains at a 64k context window, and we encourage folks with larger context needs to switch to Clef instead of Clef-flash.</p>
+<h2>Clef model is now faster</h2>
+<p>Speeds are also faster for the Clef model, with new optimizations to the hosted version of Clef on Workers AI. No new model weights are released because most of the optimizations we made are at the serving infrastructure layer, not materially to the model weights or architecture. Check out our new speeds below:</p>
+<table>
+ <tbody>
+  <tr>
+   <td>Input size</td>
+   <td>Before: median / p95 (ms)</td>
+   <td>Now: median / p95 (ms)</td>
+   <td>Median speedup</td>
+  </tr>
+  <tr>
+   <td>~800 tokens</td>
+   <td>262 / 438</td>
+   <td>152 / 351</td>
+   <td>1.7×</td>
+  </tr>
+  <tr>
+   <td>~3,400 tokens</td>
+   <td>616 / 777</td>
+   <td>305 / 531</td>
+   <td>2.0×</td>
+  </tr>
+  <tr>
+   <td>~16,000 tokens</td>
+   <td>2,721 / 3,250</td>
+   <td>1,635 / 1,805</td>
+   <td>1.7×</td>
+  </tr>
+ </tbody>
+</table>
+<p>One of the optimizations we made was to move to SGLang for serving the model. We worked with the SGLang team and made pull requests to incorporate Clef (PR <a href="https://github.com/sgl-project/sglang/pull/42721">#42721</a>), which will be released in SGLang 0.5.22. You can also self-host Clef since we released the weights, and the new SGLang launch commands are available on our <a href="https://huggingface.co/collections/Cloudflare/clef">updated Hugging Face repo</a> as well as the <a href="https://docs.sglang.io/cookbook/autoregressive/Cloudflare/clef#hw=h200&amp;variant=clef&amp;quant=bf16&amp;strategy=balanced&amp;nodes=single">SGLang cookbooks</a>.</p>
+<h2>How are people using Clef?</h2>
+<p>At Cloudflare, we’ve had teams experimenting with Clef as a model that can help classify over general domains. The coolest thing about watching teams adopt Clef is that the capability to do detections and classifications have moved into the model layer, where it is accessible for anyone to start incorporating decision models into their use cases. Previously, even with zero-shot classifiers, the small models may not have been powerful enough to classify across any domain without further tuning. You might have needed to stand up a specialized machine learning team to help train over your particular domain, and gather a corpus of data in order to train a better model. Now, all you need to do is call a model to instantly parse through input data with precision.</p>
+<p>A few highlights of how teams at Cloudflare are using Clef: Our public GitHub docs repo uses Clef to instantly <a href="https://github.com/cloudflare/cloudflare-docs/pull/34139">detect and close spam issues</a>. EmDash, our content management system, <a href="https://emdashcms.com/blog/01M49N4779YCXX3QPKWSSNE3DY">moderates plugin libraries for phishing</a>. Our data loss prevention team is scanning data for potential personally identifiable information (PII) like government IDs. And our threat intelligence team is using Clef to help detect malicious domains.</p>
+<h2>Give it a try!</h2>
+<p>We’re excited to bring you more from the Clef family of models, including new modalities like audio and video, as well as making the model more accessible with cheaper pricing and faster speeds. Clef is fully Jev-API compatible and available via AI Gateway, so it is as simple as changing the model ID to try out Clef today. Check out our <a href="https://developers.cloudflare.com/ai/models/">developer docs</a> for more information.</p>
+<p>Thank you for all the love and warm reception around Cloudflare’s first models — we are focused on bringing you more. Try out our Clef family of models, and tell us what you think.</p>

@@ -1,0 +1,50 @@
+<h1>DigitalOcean MicroVMs: Fast, isolated compute for your AI agent infrastructure</h1>
+<p>Coding-agent platforms, sandbox products, and code-execution services all need the same thing: isolated machines that start up fast, retain their state between bursts of work, and don’t consume compute when idle. If you build it yourself, you’ll have to lease compute capacity and turn raw servers into isolated, on-demand compute. This often includes fleet management, snapshot, pause and resume, per-tenant isolation, placement, and recovery. This takes a lot of time that could be better spent on building your product.</p>
+<p>Today, we’re announcing DigitalOcean MicroVMs in public preview so you don’t have to build and operate your own virtualization layer to run your agent infrastructure. A MicroVM is an isolated virtual machine built on open-source <a href="https://firecracker-microvm.github.io/">Firecracker</a> that pauses when idle and resumes exactly where it left off when active.</p>
+<p>In our previous blog post where we announced DigitalOcean MicroVMs private preview, we detailed multiple MicroVM use cases for agent infrastructure. Here, we’ll use a coding-agent platform as an example to see what building one looks like on MicroVMs. Each session consists of an agent reading a repository, writing code, and running the code and subsequent tests. This requires an isolated environment per session, which is created when the session starts and destroyed when it ends.</p>
+<h2>One MicroVM per session</h2>
+<p>When a session starts, you create a MicroVM from your container image. This packages your agent, its toolchain, and its dependencies. The MicroVM boots on Firecracker with its own kernel and a real hardware-virtualized boundary rather than a shared one. The agent inside can write and run whatever code it needs, and is designed to contain any potential bad steps to that single MicroVM, isolated from the host and other customers. The session is accessed over an authenticated HTTPS endpoint, so only requests with a valid DigitalOcean API token can reach it.</p>
+<h2>Pay only while it’s running, not while it’s paused</h2>
+<p>A coding agent spends most of its time during a session waiting, on the model to respond, on its code to run, or on a person to review its work. A MicroVM pauses when it has been idle for a time duration you set, and you don’t pay for compute while the MicroVM is paused. When the next request arrives, the MicroVM resumes in milliseconds and picks up where it left off with its memory, files, and running processes exactly where they were.</p>
+<h2>Fast startup and resume</h2>
+<p>A MicroVM starts in milliseconds, so it’s ready the moment a session begins. Resuming a paused MicroVM is just as fast, which makes it practical to pause between steps rather than holding a long-lived machine open for each session or user. It also means a burst of new sessions just spins up more MicroVMs on demand, up to your team’s MicroVM limit, instead of you having to provision capacity ahead of time.</p>
+<h2>Start every session warm, not from scratch</h2>
+<p>Creating an agent’s environment requires a lot of setup, and rebuilding everything for each new session is slow and inefficient. MicroVMs let you deal with the setup of the environment once, checkpoint it, and start new sessions from the checkpoint. Each session begins pre-warmed in the state you capture, ready for a task the moment it starts without any of the setup.</p>
+<h2>Built-in recovery and private networking</h2>
+<p>Moving coding agents beyond a proof of concept requires capabilities such as automatic recovery and private networking. If a workload crashes after it has started, the MicroVM restarts it automatically. However, with a MicroVM, a crashed workload stuck in a failure-loop will stop retrying to prevent a broken image from restarting endlessly. Additionally, MicroVMs can be run inside your VPC so they can reach your databases and internal services without exposing them to the public. If you don’t have a VPC, DigitalOcean can create one for you.</p>
+<h2>Already powering DigitalOcean Managed Agents</h2>
+<p>MicroVMs power DigitalOcean Managed Agents (available in public preview) so you have the same pause, resume, and isolation capabilities.</p>
+<p>MicroVMs give you the virtual machine and its lifecycle: create one from an image, pause and resume it, checkpoint it, run commands inside it, and access it over its endpoint. Managed Agents is the upper layer, and its DigitalOcean Harness Runtime adds an agent control plane over the MicroVM. You don’t have to build anything to handle reading and writing files, uploading and downloading them, running and upgrading the agent harness, preserving session state across runs, and brokering governed access to tools.</p>
+<h2>Pricing</h2>
+<p>You only pay for compute usage while a MicroVM is running, at $0.022 per vCPU-hour and $0.0085 per GiB-hour, billed per second. Storage, billed at $0.05 per GiB-month on what you actually use, keeps each MicroVM’s disk and saved state available, so a paused MicroVM costs you only for its storage. Outbound data transfer on public networking is $0.01 per GiB.</p>
+<table>
+ <thead>
+  <tr>
+   <th><strong>Resource</strong></th>
+   <th><strong>Rate</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>vCPU</td>
+   <td>$0.022 per vCPU-hour</td>
+  </tr>
+  <tr>
+   <td>Memory</td>
+   <td>$0.0085 per GiB-hour</td>
+  </tr>
+  <tr>
+   <td>Storage</td>
+   <td>$0.05 per GiB-month</td>
+  </tr>
+ </tbody>
+</table>
+<p>A MicroVM allocated 2 vCPU and 4 GiB memory, if run for a full hour, will cost $0.078 in compute usage. A coding-agent session with this vCPU and memory configuration, that runs for 15 minutes in that hour and is paused the rest of the time, will only cost $0.0195 in compute, plus the storage it uses. So, the longer a session is idle, the less you spend on compute.</p>
+<h2>Getting started</h2>
+<p>A coding-agent platform is just one example of what you can build with MicroVMs. You can use it for other use cases such as sandboxes for untrusted code, eval and reinforcement learning (RL) environments, CI/CD runners, and pull request (PR) preview environments.</p>
+<p>Create your first MicroVM from the Control Panel, doctl, or the API (doctl example shown below). The default HTTP port is 8080. Use --http-port to match your container.</p>
+<pre><code>doctl compute microvm create my-agent-session \
+  --oci-ref registry.digitalocean.com/your-team/agent:latest \
+  --region &lt;region&gt; \
+  --cpu 2 --memory 4096</code></pre>
+<p>From there you can pause and resume it, checkpoint it, and run commands inside it. Visit the <a href="https://cloud.digitalocean.com/microvms/new?i=61e03f&amp;region=mkc1&amp;size=mv-1vcpu-2gb&amp;imageSource=public">MicroVMs Control Panel</a> to get started or see the <a href="https://docs.digitalocean.com/products/microvms/">docs</a> to learn more.</p>

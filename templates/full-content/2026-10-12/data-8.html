@@ -1,0 +1,185 @@
+<h2>Deep memory for agents over large datasets.</h2>
+<p>Index any table, export or log once; your agent gets the few records that answer the question.</p>
+<p>Leviathan is a single binary that turns records (JSONL, JSON, CSV/TSV, SQLite, or any database CLI's output) into a ranked full-text index. Agents ask in plain words and get short, cited result cards: ~450 tokens per answer at any dataset size, instead of grepping and reading raw history.</p>
+<table>
+ <thead>
+  <tr>
+   <th>At 1M records (678 MB)</th>
+   <th>Leviathan</th>
+   <th>best grep strategy</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Median tokens per question</td>
+   <td><strong>436</strong></td>
+   <td>107,122 (245×)</td>
+  </tr>
+  <tr>
+   <td>Relevant record returned</td>
+   <td><strong>99.0%</strong> top 5 · 98.5% rank 1</td>
+   <td>96.0% within a 30K-char output</td>
+  </tr>
+  <tr>
+   <td>Worst case (1,200 questions)</td>
+   <td><strong>602 tokens</strong></td>
+   <td>9.7M tokens</td>
+  </tr>
+  <tr>
+   <td>Median latency</td>
+   <td><strong>33 ms</strong></td>
+   <td>92 ms</td>
+  </tr>
+ </tbody>
+</table>
+<p>Measured on a synthetic maintenance log (one example dataset; nothing in Leviathan is specific to it). Methodology, all six scales and caveats: docs/BENCHMARKS.md.</p>
+<h2>Quickstart</h2>
+<pre><code>cargo install leviathan-index       # or: cargo install --git https://github.com/elstongun/leviathan
+cd examples/tickets &amp;&amp; leviathan index
+leviathan search -g acme "sso login loop after password reset"</code></pre>
+<pre><code>leviathan search · customer C-ACME "Acme Corp" (7 tickets) · query "sso login loop after password reset" · shown 3 of 3 · 24 tickets indexed
+[1] T-1001 · 2024-01-08 09:12 · rel 16.9
+  Login loops back to sign-in page after password reset
+  status: closed · priority: high
+  resolution: Cleared stale session cookies on password reset; shipped in 4.2.1. Workaround: clear site data.
+  match: Users who reset their password get redirected to the sign-in page again in an endless loop.
+...</code></pre>
+<ul>
+ <li><code>-g</code> accepts a key, name or partial name. Ambiguous or unknown groups list candidates and exit 3, never guess.</li>
+ <li>No match in the group falls back to other groups, labeled <code>OTHER CUSTOMER</code>.</li>
+ <li>Combine <code>--where field=value</code>, <code>--since</code>/<code>--until</code>, <code>"phrases"</code> and <code>-exclusions</code>.</li>
+</ul>
+<p>Prebuilt binaries are on Releases. No runtime dependencies; the index is one SQLite file.</p>
+<h2>Map your data</h2>
+<p>Fields are paths (<code>a.b</code>, <code>items[].name</code>); only <code>id</code> is required.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Field</th>
+   <th>Enables</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>id</code></td>
+   <td><code>get</code>, <code>upsert</code>, <code>delete</code>, citations</td>
+  </tr>
+  <tr>
+   <td><code>title</code> / <code>text</code></td>
+   <td>Card headline (weighted 2×) / searched text (default: all strings)</td>
+  </tr>
+  <tr>
+   <td><code>group</code> / <code>group_name</code></td>
+   <td><code>-g</code> scoped search, name resolution, labeled fallback</td>
+  </tr>
+  <tr>
+   <td><code>date</code></td>
+   <td><code>--since</code>, <code>--until</code>, <code>recent</code></td>
+  </tr>
+  <tr>
+   <td><code>filters</code> / <code>display</code></td>
+   <td><code>--where</code> facets / fields shown on cards</td>
+  </tr>
+  <tr>
+   <td><code>empty_values</code> / <code>rank.boost</code></td>
+   <td>Placeholders treated as missing / favor complete records</td>
+  </tr>
+ </tbody>
+</table>
+<pre><code>leviathan init ./export                       # infer a commented leviathan.toml
+leviathan index tickets.csv --id "Ticket ID" --group customer_id --date created_at   # or flags
+leviathan index -c tickets.toml               # or a config your agent wrote from the schema
+leviathan describe                            # fields, groups, filter values, example calls</code></pre>
+<p>Any database works through its own CLI; Leviathan never holds credentials:</p>
+<pre><code>psql "$DATABASE_URL" -At -c "SELECT row_to_json(t) FROM tickets t" | leviathan index - -c tickets.toml
+leviathan index app.db --sql "SELECT * FROM tickets" -c tickets.toml
+duckdb -json -c "SELECT * FROM 'events/*.parquet'" | leviathan index - -c events.toml</code></pre>
+<p>Builds are atomic and skipped when nothing changed; <code>upsert</code> and <code>delete</code> keep an index fresh. Full reference: docs/CONFIG.md.</p>
+<h2>Plug it into your agent</h2>
+<p><strong>CLI + skill (recommended):</strong> any agent with a shell can call it. Copy <code>skills/leviathan</code> into <code>~/.claude/skills/</code> or paste it into <code>AGENTS.md</code> / <code>.cursor/rules</code>. Costs 0 tokens until used. <code>skills/leviathan-memory</code> does the same for memory.</p>
+<p><strong>MCP (optional):</strong> <code>leviathan mcp</code> serves four read-only stdio tools (<code>search</code>, <code>resolve_group</code>, <code>get</code>, <code>describe</code>) whose descriptions include a summary of your dataset (~640 tokens per session). <code>leviathan wrap &lt;agent&gt;</code> prints the config for 24 agents (Claude Code, Codex, Cursor, VS Code / Copilot, Gemini CLI, Windsurf, Cline, Zed, JetBrains and more) and <code>--apply</code> writes it; <code>leviathan wrap</code> lists them all (docs/AGENTS.md).</p>
+<p><strong>Remote (optional):</strong> <code>leviathan serve --http</code> serves the same tools as Streamable HTTP MCP, REST and OpenAPI, with a bearer token or OAuth 2.1, so claude.ai, ChatGPT, the Anthropic and OpenAI APIs and agent frameworks can connect (docs/REMOTE.md).</p>
+<h2>Memory</h2>
+<p>Optional read/write memory for agents, in its own SQLite file. The agent <code>remember</code>s one claim at a time; anything that can change has a <code>key</code>, so the next write replaces the old value instead of contradicting it. Sessions start with a short briefing, and <code>recall</code> returns only what fits a token budget.</p>
+<pre><code>leviathan wrap claude --memory --hooks --rules --apply   # tools, session-start briefing, always-on rule
+leviathan memory remember "Prefers pnpm over npm" --kind preference -s josh -k package_manager
+leviathan memory recall package manager
+leviathan memory import ~/.claude/projects/&lt;project&gt;/memory/MEMORY.md   # bring an existing markdown memory</code></pre>
+<table>
+ <thead>
+  <tr>
+   <th>After 300 sessions</th>
+   <th>Leviathan memory</th>
+   <th>MEMORY.md, whole file</th>
+   <th>MEMORY.md, first 200 lines</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Tokens at session start</td>
+   <td><strong>736</strong></td>
+   <td>33,313</td>
+   <td>2,588</td>
+  </tr>
+  <tr>
+   <td>Answer in context</td>
+   <td><strong>100%</strong></td>
+   <td>100%</td>
+   <td>18%</td>
+  </tr>
+  <tr>
+   <td>Stale value in context</td>
+   <td><strong>0%</strong></td>
+   <td>73.8%</td>
+   <td>36.4%</td>
+  </tr>
+ </tbody>
+</table>
+<p>Writes are explicit (no model runs inside Leviathan), secrets are refused, and history stays queryable (<code>as_of</code>, <code>history</code>). Guide, formats and benchmark: docs/MEMORY.md.</p>
+<h2>Commands</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Command</th>
+   <th>Does</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>init</code> / <code>index</code> / <code>upsert</code> / <code>delete</code></td>
+   <td>Propose a mapping / build / update / remove records</td>
+  </tr>
+  <tr>
+   <td><code>search [-g G] [words]</code></td>
+   <td>Ranked records (<code>--scope</code>, <code>--where</code>, <code>--since</code>, <code>--until</code>, <code>-n</code>, <code>--offset</code>)</td>
+  </tr>
+  <tr>
+   <td><code>recent [-g G]</code> · <code>resolve &lt;g&gt;</code> · <code>get &lt;id…&gt;</code> · <code>describe</code></td>
+   <td>Newest · group candidates · full records · index summary</td>
+  </tr>
+  <tr>
+   <td><code>memory remember</code> / <code>recall</code> / <code>forget</code> / <code>briefing</code></td>
+   <td>Write / ranked read / retire / session-start briefing (<code>--memory=PATH</code>)</td>
+  </tr>
+  <tr>
+   <td><code>memory list</code> / <code>history</code> / <code>stats</code> / <code>import</code> / <code>export</code> / <code>prune</code></td>
+   <td>Browse / slot versions / counts / markdown or JSONL in / backup / clean up</td>
+  </tr>
+  <tr>
+   <td><code>mcp [--memory] [--remote URL]</code> · <code>serve --http ADDR</code></td>
+   <td>stdio MCP server or bridge · HTTP MCP + REST server</td>
+  </tr>
+  <tr>
+   <td><code>wrap [agent]</code></td>
+   <td>Agent config (<code>--memory</code>, <code>--hooks</code>, <code>--rules</code>, <code>--apply</code>); no agent lists targets</td>
+  </tr>
+ </tbody>
+</table>
+<p>Global: <code>--index PATH</code>, <code>--json</code>, <code>--max-chars N</code>. Exit codes: <code>0</code> ok (zero hits included), <code>1</code> error, <code>2</code> bad request, <code>3</code> group unknown/ambiguous.</p>
+<h2>How it works</h2>
+<p>Records stream into one SQLite file with an FTS5 index. A search resolves the group (exact → name → contains → fuzzy), runs one FTS5 match where group and filter values are indexed tokens (no post-filtering), ranks by BM25 × boosts, and decodes only the top N into capped cards. A record's own group name is excluded from scoped matching, placeholders count as missing, and every answer reports <code>shown N of M</code> so agents can tell "no match" from "no data".</p>
+<h2>Reproduce the benchmark</h2>
+<pre><code>python3 -m venv bench/.venv &amp;&amp; bench/.venv/bin/pip install -r bench/requirements.txt
+bench/.venv/bin/python bench/run_bench.py &amp;&amp; bench/.venv/bin/python bench/report.py   # ~30 min, ~4 GB</code></pre>
+<h2>Contributing, security, license</h2>
+<p>See CONTRIBUTING.md (ranking changes need before/after benchmark numbers) and SECURITY.md (indexes read-only, offline unless you serve or connect over HTTP, <code>unsafe</code>-free; report privately). Licensed under Apache-2.0; dependencies in THIRD_PARTY.md.</p>

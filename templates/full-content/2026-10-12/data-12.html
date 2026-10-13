@@ -1,0 +1,61 @@
+<p>The buffers article followed an 8KB page from disk into shared memory and back. What it didn't do is name the file. Every page that passes through the buffer pool is block number N of some file under the data directory, and the file has a naming scheme, a size limit, and companion files that share its name. Before the next article reads the inside of a page, this one finds it on disk with <code>ls</code> and <code>od</code>, and shows that the bytes are the same ones.</p>
+<p>Nothing here needs more than a scratch database and shell access to its data directory. The examples were captured on PostgreSQL 18.6 with data checksums on, which is the default since 18.</p>
+<h2>Setup</h2>
+<pre><code>CREATE EXTENSION IF NOT EXISTS pageinspect;
+
+CREATE TABLE files_demo (
+    id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    title text NOT NULL,
+    value numeric(10,2)
+);
+
+INSERT INTO files_demo (title, value)
+SELECT 'row_' || i, i * 1.5 FROM generate_series(1, 1000) AS i;</code></pre>
+<p>A thousand short rows and a primary key. The <code>text</code> column is there so a TOAST table gets created.</p>
+<h2>From table name to file name</h2>
+<p>The function that answers "where is this table on disk" ships with the server:</p>
+<pre><code>SELECT pg_relation_filepath('files_demo');</code></pre>
+<pre><code> pg_relation_filepath
+----------------------
+ base/5/16431
+(1 row)</code></pre>
+<p>The path is relative to the data directory (<code>SHOW data_directory</code> prints it). Three parts: <code>base</code> is the directory for the default tablespace, <code>5</code> is the OID of the database, and <code>16431</code> is the file's name. That last number is the <strong>relfilenode</strong>, and it comes from <code>pg_class</code>:</p>
+<pre><code>SELECT oid, relfilenode, relname
+FROM pg_class
+WHERE relname LIKE 'files_demo%';</code></pre>
+<pre><code>  oid  | relfilenode |      relname
+-------+-------------+-------------------
+ 16431 |       16431 | files_demo
+ 16430 |       16430 | files_demo_id_seq
+ 16438 |       16438 | files_demo_pkey
+(3 rows)</code></pre>
+<p>Three relations, three files. The identity column's sequence and the primary key index each get their own, because to the storage layer a sequence is one-page relation and an index is a relation like any other. The <code>oid</code> and <code>relfilenode</code> columns are equal for all three, which stays true only until the table is first rewritten.</p>
+<p>The middle part of the path, <code>5</code>, is the OID of the current database from <code>pg_database</code>. Each database gets its own subdirectory under <code>base/</code>, and a table's file lives in the directory of the database it belongs to. That is the whole reason the database OID is part of the path: relfilenodes are only unique within a tablespace and database, so two databases can each have a file called <code>16431</code> without colliding.</p>
+<h2>The files you didn't create</h2>
+<p>There is a function that goes the other way, from a file number back to a name. Point it at the numbers between and around ours:</p>
+<pre><code>SELECT n, pg_filenode_relation(0, n)
+FROM unnest(ARRAY[16430, 16431, 16436, 16437, 16438]) AS n;</code></pre>
+<pre><code>   n   |     pg_filenode_relation
+-------+-------------------------------
+ 16430 | files_demo_id_seq
+ 16431 | files_demo
+ 16436 | pg_toast.pg_toast_16431
+ 16437 | pg_toast.pg_toast_16431_index
+ 16438 | files_demo_pkey
+(5 rows)</code></pre>
+<p>The first argument is the tablespace OID, where <code>0</code> means the database's default. Two relations we didn't ask for appear: a TOAST table and its index. Because <code>files_demo</code> has a <code>text</code> column, PostgreSQL created a place to put values too large for a page. They're ordinary files, <code>16436</code> and <code>16437</code>, sitting next to the main table, and nothing has been toasted yet, so the TOAST heap has no pages.</p>
+<h2>Forks</h2>
+<p>Each relation has a main file and up to three companion files that share its relfilenode and differ by a suffix. PostgreSQL calls them forks. The one with no suffix is the main fork, the table's actual pages.</p>
+<p><code>16431_fsm</code> is the <strong>free space map</strong>, a small tree that records roughly how much room each heap page has left so an INSERT can find a page without scanning them all. <code>16431_vm</code> is the <strong>visibility map</strong>, two bits per heap page: all-visible, so a scan can skip visibility checks, and all-frozen, so VACUUM can skip the page for wraparound purposes.</p>
+<p>The fourth fork, <code>init</code>, is empty for this table because <code>files_demo</code> is a normal, logged table. An unlogged table gets one. The init fork is the state the relation is reset to after a crash. An unlogged table skips the write-ahead log, so after unclean shutdown its contents can't be trusted and PostgreSQL replaces the main fork with a copy of the init fork.</p>
+<p><strong>Forks are per relation.</strong> The TOAST table, being a heap, can grow its own <code>_fsm</code> and <code>_vm</code>. The index can grow an <code>_fsm</code>, which B-trees use to track pages freed by deletion, but never a <code>_vm</code>, because visibility is a heap concept.</p>
+<h2>The same bytes, two ways</h2>
+<p><code>pageinspect</code>'s <code>get_raw_page</code> returns a page as it sits in shared buffers. The file on disk is supposed to contain the same page at the same offset.</p>
+<p>PostgreSQL computes the checksum when it writes a page out, into the copy it hands to the kernel, and never touches the shared buffer. A page that was initialised in memory and has never been read from disk carries a zero checksum in the buffer; one that was read and then modified carries whatever checksum the file had when it was read. <code>pageinspect</code> never re-verifies a checksum; it reads the buffer, not the file. If you want the on-disk bytes from SQL, <code>pg_read_binary_file</code> on the relation path reads the file rather than the shared buffer.</p>
+<h2>OID versus relfilenode</h2>
+<p>The OID is the relation's identity, the number every catalog reference points at, and it never changes. The relfilenode is just a file name. Most of the time they match, because <code>CREATE TABLE</code> assigns the same number to both. Operations that rewrite the table break the tie. <code>VACUUM FULL</code> writes a compacted copy of the table into a brand new file and then swaps the catalog entry to point at it. <code>TRUNCATE</code> does the same swap, to an empty file.</p>
+<p><strong>Don't rely on <code>oid = relfilenode</code>.</strong> Tools and scripts that build paths by hand from <code>pg_class.oid</code> work on a fresh database and break after the first <code>VACUUM FULL</code>. Use <code>pg_relation_filepath()</code> to get the path and <code>pg_filenode_relation()</code> to get the name back.</p>
+<h2>Tablespaces</h2>
+<p>Everything so far lived under <code>base/</code>, the home of the <code>pg_default</code> tablespace. A tablespace is a directory somewhere else, with the same layout inside. <code>pg_tblspc</code> holds one symlink per tablespace, named by its OID. Under the link sits <code>PG_version</code>, the server and catalog version; below that it's <code>&lt;database OID&gt;/&lt;relfilenode&gt;</code> again.</p>
+<h2>Segment files</h2>
+<p>A single file is capped at 1GB. When a relation grows past that, PostgreSQL starts a second file with the same name and a <code>.1</code> suffix, then <code>.2</code>, and so on. Each holds 131072 pages of 8192 bytes. <code>pg_relation_filepath</code> still returns the base name; the segment suffix is added by the storage manager when it computes which file holds a given block. <code>pg_relation_size</code> sums all segments.</p>

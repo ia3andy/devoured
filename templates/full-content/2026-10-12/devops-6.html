@@ -1,0 +1,61 @@
+<h1>What today's software owes to Bronze Age clocks</h1>
+<p>Here's a deceptively simple question: should this function execute?</p>
+<p>Sometimes, the answer is obvious. Is the user logged in? Does their role have the required permissions?</p>
+<p>Sometimes it's less obvious. Are there sufficient resources available? Is this work a higher priority than everything else?</p>
+<p>There are many names for the mechanisms that block or allow actions in software. Most commonly they are referred to as <strong>admission control</strong>. Perhaps you'll be familiar with a <strong>leaky bucket</strong> implementation.</p>
+<h2>A brief history of leaky buckets</h2>
+<p>Engineering applications for leaky buckets predate computers. From around 1600 BC the Babylonians, Egyptians, and Persians all used vessels with a small hole in the bottom as primitive clocks, measuring elapsed time by the volume of the container as it drained at a constant rate.</p>
+<p>By around 200 BC the Greeks had advanced leaky buckets into accurate clocks. A floating regulator kept water flowing steadily from one bucket into a second, where a rising float moved a pointer to show the hour. A siphon emptied the second bucket once it was full. Most notably, Ctesibius added gears to regularly advance each "tick" of the clock, turning the display which indicated the current season.</p>
+<p>A mechanical movement driven by a leaky bucket was born, and it became the gold standard of timekeeping for centuries.</p>
+<p>Water-based clocks were used as a form of admission control. In Athenian courts, the length of time a speaker had to plead their case was measured by the time water took to drain from a vessel. The amount of water poured into the vessel was determined by the severity of the case.</p>
+<p>Finally, in the computer age, Jonathan Turner is said to have used the term "leaky bucket" first in 1986, writing "New directions in communications" for IEEE Comms Magazine. The piece describes how a system can police the pace at which packets are sent over broadband connections.</p>
+<h2>Leaky buckets in software</h2>
+<p>There are two kinds of leaky buckets in software, to implement a <strong>meter</strong> or a <strong>queue</strong>.</p>
+<p>In both, each unit of "work" is assigned a value which is checked against the current volume of a "bucket." If the bucket lacks capacity for the size of new work, that work is rejected. Otherwise the work is allowed and its value adds to the bucket's current volume. The bucket drains (or leaks, if you will), so over time, new work can't be admitted faster than the bucket drains. The drain rate is based on time elapsed, not on the completion of work.</p>
+<p>When used as a <strong>meter</strong>, the bucket defines if and how much work is permitted to <em>immediately proceed</em>. As a <strong>queue</strong>, the bucket defines the volume of work that can <em>wait to proceed</em>, but work only begins as it drains from the bucket.</p>
+<p>In this post we'll focus on leaky buckets as a meter.</p>
+<p>Typically, leaky buckets are implemented in software to keep systems healthy. A sort of resource management to ensure the system is not overwhelmed.</p>
+<p>It's not hard to imagine this being useful in a database. Imagine being able to block or allow queries, before they execute, based on available resources or concurrency limits. One can dream!</p>
+<p><em>The leaky bucket can be tweaked by modifying its volume and the rate at which it drains.</em></p>
+<p>At its core a leaky bucket prevents work, but it also forces us to reason about the total volume of work that results in a block, how quickly more capacity becomes available, and how to handle the expected failure state when work is rejected.</p>
+<h3>Leaky buckets in API design</h3>
+<p>Shopify's GraphQL Admin API implements rate limiting with a documented leaky bucket. Each app on each store gets a bucket with a fixed size and restore rate.</p>
+<p>Each request costs a different amount based on what the query asks for, not how many requests are made. Before a query runs, the bucket must have room for its estimated cost. Once it completes, the bucket is refunded or charged any difference between the estimated and actual cost. Apps can burst faster than the restore rate until the bucket has no room left, at which point requests are throttled.</p>
+<p>Responses include the current state of the bucket, so apps can slow down before they're throttled and treat throttling as an expected outcome, not a surprise.</p>
+<h3>Classification as admission control</h3>
+<p>Now let's consider the AI age. Jev, a "System One" model (perhaps better named a "Decision Model"), recently launched, making classification through inference cheap and fast. It could classify "should this work proceed or not" based on a predefined set of options and return a response in hundreds of milliseconds.</p>
+<p>Fun full-circle fact: In 1907, the French scientist Lapicque modeled neurons as a charge that accumulates, leaks away, and fires at a threshold, later called the "leaky integrate-and-fire" model. So something like a leaky bucket has long been used to describe <strong>neurons</strong>, making it part of the origin story of <strong>neural networks</strong>, and so of Jev.</p>
+<p>Whether our decision gate is <em>mechanical</em> (leaky bucket) or requires <em>inference</em> (Jev), the requirement is the same: answering "should this proceed?"</p>
+<h3>Low cost throttling</h3>
+<p>One of the great benefits of leaky buckets in software is how cheap they are. What we've described as a slowly draining bucket isn't a long-running process that is using CPU to "drain".</p>
+<p>Simply put, a bucket is a stateful object that holds two values:</p>
+<ol>
+ <li><strong>how full</strong> it was the last time anyone looked</li>
+ <li><strong>when</strong> that was</li>
+</ol>
+<p>From those values, you can work out how full the bucket is now:</p>
+<pre><code>level_now = max(0, level_then - drain_rate × (now - then))</code></pre>
+<p>Any work rejected or admitted by the bucket updates its current state. In this way, buckets are lazily drained (as in, only when checked) and empty buckets hold no values.</p>
+<h2>Admission controls and databases</h2>
+<p>Just like hardware, operating systems, applications, and ancient Greeks, databases benefit from leaky buckets.</p>
+<p>However, open-source databases like Postgres and MySQL don't have this functionality baked in.</p>
+<p>One of the most common failure modes for databases in production is the inability to deliberately reject work they cannot complete. Blast a billion queries at your typical relational database, and it'll try its best to execute them. Success isn't likely. Some hardware, configuration, or connection limitation will unwittingly play the role of an admission control system and start blocking work in some unhandled, undesirable way.</p>
+<p>Some proprietary databases have a form of resource management so that workloads can be throttled (but not rejected). For example, in 1999 the Oracle Database Resource Manager added mapping rules to sessions for users, services, clients, and more, which could then be used to apply limits on things like resource use and concurrency.</p>
+<p>In 2008, SQL Server added the SQL Server Resource Governor, which added classifier functions to sessions that can then apply rules to queries in that session.</p>
+<p>Postgres has some configuration options to control expensive queries that have <em>already</em> consumed resources, such as <code>statement_timeout</code>, but nothing to prevent expensive work before it happens. And so in 2026, PlanetScale brought decision gates to Postgres with Database Traffic Control®.</p>
+<h2>Database Traffic Control</h2>
+<p>The health of your Postgres database is laid bare at the mercy of your applications. An unexpected connection storm or failure of the query planner can ask more of your database than it can reasonably be expected to handle.</p>
+<p>To protect your Postgres database from your application (and at times, from itself), we built Traffic Control, admission control for Postgres. In it, resource budgets determine how many resources or how much concurrency one or many queries can consume.</p>
+<p>Each budget admits or blocks queries that match a specified set of tags. Those tags can be specified as comments in the query, or they can refer to the user or application that sent it. If the resource budget determines the query should not proceed, it will log a warning or block it, depending on your resource budget configuration.</p>
+<p>Creating a resource budget opts you into an expected failure state, so it forces you to reason about the behavior your application should exhibit when queries are blocked. For this reason, we recommend creating a new budget in warning mode first, monitoring how much traffic is affected, preparing your application for blocked queries, and then updating the mode.</p>
+<h3>Admission controls but for traffic</h3>
+<p>You configure three major settings on a resource budget.</p>
+<p><strong>Server share and burst limit</strong>, the token* bucket. Server share determines how fast the bucket replenishes with tokens, expressed as a percentage of server resources. The burst limit sets the maximum capacity of the bucket, expressed in whole-server seconds.</p>
+<p>Because a database doesn't know the cost of a query before execution, Traffic Control estimates its cost based on the query plan and historical behavior of queries with that shape. If the budget has sufficient capacity the query proceeds. After execution, the cost of the query is calculated and any difference is either refunded or charged to the token bucket.</p>
+<p>Why is the refill rate measured in server capacity instead of seconds? Because not all time spent executing a query is equal. A query that took 8 cores a single second is different from a query that took one core a single second. Consider different server sizes as well: a 25% server share means a quarter of your server's capacity drains back every second, whether that server has 2 cores or 64.</p>
+<p>*Hold on, <strong>token</strong> bucket? A <em>token</em> bucket works the same as a <em>leaky</em> bucket, but with a reversed metaphor. The bucket starts filled with "tokens" and each piece of work is assigned a "cost." Work is only admitted if there are sufficient tokens remaining for that work. Tokens refill over time. It's a bit easier to reason about the remaining capacity of a resource budget in terms of a bucket's remaining tokens than its current fill level.</p>
+<p><strong>Per-query limit</strong> sets an upper limit on the maximum capacity a single query can consume. This makes an admission-control decision directly on a single query instead of measuring it against available capacity in a bucket.</p>
+<p><strong>Maximum concurrent workers</strong> similarly controls the resources a single query can consume, but measures it by available workers instead of execution time.</p>
+<p>A query may be targeted by multiple resource budgets and must satisfy all of them to proceed.</p>
+<h2>Summary</h2>
+<p>Admission control forces you to decide what should happen when work can't proceed, and leaky buckets have been a cheap way to make that decision for a very long time. Traffic Control makes that decision for Postgres before an expensive query runs, not after.</p>

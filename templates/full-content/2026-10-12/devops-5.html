@@ -1,0 +1,356 @@
+<p>A database migration that completes instantly on a developer laptop can stop a production system.</p>
+<p>The SQL may be correct. The risk comes from everything around it: a large table, long-running transactions, lock queues, replicas, multiple application versions, connection pools, background jobs, and customers actively writing data while the schema changes.</p>
+<p>Zero-downtime database migration is therefore not a special command or a feature of one framework. It is a release discipline that keeps the old and new application versions compatible while schema and data move through controlled intermediate states.</p>
+<p>At BoundLayer, we treat PostgreSQL changes as production engineering work. Every migration has an expected lock, runtime, I/O profile, compatibility window, observability plan, abort condition, and cleanup phase.</p>
+<p>This guide explains the practical patterns we use to evolve PostgreSQL safely in SaaS, fintech, data, and backend-heavy systems.</p>
+<h2>What Zero Downtime Actually Means</h2>
+<p>"The database stayed online" is not a sufficient definition.</p>
+<p>A migration can leave PostgreSQL technically available while API requests wait behind a lock, connection pools fill, background workers time out, replicas fall behind, or customers receive errors.</p>
+<p>Define migration success through service-level outcomes:</p>
+<ul>
+ <li>no material increase in request error rate;</li>
+ <li>p95 and p99 latency remain within agreed limits;</li>
+ <li>writes continue for critical workflows;</li>
+ <li>replication lag remains bounded;</li>
+ <li>no lost, duplicated, or incorrectly transformed data;</li>
+ <li>both old and new application versions remain valid during deployment;</li>
+ <li>the change can be paused or reversed without improvisation.</li>
+</ul>
+<p>Some schema operations need a short lock. The engineering goal is usually not literally zero locking; it is to make lock acquisition fast, bound its impact, and avoid long work while a restrictive lock is held.</p>
+<h2>Why Safe SQL Can Still Cause an Incident</h2>
+<p>PostgreSQL uses locks to preserve correctness while objects change. Many <code>ALTER TABLE</code> forms acquire an <code>ACCESS EXCLUSIVE</code> lock, which conflicts with normal reads and writes.</p>
+<p>The dangerous part is often the lock queue.</p>
+<p>Imagine a migration waiting for a long-running transaction to release its lock. New application queries can then queue behind the waiting migration. A schema change that has not even started may cause an expanding production outage.</p>
+<p>The impact depends on:</p>
+<ul>
+ <li>exact PostgreSQL version;</li>
+ <li>operation and data type;</li>
+ <li>table and index size;</li>
+ <li>existing transaction duration;</li>
+ <li>query traffic and connection limits;</li>
+ <li>foreign keys and dependent objects;</li>
+ <li>replicas and logical decoding slots;</li>
+ <li>whether the operation scans or rewrites the table;</li>
+ <li>disk, WAL, I/O, and CPU headroom.</li>
+</ul>
+<p>Do not classify migrations only as "DDL" or "data migration." Inspect the specific execution and locking behavior on the production version.</p>
+<h2>The Expand-Contract Pattern</h2>
+<p>Expand-contract, also called parallel change, is the foundation of zero-downtime schema evolution.</p>
+<p>Instead of replacing the old contract in one release, the team introduces a compatible new contract, moves traffic and data gradually, verifies the result, and removes the old contract later.</p>
+<pre><code>1. Expand
+   Add new schema without breaking old code
+
+2. Migrate
+   Backfill data and support both representations
+
+3. Switch
+   Move writes and reads to the new representation
+
+4. Verify
+   Prove correctness and observe a full production window
+
+5. Contract
+   Remove old code, columns, indexes, and compatibility paths
+</code></pre>
+<p>Each phase is a separate deployable and observable step. Old and new application instances can run together during a rolling deployment.</p>
+<p>The contract phase must have an owner and a scheduled date. Otherwise temporary columns, dual writes, and unused indexes accumulate into permanent complexity.</p>
+<h2>Preflight Every Production Migration</h2>
+<p>Before executing a migration, answer these questions.</p>
+<h3>What lock will it request?</h3>
+<p>Read the documentation for the deployed PostgreSQL version and test the operation. A short metadata change can still wait indefinitely if another transaction holds a conflicting lock.</p>
+<h3>Will it scan or rewrite the table?</h3>
+<p>A scan consumes I/O and can run for hours on a large relation. A rewrite can require substantial temporary disk and generate heavy WAL, replica traffic, and backup load.</p>
+<h3>How large is the object in production?</h3>
+<p>Staging usually does not reproduce row count, index size, write concurrency, data skew, or long-lived transactions. Use production metadata and a representative restored copy for rehearsal.</p>
+<h3>Which application versions will coexist?</h3>
+<p>During rolling deployment, version N and N+1 may serve traffic simultaneously. The schema must work for both.</p>
+<h3>What else depends on the object?</h3>
+<p>Check views, functions, triggers, foreign keys, analytics, ETL, CDC connectors, exports, BI tools, and manually maintained integrations.</p>
+<h3>What is the abort condition?</h3>
+<p>Specify thresholds for lock wait, latency, errors, replica lag, CPU, disk, WAL, and queue depth. Decide who can stop the migration.</p>
+<h3>Is rollback technically valid?</h3>
+<p>Reversing DDL does not reverse already transformed data or external side effects. Forward repair is often safer than a blind "down" migration.</p>
+<h2>Bound Lock Acquisition With Timeouts</h2>
+<p>A migration should fail quickly rather than wait in a production lock queue.</p>
+<p>Set a short <code>lock_timeout</code> for operations that are expected to acquire their lock almost immediately:</p>
+<pre><code>SET lock_timeout = '2s';
+SET statement_timeout = '15s';
+
+ALTER TABLE accounts
+  ADD COLUMN risk_tier text;
+</code></pre>
+<p>The values are workload-specific. The principle is to distinguish "could not safely acquire the lock" from "started valid work that needs more time."</p>
+<p>Retry lock acquisition with bounded delay during a controlled window. Do not increase the timeout until the command eventually blocks production.</p>
+<p>Use a separate session and explicit transaction scope so settings cannot leak into unrelated work. Log the attempt, database, migration version, application release, and failure reason.</p>
+<p>Before retrying, inspect blockers and long-running transactions. An old idle-in-transaction session may be the actual defect.</p>
+<h2>Adding a Column Safely</h2>
+<p>Adding a nullable column without a volatile default is generally a fast metadata operation on modern PostgreSQL, but it still requires a lock.</p>
+<p>Use an expand sequence when the new field will eventually be mandatory:</p>
+<ol>
+ <li>Add the nullable column.</li>
+ <li>Deploy code that can read old rows and write the new field.</li>
+ <li>Backfill existing rows in small batches.</li>
+ <li>Verify that no nulls remain.</li>
+ <li>Add and validate an equivalent check constraint.</li>
+ <li>Apply <code>NOT NULL</code> in the safest form supported by the deployed version.</li>
+ <li>Remove temporary compatibility logic later.</li>
+</ol>
+<p>Do not combine schema expansion, full-table backfill, and constraint enforcement in one migration transaction.</p>
+<p>Defaults also need semantic review. A database default applies when a column is omitted, not necessarily when application code explicitly writes <code>NULL</code>. Confirm how all writers behave.</p>
+<h2>Adding Constraints Without a Long Blocking Scan</h2>
+<p>Validating a foreign key or check constraint against all existing rows can be expensive.</p>
+<p>PostgreSQL supports adding some constraints as <code>NOT VALID</code>, which begins enforcing them for new or changed rows without immediately scanning all historical data:</p>
+<pre><code>ALTER TABLE payments
+  ADD CONSTRAINT payments_amount_positive
+  CHECK (amount_minor &gt;= 0) NOT VALID;
+</code></pre>
+<p>After fixing historical violations and selecting a safe period, validate separately:</p>
+<pre><code>ALTER TABLE payments
+  VALIDATE CONSTRAINT payments_amount_positive;
+</code></pre>
+<p>The current PostgreSQL ALTER TABLE documentation explains that validation uses a less restrictive lock than adding and validating the constraint in one blocking operation because new writes are already being checked.</p>
+<p>Keep the commands in separate transactions. If both are wrapped in one transaction, the initial lock remains held until commit and defeats much of the operational benefit.</p>
+<p>For a future <code>NOT NULL</code>, a validated check such as <code>CHECK (column IS NOT NULL) NOT VALID</code> can establish evidence about existing rows before the final metadata change. Confirm the exact optimization behavior for your PostgreSQL release.</p>
+<h2>Creating Indexes Concurrently</h2>
+<p>A regular <code>CREATE INDEX</code> blocks writes to the table while the index is built. On a busy, large table, use <code>CREATE INDEX CONCURRENTLY</code> when its trade-offs fit the workload:</p>
+<pre><code>CREATE INDEX CONCURRENTLY idx_orders_customer_created
+  ON orders (customer_id, created_at DESC);
+</code></pre>
+<p>Concurrent creation permits normal writes but takes longer, performs additional work, and cannot run inside a normal transaction block. It can also increase I/O, CPU, WAL, and replica lag.</p>
+<p>If the operation fails, PostgreSQL may leave an invalid index. Detect it, investigate the cause, and remove or rebuild it deliberately before retrying.</p>
+<p>Validate the index after creation:</p>
+<ul>
+ <li>it is marked valid and ready;</li>
+ <li>its definition matches the intended query;</li>
+ <li>query plans use it under production-like parameters;</li>
+ <li>write latency and storage remain acceptable;</li>
+ <li>no duplicate or redundant index should be removed later.</li>
+</ul>
+<p>For a unique or primary-key constraint, PostgreSQL can attach a suitable unique index created concurrently using <code>ADD CONSTRAINT ... USING INDEX</code>. The official documentation describes this as a way to avoid blocking table updates while building the index.</p>
+<p>Remember that an index is a production cost, not a free optimization. Every write must maintain it.</p>
+<h2>Rename a Column Across Multiple Releases</h2>
+<p>Renaming a column directly breaks application code, jobs, and integrations that still use the old name.</p>
+<p>Use a shadow-column migration.</p>
+<p>Suppose <code>users.name</code> must become <code>display_name</code>.</p>
+<h3>Release 1: Expand</h3>
+<p>Add <code>display_name</code> as nullable. Keep <code>name</code> unchanged.</p>
+<h3>Release 2: Dual write</h3>
+<p>Write both fields for every new change. Reads continue from <code>name</code>, or use a compatibility fallback.</p>
+<pre><code>display_name = row.display_name ?? row.name
+</code></pre>
+<p>Decide where dual-write correctness lives. Application writes are easier to understand but every writer must be updated. A temporary database trigger covers unknown writers but adds hidden behavior and needs careful testing.</p>
+<h3>Background backfill</h3>
+<p>Copy old values in bounded batches and record progress.</p>
+<h3>Release 3: Switch reads</h3>
+<p>Read <code>display_name</code>, retain fallback and monitoring temporarily, and compare representations.</p>
+<h3>Release 4: Stop old writes</h3>
+<p>Make the new column authoritative. Observe for an agreed period.</p>
+<h3>Release 5: Contract</h3>
+<p>Remove old-column dependencies, then drop <code>name</code> in a dedicated migration.</p>
+<p>This takes longer than a rename command, but it supports rolling deploys, rollback, and verification.</p>
+<h2>Changing a Column Type</h2>
+<p>Some type changes are metadata-only; others rewrite the table or invalidate application assumptions.</p>
+<p>For a high-risk conversion, create a new column with the target type and migrate through expand-contract:</p>
+<pre><code>ALTER TABLE events
+  ADD COLUMN occurred_at_v2 timestamptz;
+</code></pre>
+<p>Then:</p>
+<ol>
+ <li>Deploy dual-write logic.</li>
+ <li>Backfill in batches using an explicit, tested conversion.</li>
+ <li>Quarantine values that cannot convert safely.</li>
+ <li>Compare old and new representations.</li>
+ <li>Switch reads behind a feature flag.</li>
+ <li>Stop writing the old field.</li>
+ <li>Remove the old field in a later release.</li>
+</ol>
+<p>This is especially important for currency, identifiers, time zones, JSON structures, enums, and precision changes. A syntactically successful cast may still be semantically wrong.</p>
+<p>For financial data, define rounding, currency unit, historical interpretation, and reconciliation before migration.</p>
+<h2>Backfill Data Without Overloading Production</h2>
+<p>A backfill is a production workload. It competes with customer traffic for CPU, buffers, I/O, WAL, locks, vacuum capacity, and replica bandwidth.</p>
+<p>Do not run one unbounded update across a large table.</p>
+<p>Use small, committed batches selected by a stable key:</p>
+<pre><code>WITH batch AS (
+  SELECT id
+  FROM accounts
+  WHERE risk_tier IS NULL
+  ORDER BY id
+  LIMIT 1000
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE accounts AS a
+SET risk_tier = derive_risk_tier(a)
+FROM batch
+WHERE a.id = batch.id;
+</code></pre>
+<p>The exact query depends on concurrency and derivation logic. The operational pattern is more important:</p>
+<ul>
+ <li>commit each batch;</li>
+ <li>make the update idempotent;</li>
+ <li>persist a checkpoint or derive remaining work safely;</li>
+ <li>throttle between batches;</li>
+ <li>pause automatically when service metrics degrade;</li>
+ <li>monitor WAL, replica lag, dead tuples, and vacuum;</li>
+ <li>expose rows completed, remaining, failed, and retried;</li>
+ <li>allow multiple workers only with proven partitioning.</li>
+</ul>
+<p>Avoid offset pagination because concurrent changes and large offsets make progress unreliable. Use a key range, cursor, or work-claiming strategy.</p>
+<p>If derived values depend on mutable source fields, define what happens when an application write races with the backfill. Dual-write code, row versions, or conditional updates may be required.</p>
+<h2>Keep Dual Writes Consistent</h2>
+<p>Dual writes are temporary compatibility infrastructure, not a guarantee of consistency by themselves.</p>
+<p>Writing two columns in one database transaction is manageable. Writing to PostgreSQL and a separate service, broker, or database creates a distributed consistency problem.</p>
+<p>For external propagation, consider a transactional outbox or log-based CDC so the business state and event publication do not depend on two independent commits.</p>
+<p>During a migration, instrument divergence:</p>
+<ul>
+ <li>old value does not match transformed new value;</li>
+ <li>only one representation is populated;</li>
+ <li>writes still arrive from an old application version;</li>
+ <li>backfill overwrote a newer value;</li>
+ <li>downstream consumers still query the old schema.</li>
+</ul>
+<p>Do not contract until divergence is zero or every exception is understood.</p>
+<h2>Removing a Column or Table</h2>
+<p>Destructive migrations should come last, never in the same release that stops using the object.</p>
+<p>Before removal:</p>
+<ol>
+ <li>Stop application reads.</li>
+ <li>Stop all writers and background jobs.</li>
+ <li>Remove ORM mappings and wildcard <code>SELECT *</code> assumptions.</li>
+ <li>Check views, functions, triggers, reports, exports, and integrations.</li>
+ <li>Monitor database access for an observation period.</li>
+ <li>Preserve data according to backup and retention policy.</li>
+ <li>Remove dependent constraints or indexes deliberately.</li>
+ <li>Execute the drop with a short lock timeout.</li>
+</ol>
+<p>PostgreSQL can make dropping a column logically fast because it does not immediately rewrite every row, but lock acquisition and dependent-object behavior still matter. Disk space may not be reclaimed until later row rewrites or maintenance.</p>
+<h2>Migration Observability</h2>
+<p>Every significant migration should have a dedicated dashboard or run view.</p>
+<h3>Database signals</h3>
+<ul>
+ <li>lock wait and blocking sessions;</li>
+ <li>active and long-running transactions;</li>
+ <li>transaction age;</li>
+ <li>CPU, I/O latency, buffer activity, and disk headroom;</li>
+ <li>WAL generation and archive throughput;</li>
+ <li>replica lag and replication-slot retention;</li>
+ <li>dead tuples and vacuum progress;</li>
+ <li>connection-pool saturation;</li>
+ <li>index build or table operation progress where exposed.</li>
+</ul>
+<h3>Application signals</h3>
+<ul>
+ <li>request rate, error rate, and latency percentiles;</li>
+ <li>database timeout and serialization errors;</li>
+ <li>queue and job lag;</li>
+ <li>failed writes and retries;</li>
+ <li>old-code and new-code instance counts;</li>
+ <li>feature-flag state.</li>
+</ul>
+<h3>Data signals</h3>
+<ul>
+ <li>rows remaining in the backfill;</li>
+ <li>old/new representation mismatch;</li>
+ <li>null or invalid value count;</li>
+ <li>business-level reconciliation totals;</li>
+ <li>consumer progress and stale reads.</li>
+</ul>
+<p>Correlate every metric with migration phase and release version. A migration is not complete when the SQL exits; it is complete when application behavior and data correctness are verified.</p>
+<h2>Test With Production-Like Conditions</h2>
+<p>Schema migration tests need more than a clean empty database.</p>
+<p>Use a recent, protected, and appropriately anonymized production snapshot when policy permits. Reproduce:</p>
+<ul>
+ <li>table and index sizes;</li>
+ <li>realistic data distributions;</li>
+ <li>concurrent read and write traffic;</li>
+ <li>long transactions;</li>
+ <li>replicas or representative WAL consumption;</li>
+ <li>limited disk and I/O headroom;</li>
+ <li>application versions N and N+1 running together;</li>
+ <li>retries, cancellation, and partial completion.</li>
+</ul>
+<p>Measure lock acquisition separately from operation duration. A fast migration in an idle staging environment says little about a busy production table.</p>
+<p>In CI, run compatibility tests in this order:</p>
+<ol>
+ <li>Old application against old schema.</li>
+ <li>Old application against expanded schema.</li>
+ <li>New application against expanded schema.</li>
+ <li>Mixed old and new applications during dual-write.</li>
+ <li>New application after backfill.</li>
+ <li>New application after contract.</li>
+</ol>
+<p>This catches the common error where a migration and application work only when deployed simultaneously.</p>
+<h2>Rollback and Forward Recovery</h2>
+<p>Rollback planning starts before deployment.</p>
+<p>For the expand phase, application rollback is usually straightforward because the old schema remains available. During dual-write, the old representation must continue receiving valid values if rollback is a requirement.</p>
+<p>After destructive contraction, rollback becomes much harder. Recreating a column does not restore its data. Restoring a full backup can discard new production writes.</p>
+<p>Prefer these recovery options:</p>
+<ul>
+ <li>disable the new read path with a feature flag;</li>
+ <li>stop or throttle the backfill;</li>
+ <li>deploy a compatibility fix forward;</li>
+ <li>replay an idempotent transformation;</li>
+ <li>restore selected data from a retained source or archive;</li>
+ <li>delay destructive cleanup until rollback is no longer operationally necessary.</li>
+</ul>
+<p>Document the point of no easy return. Require explicit approval before crossing it.</p>
+<h2>Migration Ownership in Continuous Delivery</h2>
+<p>Unsafe database changes often come from process ambiguity rather than lack of SQL knowledge.</p>
+<p>A mature migration workflow assigns:</p>
+<ul>
+ <li>an author responsible for technical behavior;</li>
+ <li>an application owner responsible for compatibility;</li>
+ <li>a database or platform reviewer for high-risk operations;</li>
+ <li>an operator with authority to abort;</li>
+ <li>a cleanup owner and deadline;</li>
+ <li>evidence required before each next phase.</li>
+</ul>
+<p>Migration tooling should support:</p>
+<ul>
+ <li>immutable version history;</li>
+ <li>one execution owner or advisory locking;</li>
+ <li>dry-run or SQL inspection;</li>
+ <li>prohibited-operation checks;</li>
+ <li>per-migration transaction control;</li>
+ <li>lock and statement timeouts;</li>
+ <li>structured logs and metrics;</li>
+ <li>separate schema and long-running data jobs.</li>
+</ul>
+<p>Do not let every application replica race to apply production migrations on startup. Run migrations as an explicit release step with controlled concurrency and visible status.</p>
+<h2>Common Failure Modes</h2>
+<h3>Running DDL automatically on application startup</h3>
+<p>Multiple replicas can race, and a risky migration becomes coupled to service recovery. Use a controlled release job.</p>
+<h3>One transaction for every step</h3>
+<p>Long backfills and constraint validation hold locks, retain row versions, and make progress all-or-nothing. Separate compatible phases.</p>
+<h3>No lock timeout</h3>
+<p>The migration waits behind production traffic and creates a lock queue. Fail fast and retry deliberately.</p>
+<h3>Regular index creation on a hot table</h3>
+<p>Writes stall for the build duration. Evaluate concurrent creation and its resource cost.</p>
+<h3>Destructive rename in the same deploy</h3>
+<p>Old instances and background jobs fail during rolling deployment. Use expand-contract.</p>
+<h3>Unthrottled backfill</h3>
+<p>Customer traffic, replicas, and vacuum lose resources. Batch, measure, throttle, and pause.</p>
+<h3>Declaring success when row count reaches zero</h3>
+<p>The migrated values may still be wrong. Reconcile business invariants and compare representations.</p>
+<h3>Never performing the contract phase</h3>
+<p>Temporary compatibility code becomes permanent architecture. Assign cleanup ownership before expansion begins.</p>
+<h2>A Practical Migration Runbook</h2>
+<h3>1. Classify the change</h3>
+<p>Identify lock mode, scan or rewrite behavior, object size, dependencies, compatibility requirements, and business criticality.</p>
+<h3>2. Rehearse</h3>
+<p>Run the exact operation against production-scale data with concurrent traffic. Record duration, resources, WAL, locks, and failure behavior.</p>
+<h3>3. Expand</h3>
+<p>Apply the smallest backward-compatible schema addition using bounded lock and statement timeouts.</p>
+<h3>4. Deploy compatibility code</h3>
+<p>Support both schema versions, add feature flags, instrument old and new paths, and verify mixed-version behavior.</p>
+<h3>5. Backfill</h3>
+<p>Use an idempotent, resumable, throttled job with progress and correctness metrics.</p>
+<h3>6. Switch</h3>
+<p>Move reads or writes gradually. Compare results and keep a rapid application-level rollback.</p>
+<h3>7. Observe</h3>
+<p>Wait through a representative traffic and operating period. Confirm no unknown consumers use the old contract.</p>
+<h3>8. Contract</h3>
+<p>Remove compatibility code and old schema in separate, controlled changes. Verify backups and retention first.</p>
+<h2>Final Takeaway</h2>
+<p>Safe PostgreSQL migrations are built from compatibility and evidence.</p>
+<p>Expand the schema first. Keep old and new code working together. Backfill in bounded, observable batches. Switch traffic gradually. Validate data and service behavior. Remove the old contract only after production proves it is no longer needed.</p>
+<p>The individual SQL commands matter, but the release sequence matters more. A disciplined expand-contract process turns database evolution from a maintenance-window event into routine continuous delivery.</p>
