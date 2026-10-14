@@ -1,0 +1,81 @@
+<h1>Can we change an AI model’s architecture without retraining it from scratch?</h1>
+<p>“Priming” reuses pretrained Transformer weights to build models with more efficient architectures at less than 1% of the original training cost and with throughputs up to twice as high.</p>
+<h2>Key takeaways</h2>
+<ul>
+ <li>A new AWS paper introduces priming, a method that reduces pretraining costs for hybrid architectures by over 99% by leveraging pretrained Transformer weights, saving trillions of tokens and hundreds of thousands of GPU-hours.</li>
+ <li>A 32-billion-parameter Gated KalmaNet (GKA)-based hybrid model matches its source Transformer on reasoning benchmarks while decoding up to twice as quickly with 128,000 tokens of context.</li>
+ <li>State space models consistently outperform sliding-window attention (SWS) even when SWA receives twice the memory budget, and GKA's variable-iteration mechanism enables 10% faster decoding with only ~1% accuracy loss.</li>
+</ul>
+<p>AI agents are rapidly scaling: longer sessions, deeper reasoning chains, more autonomy. But the Transformer architecture underneath them still pays a memory tax that grows with the number of tokens it processes. As agents become more capable, that cost scales with them.</p>
+<p>Now, there’s a proliferation of hybrid architectures that use some combination of methods to achieve a better balance of memory, speed, and quality. Those methods include sparse attention, which selects a subset of past tokens to consider when selecting the next token; sliding-window attention, which preserves only the most recent tokens; and state space models, which compress information from the full history into a fixed-size state.</p>
+<p>These hybrid architectures can be understood as points in a sequence-model design space: to differing degrees, they mix information while traversing a sequence and passing through different states. What distinguishes them from each other is how they retain and use the past.</p>
+<p>Until now, exploring this design space has required training every new architecture from scratch, using trillions of tokens and hundreds of thousands of GPU-hours. This has made controlled comparisons of hybrid architectures extremely expensive.</p>
+<p>In a new paper, <i>“Priming: Hybrid state space models from pre-trained Transformers,”</i> our team at Amazon Web Services addresses this problem. We introduce <i>priming, </i>a method that leverages pretrained Transformer weights as a starting point to reduce the pretraining cost of hybrid architectures by more than 99%.</p>
+<p>With priming, model developers can ask questions that were previously too expensive to answer at scale: Which attention layers can be replaced by more-efficient layers? How many attention layers can be replaced without sacrificing quality? Which state space layer works best? And what does the trade-off between speed and accuracy look like?</p>
+<p>In our paper, we compare hybrid models that use three different types of state space models (Gated KalmaNet, Gated DeltaNet, and Mamba-2). Some of our findings:</p>
+<ul>
+ <li><i>Not all state space models are equal.</i> Under controlled conditions, Gated KalmaNet (GKA) performs best, followed by Gated DeltaNet (GDN) and then Mamba-2. GKA uniquely offers variable-length inference computation without retraining and gives the user direct control over its position on the speed-accuracy frontier.</li>
+ <li><i>A good lossy summary of everything beats a perfect recording of the most recent past.</i> State space models consistently outperform sliding-window attention (SWA), even when SWA gets twice the memory budget.</li>
+ <li><i>Same quality, twice the throughput.</i> A 32-billion-parameter GKA-based hybrid model matches its source Transformer on reasoning benchmarks while decoding up to twice as quickly with 128,000 tokens of context and reaching correct answers in as little as two-thirds of the wall-clock time.</li>
+</ul>
+<p>To foster further research on hybrid architectures, we have released a zoo of primed hybrid models at the eight-billion-parameter and 32-billion-parameter scales for long-context reasoning and instruction following, together with training code, optimized kernels, and a vLLM-serving plugin under the Apache 2.0 License.</p>
+<h2>The attention mechanism</h2>
+<p>A Transformer’s attention mechanism — which determines how relevant previously seen tokens are to the token currently being processed — relies on three different vectors, which take their names from database design: the query, the key, and the value. For each token, the query captures what that token is “looking for,” the key captures what it “offers,” and the value carries the actual information it will pass along. Relevance is computed by comparing the current token’s query against every other token’s key; the closer the match, the more that token’s value contributes to the output of attention.</p>
+<p>Each of these vectors is produced by multiplying the token by a learned weight projection matrix. The Transformer outputs one token at a time, and each output token becomes a new input, so the context grows one token at a time as well. To save computation, the Transformer thus stores the key and value projections of each new input in a “KV cache”.</p>
+<h2>Two kinds of memory layers: Eidetic versus fading</h2>
+<p>The attention mechanism gives Transformers what we call <i>eidetic memory</i>: verbatim recall of every past token. The possibility of recalling over an LLM’s entire context window is what made in-context learning, long-document reasoning, and retrieval-augmented generation possible. But it comes at a cost that scales with the number of input tokens.</p>
+<p>However, not all attention layers do the same job. Some perform long-range retrieval across tens of thousands of tokens. Others operate more locally, tracking the current clause, copying nearby tokens, and the like. The local ones don't need a growing cache: a compact, fixed-size summary of the past — what we call <i>fading memory</i> — suffices.</p>
+<p>Hybrid models mix both: attention layers (eidetic, growing cache) for the layers that need global recall and state space layers (fading, fixed size) for the rest. The result is a model with a reduced memory footprint that still has access to verbatim recall where it matters.</p>
+<h2><i>Priming:</i> Knowledge isn't locked to the architecture</h2>
+<p>Exploring hybrids’ design space has been impractical because each hybrid configuration would normally require pretraining from scratch. <i>Priming</i> sidesteps this by reusing the stored knowledge in a pretrained Transformer's weights.</p>
+<p>Priming is possible because a Transformer is itself a special case of a state space realization. The outputs of both attention and SSM layers can be expressed as the result of multiplying the value sequence by a “mixing” matrix that decides how much each past token contributes to each current token. Attention computes the mixing matrix by multiplying the query and key matrices; an SSM produces a similar output through a recurrent state of fixed dimension that all past information must pass through.</p>
+<p>Priming takes advantage of this structural similarity: if an SSM with a fixed-dimensional state can produce a mixing matrix close enough to the attention layer's, the query, key, and value projections from the source Transformer can be reused as the SSM's own input projections, with only the SSM-specific parameters needing to be learned.</p>
+<p>Whether the approximation holds depends on whether the attention layer performs complex, long-range retrievals or simple, local operations. We distinguish between the two using a cheap empirical proxy: replace each layer with an SWA — which preserves only a fraction of the context — and measure the degradation.</p>
+<p>Layers that tolerate this substitution are natural candidates for SSM conversion: their mixing matrices don’t need to capture long-range relationships, so the state of an SSM can faithfully represent what they do. This proxy connects to a formal quantity from dynamical-systems theory, the <i>Hankel rank</i> of the layer's mixing matrix, which measures how much information must pass through the state bottleneck and therefore the minimum SSM state dimension required to realize the layer exactly.</p>
+<p>Priming proceeds in three stages:</p>
+<ol>
+ <li><i>Layer selection:</i> identify which layers can be faithfully compressed into a fixed-size state while retaining the rest as attention;</li>
+ <li><i>Weight transfer and alignment:</i> initialize SSM layers from the corresponding attention weights, then run a short distillation process aligning each SSM to the behavior of the layer it replaces;</li>
+ <li><i>End-to-end adaptation:</i> fine-tune the full hybrid model on next-token prediction, letting all layers coadapt.</li>
+</ol>
+<p>The entire pipeline consumes less than 0.5% of the source model's pretraining token budget, and it works across Transformer families (Qwen, Llama, Mistral), model classes (dense or MoE), and scales (eight billion to 32 billion and more).</p>
+<h2>A controlled comparison of fading-memory layers</h2>
+<p>For instance, consider this question: given the same data, the same training budget, and the same ratio of eidetic to fading layers, which SSM layer works best in a hybrid model?</p>
+<p>In our paper, we evaluate three families of state space models, each representing a different approach to using a fixed-size state:</p>
+<ul>
+ <li><i>Mamba-2</i> applies a uniform scalar decay to the entire state at each step, a running average that forgets everything at the same rate. When a new token arrives, it is written into the state, while all previous entries are uniformly attenuated. Mamba-2 is simple and efficient but indiscriminate.</li>
+ <li><i>Gated DeltaNet (GDN)</i> adds targeted updates on top of uniform decay. Rather than decaying everything uniformly, it can selectively erase the value previously associated with a specific key before writing the new one (the delta rule). This makes it more expressive than Mamba-2: it can revise a specific association without uniformly decaying the rest.</li>
+ <li><i>Gated KalmaNet (GKA)</i> goes further. Its erase direction depends not only on the current key but on statistics of <i>all past keys</i>, a history-aware update that accounts for the cumulative structure of everything the model has seen.</li>
+</ul>
+<p>The theoretical expressiveness hierarchy predicts the empirical one: GKA &gt; GDN &gt; Mamba-2. The gap widens on long-context reasoning, where compression quality matters most, and narrows on short-context tasks. Furthermore, at the 32-billion-parameter (32B) scale, hybrid GKA is within 1% of its source Transformer trained on the same data, despite requiring half the KV cache at inference.</p>
+<h2>Fading memory beats verbatim windowed memory</h2>
+<p>An interesting finding in our study comes from a direct comparison of hybrid models using SSM layers and those using sliding-window attention (SWA), which retain a fixed window of recent tokens verbatim rather than compressing the past into a state. One might expect that verbatim recall, even over a limited window, would outperform lossy compression. After all, no information is lost within the sliding window’s range. And stacking multiple SWA layers increases the “receptive field” of the end-to-end model.</p>
+<p>Instead, every SSM-based hybrid we tested outperformed the corresponding SWA hybrid on long-context benchmarks, even when the window gets two to four times as much memory as the state.</p>
+<h2>A runtime knob for speed versus accuracy: Variable computation at inference time</h2>
+<p>GKA has a property that neither Mamba-2 nor GDN offers: variable test-time computation.</p>
+<p>Mamba-2 and GDN have the same computation budget for every input token, regardless of its content. GKA, by contrast, solves a regression problem iteratively, and the iteration count is adjustable at serving time without retraining.</p>
+<p>In practice, serving GKA at 10 iterations instead of its usual 30 sacrifices roughly 1% of its accuracy on AIME 2025 while delivering 10% faster decoding. A single trained model can serve multiple points on the speed-accuracy frontier, so model providers can offer different latency tiers without maintaining separate model variants.</p>
+<h2>Faster reasoning, not just faster tokens</h2>
+<p>Raw per-token throughput tells only part of the story. A model that is cheaper per token can still be slower end to end if its reasoning is weaker and it needs more tokens to compensate. The deployment-relevant question is how much more rapidly, in wall clock terms, the hybrid reaches a target accuracy.</p>
+<p>We measured this on AIME 2025, a challenging math competition benchmark, comparing our GKA-Primed-HQwen3-32B-Reasoner against the source Qwen3-32B trained on the same reasoning recipe. Both models generate similar-length thinking traces (a median of about 14,000 tokens on the full set, 28,000 on the hardest problems) — that is, they produce equally in-depth responses — but the hybrid has a much higher throughput.</p>
+<p>At realistic concurrency levels, where the Transformer's KV cache saturates GPU memory, the hybrid reaches target accuracy thresholds 1.2 to 1.4 times as quickly on the full benchmark and up to 1.6 times as quickly on the hardest problems. This is a consequence of the SSM layers' fixed-size state, which roughly halves the per-sequence memory footprint, enabling more concurrent operations on the same hardware.</p>
+<h2>Beyond the training window: Context extension with state composition</h2>
+<p>Our primed hybrids natively support 128,000 tokens. But agent sessions, codebases, and long legal documents routinely exceed that. Extending context further would normally require another round of continued pretraining on curated data. Can the hybrid architecture itself generalize to longer contexts <i>without additional training</i>?</p>
+<p>In our new arXiv paper, we describe a method of extending hybrid models’ context beyond their native limits without training. The procedure is simple:</p>
+<ul>
+ <li>partition a long input into chunks shorter than the native context length and prepend a shared prefix to each chunk;</li>
+ <li>process all chunks independently in parallel;</li>
+ <li>concatenate the KV caches across chunks while merging the SSM states via the weighted-averaging scheme we introduced in our PICASO paper.</li>
+</ul>
+<p>This approach enables us to extend the context length of our primed hybrid models from 128K to 256K tokens while preserving substantial accuracy on both retrieval (RULER NIAH) and reasoning (BABILong) tasks at lengths the model was never trained on. In our experiments we show that hybrid state composition preserves the SSM expressivity hierarchy (GKA &gt; GDN &gt; Mamba-2).</p>
+<h2>The hybrid design space is now open</h2>
+<p>All artifacts discussed in this blog are released under the Apache 2.0 License in our Hybrid Model Factory on GitHub and our model zoo on HuggingFace:</p>
+<ul>
+ <li>A collection of primed hybrids for long-context reasoning and instruction following (8B and 32B);</li>
+ <li>The priming training code;</li>
+ <li>Point-to-point sequence parallelism algorithms for SSM layers (up to 2.3 times as fast as all-to-all-based alternatives at multinode scale);</li>
+ <li>Universal sequence parallelism for prototyping novel layers on long sequences without custom kernels or distributed-training expertise;</li>
+ <li>Optimized Triton kernels for GKA decoding and training;</li>
+ <li>A vLLM serving plugin supporting primed hybrid architectures with continuous batching, chunked prefill, and tensor parallelism for inference deployment at scale.</li>
+</ul>
+<p>Priming is not tied to a specific Transformer family or model class. Extending it to Llama, Mistral, or MoE models requires no algorithmic changes. We hope these tools enable the community to explore architectures beyond what we've tested and to develop new algorithms and training recipes for building scalable next-generation architectures for AI agents.</p>

@@ -1,0 +1,186 @@
+<p>Today we are introducing Helix World, a real-time interactive audio-visual world model built by Noiz AI and The Hong Kong University of Science and Technology (HKUST). You start from a single image, move with WASD and look around with the arrow keys. The model generates the next stretch of video and the matching stereo sound at the same time, at 24 frames per second on a single NVIDIA H800 GPU.</p>
+<p>Helix World is a world model that generates an explorable scene and its spatial stereo soundtrack together, conditioned on the user's camera motion and keyboard actions. When the camera turns, the sound field turns with it.</p>
+<p>On the WBench navigation split, Helix World scores 79.9, close to the strongest silent world models, while running faster than real time with a real-time factor (RTF) of 0.77. On HelixBench, the audio-visual benchmark we release with the model, its spatial-acoustic consistency score is 41.8, compared with 12.7 for EchoWM, the only other world model in the comparison that generates sound. The paper is on arXiv, the code is on GitHub, a preview checkpoint is on Hugging Face, and the interactive demo is open at helixworld.org.</p>
+<h2>Why world models need sound</h2>
+<p>Interactive world models let a user steer a generated environment in real time. Most of them are silent. Yet sound carries information the picture does not: what a surface is made of, how hard two objects hit, and what is happening off screen. In an immersive scene, turning your head should also move the sound between your left and right ear.</p>
+<p>Adding audio after the fact does not solve this. A cascaded video-to-audio model never sees the camera trajectory or the user's actions, so its sound ignores ego-motion, and running it after the video adds latency. Bidirectional audio-visual foundation models generate both streams, but they have no control interface, and naively turning them into causal, streaming models makes errors accumulate until both picture and sound degrade. Helix World addresses all three problems: missing training data, missing control, and long-horizon drift.</p>
+<h2>Explore worlds in real time</h2>
+<p>In the demo you choose a starting image or upload your own; it is encoded at 768×512. A text prompt is optional: if you leave it empty, the scene is described automatically from the frame. Once the session starts, WASD moves the camera and the arrow keys change the view. Generation runs in chunks of about 1.3 seconds, and each keyboard input or new prompt takes effect from the next chunk, so you can redirect the scene while it is running.</p>
+<h2>Benchmarks</h2>
+<h3>Visual quality and speed</h3>
+<p>We measure visual quality and action following on the WBench navigation split. Real-time factor is the seconds of compute needed per second of output video, measured on one NVIDIA H800 including video and audio decoding; below 1.0 means faster than real time. Table 3 of the paper:</p>
+<table>
+ <tbody>
+  <tr>
+   <th>Model</th>
+   <th>Native audio</th>
+   <th>RTF (H800) ↓</th>
+   <th>WBench average ↑</th>
+  </tr>
+  <tr>
+   <td>Alaya-EVOKE-Turbo</td>
+   <td>No</td>
+   <td>4.29</td>
+   <td>82.0</td>
+  </tr>
+  <tr>
+   <td>EchoWM</td>
+   <td>Yes</td>
+   <td>1.98</td>
+   <td>81.0</td>
+  </tr>
+  <tr>
+   <td>Zing-0.5</td>
+   <td>No</td>
+   <td>2.81</td>
+   <td>81.0</td>
+  </tr>
+  <tr>
+   <td>Helix World</td>
+   <td>Yes</td>
+   <td>0.77</td>
+   <td>79.9</td>
+  </tr>
+  <tr>
+   <td>LingBot-World v2</td>
+   <td>No</td>
+   <td>5.21</td>
+   <td>79.4</td>
+  </tr>
+  <tr>
+   <td>SANA-WM</td>
+   <td>No</td>
+   <td>0.79</td>
+   <td>76.0</td>
+  </tr>
+  <tr>
+   <td>LTX-2.3 (base)</td>
+   <td>Yes</td>
+   <td>14.61</td>
+   <td>74.2</td>
+  </tr>
+  <tr>
+   <td>Matrix-Game 3</td>
+   <td>No</td>
+   <td>0.58</td>
+   <td>71.3</td>
+  </tr>
+ </tbody>
+</table>
+<p>Among models that run faster than real time, Helix World has the highest score: 79.9, against 76.0 for SANA-WM and 71.3 for Matrix-Game 3. The three models above it need between 1.98 and 4.29 seconds of compute per second of video, and two of them are silent. Helix World is the only real-time model in the table that also generates sound.</p>
+<h3>Sound that follows the camera</h3>
+<p>Existing world-model benchmarks evaluate only video, and audio-visual benchmarks use short clips without camera motion. HelixBench fills that gap with 1,015 human-verified cases across six domains and four subsets: Navigation, Perspective, Event, and Subject. Each case provides a starting frame, an audio-visual prompt, continuous camera poses, and a stereo reference. Its spatial score correlates the on-screen position of sound sources with left-right stereo panning, so it directly measures whether the sound field rotates with the camera.</p>
+<p>The baselines include EchoWM and cascaded pipelines in which we mute Helix World's video and re-dub it with a video-to-audio model (AudioX, ThinkSound, PrismAudio), so the picture stays fixed and only the audio changes. Table 4 of the paper:</p>
+<table>
+ <tbody>
+  <tr>
+   <th>Model</th>
+   <th>KL ↓</th>
+   <th>FAD ↓</th>
+   <th>DeSync (s) ↓</th>
+   <th>ImageBind ↑</th>
+   <th>CLAP ↑</th>
+   <th>Spatial ↑</th>
+  </tr>
+  <tr>
+   <td>Helix World (causal student)</td>
+   <td>1.39</td>
+   <td>2.39</td>
+   <td>0.59</td>
+   <td>0.299</td>
+   <td>0.302</td>
+   <td>41.8</td>
+  </tr>
+  <tr>
+   <td>Helix World (bidirectional teacher)</td>
+   <td>1.54</td>
+   <td>3.08</td>
+   <td>0.50</td>
+   <td>0.270</td>
+   <td>0.268</td>
+   <td>33.2</td>
+  </tr>
+  <tr>
+   <td>EchoWM</td>
+   <td>1.95</td>
+   <td>7.75</td>
+   <td>0.67</td>
+   <td>0.204</td>
+   <td>0.235</td>
+   <td>12.6</td>
+  </tr>
+  <tr>
+   <td>Helix World + ThinkSound</td>
+   <td>2.23</td>
+   <td>6.19</td>
+   <td>0.42</td>
+   <td>0.208</td>
+   <td>0.289</td>
+   <td>14.8</td>
+  </tr>
+  <tr>
+   <td>Helix World + AudioX</td>
+   <td>2.02</td>
+   <td>3.92</td>
+   <td>1.18</td>
+   <td>0.257</td>
+   <td>0.309</td>
+   <td>−5.7</td>
+  </tr>
+  <tr>
+   <td>Helix World + PrismAudio</td>
+   <td>2.24</td>
+   <td>6.39</td>
+   <td>0.46</td>
+   <td>0.215</td>
+   <td>0.272</td>
+   <td>−9.5</td>
+  </tr>
+  <tr>
+   <td>LTX-2.3 (base)</td>
+   <td>1.80</td>
+   <td>7.64</td>
+   <td>0.40</td>
+   <td>0.278</td>
+   <td>0.258</td>
+   <td>1.0</td>
+  </tr>
+ </tbody>
+</table>
+<p>Helix World leads on audio fidelity (KL, FAD), audio-visual semantic alignment (ImageBind), and spatial consistency. It is not best everywhere: LTX-2.3 and the ThinkSound pipeline have lower temporal offset (DeSync), and the AudioX pipeline scores slightly higher on text-audio alignment (CLAP). The re-dubbing pipelines produce negative spatial scores because a video-to-audio model does not know where the sound sources are relative to the camera.</p>
+<h3>What people preferred</h3>
+<p>In a user study on full audio-visual rollouts, participants preferred Helix World over EchoWM 67.9% to 20.8%, and over the re-dubbed versions of its own video by 67.9% to 24.5% (AudioX), 80.8% to 9.6% (ThinkSound) and 77.8% to 16.7% (PrismAudio); the remainder were ties. With the sound muted, Helix World was preferred over SANA-WM, Alaya and HY-WorldPlay 1.5, tied with LingBot-World v2 at 39.5% each, and was less preferred than EchoWM, 26.3% to 44.7%. Its advantage comes mainly from the audio.</p>
+<h2>How we built Helix World</h2>
+<h3>Data: true stereo with metric camera poses</h3>
+<p>Most video corpora are unusable for this task: the audio is often background music, voiceover, or pseudo-stereo with identical channels. We started from 4,100 hours of raw footage (43.9% real-world video, 34.1% game recordings, 22.0% open-source datasets) and filtered it in four stages, ordered from cheapest to most expensive:</p>
+<ul>
+ <li>Heuristic filtering removes dual-mono audio, shot cuts, low perceptual quality, text overlays, and static scenes.</li>
+ <li>Clip standardization cuts audio and video together into 121-frame clips at 24 fps and 768×512, with 48 kHz stereo.</li>
+ <li>Semantic filtering with a multimodal LLM that watches and listens rejects background music, narration, UI overlays, picture-in-picture, and talking heads, and keeps diegetic sound.</li>
+ <li>Camera and captioning recovers metric camera poses for every frame and writes three caption tracks: video-only, audio-only, and audio-visual.</li>
+</ul>
+<p>The result is 3,000 hours in 2.1 million clips, a 73.1% yield. In an ablation, training with all three caption tracks gave the best audio-visual alignment.</p>
+<h3>A bidirectional teacher with camera and action control</h3>
+<p>Helix World builds on the open-source LTX-2.3 audio-visual model. Continuous 6-DoF camera trajectories enter the visual attention through PRoPE, and discrete keyboard actions enter through AdaLN-Zero on the diffusion timestep. Cross-modal attention then binds visual geometry to the audio features, which is how camera motion becomes stereo panning.</p>
+<p>Training is progressive: first the control modules, then the video branch, then the full audio-visual backbone. Compared with fine-tuning everything at once, this lowers camera rotation error from 0.1237 to 0.1144 and translation error from 0.0957 to 0.0823, while keeping the pretrained visual quality.</p>
+<h3>A causal student that streams without drift</h3>
+<p>The bidirectional teacher sees the whole clip, so it cannot respond to live input. We distill it into a few-step causal student that generates block by block with a sliding key-value cache and fixed sink frames. The student is initialized by regressing the teacher's ODE outputs, then trained with self-forcing on its own rollouts.</p>
+<p>Self-forcing with distribution matching (DMD) alone still drifts over long rollouts. Our addition is an online trajectory distillation loss: at each update, with probability p, the student's velocity at an intermediate rollout state is supervised by the teacher's probability-flow ODE target; otherwise the DMD loss is used. A final long-horizon streaming stage trains on extended windows. Together, these raise the WBench score from 77.9 to 79.1 and keep 30-second rollouts stable.</p>
+<h2>Limitations</h2>
+<ul>
+ <li>Output resolution is 768×512. Real-time speed is reported on an NVIDIA H800 data-center GPU; the paper does not report consumer GPUs.</li>
+ <li>The public checkpoint is a preview release.</li>
+ <li>On visual quality alone, Helix World is slightly behind the best silent models (79.9 vs 82.0 WBench average), and with sound muted, viewers preferred EchoWM.</li>
+ <li>Helix World does not have the lowest DeSync on HelixBench, so tight onset timing still has room to improve.</li>
+</ul>
+<p>For a different approach to the same problem, adding streaming stereo to an existing world model, see our WorldSonus post.</p>
+<h2>Try Helix World</h2>
+<p>The interactive demo is open at helixworld.org. Read the full paper, "HelixWorld: A Real-time Interactive Audio-Visual World Model" (arXiv:2609.38123, 29 September 2026), on arXiv. Code is on GitHub and the preview weights are on Hugging Face.</p>
+<p>Authors: Lei Ke, Jiahao Pan and Zeyue Tian (equal contribution), Jiaming Wang, Haoyuan Huang, Kam Man Wu, Pengjun Fang, Hongyu Liu, Chenyang Qi, Lin Wang, Ruibin Yuan, Weijia Chen, Fangneng Zhan, Qifeng Chen, Wei Xue and Yike Guo. Corresponding authors: Zeyue Tian and Wei Xue. The Hong Kong University of Science and Technology and Noiz AI.</p>
+<h2>FAQ</h2>
+<p><strong>What is Helix World?</strong> Helix World is a real-time interactive audio-visual world model from Noiz AI and HKUST. It generates an explorable video scene and camera-aligned stereo sound together, controlled with the keyboard and an optional text prompt.</p>
+<p><strong>Does Helix World run in real time?</strong> Yes. On a single NVIDIA H800 GPU it reaches a steady-state real-time factor of 0.77 at 768×512 and 24 fps, including video and audio decoding. Input takes effect from the next generated chunk of about 1.3 seconds.</p>
+<p><strong>How is Helix World different from other world models?</strong> Most interactive world models generate silent video. Helix World generates stereo sound natively with the picture, and the sound pans with camera motion. On HelixBench its spatial-acoustic consistency score is 41.8, against 12.7 for EchoWM.</p>
+<p><strong>What is HelixBench?</strong> HelixBench is a benchmark for interactive audio-visual world models with 1,015 human-verified cases in six domains. It measures audio fidelity, temporal sync, audio-visual and text-audio alignment, and spatial-acoustic consistency.</p>
+<p><strong>What model is Helix World built on?</strong> It builds on the open-source LTX-2.3 audio-visual model, adds 6-DoF camera and keyboard-action control, and is distilled into a few-step causal student for streaming.</p>
+<p><strong>Can I try or download Helix World?</strong> Yes. The demo is at helixworld.org, the code is on GitHub (NoizAI/HelixWorld), and a preview checkpoint is on Hugging Face (NoizAI/HelixWorld-preview).</p>
