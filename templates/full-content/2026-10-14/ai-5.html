@@ -1,0 +1,176 @@
+<p>Today, we release <strong>LFM2.5-24B-A2B</strong>, a 24B-parameter reasoning model with just 2B active parameters, built for fast, private agents on-device. It is the largest and final model in the LFM2.5 family, which now spans two orders of magnitude: from LFM2.5-230M to LFM2.5-24B-A2B.</p>
+<p>LFM2.5-24B-A2B is competitive with Qwen3.6-35B-A3B, a model with ~50% more total and active parameters, on five of eight agentic and tool-use benchmarks, scoring 48.09 on LiveClaw versus 38.19 and 27.69 on AutomationBench versus 8.72. Because only 2B parameters are active per token, it runs up to 1.7× faster than comparable MoEs on-device, with 184 tokens/s on an Apple M5 Max and up to 21K output tokens/s on a single NVIDIA B300 GPU.</p>
+<p>The base (LFM2.5-24B-A2B-Base) and post-trained (LFM2.5-24B-A2B) models are open-weight and available today on Hugging Face and our Playground. Check out our docs on how to run and fine-tune it locally.</p>
+<h2>What changed since LFM2-24B-A2B</h2>
+<p>LFM2.5-24B-A2B builds on our previous LFM2-24B-A2B release, with an expanded vocabulary and context window, scaled-up pretraining, and large-scale reinforcement learning. Unlike its predecessor, LFM2.5-24B-A2B is a reasoning-only model that produces an explicit chain of thought before its final answer. We adopted this strategy to leverage its high decode speed and improve answer quality.</p>
+<p><strong>Architecture.</strong> It keeps the 40 layers, 64 experts per MoE block with top-4 routing, and the same hybrid of gated short convolutions and GQA. The two architectural changes are the context window extension from 32,768 to 131,072 tokens, and the in-place tokenizer expansion, which doubles the vocabulary from 65K to 128K tokens for better non-Latin tokenization.</p>
+<p><strong>Pre-training</strong> was scaled up from 17T tokens to 33T tokens.</p>
+<p><strong>Mid-training</strong> has two phases. The first runs 2T tokens at 32K context on curated, higher-quality data weighted toward reasoning, math, code, instruction following, and multilingual text. The second runs 300B tokens at 131K context, weighted toward long context data. Tool calls and multi-turn trajectories appear throughout both phases to prepare the model for agentic workloads.</p>
+<p><strong>Post-training</strong> turns LFM2.5-24B-A2B-Base into the agentic LFM2.5-24B-A2B in a five-stage pipeline: (1) Supervised Fine-Tuning (SFT), (2) Teacher Specialization, (3) non-agentic and (4) agentic Multi-Domain On-Policy Distillation (MOPD), and (5) Agentic Reinforcement Learning (Agentic RL), training the model inside agent harnesses, such as OpenClaw, Hermes Agent, Pi, and OpenCode.</p>
+<p>During teacher specialization, LFM2.5-24B-A2B exhibited well-known reward-hacking behaviors: searching for the final answer in a repository's git history or on platforms like GitHub, PyPI, and Hugging Face. More surprisingly, it even figured out it was in a sandbox.</p>
+<p>This behavior looks emergent but might be explained by training data containing similar patterns. We tightened our sandboxes in response, and all reported results below come from sealed evaluation environments.</p>
+<h2>Benchmarks</h2>
+<p>We evaluated LFM2.5-24B-A2B across 16 benchmarks covering tool use and agentic workflows, knowledge, instruction following, math, and coding. Despite being the smallest model in total and active number of parameters, it is competitive with, and often outperforms, larger MoEs with ~50% more total and active parameters, such as Qwen3.6-35B-A3B.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Benchmark</th>
+   <th>LFM2.5-24B-A2B</th>
+   <th>Qwen3.6-35B-A3B</th>
+   <th>Gemma-4-26B-A4B-it</th>
+   <th>Nemotron-3.5-Lightning (30B-A3B)</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>AutomationBench</td>
+   <td><strong>27.69</strong></td>
+   <td>8.72</td>
+   <td>5.46</td>
+   <td>2.61</td>
+  </tr>
+  <tr>
+   <td>BFCLv4</td>
+   <td><strong>65.01</strong></td>
+   <td>65.00</td>
+   <td>57.09</td>
+   <td>53.78</td>
+  </tr>
+  <tr>
+   <td>ToolSandbox</td>
+   <td><strong>80.71</strong></td>
+   <td>75.02</td>
+   <td>72.09</td>
+   <td>75.13</td>
+  </tr>
+  <tr>
+   <td>LiveClaw</td>
+   <td><strong>48.09</strong></td>
+   <td>38.19</td>
+   <td>41.25</td>
+   <td>37.72</td>
+  </tr>
+  <tr>
+   <td>PinchBench</td>
+   <td>83.18</td>
+   <td><strong>89.93</strong></td>
+   <td>77.12</td>
+   <td>84.20</td>
+  </tr>
+  <tr>
+   <td>τ³-Bench Banking</td>
+   <td><strong>8.04</strong></td>
+   <td>7.63</td>
+   <td>4.54</td>
+   <td>7.01</td>
+  </tr>
+  <tr>
+   <td>WebArena Verified</td>
+   <td>26.75</td>
+   <td><strong>37.62</strong></td>
+   <td>25.62</td>
+   <td>28.69</td>
+  </tr>
+  <tr>
+   <td>GPQA Diamond</td>
+   <td>74.42</td>
+   <td><strong>83.69</strong></td>
+   <td>74.90</td>
+   <td>72.42</td>
+  </tr>
+  <tr>
+   <td>AA-Omniscience</td>
+   <td>-24.90</td>
+   <td>-24.35</td>
+   <td>-59.39</td>
+   <td><strong>-3.58</strong></td>
+  </tr>
+  <tr>
+   <td>HLE</td>
+   <td>7.40</td>
+   <td>7.69</td>
+   <td><strong>8.57</strong></td>
+   <td>5.65</td>
+  </tr>
+  <tr>
+   <td>IFEval</td>
+   <td><strong>96.75</strong></td>
+   <td>93.06</td>
+   <td>92.00</td>
+   <td>94.19</td>
+  </tr>
+  <tr>
+   <td>IFBench</td>
+   <td><strong>74.69</strong></td>
+   <td>64.21</td>
+   <td>47.44</td>
+   <td>71.67</td>
+  </tr>
+  <tr>
+   <td>Multi-IF</td>
+   <td><strong>84.38</strong></td>
+   <td>81.53</td>
+   <td>82.19</td>
+   <td>82.34</td>
+  </tr>
+  <tr>
+   <td>MATH-500</td>
+   <td>96.04</td>
+   <td><strong>96.73</strong></td>
+   <td>95.66</td>
+   <td>96.40</td>
+  </tr>
+  <tr>
+   <td>SWE-Bench Verified (OpenCode)</td>
+   <td>51.00</td>
+   <td><strong>66.20</strong></td>
+   <td>25.80</td>
+   <td>53.40</td>
+  </tr>
+  <tr>
+   <td>SciCode</td>
+   <td>32.71</td>
+   <td><strong>37.35</strong></td>
+   <td>35.42</td>
+   <td>27.78</td>
+  </tr>
+ </tbody>
+</table>
+<p>LFM2.5-24B-A2B leads or matches the competition on five of the eight tool-use and agentic benchmarks (AutomationBench, BFCLv4, ToolSandbox, LiveClaw, and τ³-Bench Banking), with its widest margin on AutomationBench, where it scores more than three times the next-best model. It also leads on all three instruction-following benchmarks. Larger models keep an edge on knowledge-heavy benchmarks like GPQA Diamond, HLE, and AA-Omniscience, and on coding benchmarks like SWE-Bench Verified (OpenCode) and SciCode.</p>
+<p>The results make LFM2.5-24B-A2B an ideal foundation for agents that need to reason, call tools, and run reliably on your device. For knowledge-heavy workloads, we recommend pairing LFM2.5-24B-A2B with retrieval or web search, which plays to its tool-calling strength.</p>
+<h2>Fast inference everywhere</h2>
+<p>LFM2.5-24B-A2B ships with day-one support across the inference ecosystem:</p>
+<ul>
+ <li><strong>llama.cpp</strong> — GGUF checkpoints for efficient edge inference</li>
+ <li><strong>MLX</strong> — Optimized inference for Apple Silicon</li>
+ <li><strong>vLLM</strong> — GPU-accelerated serving for production throughput</li>
+ <li><strong>SGLang</strong> — High-performance GPU serving framework</li>
+ <li><strong>ONNX</strong> — Cross-platform inference across diverse accelerators</li>
+</ul>
+<p><strong>Edge inference.</strong> Due to the efficient LFM2 architecture, LFM2.5-24B-A2B is the fastest of the compared MoEs at reading in prompts and generating answers. It decodes 184 tokens/s on an Apple M5 Max and 114 tokens/s on an AMD Ryzen AI Max+ 395, up to 1.7x faster than the next-best model, while using the least memory.</p>
+<p><strong>GPU inference.</strong> To demonstrate the competitiveness of LFM architecture we compare the GPU inference throughput to other similarly sized MoE models. We measure GPU throughput (total output tokens / wall time) on a single NVIDIA B300 GPU using a sustained-load setting: at each concurrency level, we continuously maintain the target number of in-flight requests, replacing each completed request immediately.</p>
+<p>We benchmark each model with SGLang 0.5.22, 1,024 input tokens, up to 256 output tokens, in BF16. LFM2.5-24B-A2B is the fastest model in its size class, reaching over 21K output tokens per second at high concurrency.</p>
+<h2>Run local agents with LFM2.5-24B-A2B</h2>
+<p>LFM2.5-24B-A2B’s size, speed, and capabilities make it a great choice for agents that run continuously on your own hardware.</p>
+<p>The point of the demo is not the individual tools. It is that the tool-dispatch loop feels interactive on consumer hardware: ask, propose, confirm, run, repeat, all in well under a second per dispatch, with full audit trails and your data never leaving the device.</p>
+<h2>Get Started</h2>
+<p>Start building today with LFM2.5-24B-A2B, available on Hugging Face.</p>
+<p>For API inference, you can also sign up for Liquid Console. The model is priced at $.10/1M input tokens (at $.05 for cached input) and $1.00/1M output tokens.</p>
+<p>With LFM2.5, we're delivering on our vision of AI that runs anywhere. These models are:</p>
+<ul>
+ <li><strong>Open-weight</strong> — Download, fine-tune, and deploy.</li>
+ <li><strong>Fast from day one</strong> — Native support for llama.cpp, MLX, and vLLM across Apple, AMD, Qualcomm, and Nvidia hardware</li>
+ <li><strong>A complete family</strong> — From base models for customization to specialized audio and vision variants, one architecture covers diverse use cases</li>
+</ul>
+<h2>Citation</h2>
+<p>For citations, please use the following reference or BibTeX:</p>
+<blockquote>
+ Liquid AI, "LFM2.5-24B-A2B: Built for Fast On-Device Agents", Liquid AI Blog, Oct 2026.
+</blockquote>
+<pre><code>@article\{liquidAI202624BA2B,
+  author = \{Liquid AI},
+  title = \{LFM2.5-24B-A2B: Built for Fast On-Device Agents},
+  journal = \{Liquid AI Blog},
+  year = \{2026},
+  note = \{www.liquid.ai/blog/lfm2-5-24b-a2b},
+}</code></pre>

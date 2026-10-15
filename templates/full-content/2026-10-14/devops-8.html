@@ -1,0 +1,117 @@
+<h1>What gets TOASTed in Postgres</h1>
+<p>Insert 2,000 copies of the letter <code>x</code> into a table with an <code>int</code> ID and a <code>text</code> column, and Postgres stores all 2,000 bytes uncompressed. Insert 2,001, and Postgres compresses the value to 26 bytes with LZ4.</p>
+<p>That one extra byte is enough to trigger <strong>TOAST</strong>, the part of Postgres that compresses values once their row gets too big, and moves them out of the row when compressing isn't enough.</p>
+<p>Postgres 19, now in beta, changes how TOAST compresses, switching the default from pglz to LZ4 in builds with LZ4 support. PlanetScale already made this switch on Postgres 17 and 18.</p>
+<p>Here, we look at which values get TOASTed, what TOAST does to them, and when LZ4 is the right choice. Let's dig in!</p>
+<h2>What a row costs in bytes</h2>
+<p>Compression is all about saving bytes, so we'll start with where the bytes in a row go.</p>
+<p>Postgres stores table data in fixed 8 KB pages. A row can't be split across pages, so every row has to fit inside one.</p>
+<p>Each row starts with a 24-byte header that Postgres uses to track which transactions can see it, followed by the values of its columns. The space those values take depends on their type, and every type falls into one of two groups:</p>
+<ul>
+ <li><strong>Fixed-width types</strong> like <code>bigint</code>, <code>timestamptz</code>, and <code>boolean</code> always take the same number of bytes.</li>
+ <li><strong>Variable-length types</strong> like <code>text</code>, <code>jsonb</code>, and <code>bytea</code> take as many bytes as the value needs, plus a length header: 1 byte for values up to 126 bytes, and 4 bytes for anything longer.</li>
+</ul>
+<p><code>pg_column_size</code> shows both groups in a single row:</p>
+<pre><code>SELECT pg_column_size(ROW(1::bigint, now(), true, 'Ada'::text));
+ pg_column_size
+----------------
+             45
+(1 row)</code></pre>
+<p>That's the 24-byte header, 17 bytes for the <code>bigint</code>, <code>timestamptz</code>, and <code>boolean</code> (8, 8, and 1), and 4 bytes for <code>'Ada'</code>: three characters plus a 1-byte length header. Change <code>'Ada'</code> to <code>'Ada Lovelace'</code>, and the row grows to 54 bytes while the other columns stay at 17.</p>
+<p>Variable-length values are what make a row grow, and the only ones Postgres can compress.</p>
+<h2>Small rows don't trigger compression</h2>
+<p>TOAST stands for The Oversized-Attribute Storage Technique. As the name suggests, TOAST only steps in when a row gets too big.</p>
+<p>Postgres treats a row as oversized once it's larger than 2,032 bytes, about a quarter of an 8 KB page. This threshold was set so that at least four rows fit on every page, after room for the page header and a pointer to each row.</p>
+<p>Here's what happens when we store the most compressible value possible, a single repeated letter, at lengths just below and just above the threshold. <code>pg_column_compression</code> returns the algorithm that compressed each value, or null if the value isn't compressed, which we display as <code>none</code>. The <code>COMPRESSION lz4</code> clause picks the algorithm.</p>
+<pre><code>CREATE TABLE t (id int PRIMARY KEY, body text COMPRESSION lz4);
+
+INSERT INTO t VALUES
+  (1500, repeat('x', 1500)),
+  (2000, repeat('x', 2000)),
+  (2001, repeat('x', 2001));
+
+SELECT id AS chars,
+       pg_column_size(body) AS stored_bytes,
+       coalesce(pg_column_compression(body), 'none') AS compression
+FROM t ORDER BY id;
+ chars | stored_bytes | compression
+-------+--------------+-------------
+  1500 |         1504 | none
+  2000 |         2004 | none
+  2001 |           26 | lz4
+(3 rows)</code></pre>
+<p>The first two values aren't compressed. Each takes 4 bytes more than its length, for the length header. The third value, however, is just one character longer, and it's compressed to 26 bytes.</p>
+<p>The 2,000-character row is exactly 2,032 bytes: 24 for the row header, 4 for the <code>int</code>, and 2,004 for the text. That's right on the threshold, so TOAST leaves it alone. The 2,001-character row is one byte over.</p>
+<h2>TOAST does two different jobs</h2>
+<p>The threshold applies to the whole row, but TOAST works on individual variable-length values. Once a row is over the threshold, TOAST has two ways to shrink it:</p>
+<ul>
+ <li><strong>Compress</strong> a value, and keep the smaller version in the row, like the 2,001-character row.</li>
+ <li><strong>Move</strong> a value out of the row, into a separate table.</li>
+</ul>
+<p>That separate table is called a <strong>TOAST table</strong>. Tables with columns that can hold large values get one automatically in the <code>pg_toast</code> schema.</p>
+<p>A value moved to the TOAST table isn't stored in one piece, though. TOAST splits it into chunks of up to 1,996 bytes and stores each chunk as its own row, tagged with the value's ID (<code>chunk_id</code>) and its position in the value (<code>chunk_seq</code>). The rest of the 2,032 bytes holds the chunk row's header and IDs, so four chunk rows fit on a page. The original row keeps an 18-byte pointer, so Postgres can find the chunks and reassemble them.</p>
+<p>TOAST works through a row's values from largest to smallest. As soon as the row is back under 2,032 bytes, the table's <code>toast_tuple_target</code>, it stops.</p>
+<p>To see every outcome, we store four very different values in one table: a short string, 10 KB of repeated text, 200 KB of random characters, and 1.1 MB of a repeated sentence. <code>stored_bytes</code> is the value's size wherever it ended up, including the TOAST table for a moved-out value. <code>octet_length</code> returns a value's uncompressed size, and <code>pg_column_toast_chunk_id</code> (Postgres 17+) returns its ID in the TOAST table, or null if the value is still in the row.</p>
+<pre><code>CREATE TABLE docs (id int PRIMARY KEY, body text COMPRESSION lz4);
+
+INSERT INTO docs VALUES
+  (1, repeat('x', 200)),
+  (2, repeat('abc', 3400)),
+  (3, (SELECT string_agg(md5(random()::text), '') FROM generate_series(1, 6250))),
+  (4, repeat('The quick brown fox jumps over the lazy dog. ', 25000));
+
+SELECT id,
+       octet_length(body) AS raw_bytes,
+       pg_column_size(body) AS stored_bytes,
+       coalesce(pg_column_compression(body), 'none') AS compression,
+       pg_column_toast_chunk_id(body) IS NOT NULL AS moved_out
+FROM docs ORDER BY id;
+ id | raw_bytes | stored_bytes | compression | moved_out
+----+-----------+--------------+-------------+-----------
+  1 |       200 |          204 | none        | f
+  2 |     10200 |           60 | lz4         | f
+  3 |    200000 |       200000 | none        | t
+  4 |   1125000 |         4471 | lz4         | t
+(4 rows)</code></pre>
+<p>Each value lands somewhere different:</p>
+<ul>
+ <li><strong>Row 1</strong> is under the threshold, so TOAST never touches it.</li>
+ <li><strong>Row 2</strong> compresses from 10 KB to 60 bytes, small enough to stay in the row.</li>
+ <li><strong>Row 3</strong> is random, so compressing it doesn't save space. TOAST moves the value out uncompressed.</li>
+ <li><strong>Row 4</strong> compresses to 4,471 bytes, which is still too big for the row, so TOAST compresses it <em>and</em> moves it out.</li>
+</ul>
+<p>Each column's <strong>storage strategy</strong> decides which of those jobs TOAST can do:</p>
+<ul>
+ <li><strong><code>PLAIN</code></strong>: neither. Used by fixed-width types like <code>int</code>.</li>
+ <li><strong><code>EXTENDED</code></strong>: compress, then move out if needed. The default for <code>text</code>, <code>jsonb</code>, and <code>bytea</code>.</li>
+ <li><strong><code>EXTERNAL</code></strong>: move out, but never compress.</li>
+ <li><strong><code>MAIN</code></strong>: compress, but keep the value in the row even above the usual TOAST target if the row still fits on a page. Move it out only as a last resort. The default for <code>numeric</code>.</li>
+</ul>
+<h2>TOAST isn't a large object</h2>
+<p>Postgres has a second way to store big values, called <strong>large objects</strong>, built for whole files like videos or PDFs.</p>
+<p>TOAST and large objects both store big values in chunks, but they differ in three ways:</p>
+<ul>
+ <li><strong>TOAST is automatic.</strong> It applies to any variable-length column without you asking. A large object only exists if you create one.</li>
+ <li><strong>TOAST values top out at 1 GB.</strong> Large objects can hold up to 4 TB.</li>
+ <li><strong>TOAST values are deleted with their row.</strong> A large object stays until you remove it with <code>lo_unlink</code>, even after the row that references it is gone.</li>
+</ul>
+<h2>How pglz and LZ4 work</h2>
+<p>Postgres can compress a TOAST value with one of two algorithms, <strong>pglz</strong> or <strong>LZ4</strong>. A column uses the one its <code>COMPRESSION</code> clause names, or the <code>default_toast_compression</code> setting if it doesn't name one. Changing either only affects values compressed from then on. Values already compressed keep their algorithm, even when you copy them with <code>INSERT ... SELECT</code> or rewrite the table with <code>VACUUM FULL</code>.</p>
+<p><strong>zstd</strong> isn't an option for column compression. Postgres uses it elsewhere, like write-ahead log (WAL) compression through <code>wal_compression</code> (Postgres 15+) and backups.</p>
+<p>Both algorithms work the same basic way. They scan a value from start to finish, looking for bytes that already appeared earlier. When they find a repeat, they replace it with a short note saying where the earlier copy is and how long it is.</p>
+<h2>pglz wins on these JSON documents</h2>
+<p>In a JSON array, the same keys come back in every object, close enough for both algorithms to find them.</p>
+<p>We loaded 10,000 order documents into three tables on PlanetScale Postgres 18: one using <code>EXTERNAL</code> so nothing gets compressed, one using pglz, and one using LZ4. Each document has 25 to 100 line items, and every line item repeats the same five keys: <code>sku</code>, <code>name</code>, <code>qty</code>, <code>price_cents</code>, and <code>tags</code>.</p>
+<p>The uncompressed table is 103 MB. The pglz table is 19 MB and the LZ4 table is 24 MB.</p>
+<p>Since both find the keys, the size comes down to pglz's extra searching, which finds longer matches. LZ4 makes up for it in speed: in two runs each, it loaded the same documents in 0.48 and 1.09 s, against 1.59 and 1.73 s for pglz.</p>
+<h2>pglz is faster for previews</h2>
+<p>pglz also wins when you only read the start of a large value, like a 200-character preview with <code>left(body, 200)</code>. pglz never needs more than 9 bits to store a byte of the original, plus 2 bytes overall, so Postgres can put a ceiling on how many compressed bytes a prefix needs. A character takes 1 to 4 bytes, so 200 characters are at most 800 bytes, and 800 bytes of output need at most 902 compressed bytes. That's less than the 1,996 bytes in a chunk, so Postgres fetches only the first one. Postgres has no equivalent ceiling for LZ4, so it fetches the whole value first.</p>
+<h2>When to skip compression</h2>
+<p>Compressed values take fewer pages, which means less disk, more of a table in memory, and less WAL to send to replicas and back up. The cost is CPU, on every write that crosses the threshold and every read of a compressed value. Compression also doesn't reduce egress, since Postgres decompresses values before sending them.</p>
+<p>Two kinds of data are better off uncompressed, with <code>EXTERNAL</code>:</p>
+<ul>
+ <li><strong>Already-compressed data</strong>, like JPEG frames. LZ4 spends CPU on every frame and saves little or nothing.</li>
+ <li><strong>Large <code>bytea</code> values read from the middle</strong>, like seeking in a file.</li>
+</ul>
+<h2>Wrapup</h2>
+<p>TOAST only steps in once a row passes 2,032 bytes, so plenty of values, like the 2,000 <code>x</code>s from the start, never get compressed at all. For the ones that do, LZ4 is the right default for most tables: its speed matters more than the size difference, which can go either way. For a few kinds of data, it's worth choosing pglz or <code>EXTERNAL</code> by hand.</p>

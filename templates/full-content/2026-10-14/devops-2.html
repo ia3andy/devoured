@@ -1,0 +1,58 @@
+<h1>Announcing AWS Lambda Web Functions</h1>
+<p>Today, we’re announcing AWS Lambda Web Functions, a new form factor that lets you run standard HTTP web applications on Lambda without rewriting your code into an event handler. You can take a standard port-listening server built with Express, Hono, Fastify, Next.js, or any Node.js framework, deploy it with a single command, and Lambda automatically handles scaling, multi-region distribution, and active CPU billing. No adapters, no infrastructure to manage, and no framework lock-in.</p>
+<p>With this launch, AWS Lambda now offers three distinct form factors, each built on the same Firecracker isolation technology and designed for a different programming model.</p>
+<p><strong>Lambda Event Functions</strong> are what you already know as Lambda functions. They use the event-driven, single-concurrent handler model with wall-clock billing. We’re introducing the “Event Functions” name to highlight that programming model: your function receives an event, processes it, and returns a response. The event-driven programming model is ideal for event processing, queue consumers, and invocations triggered by other AWS services.</p>
+<p><strong>Lambda Web Functions</strong> use an HTTP-native programming model with multi-concurrent execution and active CPU billing. Your code listens on a port and handles standard HTTP requests. That programming model is ideal for web applications, API backends, and interactive HTTP workloads where multiple concurrent requests and I/O-heavy processing are the norm.</p>
+<p><strong>Lambda MicroVMs</strong> provide isolated, stateful sandbox environments with customer-managed lifecycles for running untrusted or user-generated code.</p>
+<p>The three complement each other. An application might use Event Functions for asynchronous backend processing, Web Functions for the user-facing API and server-side rendering layer, and MicroVMs for interactive code execution features, all within the same AWS account and sharing the same operational model.</p>
+<p><strong>Why Web Functions</strong></p>
+<p>Modern web applications need to serve global audiences with fast, consistent response times while giving developers the freedom to use standard frameworks and iterate quickly. Building this today typically requires assembling multiple infrastructure components, configuring multi-region deployments, setting up latency-based routing, and tuning billing models to avoid paying for I/O wait. Developers often find themselves adapting their application code to fit a specific compute model rather than deploying the HTTP server they already have.</p>
+<p>Lambda Web Functions removes this complexity. Each execution environment handles multiple requests simultaneously (up to 128 concurrent requests per environment), which means a burst of incoming traffic can share warm environments instead of mapping each request to a new one. Web Functions meter the CPU time your code uses, so time spent waiting on a database query or an API call consumes little CPU. Memory is metered for as long as the execution environment exists. For I/O-heavy web workloads like server-side rendering, API backends, and AI inference endpoints streaming token responses, this can reduce compute costs.</p>
+<p><strong>Let’s try it out</strong></p>
+<p>To get started, I wrote a simple Express.js server. This is the same code I run locally with <code>node index.js</code>, no Lambda-specific adapters or wrappers required.</p>
+<pre><code>import express from 'express';
+
+const app = express();
+const [host, port] = process.env.AWS_LAMBDA_HTTP_ENDPOINT.split(':');
+
+app.get('/', (req, res) =&gt; \{
+  res.json(\{ message: 'Hello from Lambda Web Functions!' });
+});
+
+app.listen(port, host, () =&gt; \{
+  console.log(`Server running on port $\{port}`);
+});
+</code></pre>
+<p>The only difference from running locally is the <code>AWS_LAMBDA_HTTP_ENDPOINT</code> environment variable, which Lambda sets to the host and port your server must listen on. To run locally, set it yourself, for example <code>AWS_LAMBDA_HTTP_ENDPOINT=127.0.0.1:3000 node index.js</code>.</p>
+<p>With my code ready, I deployed using the AWS Command Line Interface (AWS CLI):</p>
+<pre><code>aws lambda-web deploy --name my-web-app --code ./my-app
+</code></pre>
+<p>One command. No prior resource setup. The CLI bundled my source, created the Web Function, published its first revision, attached a Web Function endpoint, and returned a live HTTPS URL in under a minute.</p>
+<p>A revision is an immutable snapshot of the code I deployed. The endpoint is the HTTPS URL that routes traffic to a revision, or splits traffic across revisions. Those are the resources I use to iterate and to control how traffic moves to new code.</p>
+<p>I tested it immediately:</p>
+<pre><code>$ curl https://&lt;domain-id&gt;.&lt;shard-id&gt;.lambda-web.us-east-1.on.aws/
+\{"message":"Hello from Lambda Web Functions!"}
+</code></pre>
+<p>Next, I wanted my application to serve users in Europe and Asia with lower latency. I redeployed with multiple regions:</p>
+<pre><code>aws lambda-web deploy --name my-web-app --code ./my-app \
+    --regions us-east-1,eu-west-1,ap-northeast-1
+</code></pre>
+<p>Lambda Web Functions replicated my code to all three regions and configured latency-based routing automatically. Each request now routes to the Region with the lowest latency for the caller, on a best-effort basis, through one global URL (<code>&lt;domain-id&gt;.lambda-web.global.on.aws</code>).</p>
+<p>When I updated my code and ran the same deploy command again, the CLI detected the existing function, uploaded the new revision, and pointed the endpoint at it. Total turnaround from code change to live: seconds.</p>
+<p>For production workflows that require a more gradual rollout, I can shift traffic between revisions with a single API call:</p>
+<pre><code>aws lambda-web update-web-function-endpoint \
+    --function-name my-web-app \
+    --endpoint-name dev \
+    --auto-deployment-mode Disabled \
+    --revision-weights '[\{"revisionId": "&lt;current-revision-id&gt;", "weight": 90}, \{"revisionId": "&lt;new-revision-id&gt;", "weight": 10}]'
+</code></pre>
+<p>This sends 90% of endpoint traffic to the current revision and 10% to the new one, giving me a canary deployment without additional tooling.</p>
+<p><strong>Better together with Amazon CloudFront</strong></p>
+<p>For applications that combine static and dynamic content, Web Functions works well alongside Amazon CloudFront. You can select a Web Function endpoint as the origin for your CloudFront distribution. Static assets are served from the cache while dynamic requests route to your Web Function, giving you CDN performance for static content with serverless compute for the dynamic parts.</p>
+<p>Web Functions improves the private-origin experience with CloudFront. With this launch, you attach CloudFront <a href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-origin.html">origin access control (OAC)</a> to a Web Function endpoint instead. CloudFront signs requests to the origin, and the endpoint allows only your distribution to invoke it. You get the same private-origin pattern CloudFront already provides for Amazon Simple Storage Service (Amazon S3), without exposing the endpoint or adding custom authorization to your app.</p>
+<p><strong>Now available</strong></p>
+<p>AWS Lambda Web Functions is available today in US East (N. Virginia), US East (Ohio), US West (Oregon), Asia Pacific (Tokyo), and Europe (Ireland). Web Functions run Node.js 24 (nodejs24.x) on Arm64 at launch and support Amazon Virtual Private Cloud (VPC) connectivity, allowing your function to access resources that exist within a VPC.</p>
+<p>To get started, deploy your first Web Function in under a minute:</p>
+<pre><code>aws lambda-web deploy --name hello-world --hello-world
+</code></pre>
+<p>For pricing details, visit the AWS Lambda pricing page. To learn more, see the <a href="https://docs.aws.amazon.com/lambda/latest/dg/web-functions.html">Lambda Web Functions documentation</a>.</p>
