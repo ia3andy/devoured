@@ -1,0 +1,181 @@
+<p>Here's a question from our test set. A caller rings a multi-trade maintenance company.</p>
+<blockquote>
+ <p>"Hi, I had a plumber round last week and there's a problem with what he did, it's still leaking. Who do I contact about that?"</p>
+</blockquote>
+<p>Our AI receptionist does what we built it to do. It searches the company's website for context and hands the closest matches to the language model. The closest match, according to our production embeddings, was a blog post called <em>How to Find a Reliable Plumber</em>.</p>
+<p>Which, if you think about it, is about the worst page you could hand an LLM while it's on the phone with one of the company's unhappy customers.</p>
+<p>It wasn't a one-off. In a test we ran at the start of October, our search handed the LLM a wrong page on a third of 168 caller questions. This post is about what we tried instead. A model that can't write a word, picking pages off a list. It handed our LLM the wrong page a tenth as often, 3% of the time against our search's 33%. It put the right page first 88% of the time, against 70%. And, the bit I didn't see coming, it knew when the website didn't have the answer.</p>
+<h2>How our receptionist reads a website today</h2>
+<p>Sayora answers the phone for small businesses in the UK: plumbers, estate agents, electricians, bars. Most calls are routine. Bookings, messages, "are you open on Saturday?". The interesting ones are questions about the business itself. Is the valuation free? Do you fit water softeners? Can I bring the dog?</p>
+<p>The answers are usually on the business's own website, so today we fetch them the standard way:</p>
+<ul>
+ <li>For a small site, we paste the homepage (or up to eight pages) straight into the prompt.</li>
+ <li>For anything bigger, we cut every page into 1,200-character chunks with 200 characters of overlap, and embed them with OpenAI's text-embedding-3-large at 768 dimensions.</li>
+ <li>On every caller turn, we embed what they said (plus a version with the turn before, for follow-ups) and inject the closest chunks scoring above a cosine similarity of 0.36.</li>
+</ul>
+<p>It's the standard RAG recipe, and it works well enough that we shipped it. It also always bugged me.</p>
+<h2>Websites are already organised</h2>
+<p>A small business's website isn't a pile of documents. Someone who knows the business has already organised it into pages, and each page is about one thing: boiler servicing, fees, the team, the Christmas menu. Shredding those pages into confetti and trusting cosine similarity to put the meaning back together always felt backwards.</p>
+<p>So we tried the obvious alternative:</p>
+<ol>
+ <li>Keep pages whole, and write each one a short description.</li>
+ <li>Give the receptionist a tool. When it hits something it doesn't know, it says "let me check that for you" and calls it.</li>
+ <li>The tool asks a model a multiple-choice question: which of these pages answers what the caller just said? "None of these" is one of the options.</li>
+ <li>The best page or two go to the LLM. If the answer is "none", the receptionist says it doesn't know and passes the question on.</li>
+</ol>
+<p>One lookup from the test, on an estate agent's 74-page site.</p>
+<p>The model doing the picking is Jev, a decision model TypeSafe launched on 15 September. It doesn't generate text. You send it some state and some typed questions, and it sends back a choice with a probability for every option. A choice question takes up to 255 options and a request up to 64k tokens. It costs $0.042 per million input tokens, and output is free. On a 100-page site, that's about a twentieth of a cent per lookup.</p>
+<h2>How we tested it</h2>
+<p>We took four of our customers' websites and removed the pages a page picker should never see. Individual property listings went, because a feed already covers those. So did near-identical "electrician in [town]" landing pages, because a coverage list answers "do you cover X?" better than a choice between 31 copies of the same page. That left:</p>
+<ul>
+ <li>a bar and restaurant, 22 pages</li>
+ <li>an estate agent, 74 pages</li>
+ <li>an electrician, 75 pages</li>
+ <li>a multi-trade maintenance company, 232 pages</li>
+</ul>
+<p>Claude Haiku 4.5 read every page once and wrote a description: the title, the path, a 30-word factual summary and a few questions a caller might ask. About 100 tokens a page.</p>
+<p>Separately, Claude Opus 5.5 read the page text (never the descriptions) and wrote questions the way callers actually talk. That gave us 168 questions: 128 the sites answer and 40 they don't. A quarter of the answerable ones also got a follow-up form ("and how much is that?") after two turns of conversation.</p>
+<p>Then nine pickers had a go at every question:</p>
+<ul>
+ <li><strong>Jev:</strong> one choice question over every page on the site, plus "none"</li>
+ <li><strong>Jev with thinner descriptions:</strong> title and summary only, and title only</li>
+ <li><strong>Embeddings shortlist, then Jev:</strong> the top 40 pages by embedding, then Jev picks</li>
+ <li><strong>GPT-6 Luna:</strong> the same list, asked for up to three page ids, or none</li>
+ <li><strong>Embeddings on page descriptions:</strong> the same descriptions Jev read, embedded</li>
+ <li><strong>Embeddings on chunks:</strong> our production retrieval, exactly as it runs today</li>
+ <li><strong>BM25:</strong> keyword search, on the descriptions and on the page text</li>
+</ul>
+<p>Judging was pooled. For each question, every page that any picker ranked in its top three went to a judge (Claude Opus 5.5), which read the actual page text and decided whether a receptionist could answer from it. That's 1,668 judgements. No picker was graded against pages another picker chose. When the judge found an answer to a question we'd written as unanswerable, or nothing for one we'd written as answerable, the question switched sides. That happened six times.</p>
+<h2>The result: 88% against 70%</h2>
+<p>Jev put a right page first on 88% of the answerable questions, and in its top three on 95%. Our production search managed 70%. That's 18 points, with a 95% interval of 11 to 26. Or, if you prefer headline maths, 26% better.</p>
+<p>The fairer fight is embeddings over the exact descriptions Jev read. That narrows the gap to 14 points (7 to 21), still well clear of zero. Keyword search came last, at 53% to 57%.</p>
+<h2>The part that surprised us: knowing when to stop</h2>
+<p>Ranking is only half the job. On a phone call, the worse mistake is handing the LLM a page that doesn't answer the question, because a fluent model will often build an answer out of it anyway. That's how a receptionist ends up quoting a guide's average prices as if they were the business's own.</p>
+<p>At our production cut-off of 0.36, chunk search handed over a wrong page on 33% of all questions. It said the website didn't have the answer for just 9 of the 40 questions the sites can't answer. Jev handed over a wrong page 3% of the time and said "not on the website" for 38 of the 40.</p>
+<h2>Why embeddings lose on websites</h2>
+<p>I read every question where chunk search put a wrong page first. Of the 39, 23 went to a generic guide or blog post. "Rewiring a house in the UK" for "will I get a certificate?". "How to find a reliable plumber" for the leak complaint. A long advice article shares more words with a caller's question than the business's own short page does, so it wins the cosine contest.</p>
+<p>Jev reads the list more like a person would. When it was wrong, it was usually wrong between near twins ("Certified electrician" instead of "Part P certificate"), and only one of its 16 wrong first pages was a guide.</p>
+<h2>Couldn't an LLM just pick?</h2>
+<p>Fair question. It's the first one I got asked. We gave GPT-6 Luna the same list and asked for up to three page ids, or none. OpenAI's new Decisions API is reportedly built on a tuned GPT-6 Luna. We don't have access to it yet, so this stands in for its judgement, not its speed.</p>
+<p>Luna tied Jev on picking: 86% right first against Jev's 88%, a difference of 2 points with an interval of −4 to +7. But it was slower, at 0.66 s median and 1.27 s at p95 (reasoning effort low), against Jev's 0.28 s and 0.42 s. It was also less willing to say "none". It caught 80% of the unanswerable questions and handed over a wrong page 8% of the time.</p>
+<h2>Embeddings still earn their keep</h2>
+<p>Some of the best numbers in the whole test came from using both. Embeddings shortlist 40 pages, then Jev picks among them: 88% right first, in 0.25 s. On the 232-page site, a shortlist of 100 got 95% right first and never handed over a wrong page.</p>
+<p>Embeddings are good at "somewhere around here". Jev is good at "this one". You don't have to choose.</p>
+<h2>How many pages can it take?</h2>
+<p>A choice question tops out at 255 options, so we checked whether that bites. Of the 449 business websites in our customer records, 353 publish a sitemap. The median has 14 pages, and 95% have 255 or fewer. Small businesses, it turns out, have small websites. Who knew.</p>
+<p>Then we pushed it. For each question we built option lists of 16 up to 232 pages, filling them with the most similar pages first (from the same section of the site), so every extra option was a plausible distractor.</p>
+<p>Accuracy drifts down as the list fills with lookalikes. On the biggest site, Jev went from 100% at 16 options to 92% at 232, and the right page stayed in its top three every time. Embeddings over the same lists fell from 89% to 74%.</p>
+<h2>The descriptions do the heavy lifting</h2>
+<p>Jev only knows what the description tells it. Page titles alone cost 9 points on the right page first and 16 points end to end. Title plus a one-line summary did as well as the full description with example questions, so the example questions can go. Writing the summaries cost about $0.002 a page with Claude Haiku, once per page and again only when a page changes.</p>
+<h2>Follow-ups come free</h2>
+<p>On the phone, people don't repeat themselves. "And how much is that?" only makes sense with the two turns before it. We gave Jev those turns as state and the caller's last words as the question. It put the right page first 91% of the time, exactly the same as when we handed it a cleanly rewritten question.</p>
+<h2>The hard part was the crawler</h2>
+<p>Picking the page was the easy bit. Reading real small-business websites broke something different almost every time.</p>
+<h2>What's next</h2>
+<p>Real caller questions from transcripts, then a test on live calls. If it holds up, our receptionist reads a business's whole website instead of its homepage, the owner chooses which parts it can use, and every "not on the website" becomes a question for the owner to answer. We'd also like to put OpenAI's Decisions API through the same test once we can get in.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Picker</th>
+   <th>Right page first</th>
+   <th>Top 3</th>
+   <th>Answered right</th>
+   <th>Wrong page handed over</th>
+   <th>Says "not on site"</th>
+   <th>p50</th>
+   <th>p95</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Jev, every page</td>
+   <td><strong>88%</strong></td>
+   <td><strong>95%</strong></td>
+   <td><strong>90%</strong></td>
+   <td><strong>3%</strong></td>
+   <td><strong>95%</strong></td>
+   <td>0.28 s</td>
+   <td>0.42 s</td>
+  </tr>
+  <tr>
+   <td>Jev, title and summary</td>
+   <td>86%</td>
+   <td>95%</td>
+   <td>88%</td>
+   <td>4%</td>
+   <td>95%</td>
+   <td>0.27 s</td>
+   <td>0.38 s</td>
+  </tr>
+  <tr>
+   <td>Jev, title only</td>
+   <td>78%</td>
+   <td>90%</td>
+   <td>74%</td>
+   <td>7%</td>
+   <td>88%</td>
+   <td>0.25 s</td>
+   <td>0.33 s</td>
+  </tr>
+  <tr>
+   <td>Embeddings shortlist 40, then Jev</td>
+   <td>88%</td>
+   <td>93%</td>
+   <td>89%</td>
+   <td>5%</td>
+   <td>93%</td>
+   <td>0.25 s</td>
+   <td>0.36 s</td>
+  </tr>
+  <tr>
+   <td>GPT-6 Luna picks from the list</td>
+   <td>86%</td>
+   <td>92%</td>
+   <td>88%</td>
+   <td>8%</td>
+   <td>80%</td>
+   <td>0.66 s</td>
+   <td>1.27 s</td>
+  </tr>
+  <tr>
+   <td>Embeddings on descriptions</td>
+   <td>73%</td>
+   <td>87%</td>
+   <td>69%</td>
+   <td>27%</td>
+   <td>30%</td>
+   <td>0.16 s</td>
+   <td>0.23 s</td>
+  </tr>
+  <tr>
+   <td>Embeddings on chunks (production)</td>
+   <td>70%</td>
+   <td>88%</td>
+   <td>65%</td>
+   <td>33%</td>
+   <td>23%</td>
+   <td>0.16 s</td>
+   <td>0.23 s</td>
+  </tr>
+  <tr>
+   <td>BM25 on descriptions</td>
+   <td>57%</td>
+   <td>77%</td>
+   <td>–</td>
+   <td>–</td>
+   <td>–</td>
+   <td>&lt;1 ms</td>
+   <td>&lt;1 ms</td>
+  </tr>
+  <tr>
+   <td>BM25 on page text</td>
+   <td>53%</td>
+   <td>72%</td>
+   <td>–</td>
+   <td>–</td>
+   <td>–</td>
+   <td>&lt;1 ms</td>
+   <td>&lt;1 ms</td>
+  </tr>
+ </tbody>
+</table>

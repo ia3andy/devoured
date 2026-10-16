@@ -1,0 +1,111 @@
+<p>Stop rebuilding what production already built. Change-aware SQL pipelines with all state in the warehouse.</p>
+<p>SQLBuild is a SQL-first framework for building reliable warehouse pipelines. It points at your existing dbt project and makes your builds change-aware: it fingerprints your models, skips the ones that have not changed, and can reuse already-built tables from production instead of rebuilding them in dev. No SQLBuild models, no migration, no edits to your dbt files.</p>
+<p>It is also a full standalone framework. All state is persisted as append-only tables in the warehouse alongside your data: no external state database, no manifest files, no paid add-on. It keeps a low, dbt-like floor for SQL models and adds ingestion, Python nodes, testing, and opt-in virtual environments as your project grows.</p>
+<h2>Key features</h2>
+<ul>
+ <li><strong>Works with your existing dbt project.</strong> Point SQLBuild at a dbt project and get change-aware builds and production reuse with zero SQLBuild models. It reads the manifest and drives the <code>dbt</code> CLI as a subprocess; it never edits your dbt files.</li>
+ <li><strong>Reuse from production.</strong> Clone or copy already-built relations from another target, or from a production-shaped git branch, instead of rebuilding them. Zero compute for models that match.</li>
+ <li><strong>Change-aware builds by default.</strong> Models, seeds, functions, and Python nodes are fingerprinted, source freshness is tracked, and unchanged work (including audits that already passed) is skipped. Pass <code>--force</code> to run everything selected.</li>
+ <li><strong>Warehouse-native state.</strong> All change-tracking state lives in append-only tables (<code>_sqlbuild_fingerprints</code>, <code>_sqlbuild_source_freshness</code>, <code>_sqlbuild_node_results</code>) in your warehouse schemas. No external state machine, no corruption risk.</li>
+ <li><strong>Audits that block bad data.</strong> Audits run before data reaches the target table. Full table builds materialize into a staging table and only promote if audits pass; incremental models validate each batch before DML.</li>
+ <li><strong>SQL-first models, compile-time validation.</strong> Define models as SQL files with <code>MODEL()</code> headers. SQLBuild resolves references, validates SQL, infers columns, checks contracts, and computes column lineage before anything runs, all offline.</li>
+ <li><strong>Cursor-based incremental processing.</strong> Automatic gap detection and resume, with microbatch mode for large ranges. No external checkpoint to maintain.</li>
+ <li><strong>Ingestion and Python nodes.</strong> Load external data with Python <code>@loader</code> functions, and run <code>@task</code>, <code>@asset</code>, and <code>@check</code> nodes as first-class members of the same DAG as your SQL models.</li>
+ <li><strong>Testing.</strong> Chained SQL unit tests that resolve intermediate models automatically, plus end-to-end scenarios with local DuckDB replay for fast CI with no warehouse.</li>
+ <li><strong>Python you can read, Rust where it counts.</strong> The framework is Python. For SQL parsing, validation, column inference, lineage, and transpilation, SQLBuild uses Polyglot, a Rust reimplementation of SQLGlot's SQL analysis capabilities (MIT).</li>
+</ul>
+<p>See the documentation for the full feature set, including providers, lifecycle hooks, Python macros, UDFs, custom materializations, data diffs, zero-copy cloning, and virtual environments.</p>
+<h2>Works with your existing dbt project</h2>
+<p>Point SQLBuild at a dbt project and run a <code>sqb dbt</code> command. The first time, it bootstraps a minimal twin project from your <code>dbt_project.yml</code> and profile (reusing your dbt connection), then builds your selection with state recorded:</p>
+<pre><code>sqb dbt build --select path:models/marts</code></pre>
+<p>Run it again and the models that have not changed are skipped:</p>
+<pre><code>dbt (3 selected resources)
+  planned models: 0 run, 3 current, 0 blocked
+  skipped: all planned dbt models are current</code></pre>
+<p>With reuse configured, branch builds clone unchanged tables from a production git branch instead of rebuilding them, so dbt only builds what your branch actually changed.</p>
+<h2>Quick start</h2>
+<pre><code>pip install sqlbuild
+# or
+uv pip install sqlbuild</code></pre>
+<p>Create and run the included playground project:</p>
+<pre><code>sqb playground waffle-shop
+cd waffle-shop
+sqb plan
+sqb build
+sqb test</code></pre>
+<h2>Example</h2>
+<p>A model is a SQL file with a <code>MODEL()</code> header and a <code>SELECT</code>. References use <code>__ref()</code> and <code>__source()</code>, and configuration, schema, and audits are declared inline:</p>
+<pre><code>MODEL (
+  materialized table,
+  columns (
+    order_id (audits [not_null, unique]),
+  ),
+  tags [marts],
+);
+
+SELECT
+  o.order_id,
+  o.customer_id,
+  p.amount_cents AS total_cents
+FROM __ref("stg_orders") o
+JOIN __ref("stg_payments") p USING (order_id)</code></pre>
+<p>A unit test mocks sources and asserts on the model, resolving every intermediate model automatically:</p>
+<pre><code>TEST();
+
+WITH
+__source__raw__orders AS (
+  @mock_orders()
+),
+__source__raw__payments AS (
+  SELECT 1 AS payment_id, 1 AS order_id, 1500 AS amount_cents, 'credit_card' AS method
+),
+__expected__fact_orders AS (
+  SELECT 1 AS order_id, 100 AS customer_id, 1500 AS total_cents
+)
+SELECT 1</code></pre>
+<h2>Supported adapters</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Adapter</th>
+   <th>Status</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>DuckDB</td>
+   <td>Supported</td>
+  </tr>
+  <tr>
+   <td>MotherDuck</td>
+   <td>Supported</td>
+  </tr>
+  <tr>
+   <td>Snowflake</td>
+   <td>Supported</td>
+  </tr>
+  <tr>
+   <td>BigQuery</td>
+   <td>Supported</td>
+  </tr>
+  <tr>
+   <td>Databricks</td>
+   <td>Supported</td>
+  </tr>
+  <tr>
+   <td>PostgreSQL</td>
+   <td>Supported</td>
+  </tr>
+  <tr>
+   <td>SQL Server</td>
+   <td>Supported</td>
+  </tr>
+ </tbody>
+</table>
+<p>ClickHouse, Redshift, Trino, Spark, and Athena are on the way.</p>
+<h2>Documentation</h2>
+<p>Full documentation is available at docs.sqlbuild.com.</p>
+<h2>Contributing</h2>
+<p>We welcome contributions. Please see CONTRIBUTING.md for guidelines.</p>
+<h2>License</h2>
+<p>SQLBuild is licensed under the Apache License 2.0.</p>

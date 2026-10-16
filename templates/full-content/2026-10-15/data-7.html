@@ -1,0 +1,117 @@
+<h1>Four PostgreSQL arguments that came out even</h1>
+<p>Some advice gets repeated in code review because it sounds like it should matter. I picked four I have seen argued about and measured them. I expected at least two clear winners. I got three ties and one result that went the opposite way from the advice.</p>
+<h2>Setup</h2>
+<p>PostgreSQL 18.6, default settings. 2020 13-inch MacBook Pro, Intel i5-8257U, 8 GB RAM. A 2,000,000-row table <code>u</code> with an id, an email, a status and a timestamp. Times are execution times from <code>EXPLAIN (ANALYZE, TIMING OFF)</code>, warm cache, first run discarded, median of the rest.</p>
+<h2>IN, ANY or a VALUES join for 1,000 ids</h2>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>median</th>
+   <th>runs</th>
+   <th>buffers</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>id IN (1999, 3998, ...)</code></td>
+   <td>26 ms</td>
+   <td>15 to 54 ms</td>
+   <td>3,001</td>
+  </tr>
+  <tr>
+   <td><code>id = ANY('\{...}'::bigint[])</code></td>
+   <td>19 ms</td>
+   <td>15 to 20 ms</td>
+   <td>3,001</td>
+  </tr>
+  <tr>
+   <td><code>JOIN (VALUES ...) v(i) ON id = i</code></td>
+   <td>20 ms</td>
+   <td>16 to 21 ms</td>
+   <td>3,001</td>
+  </tr>
+ </tbody>
+</table>
+<p>All three read exactly the same pages. The medians differ, but one IN run took 54 ms and another 15 ms, so I would not read anything into the gap. Use whichever form your driver makes easy. ANY has one practical advantage when the array is passed as a single parameter: the statement text stays the same whatever the number of ids, which is kinder to prepared statements and to <code>pg_stat_statements</code>.</p>
+<h2>text, smallint or enum for a status column</h2>
+<p>Three values, two million rows, each stored three ways in its own one-column table.</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>table</th>
+   <th>index</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>text</td>
+   <td>72.6 MB</td>
+   <td>13.9 MB</td>
+  </tr>
+  <tr>
+   <td>smallint</td>
+   <td>73.0 MB</td>
+   <td>13.9 MB</td>
+  </tr>
+  <tr>
+   <td>enum</td>
+   <td>72.7 MB</td>
+   <td>13.9 MB</td>
+  </tr>
+ </tbody>
+</table>
+<p>Every row has a 24-byte header and is padded to 8 bytes, so a 2-byte smallint and a 7-byte <code>'active'</code> end up the same size. The indexes are identical because B-tree deduplication stores each of the three values once with a list of row pointers. In a wider table the column order can change the padding, but the type of a short status column is not where the space goes. Choose it for what it lets you check.</p>
+<h2>Columns that are usually empty</h2>
+<p>One million rows with an id and ten more integer columns. In one table the ten columns are all NULL, in the other all filled.</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>table</th>
+   <th>per row</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>ten NULL columns</td>
+   <td>44 MB</td>
+   <td>36 bytes</td>
+  </tr>
+  <tr>
+   <td>ten filled columns</td>
+   <td>77 MB</td>
+   <td>68 bytes</td>
+  </tr>
+ </tbody>
+</table>
+<p>A NULL takes no space in the row. It costs one bit in the row's null bitmap. Optional columns that are mostly empty are close to free, which is worth knowing before splitting a table to save space.</p>
+<h2>count(DISTINCT) against GROUP BY</h2>
+<p>The advice I have seen most often: <code>count(DISTINCT x)</code> is slow, rewrite it as a count over a GROUP BY subquery. On two million unique emails:</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>median</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>count(DISTINCT email)</code></td>
+   <td>1.95 s</td>
+  </tr>
+  <tr>
+   <td><code>count(*) FROM (SELECT email FROM u GROUP BY email)</code></td>
+   <td>3.12 s</td>
+  </tr>
+ </tbody>
+</table>
+<p>The rewrite was slower. I am not claiming it always is. Which one wins depends on the plan the GROUP BY gets and on <code>work_mem</code>, and both change between versions and settings. That is the point: this is advice to check with EXPLAIN on your own data, not to apply.</p>
+<h2>What I did not test</h2>
+<ul>
+ <li>IN lists with tens of thousands of values.</li>
+ <li>Status columns inside a wider row, where alignment can differ.</li>
+ <li><code>count(DISTINCT)</code> with more <code>work_mem</code>, or on columns with few distinct values.</li>
+ <li>Other hardware. Compare the ratios, not the seconds.</li>
+</ul>

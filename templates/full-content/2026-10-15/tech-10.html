@@ -1,0 +1,114 @@
+<h1>pg_vectorsearch</h1>
+<p>A PostgreSQL extension for high-performance approximate nearest neighbor (ANN) search.</p>
+<blockquote>
+ <p><strong>Status: alpha.</strong> Meant for testing, not production. Upgrading between prereleases may not be possible; plan to drop and recreate the extension and its indexes.</p>
+</blockquote>
+<ul>
+ <li><strong>PRISM index</strong> (100M+ vectors) — IVF-style, with hierarchical routing</li>
+ <li><strong>RaBitQ quantization</strong> with theoretical error bounds for two-stage search</li>
+ <li><strong>SIMD-optimized distance computation</strong> (AVX2, AVX512, NEON)</li>
+ <li><strong>Dynamic updates</strong> — inserts, updates and deletes, with posting-list splits via <code>prism_rebalance</code></li>
+ <li><strong>pgvector compatible</strong> — index existing <code>vector</code> and <code>halfvec</code> columns as-is</li>
+</ul>
+<h2>PRISM Index</h2>
+<p>PRISM (Partitioned Routing Index for Similarity Matching) is a PostgreSQL-native index access method that is conceptually similar to pgvector's IVFFlat, but it is built around state-of-the-art quantization, routing, and partitioning techniques. It is implemented in C for high performance and seamless integration with PostgreSQL.</p>
+<p>The result: an index that is significantly faster than pgvector's IVFFlat and HNSW, for both querying and index building. In fact, compared to graph-based HNSW, PRISM is faster at equivalent recall on a 100-million-vector dataset, on an instance with a quarter of the memory.</p>
+<p>To achieve this performance, PRISM uses a hierarchical centroid tree to partition vectors into clusters, and relies on the PostgreSQL buffer cache to keep that tree warm in memory. Vectors are RaBitQ-quantized and stored in posting lists with a page layout optimized for SIMD distance computation. The RaBitQ encoding carries error bounds that let a search rule out vectors that cannot possibly be nearest neighbors, so far fewer of them need reranking against the full-precision vectors stored in the table.</p>
+<pre><code>Query Flow:
+1. Traverse centroid tree to find nearest clusters (buffer cache)
+2. Scan posting lists for candidates (buffer cache, async I/O)
+3. RaBitQ two-stage filtering: estimate → error bound → rerank
+4. Full-precision reranking from heap
+5. Return k nearest neighbors</code></pre>
+<h2>Usage</h2>
+<p>Install the extension first.</p>
+<p>There are two ways to use a PRISM index. Pick the one that matches where your vectors live:</p>
+<ul>
+ <li><strong>Native types.</strong> Starting fresh, or not using pgvector? Store vectors in <code>pg_vectorsearch</code>'s own <code>vec32</code> (float32) or <code>vec16</code> (float16) columns. No other extension is needed.</li>
+ <li><strong>Existing pgvector tables.</strong> Already have <code>vector</code> or <code>halfvec</code> columns? Install <code>pg_vectorsearch</code> next to pgvector and build a PRISM index on those columns as they are. Your table and queries stay unchanged.</li>
+</ul>
+<h3>Native types</h3>
+<pre><code>CREATE EXTENSION pg_vectorsearch;
+
+CREATE TABLE items (
+    id serial PRIMARY KEY,
+    embedding vec32(3) STORAGE PLAIN
+);
+
+INSERT INTO items (embedding)
+SELECT ARRAY[i::real, (i % 7)::real, (i % 5)::real]::vec32
+FROM generate_series(1, 1000) i;
+
+CREATE INDEX ON items USING prism (embedding vec32_l2_ops);
+
+SET prism.nprobe = 40;
+
+SELECT * FROM items
+ORDER BY embedding &lt;-&gt; '[3,1,2]'
+LIMIT 5;</code></pre>
+<h3>Existing pgvector tables</h3>
+<p>If you already have a table with pgvector's <code>vector</code> or <code>halfvec</code> columns, you can build a PRISM index on it directly. Nothing about the table or your queries needs to change. <code>vec32</code> and <code>vec16</code> are binary-compatible with pgvector's <code>vector</code> and <code>halfvec</code> but have different names, so the two extensions can be installed side by side, even in the same schema.</p>
+<pre><code>CREATE EXTENSION vector;
+
+CREATE TABLE documents (
+    id        bigserial PRIMARY KEY,
+    body      text,
+    embedding vector(384)
+);
+CREATE INDEX documents_embedding_hnsw
+    ON documents USING hnsw (embedding vector_l2_ops);
+
+CREATE EXTENSION pg_vectorsearch;
+
+CREATE INDEX documents_embedding_prism
+    ON documents USING prism (embedding vec32_l2_ops);</code></pre>
+<h3>Operator classes</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Distance</th>
+   <th>Operator</th>
+   <th><code>vec32</code> / <code>vector</code></th>
+   <th><code>vec16</code> / <code>halfvec</code></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>L2</td>
+   <td><code>&lt;-&gt;</code></td>
+   <td><code>vec32_l2_ops</code></td>
+   <td><code>vec16_l2_ops</code></td>
+  </tr>
+  <tr>
+   <td>Inner product</td>
+   <td><code>&lt;#&gt;</code></td>
+   <td><code>vec32_ip_ops</code></td>
+   <td><code>vec16_ip_ops</code></td>
+  </tr>
+  <tr>
+   <td>Cosine</td>
+   <td><code>&lt;=&gt;</code></td>
+   <td><code>vec32_cosine_ops</code></td>
+   <td><code>vec16_cosine_ops</code></td>
+  </tr>
+ </tbody>
+</table>
+<h3>Tuning</h3>
+<p>Defaults are tuned from large-scale benchmarks; most deployments only ever adjust <code>prism.nprobe</code>.</p>
+<h3>Maintenance</h3>
+<p>An insert appends to whichever posting list its vector routes to, so lists grow as rows arrive and never split on their own. Besides <code>REINDEX</code>, the <code>prism_rebalance</code> procedure splits oversized lists in place.</p>
+<h2>Building</h2>
+<p><strong>Requirements:</strong></p>
+<ul>
+ <li>PostgreSQL 18+ (with development headers)</li>
+ <li>GNU C11 compiler (GCC 11+ or Clang 14+)</li>
+ <li>Meson build system</li>
+ <li>Optional: CBLAS, for faster RaBitQ encoding.</li>
+</ul>
+<pre><code># Release build
+meson setup builddir --buildtype=release
+
+# Build and install to PostgreSQL
+meson install -C builddir</code></pre>
+<h2>License</h2>
+<p>The PostgreSQL License</p>
