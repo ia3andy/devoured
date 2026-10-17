@@ -1,0 +1,88 @@
+<h1>The Gradient Is a Covariance</h1>
+<p>Why Post-Training Is Sparse, Part 1: the score, the Fisher, and a bound that holds for any reward</p>
+<p><strong>Why Post-Training Is Sparse · Part 1 of 3.</strong> Part 2 finds where the sparsity comes from. Part 3 asks what policy gradient can reach.</p>
+<ul>
+ <li>Reinforcement learning (RL), on-policy distillation and supervised fine-tuning (SFT) on near-policy data change only a small fraction of parameters. <strong>Small</strong> and <strong>sparse</strong> are different claims.</li>
+ <li>On the sampler’s own samples the score has <strong>zero mean</strong>. So the expected gradient is a <strong>covariance</strong>, the Fisher is a <strong>variance</strong>, and the Fisher caps the gradient for any reward.</li>
+ <li>At one position the Fisher is the <strong>variance of logit sensitivities</strong>: whatever moves every candidate together counts for nothing, so it is small when the sampler is confident or its likely candidates react alike.</li>
+ <li>None of this needs on-policy sampling. It needs a <strong>score centered under the sampling distribution</strong>.</li>
+</ul>
+<p>The figures step through like slides. Use <strong>→</strong> or <strong>▶</strong>, and step back with <strong>←</strong>.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Symbol</th>
+   <th>Meaning</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>$\smu(a\mid s)$</td>
+   <td>the distribution that drew the next token after prefix $s$: the sampler</td>
+  </tr>
+  <tr>
+   <td>$\pmodel(a\mid s),\ \pi_\theta(y\mid x)$</td>
+   <td>the model’s next-token distribution, and its probability of a response $y=(y_1,\dots,y_T)$ to prompt $x$; $\smu=\pmodel$ on-policy</td>
+  </tr>
+  <tr>
+   <td>$\kappa_\{i,a}=\partial z_a/\partial\theta_i$</td>
+   <td>how strongly parameter $i$ moves the logit $z_a$ of token $a$</td>
+  </tr>
+  <tr>
+   <td>$A$</td>
+   <td>the learning signal: a reward or advantage, possibly times an importance ratio</td>
+  </tr>
+  <tr>
+   <td>$G_i,\ F_i$</td>
+   <td>the expected update and the diagonal Fisher of parameter $i$</td>
+  </tr>
+ </tbody>
+</table>
+<h2>1. Small is not sparse</h2>
+<p><strong>Why the update is small, or carries little, does not explain why it lands on a few coordinates.</strong></p>
+<p>RL fine-tuning changes only 5–30% of a model’s parameters, across seven algorithms and ten models (Mukherjee et al., 2025). On-policy distillation and SFT on near-policy data behave the same way (Zhang, Mukherjee &amp; Peng, 2026). Two common explanations are that RL only reweights answers the model can already produce, and that a scalar advantage with $B$ possible values carries at most $\log_2 B$ bits per episode (Information Bandwidth). The first says the update is small, the second that it carries little. Neither makes it sparse: a hundred million parameters each moving a little is small and dense, and can carry those few bits just as well. The question is which coordinates move, and why the same few can be found before any reward is seen.</p>
+<h2>2. The gradient is a covariance, the Fisher a variance</h2>
+<p><strong>On the model’s own samples the score averages to zero, so the expected gradient is a covariance and the Fisher is a variance.</strong></p>
+<p>$$ \mathrm\{score}_i=\frac\{\partial\log\pi_\theta(y\mid x)}\{\partial\theta_i}, $$ $$ \mathbb\{E}_\{y\sim\pi_\theta}\big[\mathrm\{score}_i\big]=\sum_y\partial_i\pi_\theta(y\mid x)=\partial_i 1=0, $$ $$ G_i=\mathbb\{E}\big[A\cdot\mathrm\{score}_i\big]=\operatorname\{Cov}(A,\mathrm\{score}_i), $$ $$ F_i=\mathbb\{E}\big[\mathrm\{score}_i^2\big]=\operatorname\{Var}(\mathrm\{score}_i), $$ $$ |G_i|\le\operatorname\{std}(A)\sqrt\{F_i}. $$</p>
+<p>Probabilities sum to one, so whatever a parameter does, the responses it raises are paid for by others, and weighted by probability the changes cancel. With the score’s mean at zero, the policy gradient $\mathbb\{E}[A\cdot\mathrm\{score}_i]$ is a covariance and the Fisher is a variance; Cauchy–Schwarz gives the bound. A baseline that depends only on the prompt changes nothing in $G_i$, since $\operatorname\{Cov}(A-b,\mathrm\{score}_i)=\operatorname\{Cov}(A,\mathrm\{score}_i)$. It changes only $\operatorname\{std}(A)$ and the noise of the estimate, and the Optimal Token Baseline is the choice that minimizes that noise.</p>
+<p>A large Fisher is necessary for a large gradient, not sufficient. After “She drank a cup of”, the output rows for <em>tea</em> and <em>coffee</em> have a large Fisher; if the reward does not care which one is chosen, their gradient is zero. Measured before RL training, the top 1% of coordinates by Fisher hold 47.40% of the top 1% by gradient magnitude, against 1% at random (Zhang, Mukherjee &amp; Peng, 2026). The Fisher says where learning can happen; the reward decides where it does.</p>
+<p>The response space is finite (finite vocabulary, bounded length), so every exchange of a derivative and a sum below is exact. Probabilities are positive, which softmax sampling at temperature 1 without top-k or top-p guarantees. The reward $r(x,y)$ and the prompt distribution do not depend on $\theta$.</p>
+<p>$$ \mathbb\{E}_\{y\sim\pi_\theta}[\mathrm\{score}_i]=\sum_y\pi_\theta\,\frac\{\partial_i\pi_\theta}\{\pi_\theta}=\partial_i\sum_y\pi_\theta=0, $$ $$ G_i=\partial_i\,\mathbb\{E}_x\Big[\sum_y\pi_\theta\,r\Big] $$ $$ =\mathbb\{E}_x\Big[\sum_y\pi_\theta\,\mathrm\{score}_i\,r\Big]=\mathbb\{E}[r\cdot\mathrm\{score}_i]. $$</p>
+<p>Subtracting $\mathbb\{E}[r]\,\mathbb\{E}[\mathrm\{score}_i]=0$ turns the product into a covariance, and the same step turns $\mathbb\{E}[\mathrm\{score}_i^2]$ into a variance. Both hold per prompt, so $G_i=\mathbb\{E}_x[\operatorname\{Cov}(r,\mathrm\{score}_i\mid x)]$, which is why a baseline $b(x)$ drops out.</p>
+<p>The full Fisher $F_\{ij}=\mathbb\{E}[\mathrm\{score}_i\,\mathrm\{score}_j]$ is also the expected curvature: $\partial_j\mathrm\{score}_i=\partial_i\partial_j\pi_\theta/\pi_\theta-\mathrm\{score}_i\,\mathrm\{score}_j$, and the first term has mean $\sum_y\partial_i\partial_j\pi_\theta=0$, so $F_\{ij}=-\mathbb\{E}[\partial_i\partial_j\log\pi_\theta]$. It must be estimated on responses the model samples. On data labels the same formula gives the empirical Fisher, a different quantity.</p>
+<h2>3. One position: the Fisher is a spread of sensitivities</h2>
+<p><strong>At one prefix, a parameter’s token Fisher is the variance of how strongly it moves each candidate’s logit.</strong></p>
+<p>$$ \frac\{\partial\log\pmodel(a\mid s)}\{\partial\theta_i}=\kappa_\{i,a}-\bar\kappa^\{p}_i, $$ $$ \bar\kappa^\{p}_i=\sum_a\pmodel(a\mid s)\,\kappa_\{i,a}, $$ $$ f_i(s)=\operatorname\{Var}_\{a\sim\pmodel}\big[\kappa_\{i,a}\big] $$ $$ =\tfrac12\sum_\{a,b}\pmodel(a)\,\pmodel(b)\,\big(\kappa_\{i,a}-\kappa_\{i,b}\big)^2 . $$</p>
+<p>The softmax subtracts a mean: the token score is how strongly $\theta_i$ moves the drawn token’s logit, minus how strongly it moves the average candidate. Without that subtraction the second moment would be $f_i(s)+(\bar\kappa^\{p}_i)^2$. The removed part is the common component, which raises every logit together and changes no probability. The pairwise form says the same thing: only differences between likely candidates count. So a parameter has a small token Fisher exactly when it acts about equally on the candidates the model finds likely, either because the model is confident or because those candidates react alike.</p>
+<h2>4. Along the response: the Fisher adds up</h2>
+<p><strong>Across positions the cross terms average to zero, so the Fisher is a sum of token Fishers.</strong></p>
+<p>$$ \mathrm\{score}_i=\sum_t\mathrm\{score}_i^\{(t)}, $$ $$ \mathbb\{E}\big[\mathrm\{score}_i^\{(u)}\,\mathrm\{score}_i^\{(t)}\big] $$ $$ =\mathbb\{E}\Big[\mathrm\{score}_i^\{(u)}\;\underbrace\{\mathbb\{E}\big[\mathrm\{score}_i^\{(t)}\mid s_t\big]}_\{=0}\Big]=0\quad(u\lt t), $$ $$ F_i=\mathbb\{E}\Big[\sum_t f_i(s_t)\Big]. $$</p>
+<p>Here $\mathrm\{score}_i^\{(t)}=\kappa_\{i,y_t}-\bar\kappa^\{p}_i(s_t)$ is the token score at position $t$. Given the prefix $s_t$, the next token is drawn from $\pmodel(\cdot\mid s_t)$, so its score averages to zero. For $u\lt t$ the earlier token is part of that prefix: its score is already fixed and comes out of the inner expectation. The cancellation holds in expectation, not sample by sample. It makes the Fisher grow with length but treats every parameter alike, so it sets the scale, not which coordinates are large.</p>
+<h2>5. What this needs: a centered score</h2>
+<p><strong>None of this needs on-policy sampling. It needs the score centered under the distribution that drew the samples.</strong></p>
+<p>$$ c_i^\{(t)}=\kappa_\{i,y_t}-\bar\kappa^\{\mu}_i(s_t),\qquad c_i=\sum_t c_i^\{(t)}, $$ $$ \bar\kappa^\{\mu}_i=\sum_a\smu(a\mid s)\,\kappa_\{i,a}, $$ $$ G_i=\mathbb\{E}_\{\smu}\big[A\,c_i\big]=\operatorname\{Cov}_\{\smu}(A,c_i), $$ $$ |G_i|\le\operatorname\{std}_\{\smu}(A)\sqrt\{F^\{\mu}_i}, $$ $$ F^\{\mu}_i=\mathbb\{E}_\{\smu}\Big[\sum_t\operatorname\{Var}_\{a\sim\smu}\big[\kappa_\{i,a}(s_t)\big]\Big]. $$</p>
+<p>Off-policy, the token was drawn by an inference engine or a stale model, and under that sampler the softmax score averages to $\bar\kappa^\{\mu}_i-\bar\kappa^\{p}_i$, not to zero. Subtracting it at every prefix is score centering. Sections 2–4 then go through word for word with $\smu$ in place of $\pmodel$, and on-policy the centering comes free. This is the gradient of the covariance loss: the drawn token is raised and every token is lowered by how often the sampler draws it. It needs the sampler’s full next-token distribution at every prefix, which engine log-probabilities and stale models provide and human demonstrations do not.</p>
+<p>For any sampler $\smu$ whose full next-token distribution is known at every prefix:</p>
+<ol>
+ <li>Zero conditional mean, by construction: $\mathbb\{E}_\{a\sim\smu}\big[\kappa_\{i,a}-\bar\kappa^\{\mu}_i\big]=0$.</li>
+ <li>Cross terms vanish: for $u\lt t$, $c_i^\{(u)}$ is fixed by $s_t$, so $\mathbb\{E}_\{\smu}\big[c_i^\{(u)}c_i^\{(t)}\big]=\mathbb\{E}_\{\smu}\big[c_i^\{(u)}\,\mathbb\{E}_\{\smu}[c_i^\{(t)}\mid s_t]\big]=0$.</li>
+ <li>The Fisher is a variance: by 2 only diagonal terms survive, and by 1 each is $\operatorname\{Var}_\{a\sim\smu}[\kappa_\{i,a}(s_t)]$. By 1 and the tower property $\mathbb\{E}_\{\smu}[c_i]=0$, so the second moment is the variance.</li>
+ <li>The update is a covariance: $\operatorname\{Cov}_\{\smu}(A,c_i)=\mathbb\{E}_\{\smu}[A\,c_i]=G_i$, and Cauchy–Schwarz gives the bound.</li>
+</ol>
+<p>On-policy, $c_i=\mathrm\{score}_i$ and $G_i$ is the gradient. Off-policy, $G_i$ is the expected update of the centered estimator: the gradient of the covariance loss, not in general of the expected reward.</p>
+<h2>References</h2>
+<ul>
+ <li>Y. Zhang, S. Mukherjee, H. Peng. Understanding LLM Parameter Update Sparsity through the Lens of Fisher. arXiv, 2026.</li>
+ <li>S. Mukherjee, L. Yuan, D. Hakkani-Tür, H. Peng. Reinforcement Learning Finetunes Small Subnetworks in Large Language Models. NeurIPS 2025.</li>
+ <li>M. Marek, M. Ryabinin. Score Centering Stabilizes Off-policy Reinforcement Learning. arXiv, 2026.</li>
+ <li>Y. Li, J. Xu, et al. The Optimal Token Baseline: Variance Reduction for Long-Horizon LLM-RL. ICML 2026.</li>
+ <li>Y. Li. Information Bandwidth in Reinforcement Learning. Blog, 2025.</li>
+</ul>
+<h2>Citation</h2>
+<pre><code>@online\{li-2026-gradient-is-covariance,
+  title  = \{The Gradient Is a Covariance},
+  author = \{Li, Yingru},
+  year   = \{2026},
+  month  = oct,
+  url    = \{https://richardli.xyz/post/gradient-is-covariance/}
+}</code></pre>

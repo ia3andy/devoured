@@ -1,0 +1,116 @@
+<h2>Amazon S3 is now available on the Vercel Marketplace and v0 by Vercel</h2>
+<p>Developers building web and AI applications on Vercel can now add Amazon S3 storage resources directly from the Vercel Marketplace and v0, combining the durability, scalability, and performance of S3 with the convenience of Vercel’s provisioning workflow. Starting today, Amazon Simple Storage Service (Amazon S3), including Amazon S3 Tables and Amazon S3 Vectors, is natively available on the Vercel Marketplace and v0 by Vercel, covering three distinct workloads: everyday storage, analytics, and AI.</p>
+<p><strong>Why this matters</strong></p>
+<p>Millions of developers build, deploy, and scale web and AI applications on Vercel. Storage is essential to performant applications, but provisioning it previously required navigating to the AWS Management Console to configure policies and credentials. Now, S3 storage integrates directly into the Vercel developer experience, with resource provisioning and connection configuration handled automatically. Together with existing integrations for Amazon Aurora, Amazon DynamoDB, and Amazon OpenSearch Serverless, you get a complete application stack inside Vercel (from your database layer through to object, vector, and open table storage), all on one AWS account with one bill.</p>
+<p><strong>Storage for every application</strong></p>
+<ul>
+ <li><strong>S3 general purpose buckets</strong>: Store virtually unlimited objects, including files, images, videos, and documents, for data lakes, cloud-native applications, and mobile apps. S3 delivers the most durable storage in the cloud, designed to provide 99.999999999% (11 nines) data durability and 99.99% availability by default.</li>
+ <li><strong>S3 Tables</strong>: Fully managed Apache Iceberg storage optimized for analytics with automated table maintenance and compaction. S3 Tables are directly queryable from any Iceberg REST catalog API-compatible engine, including DuckDB.</li>
+ <li><strong>S3 Vectors</strong>: Purpose-built vector storage and query for AI applications such as retrieval-augmented generation (RAG) and semantic search, reducing the cost of uploading, storing, and querying vectors by up to 90%.</li>
+</ul>
+<p><strong>Getting started</strong></p>
+<p>From the Vercel dashboard, go to the Storage tab and choose Create. Select AWS, pick your S3 bucket type, choose a Region, and create the bucket. Provisioning takes a few seconds.</p>
+<p>Connect the bucket to a project, then pull the environment variables with the Vercel CLI:</p>
+<pre><code>vercel link 
+vercel env pull .env.local</code></pre>
+<p>The integration injects <code>AWS_REGION</code>, <code>AWS_ROLE_ARN</code>, <code>AWS_RESOURCE_ARN</code>, and a bucket name such as <code>S3_BUCKET_NAME</code>, <code>S3_TABLE_BUCKET_NAME</code>, or <code>S3_VECTOR_BUCKET_NAME</code>. At runtime, the <code>awsCredentialsProvider</code> from <code>@vercel/functions/oidc</code> exchanges a short-lived OIDC token with AWS Security Token Service (AWS STS) for temporary credentials scoped to your resource. No static keys are stored anywhere.</p>
+<p><strong>Object storage with S3</strong></p>
+<p>This Next.js route uploads a file to a general purpose bucket:</p>
+<pre><code>import \{ S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import \{ awsCredentialsProvider } from "@vercel/functions/oidc";
+
+const s3 = new S3Client(\{
+  region: process.env.AWS_REGION,
+  credentials: awsCredentialsProvider(\{
+    roleArn: process.env.AWS_ROLE_ARN,
+  }),
+});
+
+export async function POST(request) \{
+  const formData = await request.formData();
+  const file = formData.get("file");
+
+  await s3.send(new PutObjectCommand(\{
+    Bucket: process.env.S3_BUCKET_NAME,
+    Key: file.name,
+    Body: Buffer.from(await file.arrayBuffer()),
+    ContentType: file.type,
+  }));
+
+  return Response.json(\{ success: true });
+}</code></pre>
+<p>Use <code>ListObjectsV2Command</code> and <code>GetObjectCommand</code> with the same client to list and read objects.</p>
+<p><strong>Analytics with S3 Tables</strong></p>
+<p>S3 Tables offer S3 storage purpose-built for analytics and are designed to automatically optimize query performance as data volumes grow. They provide fully managed Apache Iceberg tables with automated table maintenance and compaction, and they work with any Apache Iceberg REST Catalog-compliant engine. You can use DuckDB inside a Vercel Function for lightweight queries. This example attaches the table bucket by its ARN and runs an aggregate query:</p>
+<pre><code>import \{ DuckDBInstance } from "@duckdb/node-api";
+import \{ awsCredentialsProvider } from "@vercel/functions/oidc";
+
+const creds = await awsCredentialsProvider(\{
+  roleArn: process.env.AWS_ROLE_ARN,
+})();
+
+const db = await DuckDBInstance.create();
+const conn = await db.connect();
+
+await conn.run("INSTALL aws; LOAD aws; INSTALL httpfs; LOAD httpfs; INSTALL iceberg; LOAD iceberg;");
+
+await conn.run(`
+  CREATE SECRET s3cred (
+    TYPE s3,
+    KEY_ID '$\{creds.accessKeyId}',
+    SECRET '$\{creds.secretAccessKey}',
+    SESSION_TOKEN '$\{creds.sessionToken}',
+    REGION '$\{process.env.AWS_REGION}'
+  );
+`);
+
+await conn.run(`
+  ATTACH '$\{process.env.AWS_RESOURCE_ARN}' AS s3tables (
+    TYPE iceberg,
+    ENDPOINT_TYPE s3_tables
+  );
+`);
+
+const rows = await (await conn.run(`
+  SELECT town_city, AVG(median_price) AS avg_price
+  FROM s3tables."$\{process.env.S3_TABLES_NAMESPACE}".town_monthly
+  GROUP BY town_city
+  ORDER BY avg_price DESC
+  LIMIT 10
+`)).getRowObjects();</code></pre>
+<p>If you run DuckDB inside a Next.js route, add <code>@duckdb/node-api</code> to <code>serverExternalPackages</code> in <code>next.config.mjs</code> so the native bindings are not bundled.</p>
+<p><strong>Vector search with S3 Vectors</strong></p>
+<p>S3 Vectors deliver purpose-built, cost-optimized vector storage for AI agents, AI inference, and semantic search of your content stored in Amazon S3. S3 Vectors provides native support for storing and querying vectors without a separate vector database, but it does not generate them. Create the embeddings with your model of choice, then query the index for the closest matches:</p>
+<pre><code>import \{ S3VectorsClient, QueryVectorsCommand } from "@aws-sdk/client-s3vectors";
+import \{ awsCredentialsProvider } from "@vercel/functions/oidc";
+
+const vectors = new S3VectorsClient(\{
+  region: process.env.AWS_REGION,
+  credentials: awsCredentialsProvider(\{
+    roleArn: process.env.AWS_ROLE_ARN,
+  }),
+});
+
+export async function POST(request) \{
+  const \{ embedding } = await request.json();
+
+  const result = await vectors.send(new QueryVectorsCommand(\{
+    vectorBucketName: process.env.S3_VECTOR_BUCKET_NAME,
+    indexName: "documents",
+    queryVector: \{ float32: embedding },
+    topK: 5,
+    returnMetadata: true,
+  }));
+
+  return Response.json(\{ matches: result.vectors });
+}</code></pre>
+<p><strong>Building with v0 by Vercel</strong></p>
+<p>From v0, describe what you want to build and it provisions the right resource. Ask for “a photo gallery where users upload images using AWS” to get a general purpose bucket, “a support bot that answers questions from my PDFs” to get S3 Vectors, or “an analytics dashboard for my clickstream data” to get S3 Tables. v0 then configures the connection and generates working code.</p>
+<p><strong>Combining S3 with AWS databases</strong></p>
+<p>Every AWS service on Vercel shares the same account and authentication model, so you can combine them with no extra setup. For example, store file metadata in Aurora with the files in S3, or store document text in DynamoDB with embeddings in S3 Vectors for RAG retrieval.</p>
+<p><strong>Using Vercel with your AWS account</strong></p>
+<p>You can create a new AWS account through the integration, which supports S3 features for building and testing. You can also link an existing AWS account to use your full set of S3 and AWS capabilities and keep your current billing. If you link an existing AWS account, Vercel works only with new buckets that you create through the platform. Because every S3 resource lives in your own AWS account, you keep AWS-native tooling and a single place to manage storage.</p>
+<p><strong>Pricing and availability</strong></p>
+<p>There is no charge for the integration, and you pay standard Amazon S3 pricing for the resources you use. New AWS accounts created through Vercel receive $100 in credits valid for six months. Amazon S3, including S3 Tables and S3 Vectors, is available from v0 and the Vercel Marketplace in all commercial AWS Regions supported by Vercel. To get started, visit v0 or the AWS page on the Vercel Marketplace.</p>
+<p><strong>Join the conversation</strong></p>
+<p>If you want to call APIs, search documentation, find regional availability, and check troubleshooting about this new feature, try using the AWS MCP Server and plugins with your preferred AI tool. Share your feedback on AWS re:Post for Amazon S3.</p>

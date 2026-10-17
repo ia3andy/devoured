@@ -1,0 +1,127 @@
+<h1>One Agent Development Kit, five languages</h1>
+<p>When we talk about agents, that doesn't necessarily mean we're talking about Python. In today's modern ecosystem, an agent might run as a high-concurrency Go microservice on Cloud Run, or live inside a browser tab calling Chrome's on-device model. Yet many agent frameworks assume a Python-only stack. That assumption forces teams to either spin up a Python service just for their agent workloads, or to build agent orchestration logic from scratch in their own language.</p>
+<p>Google's Agent Development Kit (ADK) removes that trade-off with coverage for Python, Go, TypeScript, Java, and Kotlin. Each version of the ADK is built from the ground up for its own runtime and type system, while sharing a unified architecture with interoperability through open protocols.</p>
+<h2>A shared foundation</h2>
+<p>Picking a language doesn't lock in your architecture: all five support the same open protocols. ADK includes a Model Context Protocol client in every language, so a custom tool exposed as an MCP server can be called from any of them immediately.</p>
+<p>For multi-agent systems, ADK supports the Agent2Agent (A2A) protocol, allowing an agent to communicate with a remote agent over HTTP. Through A2A, agents written in different languages or frameworks are interoperable.</p>
+<h2>Starting agent-first</h2>
+<p>To get started, run the one-time setup command to check your Google Cloud authentication, install the CLI, and then set up first-party ADK skills in coding agents like Antigravity, Claude Code, or Codex:</p>
+<pre><code>uvx google-agents-cli setup</code></pre>
+<p>Then, run the scaffold command to generate a working project with A2A endpoints and deployment config for Cloud Run, Gemini Enterprise Agent Runtime, or Google Kubernetes Engine (GKE):</p>
+<pre><code># Scaffold an ADK project (use --agent adk for Python or --agent adk_go for Go) 
+agents-cli scaffold create my-go-agent \ 
+  --agent adk_go \ 
+  --deployment-target cloud_run \ 
+  --region us-central1</code></pre>
+<p>Both the ADK for Python and ADK for Kotlin repositories also ship agent builder skills in their source trees, and the adk.dev/llms.txt resource gives any coding agent on-demand API documentation across all five languages.</p>
+<p>Coding-agent skills scaffold your project while MCP and A2A connect all five language runtimes.</p>
+<h2>Hands-on view of each ADK</h2>
+<p>The clearest way to feel the difference between the five languages is to define the same weather tool in each one and see how its design fits the runtime.</p>
+<h3>Python</h3>
+<p>In ADK for Python, you don't need a decorator or a schema builder class. You pass a plain Python function into the <code>tools</code> parameter, and ADK inspects its signature, type hints, and docstring at startup to automatically construct the tool declaration and Pydantic parameter schema:</p>
+<pre><code>from google.adk.agents.llm_agent import Agent
+
+def get_weather(city: str) -&gt; dict:
+    """Retrieves the current weather report for a specified city.
+    Args:
+        city (str): The name of the city for which to retrieve the weather report.
+    """
+    return \{"status": "success", "report": f"Sunny and 72F in \{city}."}
+
+root_agent = Agent(
+    name="weather_agent",
+    model="gemini-3.8-flash",
+    instruction="Answer questions about the weather in a city.",
+    tools=[get_weather],
+)</code></pre>
+<p>Beyond fast prototyping, Python is ADK's reference implementation, shipping the broadest set of Google Cloud integrations (BigQuery, Spanner, Bigtable) and model adapters (Gemini, Anthropic, OpenAI, LiteLLM). Paired with the <code>adk eval</code> or <code>agents-cli eval run</code> commands, its evaluation tooling scores agent trajectories against golden datasets in continuous integration (CI) to test the whole system end to end, even when your production service runs in another language.</p>
+<h3>Go</h3>
+<p>While Python leads in experimentation and evaluation, ADK for Go hits the sweet spot for production backend engineering.</p>
+<p>A Go tool function takes the <code>agent.Context</code> configuration and a strongly typed input struct. The <code>functiontool.New</code> function uses Go generics to infer both the input and output schemas from your <code>struct</code> tags:</p>
+<pre><code>type GetWeatherArgs struct \{
+    City string `json:"city" jsonschema:"The city to look up weather for."`
+}
+type GetWeatherResult struct \{
+    Report string `json:"report"`
+}
+
+func getWeather(_ agent.Context, args GetWeatherArgs) (GetWeatherResult, error) \{
+    return GetWeatherResult\{Report: "Sunny and 72F in " + args.City}, nil
+}
+
+weatherTool, err := functiontool.New(functiontool.Config\{
+    Name:        "get_weather",
+    Description: "Retrieves the current weather report for a city.",
+}, getWeather)</code></pre>
+<p>Because the <code>functiontool.New</code> function is generic over your handler's signature, the Go compiler verifies that your function matches the expected contract before your binary ever runs.</p>
+<p>Go was also the first language after Python to ship the ADK 2.0 Graph Workflow runtime. When you need deterministic control flow alongside LLM reasoning, the <code>workflow.New</code> function wires agents and plain Go functions into a directed graph with conditional routing and parallel steps:</p>
+<pre><code>ag, err := workflowagent.New("order_pipeline", []workflow.Edge\{
+    \{From: workflow.Start, To: triageNode},
+    \{From: triageNode, To: fulfillNode, Route: workflow.StringRoute("fulfill")},
+    \{From: fulfillNode, To: notifyNode},
+})</code></pre>
+<p>Where Go really stands out is in production on Cloud Run and GKE. A compiled Go agent packages onto a roughly 2 MiB Google distroless static base image, with no language VM or heavy dependency tree. A static Go binary binds to its port as soon as the container starts, skipping the module imports of dynamic languages and the JAR unpacking and JIT warmup of JVM services.</p>
+<p>After it's running, Go's concurrency model fits agent workloads naturally. Each goroutine starts with a 2 KB stack and minimal scheduling overhead, so a single instance can multiplex thousands of concurrent streaming requests and tool calls. ADK for Go also includes built-in A2A server handlers and OpenTelemetry tracing out of the box.</p>
+<h3>TypeScript</h3>
+<p>TypeScript erases type annotations when compiling to JavaScript, so runtime reflection isn't an option. Instead, ADK for TypeScript pairs with Zod. You pass a <code>z.object(...)</code> schema to the <code>FunctionTool</code> function, and TypeScript statically infers the parameter types of your <code>execute</code> callback from that single declaration:</p>
+<pre><code>import \{ FunctionTool, LlmAgent } from "@google/adk";
+import \{ z } from "zod";
+
+const getWeatherTool = new FunctionTool(\{
+  name: "get_weather",
+  description: "Retrieves the current weather report for a city.",
+  parameters: z.object(\{
+    city: z.string().describe("The name of the city."),
+  }),
+  execute: async (\{ city }) =&gt; \{
+    return \{ status: "success", report: `Sunny and 72F in $\{city}.` };
+  },
+});
+
+export const rootAgent = new LlmAgent(\{
+  name: "weather_agent",
+  model: "gemini-3.8-flash",
+  instruction: "Answer questions about the weather in a city.",
+  tools: [getWeatherTool],
+});</code></pre>
+<p>Your runtime input validation, the JSON Schema sent to the model, and your IDE autocomplete inside the <code>execute</code> callback all flow from one source of truth.</p>
+<p>TypeScript also runs on the ADK 2.0 Graph Workflow engine and ships a standalone browser bundle. Beyond Node.js services, you can run an ADK agent directly in a browser tab using WebMCP for page-level tools and Chrome's on-device Prompt API.</p>
+<h3>Java</h3>
+<p>ADK for Java snaps right in for teams who have standardized on Maven, Gradle, and Spring Boot. You add <code>@Schema</code> annotations to method parameters and assemble agents by using a fluent <code>LlmAgent.builder()</code> API:</p>
+<pre><code>public class WeatherTools \{
+    public static Map&lt;String, String&gt; getWeather(
+        @Schema(name = "city", description = "The name of the city") String city) \{
+        return Map.of("status", "success", "report", "Sunny and 72F in " + city);
+    }
+}
+
+LlmAgent agent = LlmAgent.builder()
+    .name("weather_agent")
+    .model("gemini-3.8-flash")
+    .instruction("Answer questions about the weather in a city.")
+    .tools(FunctionTool.create(WeatherTools.class, "getWeather"))
+    .build();</code></pre>
+<p>At runtime, the runner streams agent events reactively through RxJava. For local testing and existing JVM apps, ADK for Java ships a Maven Dev UI plugin alongside first-party bridges for Spring AI and LangChain4j.</p>
+<h3>Kotlin</h3>
+<p>ADK for Kotlin takes a strong stance on build-time safety. Its Kotlin Symbol Processing (KSP) compiler plugin reads <code>@Tool</code> and <code>@Param</code> annotations at build time and emits the tool schema directly into bytecode:</p>
+<pre><code>class WeatherTools \{
+    @Tool(
+        name = "get_weather",
+        description = "Retrieves the current weather report for a city.",
+    )
+    suspend fun getWeather(
+        @Param("The name of the city.") city: String
+    ): Map&lt;String, String&gt; = mapOf("status" to "success", "report" to "Sunny and 72F in $city")
+}
+
+val agent = LlmAgent(
+    model = Gemini("gemini-3.8-flash"),
+    name = "weather_agent",
+    instruction = Instruction("Answer questions about the weather in a city."),
+    tools = WeatherTools().generatedTools(),
+)</code></pre>
+<p>If a tool signature uses an unsupported type or declares a default value on a non-nullable parameter, your Gradle build fails immediately instead of breaking in production. Because the <code>.generatedTools()</code> function uses zero runtime reflection, it survives Android R8 shrinking.</p>
+<p>That zero-reflection design makes it possible to run the entire agent loop locally on Android. It offers JVM server support, including a Spring AI bridge and experimental ADK 2.0 graph workflows. On-device, ADK for Kotlin integrates with LiteRT-LM for tool calling and ML Kit (Gemini Nano) for text generation. It also works with Room and AppSearch for local state, and Android AppFunctions for OS-level actions, all without requiring a network connection.</p>
+<h2>Choice without compromise</h2>
+<p>Having five native languages in ADK means you don't have to pick a single runtime for your entire organization. Because every version of ADK speaks MCP and A2A, each component of your system can use the language that fits it best.</p>
+<p>What languages have you used to build agents with Google's ADK? Let me know what stack you're running on X, LinkedIn, or Bluesky.</p>

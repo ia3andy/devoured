@@ -1,0 +1,68 @@
+<h1>Sequences and other volatiles in Neki</h1>
+<p>Hi there! My name is Mats, and I have been working on database systems for a bit over ten years. My focus has shifted, but a topic that has stuck with me is the query language; its syntax, semantics, and implementation. I have contributed to ISO standardization efforts, researched and developed query language features from scratch, and implemented features in both runtime layers and query planners.</p>
+<p>For the past eight months, that work has been the Neki query planner and its runtime engine. In this blog, I will discuss how Neki, PlanetScale's sharded Postgres, implements sequences in our sharded system to match native Postgres. I will focus on two aspects that need special attention: volatile expressions and cross-shard synchronous evaluation.</p>
+<h2>Implementing Postgres sequences in Neki</h2>
+<p>In PostgreSQL, sequences are ubiquitous. A sequence is abstractly a unique number generator, which can be used to implement a counter, an identity, or a surrogate key.</p>
+<p>A key property of sequences is their guarantee to never generate the same value more than one time. (That guarantee has a caveat of its own: a sequence can be reset or cycled, which clearly would repeat values, but these aspects are out of scope for this post.) Interestingly, a sequence does not guarantee that its output numbers are always consecutive; when transactions roll back, for example, consumed sequence numbers are not reclaimed.</p>
+<h2>Can Postgres handle sequences for us?</h2>
+<p>Each Neki shard is its own complete database system with its own query planner and an extensive SQL language support, so the Neki query planner can offload a lot of work to it. In fact, we view it as a virtue to do so: if we can relay the entire query to the shard, that is the best possible case. But generally, that is not possible to do.</p>
+<p>The most obvious reason is that no shard has all the data, they only have their slice. Detecting these best cases requires a careful and complicated analysis of the SQL statement and the Neki data topology, with a strong understanding of the semantics of the SQL language and its PostgreSQL dialect with its various unique features.</p>
+<p>That's where we come in.</p>
+<p>But this post is not about these best cases and how we detect them. Instead, our focus is on some of the pathological cases where we <em>cannot</em> relay all the work to one of the shards. As I will explain, sequences fall into this category where we must assume centralized control. But before we go into sequences, we must understand some details of Neki query planning.</p>
+<h2>The general case of Neki query planning</h2>
+<p>In the most general case, each shard only needs to provide raw data. Everything else has to be possible in the router itself. For a simple query like Query 1 below, each shard hosting the (sharded) table <code>animals</code> returns its rows with the requested columns, and the router concatenates those rowsets into the full result and returns it to the client.</p>
+<p><strong>Query 1: <code>SELECT...FROM</code></strong></p>
+<p>If we extend this query with some simple expressions over the columns, seen in Query 2, we now have a choice: evaluate the expressions in the <code>router</code>, or on the <code>shard</code>?</p>
+<p><strong>Query 2: add simple expressions</strong></p>
+<p>Both choices will give the correct result, so the question is one of optimization, which as it turns out is nontrivial:</p>
+<ul>
+ <li>Is the router or the shard more resource-constrained?</li>
+ <li>Which of the two is actually fastest to evaluate?</li>
+ <li>Is it more efficient to network-transfer the evaluated expression, or the raw data from the column?</li>
+ <li>What about nested expressions; shall we split them and evaluate one part here and one part there?</li>
+</ul>
+<p>For the purpose of simplicity, we will here assume that Neki is using a simple heuristic whereby we <em>always push</em> the evaluation to the shard if we can.</p>
+<h3>Router-only expressions</h3>
+<p>But some expressions don’t give us that choice. Neki defines this class of expressions as <em>router-only</em>: they must be evaluated on the <code>router</code> and we must <strong>never</strong> push them down to the shard.</p>
+<p>One example of such an expression is the <code>now()</code> function. It returns the wall clock time recorded at the start of the transaction.</p>
+<p>If we let each shard evaluate it, the natural clock drift and the different arrival times of the request would produce different values on different shards, which violates the semantics of the expression. So we need to evaluate it in the router.</p>
+<p>Consider Query 3, which adds <code>now()</code> to the mix.</p>
+<p><strong>Query 3: adding <code>now()</code></strong></p>
+<p>A valid approach here is to run Query 2 on the shards, concatenate the results, and then evaluate <code>now()</code> in the router and append the value to each row. We don’t know how many rows the shards will return, so we have to make sure evaluating now() repeatedly in the router always gives the same value. There are a couple of ways to guarantee that.</p>
+<p>We could evaluate it once into a single-row, single-column table and join that with the rows from the shards. Or we could cache the value per statement and read from the cache on repeated evaluations. Either way, every row gets the same wall clock time.</p>
+<p>And this summarizes the Neki query planner's general model:</p>
+<ul>
+ <li>Detect what parts of the query cannot run on the shards</li>
+ <li>Compose a plan wherein those parts instead run in the <code>router</code></li>
+ <li>Send most other things into the shards</li>
+</ul>
+<h2>How Postgres classifies expressions</h2>
+<p>So far, so good, but what about sequences? In order to fully understand how to deal with sequences, we need to understand PostgreSQL's expression classification of <code>immutable</code>, <code>stable</code>, and <code>volatile</code>. During semantic analysis, one of the phases of query planning, every expression in the statement gets one of these classifications based on its own definition and its inputs.</p>
+<h3>The <code>immutable</code> class</h3>
+<p>In Query 2, all the expressions are <code>immutable</code>. This means that they will produce the same output each time they operate on the same inputs, regardless of how many times they are evaluated and even between statements. Such expressions are the majority, and they are simple enough to not warrant additional discussion here.</p>
+<h3>The <code>stable</code> class</h3>
+<p>A <code>stable</code> expression produces the same output <em>within a statement</em>. The <code>now()</code> function from Query 3 is one example. <code>to_char()</code> is another, and a useful one since it takes inputs.</p>
+<p>For Neki, this means we cannot blindly push <code>stable</code> expressions to the shards. We must also make sure their dependencies are the same on every shard. Otherwise we might get <code>'Wednesday'</code> back on one row and <code>'Onsdag'</code> on another.</p>
+<p>This can happen when a user includes a <code>SET lc_time = ...;</code> in their session. In this case, we have to push that statement to any shard that needs it for evaluation. The <code>set_config()</code> function is treated the same way. <code>now()</code> as I explained above is <code>router-only</code> for clock-synchronization reasons, but <code>to_char()</code> is not.</p>
+<h2>Enter volatility</h2>
+<p>A <code>stable</code> expression returns the same value every time it's evaluated within a statement. A <code>volatile</code> expression makes no such promise. It may produce a different output <em>on every single invocation</em>. It doesn't always, but it can.</p>
+<p>As an example, consider the <code>nextval()</code> function. It takes the name of a sequence and returns a new, unique value each time it's evaluated. This is very useful, and can be used to implement a counter in a query or a table.</p>
+<p>In Neki, these sequence tables exist on all shards, but they all start with an empty sequence. Since it is possible to reference any sequence in any query (assuming no ACL rules), evaluations on sequences require centralized governance to avoid duplicate values across shards.</p>
+<p>Thus, sequence operations are all <code>router-only</code>. The authoritative shard is the physical host for all sequences, which the router uses to get new sequence values to distribute. This is how Neki achieves cross-shard synchronization for sequence allocation.</p>
+<h2>Table expressions</h2>
+<p>The driving force to evaluate expressions in the query execution model is the row cardinality. That is, each expression must be evaluated once per row to obtain the output needed for that row. That seems simple enough, but the complexity lies in "once per row" — as it turns out, determining that is also non-trivial!</p>
+<p>A SQL statement is made up of clauses that form an abstract data model. We will not go into all details of that here, but I will define what a <em>table expression</em> is.</p>
+<p>The composition of <code>FROM ... JOIN ... WHERE ...</code> (and <code>GROUP BY</code>, <code>HAVING</code>, and more) form a logical unit known as a <code>table expression</code>. The table expression forms the basis for the evaluation of all expressions in the <code>SELECT</code> clause's output list. It is the rows of the table expression that determine the "once per row" condition of the <code>volatile</code> expressions.</p>
+<p>It is this table expression that forms the basis of evaluation for our <code>SELECT</code> clause expressions. So, we would compute <code>8 + 1</code>, <code>lower('BISMUTH')</code>, <code>nextval('tag_seq')</code>, and then we are good to return results! We know that we will only evaluate the <code>volatile</code> <code>nextval('tag_seq')</code> expression one time, and thus we will only consume one sequence value.</p>
+<h2>The Neki case: a distributed query planner</h2>
+<p>Now, I must also mention that it is entirely valid to swap the order of evaluation between the <code>JOIN</code> and the <code>WHERE</code>. That is, it would be fine for us to first filter down <code>feedings</code> to its two <code>'morning'</code> rows, and then join that subset table with <code>animals</code>. Which order to do it is a general optimization problem, but it is often beneficial to filter first and join afterwards, since evaluating the predicate is often cheap.</p>
+<p>In Neki, a very large cost is the network-transport time between <code>router</code> and <code>shard</code>. In the case of a cross-shard join, which we are focusing on here, we have to go to some shards to fetch data for <code>animals</code> and some (same or different) shards to fetch data for <code>feedings</code>. Only when we have both concatenated sets of data are we able to perform our join. We are unable to do it on any given <code>shard</code>, since it does not have all of the data either. Thus, we have a great interest in minimizing the traffic going between <code>router</code> and <code>shard</code>.</p>
+<h2>Putting it all together</h2>
+<p>We note that the table expression can be evaluated shard-locally, and thus we can push down to shard-local evaluation on all the immutable expressions (first two columns). But we still have to evaluate both <code>now()</code> and <code>nextval('tag_seq')</code> on the router to avoid the uncoordinated shards from generating conflicting values.</p>
+<p><code>now()</code> is <code>stable</code>, so we evaluate it once and use the same value on all the outgoing rows. <code>nextval('tag_seq')</code> is <code>volatile</code>, so we must generate a new value for each row. And since we don't know how many rows each shard will return, we cannot generate the sequence values in advance and then draw from a cache. We must interpose the evaluations on top of the dynamic stream.</p>
+<p>This is a DML (Data Modifying Language) query. It updates each row of the <code>animals</code> table by setting the <code>tag_id</code> column to the next sequence value from the sequence <code>'tag_seq'</code>. In an <code>UPDATE</code> query, the table expression is expressed in a different syntactic form. You can build a complex one with <code>WHERE</code> and <code>FROM</code> clauses, but here we'll stick with the trivial case: the table expression is just the relation named after <code>UPDATE</code>, which is <code>animals</code>.</p>
+<p>This is a challenge for Neki. The cardinality of <code>animals</code> is unknown, and its rows are spread out across the shards in an unknown distribution. We cannot send <code>nextval('tag_seq')</code> to the shard, as we discussed above, and we don't know how many values to produce. So what query do we send to the shards?</p>
+<p>The answer is not obvious, and there is more than one solution. What Neki does today is first establish the table expression in the router using Query 8, interpose evaluation of <code>nextval('tag_seq')</code> on top, and run the actual update, feeding it with parameterized sequence values.</p>
+<p>I hope this deep dive into Neki query planning brought you insights into our complex system, and how the classical problems of query planning map to the distributed system that is Neki.</p>
+<p>Happy hacking!</p>
+<p>Mats</p>
