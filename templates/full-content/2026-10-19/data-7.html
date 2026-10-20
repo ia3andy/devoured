@@ -1,0 +1,154 @@
+<p><em>Snapshots, time travel and writable branches for pipelines, experiments, reproducible reports and more.</em></p>
+<p>A data import needs validation. A report needs last month’s numbers. A migration needs realistic test data. An analyst wants to compare two transformations, and an agent needs somewhere to try its own.</p>
+<p>These workflows share a requirement: keep a known database state, then inspect it or work independently from it.</p>
+<p>I built duckdb-differential to make that available directly from SQL. It adds snapshots, time travel, writable branches, clones and restore to native DuckDB databases. Versions share unchanged data. Everything works locally; optional S3 publication lets other machines query a retained version or recover it into a writable database.</p>
+<p>The extension is <strong>experimental</strong>, targeting <strong>DuckDB 1.5.6 on Linux and macOS</strong>. Let’s walk through several uses with one small database. Run the local examples in order in the same session, using an unused absolute directory for the repository:</p>
+<pre><code>INSTALL differential FROM community;
+LOAD differential;
+SET differential_repository = '/absolute/path/differential-demo';
+
+ATTACH 'differential:retail' AS retail;
+CREATE TABLE retail.orders (
+    order_id INTEGER PRIMARY KEY,
+    customer VARCHAR,
+    amount DECIMAL(10, 2)
+);
+INSERT INTO retail.orders VALUES (1, 'Ada', 40.00), (2, 'Lin', 60.00);
+CALL differential_create_snapshot('retail', name =&gt; 'baseline');
+-- Snapshot 1: two orders, total 100.00</code></pre>
+<p>A snapshot retains the database’s checkpointed state. A branch starts a writable continuation from that state. A clone starts a separate database identity and snapshot history. Readers can keep querying the original while other work moves forward.</p>
+<h2>Validate an import before adopting it</h2>
+<p>Suppose a daily feed contains an order whose amount was parsed with the wrong sign. Load it on a branch, where validation can catch the problem before it becomes part of the accepted dataset:</p>
+<pre><code>CALL differential_create_branch('retail', 'import_check', snapshot =&gt; 1);
+ATTACH 'differential:retail' AS incoming (BRANCH 'import_check');
+INSERT INTO incoming.orders VALUES (3, 'Jo', -25.00);
+
+SELECT order_id FROM incoming.orders WHERE amount &lt; 0;  -- 3
+SELECT sum(amount) FROM retail.orders;                 -- Still 100.00</code></pre>
+<p>After checking the source, we correct the value to 25.00. A real pipeline could reload the affected batch after fixing its parser. Validation might check totals, missing keys, duplicate records or domain-specific rules:</p>
+<pre><code>UPDATE incoming.orders SET amount = 25.00 WHERE order_id = 3;
+SELECT count(*) AS invalid_orders FROM incoming.orders WHERE amount &lt; 0;
+-- 0
+SELECT count(*) AS orders, sum(amount) AS total FROM incoming.orders;
+-- 3 orders, 125.00
+
+CALL differential_create_snapshot(
+    'incoming', name =&gt; 'validated_import', message =&gt; 'Daily feed validated'
+);
+-- Snapshot 2
+DETACH incoming;</code></pre>
+<p>In this controlled workflow, <code>main</code> has stayed unchanged. We can adopt the candidate’s entire database state with restore:</p>
+<pre><code>DETACH retail;
+CALL differential_restore('retail', 2, request_id =&gt; 'adopt-daily-import');
+ATTACH 'differential:retail' AS retail;
+SELECT sum(amount) FROM retail.orders;  -- 125.00</code></pre>
+<p>Restore requires a detached target branch, preserves its replaced state and creates a new snapshot of the selected contents: snapshot 3 here. There is <strong>no automatic branch merge</strong>. If another workflow has advanced <code>main</code>, reconcile those changes explicitly with SQL before adopting a candidate. Restore selects a whole database state; it does not combine diverging histories.</p>
+<h2>Reproduce a report after the data changes</h2>
+<p>A report can record its input snapshot number and query that version again later. Attach it read-only when several queries should share the same input:</p>
+<pre><code>ATTACH 'differential:retail' AS report_data (SNAPSHOT_VERSION 3);
+
+INSERT INTO retail.orders VALUES (4, 'Ada', 50.00);
+CALL differential_create_snapshot('retail', name =&gt; 'later_sales');
+-- Snapshot 4
+
+SELECT sum(amount) FROM retail.orders;       -- 175.00
+SELECT sum(amount) FROM report_data.orders;  -- 125.00
+SELECT sum(amount) FROM retail.orders AT (VERSION =&gt; 3);  -- 125.00
+DETACH report_data;</code></pre>
+<p>The live database now has another order, but the report’s input remains fixed. That is useful for monthly reporting, explaining a changed metric, and reproducing a bug against the data that triggered it. Snapshot numbers are scoped to a database: record the database identity alongside the version and report code.</p>
+<h2>Compare analytical scenarios</h2>
+<p>An analyst can model a pricing change on a branch without changing accepted orders. Here we deliberately start from the report’s three-order dataset:</p>
+<pre><code>CALL differential_create_branch('retail', 'discount', snapshot =&gt; 3);
+ATTACH 'differential:retail' AS scenario (BRANCH 'discount');
+UPDATE scenario.orders SET amount = amount * 0.90;
+
+SELECT 'baseline' AS scenario, sum(amount) AS total
+FROM retail.orders AT (VERSION =&gt; 3)
+UNION ALL
+SELECT 'discount', sum(amount) FROM scenario.orders;
+-- baseline: 125.00; discount: 112.50
+
+CALL differential_create_snapshot('scenario', name =&gt; 'discount_10pct');
+DETACH scenario;</code></pre>
+<h2>Develop feature datasets on fixed inputs</h2>
+<p>A feature-engineering experiment can retain both its source data and derived tables, then label the result with its recipe:</p>
+<pre><code>CALL differential_create_branch('retail', 'feature_trial', snapshot =&gt; 3);
+ATTACH 'differential:retail' AS features (BRANCH 'feature_trial');
+CREATE TABLE features.customer_features AS
+SELECT customer, count(*) AS order_count, sum(amount) AS total_spend
+FROM features.orders GROUP BY customer;
+
+SELECT count(*) FROM features.customer_features;  -- 3
+CALL differential_create_snapshot(
+    'features', name =&gt; 'customer_spend_v1',
+    extra_info =&gt; '\{"input_snapshot":3,"recipe":"customer_spend_v1"}'
+);
+DETACH features;</code></pre>
+<h2>Test a migration without changing the working database</h2>
+<p>A clone gives a test run its own database identity. It starts with snapshot 1 in its own history and shares the source’s unchanged payloads:</p>
+<pre><code>CALL differential_clone_database('retail', 'migration_test', snapshot =&gt; 3);
+ATTACH 'differential:migration_test' AS test_db;
+ALTER TABLE test_db.orders ADD COLUMN source VARCHAR DEFAULT 'import';
+
+SELECT count(*) FROM test_db.orders WHERE source = 'import';  -- 3
+SELECT count(*) FROM retail.orders;                         -- Still 4
+DETACH test_db;
+
+CALL differential_restore('migration_test', 1);
+ATTACH 'differential:migration_test' AS test_db;
+DESCRIBE test_db.orders;  -- Original three columns; no source column
+DETACH test_db;</code></pre>
+<h2>Give data agents independent attempts</h2>
+<p>An agent can use exactly the same SQL primitives as a notebook or pipeline. A controller might create a branch, expose it to one worker, inspect its candidate snapshot and decide whether to retain it:</p>
+<pre><code>CALL differential_create_branch(
+    'retail', 'agent_attempt_42', snapshot =&gt; 3, request_id =&gt; 'attempt-42-branch'
+);
+ATTACH 'differential:retail' AS agent_work (BRANCH 'agent_attempt_42');
+
+-- Example worker transformation: normalize customer labels.
+UPDATE agent_work.orders SET customer = upper(customer);
+SELECT count(*) AS orders, sum(amount) AS total FROM agent_work.orders;
+-- 3 orders, 125.00; label correctness needs its own checks
+
+CALL differential_create_snapshot(
+    'agent_work', name =&gt; 'agent_candidate_42',
+    message =&gt; 'Candidate for review', request_id =&gt; 'attempt-42-snapshot'
+);
+DETACH agent_work;</code></pre>
+<h2>Share a validated dataset with another machine</h2>
+<p>S3 adds a distribution path to these local workflows. Create a database with an S3 <code>DATA_PATH</code>, and explicit snapshot creation exports synchronously by default. Later exports reuse previously uploaded chunks.</p>
+<pre><code>ATTACH 'differential:retail_release' AS published (
+    DATA_PATH 's3://my-bucket/differential-demo/', REGION 'eu-central-1'
+);
+CREATE TABLE published.orders AS
+SELECT * FROM retail.orders AT (VERSION =&gt; 3);
+
+SELECT snapshot_id, export_state, export_locator
+FROM differential_create_snapshot('published', name =&gt; 'report_dataset');
+-- snapshot_id = 1; export_state = 'complete'; save export_locator
+DETACH published;</code></pre>
+<p>On another machine, use a fresh session and repository:</p>
+<pre><code>ATTACH 'differential:s3://my-bucket/differential-demo/heads/retail_release/main'
+AS published (REGION 'eu-central-1');
+SELECT count(*) AS orders, sum(amount) AS total FROM published.orders;
+-- 3 orders, 125.00
+DETACH published;</code></pre>
+<h2>Recover a writable database from a completed export</h2>
+<p>In the reader session, substitute the hash from the saved export locator:</p>
+<pre><code>CALL differential_recover_export(
+    's3://my-bucket/differential-demo/descriptors/&lt;sha256&gt;',
+    'retail_recovered', region =&gt; 'eu-central-1'
+);
+ATTACH 'differential:retail_recovered' AS recovered;
+SELECT sum(amount) FROM recovered.orders;  -- 125.00
+INSERT INTO recovered.orders VALUES (4, 'Ada', 50.00);
+SELECT sum(amount) FROM recovered.orders;  -- 175.00
+DETACH recovered;</code></pre>
+<h2>How Differential stores versions</h2>
+<p>Underneath these workflows, DuckDB still handles SQL, transactions, indexes, compression and its catalog. Differential handles file operations, storing immutable chunks and their mappings in a local repository. Embedded SQLite coordinates metadata and default payload storage; no separate service is needed.</p>
+<h2>Import an existing DuckDB database</h2>
+<p>For your own existing <code>.duckdb</code> file, checkpoint and close it, then import it using an absolute path:</p>
+<pre><code>CALL differential_import_database('/absolute/path/existing.duckdb', 'imported');
+ATTACH 'differential:imported' AS imported;</code></pre>
+<h2>Project status</h2>
+<p>The release remains experimental. Try one workflow: validate an import, preserve a report’s inputs, test a migration, or give an experiment its own branch.</p>

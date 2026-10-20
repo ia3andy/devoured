@@ -1,0 +1,210 @@
+<h1>prompt_jev() now works on images</h1>
+<p>Three weeks ago we brought prompt_jev() to MotherDuck, a week after TypeSafe announced Jev. You ask a closed question in plain English, pick the shape of the answer (yes/no, one choice from a list, a score), and get a typed result with a confidence score, straight from SQL. We showed five use cases on text columns.</p>
+<p>Today, with TypeSafe's Jev 1.14, <code>prompt_jev</code> also <strong>takes images</strong>. Store them in a <code>BLOB</code> column, ask your questions, and the answers come back as columns you can filter, join and GROUP BY with the rest of your data.</p>
+<p>And yes, we also asked seven models the only question that really matters: hot dog or not hot dog? On hotdogbench.com, Jev isn't the top dog, but it's the first one to the bun.</p>
+<h2>Try it in one query</h2>
+<p>Hugging Face hosts lots of public image datasets as Parquet, with each image stored as bytes. Read them with <code>hf://</code> and hand the bytes straight to Jev:</p>
+<pre><code>SELECT image.path AS file,
+       prompt_jev([\{name: 'dish', image: image.bytes}], 'Is `dish` a dessert?') AS is_dessert
+FROM 'hf://datasets/ethz/food101/data/validation-00000-of-00003.parquet'
+LIMIT 5;
+</code></pre>
+<table>
+ <thead>
+  <tr>
+   <th>file</th>
+   <th>is_dessert</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>1827892.jpg</td>
+   <td>0.72</td>
+  </tr>
+  <tr>
+   <td>2802124.jpg</td>
+   <td>0.90</td>
+  </tr>
+  <tr>
+   <td>2192983.jpg</td>
+   <td>0.90</td>
+  </tr>
+  <tr>
+   <td>1062952.jpg</td>
+   <td>0.95</td>
+  </tr>
+  <tr>
+   <td>3157161.jpg</td>
+   <td>0.93</td>
+  </tr>
+ </tbody>
+</table>
+<p>Each row gets a probability between 0 and 1. These five photos are beignets, so they score high.</p>
+<h2>How fast, how accurate, how cheap?</h2>
+<p>We used the same dataset: Food-101, labeled photos of 101 dishes. One question per photo, "Which dish is shown?", with all 101 dishes as the allowed answers, asked to Jev, Gemini, GPT and Claude on the same 1,010 photos (10 per dish).</p>
+<table>
+ <thead>
+  <tr>
+   <th>Model</th>
+   <th>Rows/s</th>
+   <th>Accuracy</th>
+   <th>Cost for the 1,010 photos</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Jev (prompt_jev in MotherDuck)</strong></td>
+   <td><strong>44</strong></td>
+   <td>90.2%</td>
+   <td><strong>~$0.06</strong></td>
+  </tr>
+  <tr>
+   <td>Gemini 3.8 Flash, low thinking</td>
+   <td>10</td>
+   <td>96.8%</td>
+   <td>$1.14</td>
+  </tr>
+  <tr>
+   <td>Gemini 3.8 Flash, default thinking</td>
+   <td>7</td>
+   <td>97.0%</td>
+   <td>$1.43</td>
+  </tr>
+  <tr>
+   <td>GPT 6.1 Sol</td>
+   <td>7</td>
+   <td>93.4%</td>
+   <td>$1.89</td>
+  </tr>
+  <tr>
+   <td>Claude Opus 5.5</td>
+   <td>9</td>
+   <td>95.7%</td>
+   <td>$6.60</td>
+  </tr>
+ </tbody>
+</table>
+<p>We can score accuracy here because Food-101 has the right answer for every photo. On your own data you won't have that, so the real question is which answers you can trust.</p>
+<p>The big difference between Jev and a standard LLM is the <strong>confidence score</strong>. Every answer comes with one, and on this benchmark it reflects how often Jev is actually right. If you keep only the answers at 0.8 or more (<code>WHERE jev.confidence &gt;= 0.8</code>), Jev is right <strong>97.7%</strong> of the time, on 80% of the photos.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Min. confidence threshold</th>
+   <th>Photos kept</th>
+   <th>Accuracy on kept photos</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>(keep everything)</td>
+   <td>100%</td>
+   <td>90.2%</td>
+  </tr>
+  <tr>
+   <td>0.5</td>
+   <td>94%</td>
+   <td>92.7%</td>
+  </tr>
+  <tr>
+   <td>0.7</td>
+   <td>86%</td>
+   <td>95.8%</td>
+  </tr>
+  <tr>
+   <td>0.8</td>
+   <td>81%</td>
+   <td>97.7%</td>
+  </tr>
+  <tr>
+   <td>0.9</td>
+   <td>73%</td>
+   <td>98.5%</td>
+  </tr>
+  <tr>
+   <td>0.95</td>
+   <td>65%</td>
+   <td>98.9%</td>
+  </tr>
+  <tr>
+   <td>0.99</td>
+   <td>50%</td>
+   <td>99.2%</td>
+  </tr>
+ </tbody>
+</table>
+<p>This of course begs the question - what if we combine Jev with another model to a cheap first pass and then a secondary cleanup loop?</p>
+<table>
+ <thead>
+  <tr>
+   <th>Models to use</th>
+   <th>Accuracy</th>
+   <th>Cost per 1,000 photos</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Gemini 3.8 Flash alone</td>
+   <td>97.0%</td>
+   <td>$1.40</td>
+  </tr>
+  <tr>
+   <td><strong>Jev + Gemini 3.8 Flash</strong></td>
+   <td><strong>96.5%</strong></td>
+   <td><strong>~$0.45</strong></td>
+  </tr>
+  <tr>
+   <td>Jev + Gemini Flash-Lite</td>
+   <td>95.3%</td>
+   <td>~$0.18</td>
+  </tr>
+  <tr>
+   <td>Jev alone</td>
+   <td>90.2%</td>
+   <td>$0.08</td>
+  </tr>
+ </tbody>
+</table>
+<p>Notice how we can achieve big gains in accuracy for relatively small increases cost compared to using a System Two LLM for the entire job.</p>
+<h2>Getting your images in</h2>
+<p>If your images sit in S3, one query loads them into a <code>BLOB</code> column (with an S3 secret in place):</p>
+<pre><code>CREATE TABLE images AS
+SELECT filename AS path, content AS image
+FROM read_blob('s3://my-bucket/photos/*.jpg');
+</code></pre>
+<p>Jev needs each side of an image between 280 and 1,568 pixels. Bigger images need a resize first: a Flight (Python that runs on MotherDuck compute) with Pillow does it. The docs have a ready-to-use example that reads from S3, shrinks anything too big and writes the result back as a BLOB.</p>
+<p>Or skip the code and ask the MotherDuck MCP server from Claude or your agent of choice:</p>
+<blockquote>
+ <p>Load the JPEGs under s3://my-bucket/photos/ into a new table <code>photos.main.images</code>, one row per file with the image as a BLOB. Resize anything longer than 1568px on its longest side, skip images under 280px on their shortest side, and run it as a MotherDuck Flight. Tell me how many images landed and how many were skipped.</p>
+</blockquote>
+<h2>Five centuries of art in one GROUP BY</h2>
+<p>We took the Metropolitan Museum of Art's open access collection, half a million CC0 catalog records, and kept every public-domain painting, print, drawing and photograph with an image: about 77k works, loaded as 600px BLOBs. Then we asked <strong>14 questions about every image in one SQL query</strong>. Here are 4 of them:</p>
+<pre><code>SELECT object_id,
+       prompt_jev(
+         [\{name: 'art', image: image}],
+         questions := \{
+           smile: \{type: 'choice',
+                   instructions: 'If a human face is clearly visible in `art`, what is the expression of the most prominent face?',
+                   criteria: ['no_clear_face', 'neutral_or_serious', 'closed_mouth_smile', 'smile_showing_teeth', 'laughing']},
+           dog: \{type: 'noul', instructions: 'Is there a dog anywhere in `art`?'},
+           dog_box: \{type: 'box', instructions: 'the dog in `art`'},
+           skull: \{type: 'noul', instructions: 'Does `art` show a human skull or skeleton?'}
+           -- plus 10 more: main subject, weather, sunset, drink, food, cat, ...
+         }) AS jev
+FROM images;
+</code></pre>
+<p>Once the answers are stored as columns, they join with the Met's catalog like any other data. When did people start smiling in art? One <code>GROUP BY</code>:</p>
+<pre><code>SELECT (floor(o.begin_year / 50) * 50)::INT AS half_century,
+       round(100 * count(*) FILTER (WHERE f.smile IN ('closed_mouth_smile', 'smile_showing_teeth', 'laughing'))
+                 / count(*) FILTER (WHERE f.smile &lt;&gt; 'no_clear_face')) AS pct_smiling
+FROM features f  -- Jev's answers, one column per question
+JOIN objects o USING (object_id)
+WHERE o.begin_year BETWEEN 1400 AND 1949
+  AND o.end_year - o.begin_year &lt;= 25  -- only works the Met dates within 25 years
+  AND NOT f.rejected
+GROUP BY ALL
+ORDER BY half_century;
+</code></pre>
+<p>Almost nobody smiles before 1600! Many reasons for that, but that's for another blog.</p>
+<h2>Get started</h2>
+<p>Images are now just another column in MotherDuck. Load your product photos, scans, screenshots or camera-trap pictures as BLOBs, ask your questions, and join the answers with the rest of your data.</p>
+<p>Everything you need is in the prompt_jev() docs.</p>

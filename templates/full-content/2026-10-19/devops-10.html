@@ -1,0 +1,72 @@
+<h2>Atlantis at Scale: How It Works and Where It Breaks</h2>
+<p>Atlantis is the tool of choice when engineers run <code>terraform apply</code> from their laptops. You drop a server in your network, wire up webhooks, and then your infrastructure changes are applied via pull requests like normal code.</p>
+<p>That story holds up really well for a while, but when your organization grows, your repo count expands, and multiple people open PRs at the same time, things start feeling slow and fragile. In this article, we will walk through what Atlantis is, where it starts to break as you scale, what a serious production deployment looks like, and when it makes sense to move to something else.</p>
+<h2>What is Atlantis?</h2>
+<p>Atlantis is an open-source tool that automates Terraform through pull requests. It is a single GO binary that listens for webhooks from your Git provider, runs Terraform commands, and posts the output back as a comment on the PR.</p>
+<p>The process is simple and easy to follow:</p>
+<ol>
+ <li>You modify your Terraform files and open a pull request.</li>
+ <li>Once the pull request is open, Atlantis receives a webhook, clones the repo, and runs <em>terraform plan</em>.</li>
+ <li>The plan output appears as a comment on your PR.</li>
+ <li>A reviewer approves, someone comments <code>atlantis apply</code>, and Atlantis runs the apply.</li>
+ <li>The PR merges, and Atlantis unlocks the project.</li>
+</ol>
+<p>The Atlantis adoption is really simple, as everything happens where your team already works. You don’t need to learn a new UI; just read a comment and type another one.</p>
+<h3>Atlantis architecture overview at scale</h3>
+<p>Of the many ways to deploy Atlantis, the most common is Kubernetes. By default, Atlantis has no external database and stores plan files on the local disk. The official Kubernetes manifests use a StatefulSet with <em>replicas: 1</em> and a persistent volume.</p>
+<p>So, the Atlantis architecture has:</p>
+<ul>
+ <li><strong>One HTTP server</strong> that accepts webhooks and serves a small web UI</li>
+ <li><strong>A working directory on disk</strong> where every repo gets cloned per PR and workspace</li>
+ <li><strong>A locking layer</strong> that helps prevent two PRs from planning or applying to the same project at the same time.</li>
+ <li><strong>Terraform binaries</strong> that Atlantis uses to download and execute as subprocesses on the same machine</li>
+</ul>
+<h2>Where Atlantis breaks down at scale</h2>
+<h3>1. The single server becomes a queue</h3>
+<p>Atlantis runs every clone, plan, and apply as a subprocess on the machine that received the webhook. That is fine when two people are working. It stops being fine when your monorepo has 70 projects and a PR touches a shared module because autoplan fires for every affected project. Multiply that by four open PRs and the worker pool is saturated.</p>
+<h3>2. Vertical scaling is the only straightforward lever you have</h3>
+<p>The obvious fix is a bigger box, and it works for a while. You add CPU and memory and then raise <code>--parallel-pool-size</code>, which controls how many plans and applies run at once and defaults to 15 on a single machine. The catch is what actually saturates first. Teams end up on very large instances with the CPU mostly idle and the disk thrashing on git clones and provider downloads.</p>
+<h3>3. You can scale horizontally, but you have to opt into it</h3>
+<p>By default, Atlantis stores locks in an embedded database only one process can open. Switching to <code>--locking-db-type=redis</code> lets several replicas share lock state. Plan files still sit on local disk, so you must enable <code>--enable-external-stores</code> to upload plans to an S3-compatible bucket.</p>
+<h3>4. Provider and module downloads dominate runtime</h3>
+<p>Every run gets a fresh working directory per PR and workspace, so <code>terraform init</code> runs again and providers download again. Atlantis does cache plugins by default, but the documentation recommends turning that cache off when several projects plan and apply in the same PR because Terraform has a known race condition on a shared cache directory. The two things you want most under load, parallelism and caching, pull against each other.</p>
+<h3>5. Access control is too limited</h3>
+<p>Atlantis gives you two ways to decide who can run what: <code>--gh-team-allowlist</code> or an external authorization command. That script is a piece of production access control that you write, test, and maintain forever. The product has no roles, no environments, and no per-account model.</p>
+<h3>6. Every credential ends up on the same box</h3>
+<p>If Atlantis manages infrastructure across ten AWS accounts, that one server holds access to all ten. It is the most privileged machine you run, the one with the widest blast radius if someone compromises it.</p>
+<h3>7. There is a simple alpha version of drift detection</h3>
+<p>Atlantis only sees the changes that arrive through a PR. As of v0.45.0 there is an alpha drift API, but you don’t get a scheduler. Something outside Atlantis has to call that endpoint on a cadence, and you own it.</p>
+<h3>8. No dependency graph across projects</h3>
+<p>If your networking stack has to be applied before your EKS stack, Atlantis will not enforce that. Across PRs and repositories there is nothing. No graph, no shared outputs, no way to declare that one project depends on another.</p>
+<h3>9. Visibility is limited to PR comments</h3>
+<p>After the PR closes, your audit trail is a set of comments spread across repos. There is no central run history, no searchable log store, and no per-team dashboard unless you build one and keep it running.</p>
+<h2>How to deploy Atlantis at scale</h2>
+<ol>
+ <li><strong>Decide centrally, not per repo:</strong> Point the server to a central repo config with <code>--repo-config</code> and set your defaults there.</li>
+ <li><strong>Cache your provider downloads:</strong> Set a plugin cache directory and back it with persistent storage.</li>
+ <li><strong>Set concurrency based on reality:</strong> Raising <code>--parallel-pool-size</code> without adding CPU and memory simply moves the queue rather than removing it.</li>
+ <li><strong>Turn off the dangerous shortcuts:</strong> Use <code>--disable-apply-all</code> to force engineers to name the specific project they are applying.</li>
+ <li><strong>Watch what triggers a plan:</strong> Tighten your autoplan file patterns so a docs change doesn’t trigger 20 runs.</li>
+ <li><strong>Keep the disk on Kubernetes:</strong> Plans live on local disk, so the official manifests use a StatefulSet with a persistent volume.</li>
+</ol>
+<h2>Why use Spacelift as an Atlantis alternative</h2>
+<p>Spacelift is an alternative to Atlantis because it offers the same PR workflow while providing enterprise-grade orchestration.</p>
+<ul>
+ <li><strong>Policy as code with OPA:</strong> Control what resources users can create, approval requirements, and notification logic.</li>
+ <li><strong>Built-in drift detection:</strong> Understand changes made to stacks on a defined schedule without managing external infrastructure.</li>
+ <li><strong>Stack dependencies:</strong> Create a directed acyclic graph between configurations and share outputs between them.</li>
+ <li><strong>Real RBAC and SSO:</strong> Native integration with SAML 2.0 for fine-grained access control.</li>
+ <li><strong>Full run history and audit trail:</strong> Centralized logs and history instead of comments scattered across PRs.</li>
+ <li><strong>Private worker pools:</strong> Run infrastructure tasks inside your network for security and isolation.</li>
+</ul>
+<h2>How to migrate from Atlantis to Spacelift</h2>
+<ol>
+ <li><strong>Each Atlantis project needs its own stack:</strong> Define them with the Spacelift Terraform provider so the setup is versioned.</li>
+ <li><strong>Import your state:</strong> Import your existing state file or continue using your existing S3 backend.</li>
+ <li><strong>Move your credentials:</strong> Swap static cloud credentials for Spacelift’s managed cloud integrations.</li>
+ <li><strong>Translate your rules into policies:</strong> Convert <code>apply_requirements</code> into approval policies.</li>
+ <li><strong>Run both in parallel briefly:</strong> Point a few low-risk stacks at Spacelift and compare results before full migration.</li>
+ <li><strong>Turn off Atlantis:</strong> Gradually disable webhooks and decommission the server.</li>
+</ol>
+<h2>Key takeaways</h2>
+<p>Atlantis is an excellent tool with a simple design: one server, local disk, and PR comments as the interface. Its limits are structural: single-server execution, disk-bound plan files, coarse permissions, no enterprise-ready drift detection, and no dependency graph. You should always measure the real cost before deciding to use Atlantis, as plan latency and platform engineering hours matter far more than the instance bill.</p>
