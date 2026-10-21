@@ -1,0 +1,76 @@
+<ul>
+ <li>Sometimes, giving an AI agent all of the knowledge it needs is the wrong approach.</li>
+ <li>At Meta, we’ve seen notable improvements in efficiency and accuracy by keeping the orchestration layer of our data pipeline agents deliberately thin: It routes work and enforces reliability checks, while specialized agents do the domain reasoning.</li>
+ <li>We’re sharing our own process and insights, plus how any team can apply this to their production AI agents.</li>
+</ul>
+<p>We built a 1,300-line orchestrator that routes 20+ workflows to 14 specialized AI agents. It performs zero domain work itself. That’s the point.</p>
+<p>When we first deployed AI agents to automate data column onboarding across Meta’s recommendation systems — a process spanning three code repositories, three programming languages, and up to six pipeline stages that must stay in sync — we did what most teams do: We built one smart agent that knew everything.</p>
+<p>It worked in demos. In production, it started hallucinating.</p>
+<p>The fix wasn’t better prompts or a bigger context window. It was giving the central agent less to do. We call this the thin orchestrator pattern: a router that owns sequencing and reliability checks, and leaves every domain decision to specialists.</p>
+<h2>The Problem: More Context, Worse Results</h2>
+<p>Our pipeline is config-as-code: Python configurations drive C++ code generation, which feeds data processing services, which populate analytics systems. Onboarding a single data column requires coordinated changes across configuration registries, backend services, and data pipelines, and each column moves through up to six stages before its data arrives.</p>
+<p>Our first approach was a single AI agent loaded with all domain knowledge, configuration schemas, code generation rules, pipeline routing logic, validation requirements, and population patterns for 10+ data sources.</p>
+<p>The agent had everything it needed. That was the problem.</p>
+<p>Past a certain context threshold, additional knowledge <em>degraded</em> rather than improved performance. The agent would cross-contaminate concepts, applying field naming conventions from one subsystem to another, or using a code generation pattern meant for one data source when populating from a different one. A preprint from the Windreich Department of Artificial Intelligence and Human Health at Mount Sinai found that orchestrated multiagent systems held 65.3% accuracy at 80-task batches where single agents fell to 16.6%, while reducing token usage up to 65-fold. The authors attribute this to the design’s isolation of tasks, which prevented context interference. We were experiencing the inverse, a single agent drowning in its own knowledge.</p>
+<p>We also evaluated an alternative single-agent approach. Its success rate was 70-80% <em>with</em> manual prompt engineering per task: An engineer had to craft a custom system prompt for each specific job. Without that handholding, success dropped to 10-20%. This wasn’t a prompt engineering problem. It was an architectural one.</p>
+<h2>The Approach: A Thin Router With Specialist Workers</h2>
+<p>We split the system into two layers:</p>
+<ol>
+ <li><strong>A deterministic orchestrator</strong> that performs zero domain work. It classifies intent, gathers required fields, runs reliability checks, and delegates to the right specialist. It never reasons about code, never generates configurations, and never touches the codebase. It’s a router.</li>
+ <li><strong>Fourteen specialized subagents</strong>, each a complete domain expert with isolated context. A schema management agent knows configuration registries. A population agent knows how to generate code for each of 10 data sources. A validation agent knows build systems and quality checks. No agent sees the full picture. That’s the feature, not the bug.</li>
+</ol>
+<p>The orchestrator follows a fixed 7-step protocol for every request:</p>
+<ol>
+ <li><strong>Read</strong> the relevant subagent’s instruction file.</li>
+ <li><strong>Check</strong> if the target already exists (prevent duplicates).</li>
+ <li><strong>Gather</strong> required fields from the user.</li>
+ <li><strong>Auto-discover</strong> what can be inferred (repository type, existing configurations).</li>
+ <li><strong>Reliability gate</strong> check for active warnings or required reviewers.</li>
+ <li><strong>Delegate</strong> to the subagent with full context.</li>
+ <li><strong>Handle</strong> results and surface errors, confirm success.</li>
+</ol>
+<p>Steps 1–5 and 7 are deterministic. Only step 6 involves large language model (LLM) reasoning, and it happens inside an isolated subagent with only its domain knowledge loaded.</p>
+<h2>What We Built: Workflow Templates, Not New Agents</h2>
+<p>One architectural insight was separating <em>what</em> needs to happen from <em>how</em> each step is performed. The orchestrator defines phase ordering through workflow templates — deterministic state machines that constrain the LLM’s decision space:</p>
+<ul>
+ <li><strong>Column Onboarding:</strong> Schema → Validation → Population → Testing</li>
+ <li><strong>Event Onboarding:</strong> Schema → Population → Validation → Testing → Event Processing</li>
+ <li><strong>Pipeline Migration:</strong> Assessment → Planning → Population → Validation → Monitoring</li>
+</ul>
+<p>Each workflow template reuses the same pool of 14 subagents in different sequences. When we needed to support pipeline migration, a completely new use case, we didn’t build new agents. We wrote a new workflow template that sequenced existing agents differently. Zero new agent code. Full production capability.</p>
+<p>Each subagent follows a standardized structure:</p>
+<ul>
+ <li><strong>Knowledge sources:</strong> which domain files to load at runtime (typically a few thousand tokens each).</li>
+ <li><strong>Pre-gathering checklist:</strong> what the orchestrator must collect before delegation.</li>
+ <li><strong>Step-by-step workflow:</strong> the domain-specific execution plan.</li>
+ <li><strong>Discovery patterns:</strong> how to find relevant code patterns in the monorepo.</li>
+ <li><strong>Troubleshooting:</strong> error-to-resolution mappings for common failures.</li>
+</ul>
+<p>This uniformity means adding a new subagent is templated work, not greenfield engineering. The 15th subagent looks structurally identical to the first.</p>
+<p>Knowledge files are loaded on demand at subagent execution time, not embedded in the orchestrator. We maintain 25+ knowledge files organized by workflow domain. When a knowledge file is updated, the next session automatically uses the latest version — no orchestrator changes required. The same knowledge files serve multiple platform implementations of our agent.</p>
+<h2>Results</h2>
+<p>Configuration prep for a new column took three to four days by hand and about a day with our earlier config-driven system. The thin orchestrator system does it in under an hour.</p>
+<p>For broader context: About two-thirds of the system’s changes land without significant human edits. It gets there by trading generality for deep domain knowledge, a deliberate architectural choice. The orchestrator is general; the subagents are specialists.</p>
+<h2>Why This Works (And Why Heavyweight Orchestrators Don’t)</h2>
+<p>The conventional approach is to make the orchestrator the smartest component — give it all the context and let it reason about what to do and how to do it. This works until it doesn’t, and it stops working exactly when you need it most — at scale, with complex multi-step workflows, across heterogeneous subsystems.</p>
+<p>The thin orchestrator works because it aligns architectural boundaries with computational boundaries:</p>
+<ul>
+ <li><strong>Deterministic decisions stay deterministic.</strong> “Which subagent handles this?” is a routing decision, not a reasoning task. Don’t use an LLM for it.</li>
+ <li><strong>Context isolation prevents cross-contamination.</strong> The population agent for data source A never sees data source B’s patterns. It can’t hallucinate the wrong one.</li>
+ <li><strong>Failures are contained.</strong> If a subagent fails, the orchestrator retries or escalates. The failure doesn’t corrupt the orchestrator’s state or other subagents’ contexts.</li>
+ <li><strong>The system improves at every layer independently.</strong> A better model improves all 14 subagents simultaneously. A knowledge file update takes effect immediately. A new workflow template unlocks new capabilities without touching agents. No single component carries the full weight.</li>
+</ul>
+<h2>How to Apply This to Your AI Agents</h2>
+<ol>
+ <li><strong> Separate routing from reasoning.</strong> If your orchestrator is making domain decisions, it’s doing too much. Routing should be deterministic: keyword matching, intent classification, field gathering. Push all domain reasoning into isolated subagents.</li>
+ <li><strong> Design subagents as structurally uniform specialists.</strong> Every subagent should have the same structure: knowledge sources, required inputs, execution steps, error handling. This makes adding new capabilities templated work rather than architecture changes.</li>
+ <li><strong> Use workflow templates, not new agents, to scale.</strong> When you need a new use case, first ask: Can I sequence existing agents differently? If you can’t reuse agents across workflows, your agents are too coupled to specific use cases.</li>
+ <li><strong> Load knowledge at runtime, not at build time.</strong> Embed knowledge in the orchestrator and every update requires redeployment. Load it on demand and updates take effect immediately, across all platforms.</li>
+ <li><strong> Draw the deterministic/probabilistic boundary explicitly.</strong> For every component, decide: Is this a routing decision (deterministic) or a reasoning task (probabilistic)? The orchestrator should be on one side, the subagents on the other. Don’t mix them.</li>
+</ol>
+<p>The strongest argument for a thin orchestrator is the failure mode of the alternative. When a heavyweight orchestrator hallucinates, the error spreads to everything downstream: it routes to the wrong agent, gathers the wrong fields, or skips reliability checks. A thin orchestrator leaves little room for hallucination because its routing and reliability steps don’t rely on LLM reasoning. It follows a fixed protocol. The creativity happens downstream, in isolated, domain-scoped contexts where hallucination risk is minimized and failures are contained.</p>
+<h2>What’s Next</h2>
+<p>We’re scaling this architecture to handle an increase in data columns across new pipeline domains. The compositional thesis predicts this will work because scaling means adding workflow templates and knowledge files, not rebuilding agents. We’re also exploring how the system can continuously improve from production usage, using automated feedback loops to identify failure patterns and propose targeted improvements to subagent knowledge, with human review always gating any changes.</p>
+<p>The counterintuitive lesson: the most important component in our AI agent system is the one that does the least work. Keep your orchestrator thin and your specialists deep, and the whole system becomes more reliable.</p>
+<h2>Acknowledgements</h2>
+<p><em>This work was a team effort. Some other people who contributed to this effort include: Mani Bhushan, Rahul Maliakkal, Jae Ha, Chakrapani Kumar, Vivek Tiwari, and Amanda Yin.</em></p>
