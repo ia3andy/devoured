@@ -1507,7 +1507,7 @@ public class DigestHelper implements Runnable {
 
     static String sanitizeText(String s) {
         if (s == null || s.isEmpty()) return s;
-        return Jsoup.clean(s, org.jsoup.safety.Safelist.none()).trim();
+        return Jsoup.parse(s).text().trim();
     }
 
     static String stripReadingTime(String s) {
@@ -2246,8 +2246,8 @@ public class DigestHelper implements Runnable {
             for (var a : articles) {
                 var article = a.getAsJsonObject();
                 String id = jsonStr(article, "id");
-                String title = org.jsoup.parser.Parser.unescapeEntities(jsonStr(article, "title"), false);
-                String oneLiner = org.jsoup.parser.Parser.unescapeEntities(jsonStr(article, "one-liner"), false);
+                String title = jsonStr(article, "title");
+                String oneLiner = jsonStr(article, "one-liner");
                 String image = jsonStr(article, "image");
                 if (id.isEmpty() || title.isEmpty()) continue;
                 Path file = articleDir.resolve(id + ".html");
