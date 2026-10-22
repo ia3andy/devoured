@@ -1,0 +1,99 @@
+<p>AI tools have made it easy to vibe code agents. Building and maintaining an enterprise agent in production, however, remains significantly more challenging. In particular, developers are often forced to make a trade-off between quality (getting good answers, especially on long-tail tasks) and efficiency (keeping cost and latency in check at scale). Oftentimes, techniques bring gains in one dimension at the cost of another.</p>
+<p>Memory is a promising way to improve both at the same time. It can help agents carry useful context across tasks, such as user preferences, prior corrections, metric definitions, and successful workflows. In principle, this can improve accuracy, reduce repeated errors, and avoid unnecessary rediscovery. But more history is not necessarily better memory. Supplying every past interaction is costly and can introduce stale, conflicting, or irrelevant context. The central challenge is deciding what to retain, how to maintain it, and how to measure usefulness.</p>
+<p>In this post, we introduce <strong>MemCurrent</strong>, a persistent memory architecture for production agents, which now powers the new Agent Bricks Memory and Genie. Agents read and write memory as they work, and an offline “dreaming” pipeline consolidates memory to keep it consistent and fresh. On our internal benchmark, built from realistic enterprise tasks, MemCurrent triples the agent's pass rate over having no memory, while using 31% fewer tokens and running 26% faster. The rest of this post covers how we designed and evaluated it, and what we learned along the way.</p>
+<h2>How We Designed Memory</h2>
+<p>There are three ways to wire memory into an agent. As a <strong>plugin</strong> (like our earlier work on MemAlign and Memory Scaling), memory is read and written automatically at fixed points in a session. As <strong>tools</strong>, the agent decides what and when to read and write. As an <strong>offline pipeline</strong>, memory is updated in the background on a schedule or trigger, and used in later sessions. Each comes with trade-offs:</p>
+<table>
+ <tbody>
+  <tr>
+   <td><strong>Memory as a …</strong></td>
+   <td><strong>Triggered by</strong></td>
+   <td><strong>Time of computation</strong></td>
+   <td><strong>Pros</strong></td>
+   <td><strong>Cons</strong></td>
+  </tr>
+  <tr>
+   <td><strong>Plugin</strong></td>
+   <td>Automatic</td>
+   <td>Online</td>
+   <td>
+    <ul>
+     <li>Updates take effect immediately</li>
+     <li>Predictable behavior</li>
+    </ul></td>
+   <td>
+    <ul>
+     <li>Higher runtime cost and latency</li>
+     <li>Inflexible (e.g., wasting tokens even when memory isn't needed)</li>
+    </ul></td>
+  </tr>
+  <tr>
+   <td><strong>Tool</strong></td>
+   <td>Agent</td>
+   <td>Online</td>
+   <td>
+    <ul>
+     <li>Updates take effect immediately</li>
+     <li>Agent has flexibility</li>
+    </ul></td>
+   <td>
+    <ul>
+     <li>Higher runtime cost and latency</li>
+     <li>Quality constrained by agent capability</li>
+    </ul></td>
+  </tr>
+  <tr>
+   <td><strong>Pipeline</strong></td>
+   <td>Schedule or trigger</td>
+   <td>Offline</td>
+   <td>
+    <ul>
+     <li>Lower runtime cost and latency (async batched)</li>
+    </ul></td>
+   <td>
+    <ul>
+     <li>Updates arrive with a delay</li>
+    </ul></td>
+  </tr>
+ </tbody>
+</table>
+<p>MemCurrent uses all three, each where it fits best.</p>
+<p>MemCurrent has two types of memory: <strong>episodic memory</strong>, which stores raw session traces; and <strong>derived memory</strong>, which has the distilled learnings from these traces, stored as files in a structured knowledge base. An auto-generated <code>memory.md</code> index sits at the top, describing the file structure and what each file contains.</p>
+<p>Both episodic and derived memory live in a production-grade database that can scale to many users while delivering low-latency responses. Episodic memory is append-only, where a plugin logs each step as the session runs. Derived memory is a mutable table simulating a hierarchical file system, where writing happens in two ways. Agent tools (<code>add_memory</code>, <code>update_memory</code>, <code>delete_memory</code>) handle explicit requests like “Never write scripts in the /tmp dir”. An offline dreaming pipeline captures the rest, distilling implicit learnings from each new session into the relevant files. It also cleans up the whole store, splitting oversized files, merging duplicates, and resolving conflicts.</p>
+<p>Reading works in layers. At session start, a plugin injects the memory index, so the agent knows what it knows before it begins. During the session, the agent has two tools that work across both memory types: <code>search_memory</code> returns the top matches for a query (a step in a past trace, or a line in a memory file), and <code>fetch_memory</code> returns the full entry by identifier (session ID or file path).</p>
+<h2>How We Evaluated Memory</h2>
+<h3>Benchmarks</h3>
+<p>We start with three popular open-source benchmarks: <strong>LoCoMo</strong>, <strong>LongMemEval</strong>, and <strong>ConvoMem</strong>. All three test whether an agent can recall facts stated earlier in open-ended synthetic conversations.</p>
+<p>In addition, we built an Internal Memory Benchmark from real Genie conversations, where users ask all kinds of questions about their data. We started from 12K+ sessions, mined 3K candidates containing memory-worthy signals, and drafted a follow-up question with scoring rubrics. The other sessions from the same user serve as fillers for the test case. An adversarial judge then checked each test case against 7 criteria, such as whether the knowledge is actually present, specific to the user, required to answer, natural, and verifiable. After a final manual review, the benchmark has a total of 114 test cases, with 29 users and 2,233 history sessions.</p>
+<p>Our benchmark differs from existing ones in three ways:</p>
+<p><strong>Enterprise domain.</strong> Existing benchmarks are open-ended chats about the lives of simulated personas. Ours is from real work in a data workspace, involving rich enterprise knowledge like table semantics, metric definitions, and workflows.</p>
+<p><strong>Memory feeds actions, not answers.</strong> Finding the right string in past conversations is not enough; agents must apply retrieved knowledge to complete multi-step tasks.</p>
+<p><strong>Diversity.</strong> Test cases span 5 memory types (profile, preferences, domain knowledge, projects, workflows) crossed with 11 scenarios (direct instruction, changing or outdated facts, multi-session aggregation, memory-independent questions, and more).</p>
+<h3>Results</h3>
+<p>We compare MemCurrent with three open-source memory backends, Mem0, PropMem, OpenClaw memory, using the same underlying LLM.</p>
+<p><strong>Open-Source Benchmarks.</strong> We pair each memory backend with a simple question-answering agent, built with two agent harnesses (LangGraph and OpenAI Agents SDK). We also run two baselines: a floor with <strong>no memory</strong>, and a ceiling with <strong>full context</strong>, where every past session goes into the agent's context. Across all three benchmarks, <strong>MemCurrent scores highest among all memory backends</strong> and <strong>stays on the cost-accuracy Pareto frontier</strong>. On average, MemCurrent (88.1%) performs on par with full context (87.8%) <strong>at ~12x fewer input tokens per question</strong> (8.4K vs 103K). On the two benchmarks with the longest histories, it even beats full context, where dumping everything into the prompt ends up confusing the agent.</p>
+<p><strong>Internal Memory Benchmark.</strong> On our benchmark, the gap widens. Here, each memory backend runs inside our internal Genie, the same agent the benchmark sessions came from. The histories are too long to fit in context, so our ceiling is gold injection: injecting only the gold memories into the agent's context. Among all memory backends, MemCurrent has the highest pass rate (68.4%) and the lowest latency (252s) and token usage (418K), closing over 80% of the gap between no memory (22.3%) and gold injection (78.6%). Notably, while Mem0 was also on frontier on earlier benchmarks, it trails at 43.9% here with higher latency and cost. Compared to no memory, <strong>MemCurrent triples the agent's pass rate</strong> (22.3% → 68.4%) <strong>while making it 1.35x faster and 1.44x cheaper</strong>.</p>
+<h2>MemCurrent in Action</h2>
+<p>In addition to benchmark numbers, let's examine two examples of how MemCurrent helps in practice, from internal Genie sessions.</p>
+<p><strong>Example 1: Memory stops an occasional hallucination mistake.</strong> In Figure 7, a user asked the agent for the top 20 users of Product X over the past two months. The agent wrote a correct SQL query, but never read the actual execution results saved to a file. It still confidently produced a table with hallucinated content. Upon user feedback, the agent saved the lesson to memory. Next time, once the query ran, the agent read the results first and returned the right table. One memory correction kept a one-off slip from becoming a habit.</p>
+<p><strong>Example 2: Memory saves computation on related tasks.</strong> In Figure 8, a user asked for “the top 5 SDP customers”. The agent had to figure everything out from scratch: what “SDP” stands for, which tables held usage data, and how to join and filter them. It took 11 tool calls, 8 subagents, and nearly six minutes. The agent saved these steps as a workflow file in memory, which it could reuse on related tasks. Later, the user asked a different question: how many SDP customers had more than 5K pipeline runs last month. Using the workflow, the agent answered with 2 tool calls and 1 subagent in 41 seconds. The question was new, but the path to the answer wasn't, and memory let the agent skip unnecessary exploration.</p>
+<h2>What Makes MemCurrent Work</h2>
+<p>To understand what accounts for MemCurrent's superior performance, we ran ablations on our Internal Memory Benchmark for two design choices: memory types and extraction strategy.</p>
+<p><strong>Do we need both memory types?</strong> Episodic memory alone helps moderately: 35.8%, up from 22.3% with no memory. The raw history is useful, but the agent only searches it in about a third of test cases, though it passes 60% of those when it does. Derived memory avoids this issue, as the injected memory index at session start gives the agent information about what's available in memory and when to look, lifting pass rate to 66.1%. Adding episodic memory on top gives the best result, at 68.4%. The gain is small, but it suggests raw traces can recover details that distillation drops.</p>
+<p><strong>What's a good memory extraction strategy?</strong> Two channels extract derived memory: online tools and offline dreaming. When isolated, offline dreaming (63.5%) beats online tools (53.9%) by nearly 10 points. Their combination produces the highest pass rate at 66.1%. That supports a split of duties: dreaming handles background extraction and consolidation, while online tools make explicit requests take effect right away.</p>
+<h2>Conclusion</h2>
+<p>Memory is how an agent stops starting from zero. In this post, we introduced MemCurrent, a memory architecture for production agents that combines episodic memory and derived memory, with three access patterns: plugins to log and load context automatically, tools the agent calls on demand, and an offline dreaming pipeline that consolidates memory in the background.</p>
+<p>Across all benchmarks we ran, MemCurrent improves quality and efficiency at the same time, the trade-off we set out to break. On open-source benchmarks, it matches full context performance at about 12x fewer input tokens. On our Internal Memory Benchmark, built from real data work, it triples the agent's pass rate over no memory while also making it faster and cheaper.</p>
+<p>The ablations point to where the value comes from. Derived memory does most of the work, and episodic memory adds a smaller boost by recovering details that distillation drops. Combining online tools with offline dreaming makes the best extraction strategy: explicit requests take effect immediately, while dreaming distills implicit learnings and consolidates the store in the background.</p>
+<p>Beyond the numbers, memory provides a knowledge base that isn't tied to a single agent or LLM. It can move with users to new agents or LLMs, and could seed knowledge shared across their organization, a direction we are exploring next.</p>
+<h2>Getting Started</h2>
+<p>We're bringing these findings to drive improvements across Databricks products:</p>
+<p><strong>For agent developers.</strong> Agent Bricks is Databricks' developer platform for building custom agents. MemCurrent is built into Agent Bricks' Memory offering, powered by Lakebase. The offering includes:</p>
+<ul>
+ <li>Session store for episodic memory</li>
+ <li>Memory store for derived memory</li>
+ <li>An automatic dreaming pipeline</li>
+ <li>Tracing and evaluation of agent quality, including the impact of memory</li>
+ <li>A CLI which helps you quickly get started with an end-to-end sample agent with all of the above in &lt;10 minutes</li>
+</ul>
+<p><strong>For Databricks Genie users.</strong> Genie is an interface where Databricks users can converse with their data in natural language. MemCurrent is already in action behind the scenes, helping to improve answer quality while reducing response latency and cost.</p>

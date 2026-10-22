@@ -1,0 +1,65 @@
+<h1>Announcing Wiz Runtime Sensor add-on for GKE: Turnkey threat detection for Kubernetes</h1>
+<p>Everything is moving faster in the age of AI, and that includes security threats. What used to take attackers weeks to exploit can now happen in just a few minutes.</p>
+<p>Standard vulnerability scans that run on artifacts at rest can catch basic setup issues, but to detect an attack that's actively happening you need real-time runtime protection.</p>
+<p>Today, we’re introducing the <strong><a href="https://docs.cloud.google.com/kubernetes-engine/security/install-wiz-sensor-addon">Wiz Runtime Sensor add-on for Google Kubernetes Engine</a></strong> (GKE), in preview. This built-in integration brings low-touch deployment, automated lifecycle management, enterprise credential security, and fleet-wide governance to Wiz's industry-leading eBPF runtime threat detection for both Standard and Autopilot GKE clusters.</p>
+<h2>The operational friction of runtime security</h2>
+<p>Security and platform engineering teams share common dilemmas when deploying in-cluster runtime defenses:</p>
+<ul>
+ <li><strong>Deployment and lifecycle friction</strong>: Deploying runtime agents often requires managing installations from third-party sources across dozens or hundreds of clusters.</li>
+ <li><strong>Credential sprawl and security risks</strong>: Passing and rotating API keys as Kubernetes Secrets introduces administrative overhead and security risk.</li>
+ <li><strong>Fleet-wide enforcement gaps</strong>: Platform teams lack built-in policy controls to enforce that every new cluster has runtime sensors enabled before workloads are deployed and start receiving traffic.</li>
+ <li><strong>Performance and operational overhead</strong>: Without explicit and strategic resource limits, runtime agents can impact how much CPU and memory is available for your workloads and system functionality.</li>
+</ul>
+<p>With the <strong>Wiz Runtime Sensor for GKE</strong>, Google Cloud and Wiz have minimized these operational barriers. The Runtime Sensor is now available in GKE as a first-party, managed platform add-on.</p>
+<h2>Bridging the gap with Wiz Runtime Sensor for GKE</h2>
+<p>The Wiz Runtime Sensor for GKE connects central security and platform engineering workflows by simplifying and automating the sensor lifecycle.</p>
+<p>With the add-on, GKE manages the sensor deployment, credential injection, and lifecycle updates. Building runtime protection directly into the platform reduces administrative overhead and provides the following benefits for your Kubernetes fleet:</p>
+<p><strong>Native Secret Manager integration: </strong>Security teams no longer need to distribute Wiz API keys across cluster namespaces. The add-on uses GKE's <a href="https://docs.cloud.google.com/secret-manager/docs/sync-k8-secrets"><strong>Secret Manager secret sync integration</strong></a> to store your Wiz credentials in an off-cluster, centralized credential vault that only a dedicated service account can access.</p>
+<p>GKE automatically retrieves the credentials and injects them directly into the Runtime Sensor pods. Updating a key in Secret Manager automatically syncs to the sensor without requiring cluster restarts or manual intervention.</p>
+<ul>
+ <li><strong>Simplified enablement: </strong>After you add your Wiz credentials to Secret Manager, platform operators can enable the Runtime Sensor add-on by using the gcloud CLI or the GKE API. The GKE control plane handles deploying the sensor components, managing the lifecycle of pods, and configuring the nodes.</li>
+ <li><strong>Secure egress and proxy support</strong>: For environments that restrict public internet access, the managed sensor supports standard HTTP and mTLS proxy configurations. Telemetry is routed back to Wiz without violating your egress firewall policies.</li>
+ <li><strong>Fleet-wide governance with organization policy</strong>: Platform security leads can enforce compliance across their entire organization using <a href="https://docs.cloud.google.com/organization-policy/create-custom-constraints">custom organization policy constraints</a>. You can use a constraint to reject any attempts to create a cluster that doesn't enable the Runtime Sensor add-on, which can prevent malicious actors from spinning up rogue infrastructure to evade runtime detection.</li>
+ <li><strong>Kernel-level observability with minimal overhead</strong>: The Wiz Runtime Sensor continuously monitors system calls, running processes, network connections, and file access. It catches suspicious activity, including reverse shells, unauthorized privilege escalations, container escapes, and unsafe outbound connections while keeping CPU usage low even under heavy workload activity. The sensor uses a fixed memory limit on each node to ensure consistent performance as workload density changes. This is especially valuable for AI workloads and web services where application activity might fluctuate quickly.</li>
+ <li><strong>Independent auto-updates</strong>: Security threats and zero-day vulnerabilities don’t wait for scheduled infrastructure maintenance windows. The lifecycle of the Wiz sensor add-on for GKE is independent of your GKE cluster and node lifecycle. The sensor periodically rolls out updates of new sensor versions published by Wiz, to help ensure that your clusters always have the latest detection rules without requiring GKE version bumps, node pool recreations, or workload disruption.</li>
+</ul>
+<h2>How it works: Deploying and enforcing the sensor</h2>
+<p>Enabling the Wiz sensor add-on follows the same process that platform administrators are already familiar with on GKE. Using standard gcloud commands, you can activate runtime protection during cluster creation, turn it on for existing clusters, and enforce it across your fleet while keeping credentials securely managed in Secret Manager.</p>
+<h3>Provisioning a cluster with the Wiz Sensor add-on</h3>
+<pre><code>gcloud container clusters create production-ai-cluster \
+ --zone=us-central1-a \
+ --release-channel=regular \
+ --workload-pool=$\{PROJECT_ID}.svc.id.goog \
+ --enable-secret-sync \
+ --enable-secret-sync-rotation \
+ --addons=WizSensor=ENABLED \
+ --wiz-sensor-registry-secret-uri=projects/$\{PROJECT_ID}/secrets/wiz-registry-secret/versions/latest \
+ --wiz-sensor-api-key-secret-uri=projects/$\{PROJECT_ID}/secrets/wiz-api-key-secret/versions/latest</code></pre>
+<p>To enable the sensor on an existing running cluster with Workload Identity Federation for GKE and Secret Manager secret sync enabled, run the following:</p>
+<pre><code>gcloud container clusters update production-ai-cluster \
+ --zone=us-central1-a \
+ --update-addons=WizSensor=ENABLED \
+ --wiz-sensor-registry-secret-uri=projects/$\{PROJECT_ID}/secrets/wiz-registry-secret/versions/latest \
+ --wiz-sensor-api-key-secret-uri=projects/$\{PROJECT_ID}/secrets/wiz-api-key-secret/versions/latest</code></pre>
+<h3>Enforcing fleet-wide protection with organization policy</h3>
+<p>You can require all new GKE clusters across your organization to install the runtime sensor by deploying a <a href="https://docs.cloud.google.com/kubernetes-engine/multi-cloud/docs/attached/generic/how-to/setup-custom-constraints">custom constraint</a>:</p>
+<pre><code>name: organizations/123456789012/customConstraints/custom.GKEWizSensorEnforced
+resource_types:
+- container.googleapis.com/Cluster
+method_types:
+- CREATE
+- UPDATE
+condition: resource.addonsConfig.wizSensorConfig.enabled == true
+action_type: ALLOW
+display_name: Enforce Wiz Sensor on All GKE Clusters
+description: Mandates that all GKE clusters enable the managed Wiz Runtime Sensor backed by the corporate Secret Manager vault.</code></pre>
+<h2>Intelligent threat correlation for AI security</h2>
+<p>The true power of this integration emerges when the managed sensor connects to the broader Wiz AI Application Protection Platform (AI-APP). By feeding GKE runtime telemetry into the Wiz Security Graph, you unlock a security toolkit that goes beyond static alerting, with:</p>
+<ul>
+ <li><strong>Real-time risk assessment and threat verification</strong>: By pairing background security scans with live activity monitoring, you get a clear view of real risks. The sensor checks whether vulnerable code is actually running in memory, so you can focus on active security threats and ignore inactive ones.</li>
+ <li><strong>Real-time threat detection and response</strong>: Identify suspicious activity like malware, unauthorized access attempts, and software vulnerabilities in real time. Security teams can set rules to automatically block or stop threats before they can spread.</li>
+ <li><strong>Network activity and detailed security insights</strong>: Track system activity, network connections, and data flows to uncover hidden risks and unauthorized software usage. If a threat is detected, the sensor automatically gathers diagnostic data to help teams quickly investigate what happened.</li>
+</ul>
+<h2>Get started today</h2>
+<p>The Wiz Runtime Sensor add-on for GKE delivers a standard for container security: deep, kernel-level eBPF protection without operational complexity or deployment friction.</p>
+<p>By combining GKE's managed platform automation with Wiz's comprehensive security intelligence, platform and security teams can innovate at cloud speed while maintaining strong runtime defense. Check out the <a href="https://docs.cloud.google.com/kubernetes-engine/security/install-wiz-sensor-addon">Wiz Sensor for GKE documentation</a> to learn more.</p>

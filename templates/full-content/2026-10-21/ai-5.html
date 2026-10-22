@@ -1,0 +1,59 @@
+<p>Developers are familiar with running coding agents locally through harnesses like Pi, Claude Code, and others. They are reliable daily drivers for generating code, but keeping agents running around the clock requires your computer to be on and awake, which led to the laptop lid memes and Mac mini demand spike.</p>
+<p>Harnesses run in the cloud now, so you can close the lid.</p>
+<h2>Running harnesses in the cloud</h2>
+<p>Harness workloads are moving to the cloud. Individual developers are deploying always-on coding agent workflows, projects like OpenWork and HanaAgent use open-source harnesses as the engines behind the apps, and engineers are building their own harness products.</p>
+<p>These harnesses are designed for long-lived processes that keep the session in memory, and agent tasks commonly run for minutes or hours. Locally, a harness has direct, continuous access to the workspace and session history on the same disk, so resuming interrupted work only requires a simple prompt.</p>
+<p>In the cloud, you can replicate that setup with a VM and persistent storage, but the VM doesn't automatically record which model and tool calls completed or resume interrupted turns after a crash. A failed turn or network error means lost work.</p>
+<p>Also, not every agent task executed through a harness needs a sandbox. Database queries and API calls can run securely in functions, and that also means required credentials never have to enter the sandbox.</p>
+<h3>Making every harness durable</h3>
+<p>We built eve and fx to run durably in the cloud out of the box, and today we are introducing <code>durable-harness</code>, which extends that durability to any harness, including Pi, OpenCode, Codex, and Claude Code. It uses the same machinery that powers Workflow SDK to survive crashes and function timeouts.</p>
+<p>With <code>durable-harness</code>, you can:</p>
+<ul>
+ <li>Run any of these harnesses durably on Vercel</li>
+ <li>Self-host a harness with your own Postgres instance</li>
+ <li>Make your local harness workflow durable</li>
+ <li>Build your own durable harness</li>
+</ul>
+<h2>Sessions that survive a crash mid-turn</h2>
+<p>Take the example of a coding agent adding a pricing page to an existing app. The agent reads the existing page, writes a new one, opens a pull request, and waits for CI to finish before reporting back.</p>
+<p>What happens if its function times out while CI is still running?</p>
+<p>Without durability, the agent stops work until it is manually restarted, and completed work is repeated unnecessarily.</p>
+<p>With <code>durable-harness</code>, a new function reads completed results from the log and resumes the turn. If the browser disconnects, the agent keeps running, and reconnecting catches up from the log.</p>
+<h2>Logs and queues</h2>
+<p><code>durable-harness</code> is the newest package in our open source portfolio. It’s a set of adapters and utilities that let the harnesses you already use keep their sessions in a World, the Workflow SDK’s durable backend.</p>
+<p>It writes each step of a turn to a durable log. Before a model call or tool call runs, it records an intent, and when the call finishes, it records the outcome. The turn itself is backstopped with a queue message, so if its function dies, the queue hands the turn to a new function that reads the log and continues where it left off.</p>
+<p>After a crash, the log says what finished, what was running, and what never started:</p>
+<ul>
+ <li>Completed calls never run again because their results are read from the log, so you’re never billed twice for a finished model call’s tokens.</li>
+ <li>Models remember their previous calls rather than repeating them.</li>
+ <li>Interrupted tools marked <code>replay: 'safe'</code> run again. Any other tool comes back to the model as possibly run, and the model decides whether to check.</li>
+</ul>
+<p>Harnesses that keep their own session files, like Claude Code's transcript, Codex's rollout, and OpenCode's event store, have every record mirrored into the log, so a new function or Sandbox rebuilds them from it.</p>
+<h2>Pick your harness</h2>
+<p>fx and eve are durable on their own. For the rest, <code>durable-harness</code> adds durability from the outside, without changing the harness.</p>
+<h2>Runs everywhere</h2>
+<p>Durable agents need a log of each step, a way to resume a turn when its process dies, and a stream for whoever is watching.</p>
+<p>Workflow SDK ships all three behind one interface, a World.</p>
+<pre><code>import type \{ Queue, Storage, Streamer } from '@workflow/world'interface World extends Storage, Queue, Streamer \{}</code></pre>
+<p>A World is the log, the backstop and the stream behind one interface.</p>
+<p><code>durable-harness</code> writes to that interface, so you can move the same agent from one World to another without changing its code.</p>
+<pre><code>WORKFLOW_TARGET_WORLD="@workflow/world-postgres"WORKFLOW_POSTGRES_URL="postgres://user:password@host:5432/database"</code></pre>
+<h2>See every session in Agent Runs</h2>
+<p>Agent Runs on Vercel shows the trace for every session, including each model call and tool call. Turns that resumed after a crash appear in the same trace, so you can see exactly where a turn stopped and picked back up.</p>
+<h2>Tools</h2>
+<p>An agent has only the tools you give it, and they run in your function. Each tool says what should happen if a crash interrupts it. A <code>'safe'</code> tool, such as a lookup, can run again. A <code>'never'</code> tool, such as a refund, never runs twice: the model is told the call may have happened, so it can check before it tries again.</p>
+<pre><code>1import \{ pi } from 'durable-harness/pi';2import type \{ HostTool } from 'durable-harness';3import \{ getOrder, refundOrder } from './orders'; // your own code4
+5const tools: HostTool[] = [6  \{7    name: 'get_order',8    description: 'Looks up an order',9    replay: 'safe', // safe to run again after a crash10    inputSchema: \{ type: 'object', properties: \{ id: \{ type: 'string' } }, required: ['id'] },11    execute: async (\{ id }) =&gt; JSON.stringify(await getOrder(id)),12  },13  \{14    name: 'refund_order',15    description: 'Refunds an order',16    replay: 'never', // never runs twice17    inputSchema: \{ type: 'object', properties: \{ id: \{ type: 'string' } }, required: ['id'] },18    execute: async (\{ id }) =&gt; JSON.stringify(await refundOrder(id)),19  },20];21
+22export const agent = pi(\{ model: 'anthropic/claude-sonnet-5.5', tools });</code></pre>
+<h2>Files</h2>
+<p>When a harness needs a shell and files, it’s not safe to run them directly on a shared serverless function host. Many sessions can share the same function, and its filesystem isn’t guaranteed to persist between invocations.</p>
+<p>To address this, <code>durable-harness</code> gives you a few options:</p>
+<ul>
+ <li><code>virtual()</code> keeps the files in the session’s log, with a bash-compatible shell that can’t reach your function’s files or the network.</li>
+ <li><code>virtual(\{ durable: false })</code> keeps the files in memory for scratch work and clears them at the end of every turn.</li>
+ <li><code>sandbox()</code> gives the session its own Vercel Sandbox, with <code>/workspace</code> on a Drive that outlives every sandbox and every function.</li>
+</ul>
+<h2>Documents</h2>
+<p>Some state belongs with the session but isn’t part of the conversation, such as a to-do list, a plan, or a form the agent fills in. A document is typed JSON that lives in the session’s log, so it survives a crash and moves with the session.</p>
+<h2>Wrapping up</h2>
+<p>Developers choose a harness for the choices it makes about prompts, tools, and context. How it survives a crash shouldn’t be one of them. With <code>durable-harness</code>, a turn that loses its function partway through continues from the log on a new one, without a manual retry and without repeating what already finished. Self-hosting and portability work out of the box by building on top of the Workflow SDK’s World interface.</p>

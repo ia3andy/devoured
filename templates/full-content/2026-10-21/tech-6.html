@@ -1,0 +1,60 @@
+<p>Decision models have exploded onto the scene recently, starting with TypeSafe’s Jev, followed by Perplexity’s Decider, Liquid’s d1, Cloudflare’s Clef, and OpenAI’s Decisions API. These models promise fast, inexpensive classification.</p>
+<p>Decision models are an appealing low-cost alternative to LLM judges for automated evals. But whether they’re the right choice depends on the cost, performance, and latency requirements of your use case.</p>
+<p>We’ve also noticed people using the default decision threshold of 0.50 without checking whether it works well for their task. This can leave a lot of performance on the table.</p>
+<p>In this post, we’ll start by showing how to tune thresholds to get the best results from decision models. With those thresholds tuned, we’ll compare cost and performance to help you assess which model fits your use case. Finally, we’ll explore how to interpret model scores when deciding whether to act, and how calibration can make them more useful as confidence estimates.</p>
+<h2>What we tested</h2>
+<p>We used 100 traces, or logs of conversations and actions, from an apartment leasing agent. The task is to identify traces containing an error, such as a failed booking or a missed handoff to a human. We used the same dataset and broad failure-finding task in our prior post on automated evals. Here, each decision model returns a failure probability for each trace.</p>
+<p>We tested Jev 1.13, Perplexity Decider 1.1 27B, Liquid d1 and d1-ultra, Cloudflare Clef Flash, and OpenAI Decisions (GPT-6 Luna). Each model received the same evaluation criteria.</p>
+<p>We compare models on two dimensions:</p>
+<ul>
+ <li><strong>Performance:</strong> We compare each model’s predictions with traces that people have reviewed and labeled as passing or failing. This measures how well the model catches failures while avoiding false alarms.</li>
+ <li><strong>Cost:</strong> We calculate API cost from token usage and the provider’s prices.</li>
+</ul>
+<p>For brevity, we leave latency aside because it depends on factors outside this experiment’s control.</p>
+<h2>Understanding decision thresholds</h2>
+<p>We assign each trace one of two labels, pass or fail. This is a binary pass/fail eval, which we recommend because it encourages clear criteria and is easier to align with human preferences.</p>
+<p>Each decision model returns a score from 0 to 1 that estimates how likely a trace is to contain a failure. The APIs turn this score into a decision using a <strong>default decision threshold of 0.50</strong>. Traces with scores at or above the threshold are flagged as failures. Using this default without checking it against your data can give you subpar results.</p>
+<p>For example, a model could assign every failure a score of 0.40 and every passing trace a score of 0.10. Even though this model classifies traces perfectly at a threshold of 0.30, the default threshold of 0.50 would catch nothing.</p>
+<p>In practice, scores for failures and passing traces will overlap. Lowering the threshold catches more failures but can also raise more false alarms. Choosing a threshold means balancing:</p>
+<ul>
+ <li><strong>Precision:</strong> The share of flagged traces that contain a known failure.</li>
+ <li><strong>Recall:</strong> The share of known failures that the model catches.</li>
+</ul>
+<p>The right tradeoff depends on your business goals. For this comparison, we’ll give precision and recall equal weight using the F1 score, their harmonic mean. F1 ranges from 0 to 1, and higher is better.</p>
+<p>It’s also important not to blindly maximize F1 without thinking about your minimum requirements for the classifier to be useful. For example, if this classifier is used for an automated alerting system, I would want a minimum of 80% on both precision and recall so that I’m minimizing false alarms while catching a sufficient number of failures.</p>
+<h3>Tuning the decision threshold</h3>
+<p>For this example, we’ll optimize F1. For our candidates, we’ll restrict tuning to thresholds that meet both 80% minimums on the training data whenever possible.</p>
+<p>With labeled traces and saved model scores, you can ask a coding agent to tune the thresholds. Below is an example prompt you can modify for your use case:</p>
+<blockquote>
+ <p>Using my saved model scores and binary labels (1 means failure), tune a decision threshold to maximize F1 while requiring at least 80% precision and 80% recall. Use stratified five-fold cross-validation, choosing thresholds on the training examples and measuring performance on the remaining examples. If comparing models, use the same splits for each. Only select thresholds that meet both minimums on the training examples. If none qualifies, report that rather than relaxing either requirement. Report validation precision, recall, and F1, along with any splits where no threshold qualified or validation performance fell below my minimums. Compare with the default threshold of 0.50. Reuse the saved scores without making new model calls.</p>
+</blockquote>
+<p>Our candidate models gained less from F1 tuning than Liquid d1 and Clef Flash, which fell below our minimums. However, even a small shift in precision and recall can affect business costs or the user experience, so choose the tradeoff deliberately.</p>
+<h2>Performance versus cost</h2>
+<p>The chart below compares each model’s F1 (after tuning) against cost, focused on our remaining candidates. The dashed line shows the <strong>Pareto frontier</strong> among our remaining candidates. For any given F1 score, it identifies the cheapest candidate that meets or exceeds that score.</p>
+<h2>Can we trust the probabilities?</h2>
+<p>Beyond pass/fail evals, you may want to use a decision model’s score as a confidence estimate. But can you take that number literally? For a score of 0.80 to mean an 80% chance of failure, roughly 80% of traces with similar scores should contain failures.</p>
+<p>If the predicted probabilities don’t match the observed outcomes, we can adjust them using another model. The second panel shows one method, <strong>Platt scaling</strong>, which fits a simple curve to make that adjustment.</p>
+<blockquote>
+ <p>Using my saved failure probabilities and binary labels (1 means failure), test whether Platt scaling improves each model’s probabilities. Use stratified five-fold cross-validation with the same splits for every model. Fit the calibration mapping on each training split and apply it to the remaining traces. Fit on log-odds, clipping probabilities away from 0 and 1 first. Plot predicted probabilities against observed failure rates before and after calibration. Report Brier scores (lower is better), and explain which models improved or got worse. Reuse the saved scores without making new model calls.</p>
+</blockquote>
+<h2>Prompt tuning and evaluator scope</h2>
+<p>We kept the eval task in this post broad to make the differences between models easier to see. In practice, we recommend building a separate judge for each failure mode. With a narrower task and more specific guidance, we expect the performance gaps between models to shrink.</p>
+<h2>Putting these ideas into practice</h2>
+<p>For this particular dataset, OpenAI had breakout performance at a higher cost. Perplexity and Liquid d1-ultra offer lower-cost options with lower performance. We have observed that model performance varies substantially across tasks and datasets, which means it’s important to measure things yourself.</p>
+<p>To recap:</p>
+<ul>
+ <li>Once you’re satisfied with your judge’s prompt, set minimum precision and recall requirements for your use case. Rule out models that cannot meet these.</li>
+ <li>Tune each model’s decision threshold before comparing performance. Choose a precision-recall tradeoff that fits your business goals.</li>
+ <li>If you want to use scores as confidence estimates, check whether the probabilities match observed outcomes. Calibration can help, but you need to measure whether it improves them.</li>
+ <li>Weigh performance against cost and latency for your workload.</li>
+</ul>
+<h2>Appendix: Evaluation prompt</h2>
+<pre><code>Decide whether `messages` contains at least one substantive failure, risk, or quality problem in the AI assistant's behavior or tool use. This is one complete production trace from an AI that handles apartment-leasing customer support over phone or messaging. The trace includes the conversation plus any tool calls and tool outputs.
+
+Evaluate the AI assistant and its tool use, not the customer. Treat system messages inside `messages` as the instructions governing the assistant's behavior and allowed capabilities. Inspect the full trace, including final turns and all tool calls and outputs. Base the judgment only on evidence visible in this trace. Do not assume external policies, channel behavior, or business requirements that are not present. Do not assume every trace failed. A short, ambiguous, or inconclusive trace is not an issue unless visible evidence establishes a substantive failure.
+
+Return the probability that at least one substantive issue is present; the issue does not need to be named or clustered.
+
+Count as an issue when supported by the trace: the assistant contradicts an applicable system instruction or tool result; makes an unsupported factual or operational claim; misses, misuses, repeats, or falsely claims completion of a required tool action, transfer, booking, cancellation, follow-up, or confirmation; materially misunderstands or leaves an explicit user request unresolved; or exposes internal actions, placeholders, or broken content to the customer in a way that materially harms the interaction.
+
+Do not count as an issue: a minor stylistic preference with no meaningful effect; a failure caused only by the customer's behavior; internal tool metadata that was not exposed to the customer and did not cause an incorrect response; a hypothetical concern requiring information outside the trace; or insufficient evidence and inconclusive conversations.</code></pre>
