@@ -8,6 +8,7 @@ import io.quarkiverse.roq.frontmatter.runtime.model.DocumentPage;
 import io.quarkiverse.roq.frontmatter.runtime.model.Page;
 import io.quarkiverse.roq.frontmatter.runtime.model.Site;
 import io.quarkiverse.roq.plugin.lunr.runtime.RoqPluginLunrTemplateExtension;
+import io.quarkiverse.tools.stringpaths.StringPaths;
 import io.quarkus.qute.RawString;
 import io.quarkus.qute.TemplateExtension;
 import io.vertx.core.json.JsonArray;
@@ -79,9 +80,11 @@ public class TemplateExtensions {
                             if (!takeaway.isEmpty()) content.append(takeaway).append(" ");
                         }
                         var tags = article.getJsonArray("tags");
+                        String postSlug = StringPaths.slugify(page.title(), false, false).toLowerCase();
+                        String articleUrl = page.site().url("digest-posts", postSlug, id).absolute();
                         var entry = new JsonObject()
                                 .put("title", page.title() + " - " + title)
-                                .put("url", pageUrl + "?a=" + id)
+                                .put("url", articleUrl)
                                 .put("fragment", id)
                                 .put("content", content.toString().trim())
                                 .put("boost", 4);
@@ -140,7 +143,10 @@ public class TemplateExtensions {
             String image = article.getString("image", "");
             if (!image.isEmpty()) newsArticle.put("image", image);
             String id = article.getString("id", "");
-            if (!id.isEmpty()) newsArticle.put("url", pageUrl + "?a=" + id);
+            if (!id.isEmpty()) {
+                String postSlug = StringPaths.slugify(page.title(), false, false).toLowerCase();
+                newsArticle.put("url", page.site().url("digest-posts", postSlug, id).absolute());
+            }
             String source = article.getString("source", "");
             if (!source.isEmpty()) newsArticle.put("publisher", new JsonObject()
                     .put("@type", "Organization").put("name", source));
@@ -152,6 +158,65 @@ public class TemplateExtensions {
                 .put("@type", "ItemList")
                 .put("name", data.getString("title", ""))
                 .put("itemListElement", items);
+        return new RawString(ld.encodePrettily());
+    }
+
+    static JsonObject findArticle(Page page) {
+        if (page.data() == null) return null;
+        String postDate = page.data().getString("post-date", "");
+        String articleId = page.data().getString("article-id", "");
+        if (postDate.isEmpty() || articleId.isEmpty()) return null;
+        var posts = page.site().collections().get("digest-posts");
+        if (posts == null) return null;
+        for (var post : posts) {
+            if (!post.date().format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE).equals(postDate)) continue;
+            var sections = post.data().getJsonArray("sections");
+            if (sections == null) continue;
+            for (int i = 0; i < sections.size(); i++) {
+                var section = sections.getJsonObject(i);
+                var articles = section.getJsonArray("articles");
+                if (articles == null) continue;
+                for (int j = 0; j < articles.size(); j++) {
+                    var article = articles.getJsonObject(j);
+                    if (articleId.equals(article.getString("id", ""))) {
+                        var result = article.copy();
+                        result.put("section", section.getString("name", ""));
+                        return result;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    static DocumentPage findPost(Page page) {
+        if (page.data() == null) return null;
+        String postDate = page.data().getString("post-date", "");
+        if (postDate.isEmpty()) return null;
+        var posts = page.site().collections().get("digest-posts");
+        if (posts == null) return null;
+        for (var post : posts) {
+            if (post.date().format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE).equals(postDate))
+                return post;
+        }
+        return null;
+    }
+
+    static RawString articleJsonLd(Page page) {
+        var article = findArticle(page);
+        if (article == null) return new RawString("{}");
+        var ld = new JsonObject()
+                .put("@context", "https://schema.org")
+                .put("@type", "NewsArticle")
+                .put("headline", article.getString("title", ""))
+                .put("datePublished", page.data().getString("post-date", ""));
+        String oneLiner = article.getString("one-liner", "");
+        if (!oneLiner.isEmpty()) ld.put("description", oneLiner);
+        String image = article.getString("image", "");
+        if (!image.isEmpty()) ld.put("image", image);
+        String source = article.getString("source", "");
+        if (!source.isEmpty()) ld.put("publisher", new JsonObject()
+                .put("@type", "Organization").put("name", source));
         return new RawString(ld.encodePrettily());
     }
 

@@ -4,6 +4,7 @@
 //DEPS com.google.code.gson:gson:2.11.0
 //DEPS info.picocli:picocli:4.7.6
 //DEPS io.smallrye.reactive:mutiny:2.7.0
+//DEPS io.quarkiverse.tools:string-paths:3.0.0
 
 import com.google.gson.*;
 import io.smallrye.mutiny.*;
@@ -21,6 +22,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import java.util.stream.*;
 import java.util.regex.*;
+import io.quarkiverse.tools.stringpaths.StringPaths;
 import picocli.CommandLine;
 import picocli.CommandLine.*;
 
@@ -39,6 +41,7 @@ import picocli.CommandLine.*;
         DigestHelper.DedupCmd.class,
         DigestHelper.TestFetchCmd.class,
         DigestHelper.AddRatingCmd.class,
+        DigestHelper.GenerateArticlePagesCmd.class,
 }, mixinStandardHelpOptions = true)
 public class DigestHelper implements Runnable {
 
@@ -624,6 +627,24 @@ public class DigestHelper implements Runnable {
             loadEnv(Path.of(projectDir));
             addRating(dataFile, dateArg);
             reportCost("add-rating");
+            return 0;
+        }
+    }
+
+    @Command(name = "generate-article-pages", description = "Generate article pages for all existing posts")
+    static class GenerateArticlePagesCmd implements Callable<Integer> {
+        @Parameters(index = "0", description = "Data directory") String dataFile;
+
+        @Override
+        public Integer call() throws Exception {
+            var store = new PostStore(dataFile);
+            var posts = store.all();
+            System.err.println("Generating article pages for " + posts.size() + " posts...");
+            for (var post : posts) {
+                String date = jsonStr(post, "date");
+                writeArticlePages(post, date);
+            }
+            System.err.println("Done.");
             return 0;
         }
     }
@@ -1463,6 +1484,27 @@ public class DigestHelper implements Runnable {
         return GSON.fromJson(reader, JsonObject.class);
     }
 
+    static final int MAX_SLUG_LENGTH = 60;
+
+    static String slugify(String text) {
+        if (text == null || text.isEmpty()) return text;
+        String slug = StringPaths.slugify(text, false, false).toLowerCase();
+        if (slug.length() > MAX_SLUG_LENGTH) {
+            int cut = slug.lastIndexOf('-', MAX_SLUG_LENGTH);
+            if (cut > 20) slug = slug.substring(0, cut);
+            else slug = slug.substring(0, MAX_SLUG_LENGTH);
+        }
+        return slug;
+    }
+
+    static String uniqueSlug(String slug, Set<String> existing) {
+        if (existing.add(slug)) return slug;
+        for (int i = 2; ; i++) {
+            String candidate = slug + "-" + i;
+            if (existing.add(candidate)) return candidate;
+        }
+    }
+
     static String sanitizeText(String s) {
         if (s == null || s.isEmpty()) return s;
         return Jsoup.clean(s, org.jsoup.safety.Safelist.none()).trim();
@@ -1859,18 +1901,16 @@ public class DigestHelper implements Runnable {
         if (aiMap.isEmpty()) return null;
 
         var section = new JsonObject();
-        String sectionId = feedName.toLowerCase().replaceAll("[^a-z0-9]", "-");
         section.addProperty("name", feedName);
         var sectionArticles = new JsonArray();
+        var usedSlugs = new HashSet<String>();
 
-        int index = 0;
         for (int i = 0; i < articles.size(); i++) {
             var a = articles.get(i).getAsJsonObject();
             var ai = aiMap.get(i + 1);
             if (ai != null && ai.has("skip") && ai.get("skip").getAsBoolean()) continue;
 
-            index++;
-            String id = sectionId + "-" + index;
+            String id = uniqueSlug(slugify(jsonStr(a, "title")), usedSlugs);
             String link = normalizeUrl(sanitizeUrl(jsonStr(a, "link")));
             String image = sanitizeUrl(ai != null && ai.has("image") ? jsonStr(ai, "image") : jsonStr(a, "ogImage"));
             String desc = sanitizeMarkdown(jsonStr(a, "description"));
@@ -1880,7 +1920,7 @@ public class DigestHelper implements Runnable {
         }
 
         section.add("articles", sectionArticles);
-        System.err.println("  Output " + index + " articles for " + feedName);
+        System.err.println("  Output " + sectionArticles.size() + " articles for " + feedName);
         return section;
     }
 
@@ -2167,6 +2207,9 @@ public class DigestHelper implements Runnable {
         System.err.println("  Wrote " + written + " HTML files to " + contentDir);
         int skipped = articles.size() - eligible.size();
         System.err.println("  Skipped " + skipped + " articles (rating < 3)");
+
+        writeArticlePages(post, date);
+
         return complete;
     }
 
@@ -2181,6 +2224,53 @@ public class DigestHelper implements Runnable {
             writeContent(dataDir, date, cacheDir);
         }
         System.err.println("\nDone processing all posts.");
+    }
+
+    static void writeArticlePages(JsonObject post, String date) {
+        String postTitle = jsonStr(post, "title");
+        String postSlug = slugify(postTitle);
+        Path articleDir = Path.of("content/digest-articles/" + postSlug);
+        try {
+            Files.createDirectories(articleDir);
+        } catch (IOException e) {
+            System.err.println("  Failed to create article pages dir: " + e.getMessage());
+            return;
+        }
+        var sections = post.getAsJsonArray("sections");
+        if (sections == null) return;
+        int count = 0;
+        for (var s : sections) {
+            var section = s.getAsJsonObject();
+            var articles = section.getAsJsonArray("articles");
+            if (articles == null) continue;
+            for (var a : articles) {
+                var article = a.getAsJsonObject();
+                String id = jsonStr(article, "id");
+                String title = jsonStr(article, "title");
+                String oneLiner = jsonStr(article, "one-liner");
+                String image = jsonStr(article, "image");
+                if (id.isEmpty() || title.isEmpty()) continue;
+                Path file = articleDir.resolve(id + ".html");
+                var sb = new StringBuilder();
+                sb.append("---\n");
+                sb.append("layout: digest-article\n");
+                sb.append("post-date: \"").append(date).append("\"\n");
+                sb.append("article-id: ").append(id).append("\n");
+                sb.append("title: \"").append(title.replace("\"", "\\\"")).append("\"\n");
+                if (!oneLiner.isEmpty())
+                    sb.append("description: \"").append(oneLiner.replace("\"", "\\\"")).append("\"\n");
+                if (!image.isEmpty())
+                    sb.append("image: ").append(image).append("\n");
+                sb.append("---\n");
+                try {
+                    Files.writeString(file, sb.toString());
+                    count++;
+                } catch (IOException e) {
+                    System.err.println("  Failed to write article page " + id + ": " + e.getMessage());
+                }
+            }
+        }
+        System.err.println("  Wrote " + count + " article pages to " + articleDir);
     }
 
     static void writeHtmlFile(Path dir, String id, String html) {

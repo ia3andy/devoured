@@ -110,6 +110,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const target = articlePage.querySelector('.digest-article[data-article-id="' + articleId + '"]');
     if (!target) return;
 
+    const articleUrl = target.dataset.articleUrl;
+    if (articleUrl) {
+      window.location.replace(articleUrl);
+      return;
+    }
+
     focusArticleId = articleId;
     articlePage.classList.add('is-article-focus');
     target.classList.add('is-focused');
@@ -283,10 +289,16 @@ document.addEventListener('DOMContentLoaded', () => {
     const btn = e.target.closest('.digest-share-btn');
     if (!btn) return;
     if (btn.dataset.shareArticle) {
-      const swipeRoot = document.querySelector('.swipe-page-root');
-      const basePath = swipeRoot ? swipeRoot.dataset.backUrl : window.location.pathname;
-      const base = window.location.origin + basePath;
-      shareUrl(btn.title, base + '?a=' + btn.dataset.shareArticle);
+      const articleEl = btn.closest('.digest-article');
+      const articleUrl = articleEl?.dataset.articleUrl;
+      if (articleUrl) {
+        shareUrl(btn.title, window.location.origin + articleUrl);
+      } else {
+        const swipeRoot = document.querySelector('.swipe-page-root');
+        const basePath = swipeRoot ? swipeRoot.dataset.backUrl : window.location.pathname;
+        const base = window.location.origin + basePath;
+        shareUrl(btn.title, base + '?a=' + btn.dataset.shareArticle);
+      }
     } else {
       shareUrl(document.title, window.location.href.split('?')[0].split('#')[0]);
     }

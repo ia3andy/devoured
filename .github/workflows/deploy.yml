@@ -7,6 +7,10 @@ on:
     workflows: ["Daily Digest"]
     types: [completed]
   workflow_dispatch:
+    inputs:
+      roq-version:
+        description: 'Roq version override (use 999-SNAPSHOT to build from source)'
+        default: ''
 
 jobs:
   build:
@@ -14,11 +18,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0 # Full history for sitemap <lastmod>
+      - name: Setup Java
+        if: ${{ inputs.roq-version == '999-SNAPSHOT' }}
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: 'maven'
+      - name: Build Roq from source
+        if: ${{ inputs.roq-version == '999-SNAPSHOT' }}
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: quarkiverse/quarkus-roq
+          path: quarkus-roq
+      - name: Install Roq snapshot
+        if: ${{ inputs.roq-version == '999-SNAPSHOT' }}
+        working-directory: quarkus-roq
+        run: mvn install -DskipTests -ntp
       - name: Generate Roq Site
         uses: quarkiverse/quarkus-roq@d0bdb4255f4dcc3ddd218c83f9dd19faa823ac31 # v1.1
         with:
+          setup-java: ${{ inputs.roq-version != '999-SNAPSHOT' }}
           java-version: '25'
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          maven-build-args: ${{ inputs.roq-version && format('-Droq.version={0}', inputs.roq-version) || '' }}
   deploy:
     environment:
       name: github-pages
