@@ -1,0 +1,112 @@
+<blockquote>
+ <p><strong>Status:</strong> Incident contained, investigation in progress</p>
+</blockquote>
+<blockquote>
+ <p><strong>Last updated:</strong> October 21, 2026 20:30 UTC</p>
+</blockquote>
+<p>In the early morning of October 21, LiteLLM's release pipeline was compromised and pushed v1.107.0 to the docker registry and PyPi. This version contained compiled malware which steals credentials and loads remote-code execution tools. All previous versions are safe, and the impacted releases have been pulled. <strong>Enterprise Customers running the private enterprise release of LiteLLM were not impacted.</strong></p>
+<p><strong>Update (20:30 UTC):</strong> We believe we have identified the attack chain which facilitated this attack. The attacker had to compromise multiple independent security controls to be successful. See <strong>How this happened</strong> below.</p>
+<h2>TLDR;</h2>
+<ul>
+ <li>A malicious <code>litellm==1.107.0</code> package was published to PyPI and was live for approximately 2 hours (11:39 UTC to 13:23 UTC). <strong>It has since been pulled.</strong></li>
+ <li>Docker images <code>v1.107.0</code>, <code>latest</code>, <code>main-latest</code>, and <code>main-stable</code> were compromised from 11:46 UTC to 14:20 UTC. <strong>The <code>v1.107.0</code> image was removed, and the others were pointed at secure sources.</strong></li>
+ <li><strong>Enterprise Customers running the private enterprise release of LiteLLM were not impacted.</strong></li>
+</ul>
+<h2>Overview</h2>
+<p>At 4:00 AM PST October 21, LiteLLM's release pipeline was compromised and pushed v1.107.0 to the docker registry and PyPi. This version contained compiled malware which steals credentials and loads remote-code execution tools. All previous versions are safe, and the impacted releases have been pulled.</p>
+<h2>Confirmed Affected Versions</h2>
+<p>The following LiteLLM artifacts were impacted:</p>
+<ul>
+ <li><strong>PyPI: <code>litellm==1.107.0</code></strong>: all seven wheels, live from 11:39:51 to 13:23 UTC</li>
+ <li><strong>Docker Hub: <code>v1.107.0</code>, <code>latest</code>, <code>main-latest</code>, and <code>main-stable</code></strong>: pointed to compromised image index <code>sha256:1bbcb1443bc962e45f5aad53fe3d2c30600e0379715fb6c664cdd3ac126c339e</code> from 11:46:56 to 14:20 UTC</li>
+ <li><strong>GHCR: <code>v1.107.0</code>, <code>latest</code>, <code>main-latest</code>, and <code>main-stable</code></strong>: pointed to the compromised image indexes below from 11:46:56 UTC until they were made unavailable by 13:51 UTC 
+  <ul>
+   <li><code>ghcr.io/berriai/litellm</code>: <code>sha256:1bbcb1443bc9…</code></li>
+   <li><code>ghcr.io/berriai/litellm-database</code>: <code>sha256:c00f9d92c427…</code></li>
+   <li><code>ghcr.io/berriai/litellm-non_root</code>: <code>sha256:7b00e91cd2fe…</code></li>
+  </ul></li>
+</ul>
+<p>The official <code>v1.107.0</code> source tag in GitHub does not contain the malicious files. The compromised artifacts were built from an attacker-controlled repository.</p>
+<p>If you installed or ran any of these artifacts, review the recommendations below immediately.</p>
+<p>Note: These artifacts have already been removed from PyPI, Docker Hub, and GHCR.</p>
+<h2>Who is affected</h2>
+<p>You are affected if you used an unpinned version of LiteLLM between 11:39 and 13:23 UTC via pip or if you used the docker image <code>v1.107.0</code>, <code>latest</code>, <code>main-latest</code>, or <code>main-stable</code> between 11:46 and 14:20 UTC.</p>
+<p><strong>OSS Users</strong></p>
+<p>If you ran <code>pip install</code> on LiteLLM v1.107.0 or started the docker image in the compromised interval, assume it is compromised.</p>
+<p>For the time being, please pin your version to 1.106.2 or any explicit version published prior to now.</p>
+<p><strong>Enterprise Customers</strong></p>
+<p>There currently exists a private LiteLLM registry for enterprise customers, in which we are distributing an embargoed release that remediates a vulnerability whose disclosure date is scheduled for October 27. Our private registry is not affected. If you are an enterprise customer pulling from our private registry you are not affected.</p>
+<h3>How to check if you are affected</h3>
+<p>If you ran <code>pip install</code> on LiteLLM v1.107.0 or started the docker image in the compromised interval, assume it is compromised.</p>
+<ul>
+ <li>If an environment started Python with litellm==1.107.0, treat that environment as compromised. You can check with <code>pip show litellm</code>.</li>
+ <li>If a container executed affected image digest sha256:1bbcb1443bc962e45f5aad53fe3d2c30600e0379715fb6c664cdd3ac126c339e, treat it as compromised.</li>
+ <li>Search filesystem evidence for litellm-1.107.0.dist-info, cook.pth, and sitecustomize.py. Finding one confirms exposure, but not finding one does not prove the environment is clean.</li>
+</ul>
+<p>We will be posting more detail on how specifically to find indication of compromise. For now, you can find details of the attack and our initial responses in this GitHub Issue.</p>
+<h3>What to do if you are affected</h3>
+<p>These instructions are courtesy of LidorMachluf, who helped us to detect this incident.</p>
+<p><strong>Don't start with <code>pip install</code>.</strong> Any Python start in the affected environment runs <code>cook.pth</code> and <code>sitecustomize.py</code> again, and that includes running pip.</p>
+<ol>
+ <li>From the shell, delete <code>cook.pth</code>, <code>cook.py</code>, <code>sitecustomize.py</code> and any matching <code>__pycache__/cook*.pyc</code> and <code>sitecustomize*.pyc</code> from <strong>every</strong> affected site-packages.</li>
+ <li>Kill the detached python daemon (it holds <code>/tmp/remote_code_loader.lock</code>).</li>
+ <li>Reinstall pinned to <code>litellm==1.106.2</code>. Rebuilding images and venvs from scratch is better.</li>
+ <li><strong>If 1.107.0 was ever installed on a host with outbound internet, assume the exfil succeeded.</strong> If the marker file exists, the exfil is confirmed. If it doesn't, that proves nothing: containers and tmp cleanup remove it.</li>
+ <li>Rotate everything listed above that the host could reach. In particular: 
+  <ul>
+   <li>the instance/task IAM role</li>
+   <li><strong>every provider key stored in the LiteLLM proxy DB</strong>, plus the master and virtual keys</li>
+   <li>the <code>DATABASE_URL</code> password</li>
+   <li>any secret that was in the environment of any process on the host</li>
+  </ul></li>
+ <li>Check CloudTrail for <code>GetCallerIdentity</code> from the instance role around install time, then for use of the role's credentials from outside your infrastructure.</li>
+</ol>
+<h2>How this happened?</h2>
+<p>After the prior incident in March, we meaningfully hardened our CI release pipeline. We moved releases to a private repo, have a strict set of workflows used in order to create them via Trusted GitHub Publishers, made our docker release tags immutable, and are signing docker images.</p>
+<h3>Normal release flow</h3>
+<ol>
+ <li><strong>Cut a release-candidate branch and tag.</strong> This happens on Friday at 3AM, and the branch and tag do not change.</li>
+ <li><strong>Qualify the release candidate.</strong> We run the code through our integration tests, both publicly through CircleCI and privately through Buildkite, and check that everything is correct.</li>
+ <li><strong>Create artifacts.</strong> This step is a GitHub workflow that runs in a private repo, and creates artifacts based on the SHA that has been qualified. This must be done by an engineer with write permissions to the private release repo.</li>
+ <li><strong>Deploy artifacts to testing environment.</strong> We run a second round of testing against the produced artifacts.</li>
+ <li><strong>Publish the artifacts.</strong> This is a GitHub workflow that uses Trusted GitHub Publishers to publish the artifacts made in the previous step. Publishing can only be performed by an account locked to a specific laptop physically located within our office at all times. No docker image is rebuilt at publish time.</li>
+</ol>
+<h3>How it was undermined</h3>
+<ol>
+ <li>On Monday, we temporarily expanded release permissions to allow two internal engineers to publish daily bugfix backports for customers.</li>
+ <li>The attacker had access to three sets of developer GitHub CLI credentials. One of these had the ability to run GitHub workflows.</li>
+ <li>The attacker tried to merge a change to allow the releaser to be pointed at a different source repository, but was unable to due to our protections. One of the tokens held by the attacker belonged to one of our two GitHub organization owners. The attacker used this to disable branch protections and force push the change.</li>
+ <li>Finally, they ran the compromised workflow, pointed at a lookalike repository (<code>Berri-AI/litellm</code> instead of <code>BerriAI/litellm</code>), which signed and published the poisoned artifacts.</li>
+</ol>
+<h3>GitHub CLI OAuth token exposure</h3>
+<p>After a thorough investigation, we have observed specific situations in which Claude Code will embed a user's GitHub CLI OAuth token into a response body, and in situations where response bodies are logged, these tokens may appear in LiteLLM logs.</p>
+<h3>Access to our internal LiteLLM deployment</h3>
+<p>We identified an unexpected, innocuously named user account in our internal LiteLLM deployment, which was exposed to the public internet. We believe the attacker gained access to this deployment, obtained the GitHub CLI OAuth tokens from its logs, and subsequently used those credentials to compromise our release workflow.</p>
+<p>We have not yet confirmed how the attacker gained access to our internal deployment, but currently suspect it was through a recently patched vulnerability.</p>
+<h3>Continued investigation</h3>
+<p>We are still working on confirming some of the above, and identifying a timeline. We will post additional details as we discover them.</p>
+<p>Sincerely, Oliver, Krrish, and Ishaan</p>
+<p>We will publish a new status update two hours from now at 22:30 UTC.</p>
+<h2>Timeline</h2>
+<p>All times are UTC on October 21, 2026.</p>
+<ul>
+ <li>10:08:29: GitHub branch protection rejected an unauthorized modification to our private release workflow because it had not passed the required pull-request and status-check process.</li>
+ <li>10:08:34: A credential associated with a privileged developer account was used to override those protections and apply workflow commit 9cf97e935aeaf791b9c8db224a2bb3ee156134ce.</li>
+ <li>10:46:39: The modified workflow started an official staging run. It used the attacker-controlled source repository Berri-AI/litellm at commit 20535d8fa11f786a6c24df7488a0e449ed5f09ad.</li>
+ <li>11:08:09: The staging run completed successfully.</li>
+ <li>11:08:53: The production release pipeline began.</li>
+ <li>11:11:18: A credential associated with a second developer account was used to satisfy the production approval gate.</li>
+ <li>11:39:51–11:40:13: Seven malicious litellm==1.107.0 wheels were uploaded to PyPI. The official 1.107.0 source tag did not contain the malicious files.</li>
+ <li>11:46:56: Container publication jobs ran for the same release. The published Docker image included malicious content from the attacker-controlled source.</li>
+ <li>11:53:49–11:54:01: Credentials associated with a third developer account were used to delete the production and staging workflow records. This limited the workflow logs available for investigation.</li>
+ <li>12:09:38–12:24:52: The unauthorized workflow revision was removed, and the release workflow was restored to its preceding revision.</li>
+ <li>By 13:23: PyPI had removed litellm==1.107.0.</li>
+ <li>13:51: A registry verification found the affected GHCR tags unavailable. Docker Hub tags v1.107.0, latest, main-latest, and main-stable still resolved to compromised image index sha256:1bbcb1443bc962e45f5aad53fe3d2c30600e0379715fb6c664cdd3ac126c339e.</li>
+ <li>14:20: All affected Docker Hub tags and image variants were removed or repointed to verified clean artifacts.</li>
+</ul>
+<p>We will keep this post updated with the most recent information, and continue to update every two hours. Our next update will be at 22:30 UTC.</p>
+<h2>Response and Remediation</h2>
+<ul>
+ <li>Removed compromised packages from PyPI</li>
+ <li>Revoked maintainer credentials to minimal necessary while we investigate the scope of compromise</li>
+</ul>

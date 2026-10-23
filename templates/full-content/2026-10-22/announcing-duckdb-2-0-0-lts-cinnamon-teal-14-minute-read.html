@@ -1,0 +1,102 @@
+<h1>Announcing DuckDB 2.0.0 LTS “Cinnamon Teal”</h1>
+<p><em>TL;DR: The DuckDB team is happy to announce that today we're releasing DuckDB version 2.0.0 LTS, codenamed “Cinnamon Teal” (Spatula cyanoptera). This is our biggest feature release so far, and it ships a polished version of the Quack protocol, asynchronous I/O, a first-class <code>VARIANT</code> type, agent mode, triggers, an extensible SQL parser and much more, built from close to 20,000 commits since DuckDB 1.5.</em></p>
+<p>We are proud to release DuckDB 2.0.0, codenamed “Cinnamon Teal” after the <em>Spatula cyanoptera</em>, a strikingly reddish-brown duck found in the western Americas.</p>
+<p>While DuckDB 1.0 was all about stability and backward compatibility, DuckDB 2.0 is above all a feature release. In this blog post, we summarize the highlights and then walk through the breaking changes and how to migrate. We showcased many of the new features in “A Preview of DuckDB v2.0”, which covers each one in more depth. For the complete release notes, see the release page on GitHub.</p>
+<blockquote>
+ <p>Tip: To install the new version, please visit the installation page. Some clients, such as the CLI and Python, are already available. Other client libraries (e.g., R and Rust) and some extensions can take a few days to release due to the extra changes and review rounds required.</p>
+</blockquote>
+<p>With this release, there are currently three DuckDB lines available. DuckDB 2.0 is a long-term support (LTS) release with support until at least October 2027. The previous LTS release, version 1.4, is still supported until November 17, 2026. To ensure a smooth transition and allow sufficient time for testing, we extended the support period of DuckDB 1.5 until March 2027, effectively also turning it into an LTS release.</p>
+<h2>DuckDB as a Server</h2>
+<p>DuckDB has been an in-process database since day one. In DuckDB 1.5.3, released in May, we introduced the Quack protocol that lets you run DuckDB in a traditional client-server setup, along with the <code>quack</code> extension, which implements DuckDB's native protocol, so any DuckDB process can serve its databases.</p>
+<h3>Quack and <code>CONNECT</code></h3>
+<p>DuckDB 2.0.0 ships a polished version of the Quack protocol with substantial performance and stability improvements. It also introduces the new <code>CONNECT</code> statement that allows attaching and switching to a remote database in a single command for better ergonomics:</p>
+<h4>DuckDB server</h4>
+<pre><code>CALL quack_serve(
+    token = 'my_token'
+);
+
+CREATE TABLE events
+    (date DATE, name VARCHAR);
+
+INSERT INTO events VALUES
+    ('2027-04-07',
+     'DuckCon #8');
+</code></pre>
+<h4>DuckDB client</h4>
+<pre><code>ATTACH 'quack:localhost'
+    AS qk (TOKEN 'my_token');
+
+CONNECT qk;
+SELECT * FROM events;
+
+┌────────────┬────────────┐
+│    date    │    name    │
+│    date    │  varchar   │
+├────────────┼────────────┤
+│ 2027-04-07 │ DuckCon #8 │
+└────────────┴────────────┘
+</code></pre>
+<p>For simplicity, this example runs the server and the client on the same machine. By default, the server only listens on <code>localhost</code>. To accept connections from other machines, keep the server on <code>localhost</code> and put it behind a TLS-terminating reverse proxy. The <code>allow_other_hostname</code> option, which exposes the server directly, is only meant for testing.</p>
+<p>The <code>CONNECT</code> statement is not limited to Quack: it points your session at any remote database that supports it, including PostgreSQL and MySQL. For these, the new remote pushdown optimizer ships queries directly to the remote server instead of pulling tables over the wire.</p>
+<h3>Quack in the CLI</h3>
+<p>The CLI also has shortcuts for setting up a Quack client-server pair: the new <code>-serve</code> and <code>-connect</code> arguments start a Quack server or connect to one directly from the command line:</p>
+<h4>CLI server</h4>
+<pre><code>duckdb -serve
+</code></pre>
+<h4>CLI client</h4>
+<pre><code>duckdb -connect
+</code></pre>
+<h2>Performance</h2>
+<h3>Asynchronous I/O</h3>
+<p>DuckDB 2.0 introduces asynchronous I/O for reading Parquet and CSV files, as well as DuckDB's native storage format. The I/O layer now scales independently from the query processing layer, issuing reads in the background and keeping multiple requests in flight. This means far more parallelism for remote reads and dramatically faster queries on object storage such as <code>s3://</code>.</p>
+<h3>The <code>VARIANT</code> Type Becomes a First-Class Citizen</h3>
+<p>The <code>VARIANT</code> type stores semi-structured, schema-less data such as JSON while keeping the performance of columnar execution. So you can think of it as JSON on steroids: a <code>VARIANT</code> column can store differently shaped data in every row, but unlike JSON it is not a text format.</p>
+<p>DuckDB 2.0 detects the common structure in your data and “shreds” it, so it compresses well and executes fast. The pipeline works end to end, from shredded execution straight out of storage to shredded <code>VARIANT</code> reading and writing for Parquet, backed by a family of <code>variant_*</code> functions.</p>
+<h3>Agent Mode in the CLI</h3>
+<p>Coding agents such as Claude Code, Codex and Cursor increasingly drive the DuckDB CLI on their users' behalf. The 2.0 CLI detects when it is being run by an agent and switches to agent mode: it prints compact Markdown tables instead of padded boxes, says clearly when a result was truncated, stops runaway queries early and reports errors as JSON.</p>
+<h2>Extensibility</h2>
+<h3>A Brand New SQL Parser</h3>
+<p>DuckDB has always used a parser derived from PostgreSQL's. In 2.0, our own modern, extensible PEG-based parser, which debuted as an opt-in feature in DuckDB 1.5, becomes the default. Extensions can now hook into the grammar itself, so expect extensions that expose entirely new SQL syntax. Error messages now come with precise source locations. The new parser is designed to be compatible with the old one, apart from a few deliberate changes listed in the migration guide.</p>
+<h3>Write Extensions Once and Host Them Yourself</h3>
+<p>DuckDB 2.0 ships a revamped C API v2, which is considerably more powerful than its predecessor and exposes components such as file systems and table functions to extensions.</p>
+<p>You can also register and host your own trusted extension repositories, so an organization can host and sign its own extensions and have them install and load just like the built-in ones:</p>
+<pre><code>SET allow_extension_repositories = 'allowed';
+
+CREATE EXTENSION REPOSITORY my_repo
+    WITH PREFIX 'https://extensions.example.org';
+
+INSTALL AND LOAD my_ext FROM my_repo;
+</code></pre>
+<h3>Core Extension Updates</h3>
+<ul>
+ <li>We released DuckLake 1.1, including a new specification and reference implementation.</li>
+ <li>The Iceberg extension strives to become a feature-complete implementation.</li>
+ <li>The Delta extension can create Delta tables with <code>CREATE TABLE</code> (including partitioning and Delta table properties), supports time travel and improves <code>VARIANT</code> support.</li>
+</ul>
+<h2>SQL Features</h2>
+<h3>Triggers</h3>
+<p>DuckDB 2.0 delivers triggers: the <code>CREATE TRIGGER</code> statement with <code>BEFORE</code> and <code>AFTER</code> triggers, <code>FOR EACH ROW</code> and <code>FOR EACH STATEMENT</code>, transition tables via <code>REFERENCING OLD/NEW TABLE</code>, multiple triggers per event, <code>RETURNING</code> on triggered tables and <code>DROP TRIGGER</code>.</p>
+<h3>SQL Dialect Additions</h3>
+<ul>
+ <li>The <code>$variable</code> shorthand lets you write <code>$x</code> in most places where an expression is allowed, instead of <code>getvariable('x')</code>.</li>
+ <li>Data-modifying CTEs let you use <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code> and <code>COPY</code> as pipeline steps.</li>
+ <li><code>NEAREST</code> joins turn top-k similarity search into a join clause.</li>
+ <li>Nested schemas allow schemas within schemas, e.g., <code>CREATE SCHEMA finance.reports</code>.</li>
+ <li>JSON mutation functions <code>json_set</code>, <code>json_insert</code>, <code>json_replace</code> and <code>json_remove</code> return modified copies of JSON documents.</li>
+</ul>
+<h2>Migrating to 2.0</h2>
+<p>DuckDB 2.0 comes with a small set of breaking changes. For most users, upgrading is straightforward, but complex deployments running many DuckDB processes need more care. The storage format is the most likely source of problems: DuckDB versions before 2.0 cannot read database files created by DuckDB 2.0.</p>
+<h2>Internals and Deprecations</h2>
+<h3>Compiler Requirements</h3>
+<p>Following DuckDB's long stint on C++11, DuckDB 2.0 now requires a C++17 compiler.</p>
+<h3>Timezones, Calendars and Collations Without ICU</h3>
+<p>Timezone-aware timestamps, calendars and collations have always been powered by the ICU library. In 2.0, the ICU library is gone entirely: the <code>icu</code> extension now implements timezones, calendars and collations itself, with the timezone data built directly from the IANA database.</p>
+<h3>Deprecations</h3>
+<h4>Lambda Syntax</h4>
+<p>The old single-arrow lambda syntax (<code>x -&gt; x + 1</code>) is now disabled by default. Use the Python-style syntax instead.</p>
+<h4>Amalgamation Builds</h4>
+<p>The amalgamation build, which bundles DuckDB's entire source code into a single header and a single source file, is now deprecated.</p>
+<h4>Gradual Phase-Out of macOS x86_64</h4>
+<p>We are gradually phasing out <code>osx_amd64</code> from the list of fully supported platforms. DuckDB 2.1 will stop supporting <code>osx_amd64</code>.</p>
+<h2>Summary</h2>
+<p>These were a few highlights, but there are many more features and improvements in this release. There have been almost 20,000 commits by many contributors since DuckDB 1.5, shipping smaller features as well as performance and usability improvements.</p>

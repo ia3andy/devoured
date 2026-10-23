@@ -1,0 +1,131 @@
+<h1>PyDebeziumAI</h1>
+<blockquote>
+ <p>Real-time CDC Integration for LangChain &amp; LangGraph using Debezium</p>
+</blockquote>
+<p>PyDebeziumAI bridges <strong>Debezium CDC streams</strong> with <strong>LangChain</strong> and <strong>LangGraph</strong>, keeping your vector store automatically in sync with relational database changes — in real time.</p>
+<p><strong>Documentation</strong>: Complete user guides, tutorials, and API reference are available at <a href="https://debezium-ai-python.readthedocs.io/en/latest/">debezium-ai-python.readthedocs.io</a>.</p>
+<h2>Environment &amp; Prerequisites</h2>
+<p>PyDebeziumAI requires Java 17+ for running the embedded Debezium JVM engine. Set your <code>JAVA_HOME</code> environment variable for your operating system:</p>
+<pre><code># Linux
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+
+# macOS
+export JAVA_HOME=$(/usr/libexec/java_home -v17)
+
+# Windows (PowerShell / Command Prompt)
+set JAVA_HOME=C:\Program Files\Java\jdk-17</code></pre>
+<p>Download Debezium engine dependencies using the cross-platform setup script:</p>
+<pre><code>python tools/setup_jars.py</code></pre>
+<h2>Why PyDebeziumAI?</h2>
+<p>Most RAG pipelines go stale because they rely on periodic batch reloads. PyDebeziumAI uses Debezium's Change Data Capture to push every <code>INSERT</code>, <code>UPDATE</code>, and <code>DELETE</code> into your vector store the moment it happens.</p>
+<pre><code>PostgreSQL ──► Debezium CDC ──► PyDebeziumAI ──► Chroma / PGVector / Milvus ──► LangChain RAG</code></pre>
+<h2>Quick Start</h2>
+<pre><code># Install with Chroma + local sentence-transformers embeddings
+pip install 'pydebeziumai[chroma,local-embeddings,debezium]'</code></pre>
+<pre><code>from pydebeziumai import LiveContext
+
+rag = LiveContext(
+    debezium_config=\{
+        "name": "my-pg-connector",
+        "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+        "database.hostname": "localhost",
+        "database.port": "5432",
+        "database.user": "postgres",
+        "database.password": "postgrespassword",
+        "database.dbname": "mydb",
+        "database.server.name": "myserver",
+        "topic.prefix": "myserver",
+        "table.include.list": "public.products",
+        "plugin.name": "pgoutput",
+        "snapshot.mode": "initial",
+    },
+    vector_store="chroma",
+    embedding_model="local",  # uses sentence-transformers, no API key needed
+    id_strategy="table_pk",
+)
+
+# Start real-time sync in the background
+rag.start()
+retriever = rag.as_retriever(search_kwargs=\{"k": 5})
+
+# Use it in any LangChain chain
+docs = retriever.invoke("What products are available under $50?")</code></pre>
+<h3>Offset Checkpoint Replay Behavior</h3>
+<p>On application restart, events processed since the last <code>offset.flush.interval.ms</code> (default 5000ms) checkpoint may be redelivered by the Debezium engine. PyDebeziumAI handles this safely because all writes are idempotent upserts keyed by primary-key document IDs.</p>
+<h2>Features</h2>
+<ul>
+ <li><strong>Real-time sync</strong> — Push-based WAL capture with low-latency delivery (typically ~280–500ms total vector indexing wall-clock time depending on embedding model &amp; vector DB)</li>
+ <li><strong>Deterministic IDs</strong> — same row always maps to same document ID (correct upsert/delete semantics)</li>
+ <li><strong>Pluggable backends</strong> — Chroma, PGVector, Milvus (more coming)</li>
+ <li><strong>Local embeddings</strong> — works offline with <code>sentence-transformers</code>, no API key needed</li>
+ <li><strong>LangGraph support</strong> — reactive CDC-aware agent nodes</li>
+ <li><strong>Schema evolution</strong> — additive columns and nullable changes handled gracefully</li>
+ <li><strong>Retry + DLQ</strong> — exponential backoff and dead-letter queue for reliability</li>
+ <li><strong>Connect mode</strong> — JPype-native SourceRecord for lower latency (no JSON round-trip)</li>
+</ul>
+<h2>Architecture</h2>
+<pre><code>┌─────────────┐    ┌──────────────────┐    ┌──────────────────┐
+│  Debezium   │───►│ IngestionHandler │───►│  DocumentBuilder │
+│  (via       │    │  (JSON / Connect)│    │  (Projection     │
+│  pydbzengine│    └──────────────────┘    │   Policy + ID)   │
+└─────────────┘                            └────────┬─────────┘
+                                                    │
+                    ┌──────────────────┐    ┌───────▼─────────┐
+                    │ LangChain /      │◄───│   SyncManager   │
+                    │ LangGraph        │    │  (upsert/delete │
+                    │ Retriever        │    │   + retry/DLQ)  │
+                    └──────────────────┘    └───────┬─────────┘
+                                                    │
+                                           ┌────────▼─────────┐
+                                           │  VectorStore     │
+                                           │  Adapter         │
+                                           │ (Chroma/PGVector │
+                                           │  /Milvus)        │
+                                           └──────────────────┘</code></pre>
+<h2>Installation</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Extra</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>chroma</code></td>
+   <td>Chroma vector store backend</td>
+  </tr>
+  <tr>
+   <td><code>pgvector</code></td>
+   <td>PostgreSQL PGVector backend</td>
+  </tr>
+  <tr>
+   <td><code>milvus</code></td>
+   <td>Milvus vector store backend</td>
+  </tr>
+  <tr>
+   <td><code>local-embeddings</code></td>
+   <td>sentence-transformers (no API key)</td>
+  </tr>
+  <tr>
+   <td><code>openai</code></td>
+   <td>OpenAI embeddings</td>
+  </tr>
+  <tr>
+   <td><code>langgraph</code></td>
+   <td>LangGraph node support</td>
+  </tr>
+  <tr>
+   <td><code>debezium</code></td>
+   <td>pydbzengine JVM bridge</td>
+  </tr>
+  <tr>
+   <td><code>dev</code></td>
+   <td>All dev/test dependencies</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Contributing</h2>
+<p>Please see CONVENTIONS.md for coding styles, formatting, type check guidelines, and commit sign-off requirements.</p>
+<h2>License</h2>
+<p>Apache 2.0 — see LICENSE.txt</p>
