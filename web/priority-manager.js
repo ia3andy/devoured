@@ -3,7 +3,7 @@ import DigestStorage from './digest-localstorage.js';
 document.addEventListener('DOMContentLoaded', () => {
 
   const container = document.querySelector('.digest-articles');
-  if (!container) return;
+  if (!container || container.hasAttribute('data-article-page')) return;
 
   // --- Migrate old localStorage format ---
   const oldPri = DigestStorage.getLegacyTagPriorities();

@@ -2,7 +2,9 @@ package io.acme;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import io.quarkiverse.roq.frontmatter.runtime.model.DocumentPage;
 import io.quarkiverse.roq.frontmatter.runtime.model.Page;
@@ -161,45 +163,46 @@ public class TemplateExtensions {
         return new RawString(ld.encodePrettily());
     }
 
+    static DigestService digest(Page page) {
+        return io.quarkus.arc.Arc.container().instance(DigestService.class).get();
+    }
+
     static JsonObject findArticle(Page page) {
         if (page.data() == null) return null;
-        String postDate = page.data().getString("post-date", "");
-        String articleId = page.data().getString("article-id", "");
-        if (postDate.isEmpty() || articleId.isEmpty()) return null;
-        var posts = page.site().collections().get("digest-posts");
-        if (posts == null) return null;
-        for (var post : posts) {
-            if (!post.date().format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE).equals(postDate)) continue;
-            var sections = post.data().getJsonArray("sections");
-            if (sections == null) continue;
-            for (int i = 0; i < sections.size(); i++) {
-                var section = sections.getJsonObject(i);
-                var articles = section.getJsonArray("articles");
-                if (articles == null) continue;
-                for (int j = 0; j < articles.size(); j++) {
-                    var article = articles.getJsonObject(j);
-                    if (articleId.equals(article.getString("id", ""))) {
-                        var result = article.copy();
-                        result.put("section", section.getString("name", ""));
-                        return result;
-                    }
-                }
-            }
-        }
-        return null;
+        return digest(page).findArticle(
+                page.data().getString("post-date", ""),
+                page.data().getString("article-id", ""));
     }
 
     static DocumentPage findPost(Page page) {
         if (page.data() == null) return null;
-        String postDate = page.data().getString("post-date", "");
-        if (postDate.isEmpty()) return null;
-        var posts = page.site().collections().get("digest-posts");
-        if (posts == null) return null;
-        for (var post : posts) {
-            if (post.date().format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE).equals(postDate))
-                return post;
-        }
-        return null;
+        return digest(page).findPost(page.data().getString("post-date", ""));
+    }
+
+    static JsonObject prevArticle(Page page) {
+        if (page.data() == null) return null;
+        return digest(page).prevArticle(
+                page.data().getString("post-date", ""),
+                page.data().getString("article-id", ""));
+    }
+
+    static JsonObject nextArticle(Page page) {
+        if (page.data() == null) return null;
+        return digest(page).nextArticle(
+                page.data().getString("post-date", ""),
+                page.data().getString("article-id", ""));
+    }
+
+    static int articleCount(Page page) {
+        if (page.data() == null) return 0;
+        return digest(page).articleCount(page.data().getString("post-date", ""));
+    }
+
+    static String articleSection(Page page) {
+        if (page.data() == null) return "";
+        return digest(page).findSection(
+                page.data().getString("post-date", ""),
+                page.data().getString("article-id", ""));
     }
 
     static RawString articleJsonLd(Page page) {
