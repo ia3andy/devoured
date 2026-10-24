@@ -1,0 +1,56 @@
+<h1>I don't trust ON DELETE CASCADE</h1>
+<p>Postgres <code>ON DELETE CASCADE</code> is very tempting to use at first. Fully integrity checked, atomic deletion of your data. You don't need to write any application code to clean up related rows, you simply set up your foreign keys, then issue a single <code>DELETE</code> statement, Postgres takes care of the rest.</p>
+<p>What could be simpler?</p>
+<pre><code>CREATE TABLE customer_organizations (
+    id SERIAL PRIMARY KEY,
+    name text NOT NULL
+);
+CREATE TABLE customer_users (
+    id SERIAL PRIMARY KEY,
+    name text NOT NULL,
+    organization_id INT NOT NULL,
+    FOREIGN KEY(organization_id)
+       REFERENCES customer_organizations(id)
+       ON DELETE CASCADE
+);
+</code></pre>
+<h2>How cascades grow</h2>
+<p>Over time, your application grows, you add more tables, all doing a <code>ON DELETE CASCADE</code> pointing at <code>customer_organizations</code>. To keep the simplicity of <code>ON DELETE CASCADE</code>, you even have this happening recursively - tables that point at tables that point at tables, all doing <code>ON DELETE CASCADE</code>. Your application doesn't need to think about the relationship tree when deleting, it just picks the record to delete (an organization, a user etc etc) and Postgres takes care of things.</p>
+<h2>Cascade plus migration equals outage</h2>
+<p>Then one day, you get paged. Your production database is not responding properly, nearly all writes to most of your tables are timing out, and your customers are complaining. The cause: very large <code>ON DELETE CASCADE</code> interacting with a simple, innocent schema change adding a column to one of your tables.</p>
+<p>Let's dig in to what happened:</p>
+<p>When Postgres processes a delete that causes a cascading delete like this, it has to issue a <code>DELETE</code> for matching rows, generating dead tuples, index updates and WAL, all in one transaction. While doing that, it holds <code>RowExclusiveLock</code> on every table involved. Your simple migration (e.g. adding a nullable text column to one of the tables involved) requests <code>AccessExclusiveLock</code>. The <code>AccessExclusiveLock</code> then blocks subsequent <code>INSERT</code> behind it.</p>
+<p><em>The <code>ALTER TABLE</code> can't start until the cascading <code>DELETE</code> finishes, so every new query on <code>customer_users</code> piles up behind it.</em></p>
+<p>You can work around this by setting a short <code>lock_timeout</code> on your migrations, and retrying them - instead of breaking things, your migration gets retried until there's a period where it can work.</p>
+<p>But that <code>DELETE CASCADE</code> causes other problems. In larger environments we've seen hundreds of gigabytes of WAL written by a single transaction, leaving other transactions waiting behind synchronous replication.</p>
+<h2>Unindexed foreign keys</h2>
+<p>There's an even worse failure mode that can happen with <code>ON DELETE CASCADE</code> - unindexed foreign keys. Typically in Postgres, you index your foreign keys, so lookups are fast. This also means <code>ON DELETE CASCADE</code> can use those indexes to find relevant rows. But, applications can sometimes miss this, leading to full table seq scans during single row deletes, a very confusing performance situation, and a bad one.</p>
+<h2>Cascades and logical replication</h2>
+<p>Built-in Postgres logical replication (a publisher streaming row changes to subscribers) adds another surprise.</p>
+<p>On the publisher, deleting org 42 shows up as one transaction of ordinary row deletes: org, then users, then grandchildren. On the subscriber, the apply worker (the process replaying those changes) runs with <code>session_replication_role = replica</code>, which by default skips the internal triggers that check foreign keys and run their cascades. Replicated changes get neither checks nor cascades unless you enable those triggers for replica sessions.</p>
+<p>That's deliberate: the publisher already sent the child deletes. Any child row whose delete isn't replicated is left orphaned once its parent disappears, still pointing at a row that's gone.</p>
+<p>Give a subscriber its own table:</p>
+<pre><code>-- only on the subscriber
+CREATE TABLE user_activity_rollups (
+    user_id INT PRIMARY KEY REFERENCES customer_users(id) ON DELETE CASCADE,
+    events_last_30d bigint
+);
+</code></pre>
+<p>Delete org 42 on the publisher: org 42's users vanish from the subscriber, but their rollup rows don't. No error, no warning, only a violated foreign key. A hand-picked table list that skips a child does the same.</p>
+<p>The publisher has a trap too. A table needs a usable replica identity (how subscribers find the row, by default its primary key) to publish deletes.</p>
+<p>A publication selects which tables and changes to replicate. Put <code>user_sessions(user_id, token)</code>, a cascade child of <code>customer_users</code> with no primary key and the default replica identity, in one that includes deletes. Now deleting an org with users fails, even when those users have no sessions:</p>
+<pre><code>DELETE FROM customer_organizations WHERE id = 43;
+ERROR:  cannot delete from table "user_sessions" because it does not have a replica identity and publishes deletes
+HINT:  To enable deleting from the table, set REPLICA IDENTITY using ALTER TABLE.
+</code></pre>
+<p>If you cascade and replicate, publish and subscribe to the whole foreign key tree on the publisher: <code>FOR ALL TABLES</code> publishes every table in the database, and <code>FOR TABLES IN SCHEMA</code> (Postgres 15+) publishes whole schemas, so list every relevant one. Subscriber-only children need separate cleanup. An orphan check tells you what slipped through.</p>
+<p>Or shrink the problem with a soft delete: marking the org deleted replicates as a one-row <code>UPDATE</code>, and the real deletes come later, in batches you control.</p>
+<h2>Soft deletes are the better alternative</h2>
+<p>A competing (and I'd argue much better in many ways) approach for doing customer data deletion, especially at scale is soft deletes. Instead of having to synchronously delete millions of rows in one transaction (and replicate every one of them you publish), you update a single row:</p>
+<pre><code>UPDATE customer_organizations SET deleted_at = now() WHERE id = 42;
+</code></pre>
+<p>This requires more up-front work - in your application code, reads (even to child tables) have to check <code>deleted_at</code> on relevant rows. Soft deletes can also help with restoring customer data after accidental deletion. Then later on, you also will want code that runs real <code>DELETE</code> on rows impacted (potentially after a timeout, e.g. keep deleted rows for 30 days, or more depending on business requirements). With soft deletes, this background "reaping" of dead rows can happen more slowly, at times of low customer traffic, and carefully batch to ensure transactions remain fast. One neat trick you can also do is vacuum after batched deletes finish, marking the space as reusable.</p>
+<p><em>Each batched <code>DELETE</code> finishes quickly, so the <code>ALTER TABLE</code> and the queries behind it only wait for a moment before everything flows again.</em></p>
+<p>The result is a design that scales to very large customers, keeping logical deletes fast, bounding transaction size and giving you more flexibility.</p>
+<h2>Keep transactions short and bounded</h2>
+<p>Ultimately this is a subset of general high-scale OLTP database design: keep your transactions short, small and bounded in what they do. Single transactions should touch small numbers of rows (hundreds to low thousands is a great starting point, and often far fewer, but tune for your workloads).</p>

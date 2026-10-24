@@ -1,0 +1,129 @@
+<p>TL;DR: I fine-tuned a 360M-parameter language model to act as a terminal. There's no shell or filesystem behind it: every keypress goes in, and the model predicts how the screen changes. It can create files, run vim and tmux, play snake, and usually remembers what you wrote a few commands later. The biggest wins were teaching it to repair its own mistakes and decoding screen rows in parallel.</p>
+<p>The demo is designed for a desktop browser with WebGPU and a physical keyboard. Chrome or Edge is the best place to try it. It should work on a modern phone, but painfully slowly.</p>
+<p>When I first saw Genie 3 last year, I started imagining a future where applications aren't written in code but learned. Instead of a game engine rendering the scene, a model predicts the next most likely frame from the user's inputs.</p>
+<p>Naturally I wanted to train my own world model. But I don't have a massive GPU cluster or a pile of video data, so I scaled down my ambition: instead of a game world, a terminal.</p>
+<p>A terminal turned out to be a good fit. It's just a grid of characters rather than pixels, and I can generate as much perfectly labelled training data as I want by running real shells. A pretrained language model also already has a pretty good idea of what <code>ls</code> or <code>cat</code> should print.</p>
+<p>What I really wanted to know was whether it could maintain a consistent world, or just generate convincing terminal output.</p>
+<p>The final model is based on Qwen2.5-Coder-0.5B, fine-tuned on terminal sessions recorded from real programs running inside Docker.</p>
+<h2>How it sees a terminal</h2>
+<p>Standard LLMs take a prompt and then append tokens to the end, one at a time. That doesn't map well to a terminal. A single keypress can do something on its own, like <code>esc</code> in vim, and output doesn't always go to the bottom: <code>clear</code> wipes the screen and sends the cursor back to the top. So instead of predicting a stream of text, I need to predict changes to the screen.</p>
+<p>I treat the terminal as a grid of characters, one per cell. The model doesn't see the grid directly, but a sequence of tokens describing its contents and the changes made to it.</p>
+<h3>A session</h3>
+<p>Every session starts with a snapshot: the screen size, its contents and where the cursor is.</p>
+<p>The size is part of the input, not fixed at 32×96. In the demo, you can set the rows and columns when creating a custom starting screen.</p>
+<pre><code>BOS SCREEN_START 32 96
+ROW_0 0 'simedw@laptop:~$ '
+CURSOR 0 17 1
+SCREEN_END
+</code></pre>
+<p>This also lets me start partway through an application. Give it a bash prompt, vim buffer or a game of snake, and the model tries to continue from there.</p>
+<p>After that, each keypress goes in as the raw bytes a real terminal would send. Letters are themselves, Enter is <code>\r</code>, Escape is <code>0x1b</code> and ← is <code>ESC [ D</code> and so on.</p>
+<pre><code>INPUT_START 'l' INPUT_END
+</code></pre>
+<p>The model answers with which rows to rewrite and where the cursor ends up:</p>
+<pre><code>OUTPUT_START
+ROW_0 17 'l'
+CURSOR 0 18 1
+OUTPUT_END
+</code></pre>
+<p>In words: on row 0, starting at column 17, write <code>l</code>, then move the cursor to row 0, column 18. The last <code>1</code> means the cursor is visible, since full-screen apps sometimes hide it.</p>
+<p>Nothing gets cleared first. New characters are simply drawn over the old ones.</p>
+<p>I didn't need new tokens for characters. Qwen already has tokens for all 256 byte values, which I reuse for characters, coordinates and other small numbers. So a coordinate like 17 takes one token, not two.</p>
+<p>Time is an input too. If nothing is pressed, the model gets a WAIT token with a duration instead of a key, which is how snake keeps moving on its own.</p>
+<h3>Copying rows</h3>
+<p>When you reach the bottom of the terminal window and press enter, every line has to move up by one. I could just ask the model to output every row again in its new place, but that's around 3,000 tokens for a single keypress.</p>
+<p>So I added a <code>COPY</code> operation instead:</p>
+<pre><code>ROW_0 COPY 1
+ROW_1 COPY 2  
+ROW_2 COPY 3
+...
+</code></pre>
+<p>Each operation copies a row from the previous screen. In this example, the old row 1 becomes row 0, row 2 becomes row 1, and so on.</p>
+<p>A scroll now costs three tokens per row instead of roughly 96.</p>
+<p>The same trick covers clearing the screen, inserting and deleting lines in vim, and navigating man pages. You can also copy a row and then overwrite part of it.</p>
+<p>Altogether, the model uses a tiny vocabulary of 333 tokens: 256 byte tokens, 64 row tokens and a handful of special operations. Decoding is grammar-constrained, so every prediction is a valid screen update.</p>
+<h2>Generating the training data</h2>
+<p>I initially looked for existing datasets of terminal recordings, including asciinema, but couldn't find one with the precise keystroke-to-screen alignment I needed. Luckily it wasn't too hard to create my own.</p>
+<p>The basic idea was to generate believable terminal sessions by running real commands inside Docker containers, recording every keypress and the screen after each one.</p>
+<p>The synthetic recipe was:</p>
+<ol>
+ <li>Randomize usernames, hostnames, prompt styles, terminal sizes.</li>
+ <li>Randomize directories and files based on a fictional persona (developer, sysadmin, etc.).</li>
+ <li>Pick 6–24 weighted activities (modify files, vim, python, tmux, etc.).</li>
+ <li>Track state, so sessions mostly open files that exist.</li>
+ <li>Type like a person: one keypress at a time, with tab completion etc. I set the typo rate to 1.2%, which is generous to me.</li>
+ <li>35% of sessions start partway through, forcing the model to learn to work from any state.</li>
+</ol>
+<p>The terminal size was mostly 32×96, with some 24×80 and 40×120, so the model doesn't overfit to one size.</p>
+<p>I kept expanding the dataset as the model became more capable, and finally landed on 336k episodes, which corresponds to roughly 2B tokens. For comparison, the base model saw around 18T tokens during training.</p>
+<h2>Training</h2>
+<p>I used Qwen2.5-Coder-0.5B as the starting point. I needed a small model to get close to realtime performance. Being a coding model, it had also already seen plenty of CLI usage.</p>
+<p>I started off by doing straightforward supervised fine-tuning: give a screen history and a keypress, predict the screen delta produced by the real terminal.</p>
+<p>Ordinary typing was learned quickly: a letter appears, backspace removes it, the cursor moves.</p>
+<p>In longer sessions, though, errors started to compound: a mistake in a filename propagated through the rest of the session.</p>
+<h3>Learning from its own mistakes</h3>
+<p>To address this I took a page from DAgger, where a model learns from the states it visits rather than just the ideal demonstrations.</p>
+<p>For each training example:</p>
+<ol>
+ <li>Pick a point in a recorded session, usually close to the command that produces the output.</li>
+ <li>Let the model predict the next 1-4 events.</li>
+ <li>Compare the resulting screen with the real recorded screen.</li>
+ <li>If the difference is small enough, construct a correction that repairs the model's screen on the next keypress.</li>
+ <li>Continue training on the corrected frame and a few subsequent real events.</li>
+</ol>
+<p>The delta takes the model's incorrect screen to the correct next screen. In essence, it learns to "repair" its own mistakes.</p>
+<p>There's one important restriction: the model must have enough information to infer the correction. Any words introduced by a correction must have appeared on an earlier real screen or in the user's typing, not just in the model's own predictions.</p>
+<p>Self-correction was one of the more effective training changes.</p>
+<p>In total, training the model and its later refinements took roughly 75 GPU-hours on an RTX 4090.</p>
+<h3>Testing</h3>
+<p>I use three tests. <strong>ShellBench</strong> has 106 commands across 24 handwritten bash sessions, scored by exact output. <strong>PresetBench</strong> has 47 scripted cases drawn from failures I hit in the demo. Neither test appears in the training data.</p>
+<p>The <strong>memory test</strong> has 32 worlds. Each writes two random values to two files, then reads them back in separate sessions. A world passes only if both readbacks are exact, giving 64 readbacks overall.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Model</th>
+   <th>ShellBench /106</th>
+   <th>File readbacks /13</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Qwen2.5-Coder-0.5B, prompted</td>
+   <td>52</td>
+   <td>2</td>
+  </tr>
+  <tr>
+   <td>Qwen3-0.6B, prompted</td>
+   <td>60</td>
+   <td>3</td>
+  </tr>
+  <tr>
+   <td>WorldTUI</td>
+   <td>80</td>
+   <td>9</td>
+  </tr>
+ </tbody>
+</table>
+<p>The biggest difference was memory: WorldTUI got 9/13 readbacks right, compared with 2/13 and 3/13 for the prompted models.</p>
+<h2>Making it fast</h2>
+<p>For a while I stayed away from autoregressive models altogether. A full redraw is around 3,000 tokens, and generating those one at a time seemed hopeless for something that's supposed to feel like a terminal.</p>
+<h3>Rows in parallel</h3>
+<p>What I'd missed was that most rows in a frame don't depend on each other, so there's no reason to generate them one after another. I run one batch element per row. Each gets the same previous history (including KV cache) but generates only its own update.</p>
+<p>That changes the decoding cost from the sum of all rows, up to 3,000 steps, to the length of the longest row, roughly 100 steps.</p>
+<p>This required a matching attention mask during training, but the speed improvement was worth it. Large-frame p95 latency dropped from 6.7 s to 0.87 s.</p>
+<h3>Rows that can't talk to each other</h3>
+<p>The solution was speculative decoding. Normally speculative decoding uses a small model to draft tokens and a larger model to verify them. Here I use the same model for both: the parallel rows produce a draft, which the model then verifies sequentially.</p>
+<h2>Making it smaller</h2>
+<p>I started with Qwen2.5-Coder-0.5B, which has roughly 494M parameters. I really wanted a web demo, so I needed to shrink it. The embedding table for its 151,936-token vocabulary is 136M parameters. I only need my 333 tokens, so I can drop almost all of it, which takes the model from 494M to about 360M parameters.</p>
+<p>I then quantized it to int4, which brought it to 208 MB.</p>
+<p>The browser demo uses a custom JavaScript implementation of the Qwen decoder, with compute shaders written in WGSL and run through WebGPU.</p>
+<h2>What it can do</h2>
+<p>Generating a convincing directory listing is easy. What I wanted was to create a file, edit it, wander off, and come back to find it unchanged.</p>
+<p>In vim, it handles the mode switch on <code>esc</code> and lets me save, quit or go back into insert mode.</p>
+<p>What really blew my mind was tmux: I can create multiple panes, do various things in each and jump between them.</p>
+<h2>What doesn't work</h2>
+<p>I didn't allow the Docker containers internet access, so tools like lynx are fairly boring. Python can handle very simple operations, but anything harder produces answers that remind me of GPT-3-era hallucinations.</p>
+<p>Sometimes, when I create nested directories, it gets lost and all of a sudden I'm in a different path. There's clearly a lot of room to improve consistency.</p>
+<h2>Summary</h2>
+<p>I had a blast building this. Is it useful? Not really. But for a 360M-parameter model running in a browser tab, it's far better than I expected.</p>
+<p>What interests me most is that it manages to maintain a somewhat consistent world without implementing any of the rules underneath.</p>
