@@ -1,0 +1,144 @@
+<h1>Shard design doesn't start from your tables</h1>
+<p>Previously, in The lifecycle of a sharded Postgres query, the router had to join <code>customers</code> and <code>orders</code> itself, because each table was sharded by its own ID. The fix was to shard <code>orders</code> by <code>customer_id</code>, hashed and mapped the same way as <code>customers</code>. In Neki, that fix is called a "shard group."</p>
+<p>Sharding splits a table's rows across multiple Postgres clusters, called shards. Each shard holds one subset of the table. For the best performance, you want most of your queries to touch a single shard. Then the Neki router does not have to fan out to multiple shards to collect and aggregate results. To do this, you place all related rows on the same shard, so that joins and transactions stay local.</p>
+<p>Neki gives you powerful options to do this with <strong>shard groups</strong>. A shard group is the unit of co-location in Neki. When two tables belong to the same shard group and hash their shard keys the same way, rows with the same key value always land on the same shard.</p>
+<p>Shard groups are worth thinking through when you migrate to Neki, because they decide which queries stay on one shard. But keep in mind, they aren't permanent. The Reshard workflow allows you to change a table's shard key or shard count later, which you'll likely need to do as your queries evolve. In this post, we walk through how to design them, extending the storefront example from the earlier post.</p>
+<p>Let's start with a data topology snippet that fully describes the sharding scheme of the storefront. You may want to refer to our earlier post, What is a data topology?</p>
+<h2>Co-locating related tables</h2>
+<pre><code>\{
+  "shard_indexes": \{
+    "by_customer": \{ "type": "xxhash", "columns": ["customer_id"] }
+  },
+  "shard_groups": [
+    \{
+      "uid": "customer_data",
+      "default_shard_index": "by_customer",
+      "key_ranges": [
+        \{ "shard_uid": "store-1", "end": "80" },
+        \{ "shard_uid": "store-2", "start": "80" }
+      ]
+    }
+  ],
+  "databases": \{
+    "store": \{
+      "default_shard_group": "customer_data",
+      "schemas": \{
+        "public": \{
+          "tables": \{
+            "customers": \{ "primary_indexes": [\{ "columns": ["id"] }] }
+          }
+        }
+      }
+    }
+  }
+}
+</code></pre>
+<p>The <code>customer_data</code> shard group has two key elements.</p>
+<p>First, it defines a default shard index. <code>by_customer</code> says that tables in this shard group have a <code>customer_id</code> column. Neki takes the value in that column and hashes it. <code>xxhash</code> maps a number, in this case a specific <code>customer_id</code>, into a 64-bit keyspace.</p>
+<p>Second, the shard group's <code>key_ranges</code> split that keyspace across physical Postgres clusters, the shards. Each shard holds one section of the 64-bit space. Here we split the range in two, and the hash decides whether a row goes to <code>store-1</code> or <code>store-2</code>.</p>
+<p>We can now apply this shard group to the tables in our database. Say our <code>store</code> database has the tables <code>customers</code>, <code>orders</code>, <code>items</code>, and <code>addresses</code>. Usually, the primary key of <code>customers</code> is <code>id</code>, and the other tables refer to the customer in their <code>customer_id</code> column.</p>
+<p>The default shard index already uses the <code>customer_id</code> column as the shard key. But we need a special case for <code>customers</code>. Neki lets you inherit the default index but use a different column, <code>id</code>. As a result, all of a customer's orders, items, and addresses are on a single shard. Common queries and transactions for a single customer or a single order never leave the shard.</p>
+<p>This matters for more than speed. A transaction that stays on one shard keeps full Postgres semantics. A transaction that reaches two shards does not: Neki commits each shard separately, with no atomic commit and no shared snapshot.</p>
+<h2>Reference tables</h2>
+<p>Some tables, such as lookup tables, appear in many queries but are not specific to a customer. For example: <code>countries</code>, <code>states</code>, <code>currencies</code>, and <code>tax_rates</code>. If we place these tables on one of the two shards, or on a third shard, many queries become cross-shard.</p>
+<p>Neki lets you declare these as reference tables. Each shard in the shard groups you list then holds a full copy of the table. The MoveTables workflow loads the initial copies. After that, the Neki router sends every insert, update, and delete to all copies, so they stay in sync. A join between a sharded table and a reference table never leaves the shard.</p>
+<pre><code>"reference_tables": \{
+  "countries":  \{ "shard_groups": ["customer_data"] },
+  "currencies": \{ "shard_groups": ["customer_data"] }
+}
+</code></pre>
+<h2>Differently sharded tables</h2>
+<p>Storefronts also have product catalogs, with tables like <code>products</code>, <code>inventory</code>, and <code>prices</code>. The natural key for these tables is a SKU, so we want to co-locate all rows that relate to a SKU. We also want to reuse the same shards. The snippet below adds a new shard group to our data topology:</p>
+<pre><code>"shard_indexes": \{
+  "by_customer": \{ "type": "xxhash", "columns": ["customer_id"] },
+  "by_sku":      \{ "type": "xxhash", "columns": ["lower(sku)"] }
+},
+"shard_groups": [
+  \{ "uid": "main", "key_ranges": [\{ "shard_uid": "store-1" }] },
+  \{
+    "uid": "customer_data",
+    "default_shard_index": "by_customer",
+    "key_ranges": [
+      \{ "shard_uid": "store-1", "end": "80" },
+      \{ "shard_uid": "store-2", "start": "80" }
+    ]
+  },
+  \{
+    "uid": "catalog",
+    "default_shard_index": "by_sku",
+    "key_ranges": [
+      \{ "shard_uid": "store-1", "end": "80" },
+      \{ "shard_uid": "store-2", "start": "80" }
+    ]
+  }
+]
+</code></pre>
+<p>The <code>main</code> group is the single-shard home for database-wide metadata, such as sequences and schema information. Every data topology names one shard group as its authoritative shard group.</p>
+<p>Note that the two shard groups do not have to share shards. It is just economical in our case. If the number of customers and orders grows significantly, we can give the catalog two small shards and the customer data eight big shards, for example. As we will see later, Neki makes it easy to split and merge shards in a shard group.</p>
+<h3>SQL expressions in shard indexes</h3>
+<p>In the example above, <code>by_sku</code> hashes <code>lower(sku)</code>, not <code>sku</code>. This allows SKUs in mixed case, which often appear when catalogs come from different vendors. <code>AB-1042</code> and <code>ab-1042</code> both map to the same shard.</p>
+<p>Another common example is an application that encodes a store ID as part of an order ID. You can specify this as <code>"columns": ["left(order_id, 4)"]</code>. Then <code>4711-00093821</code> maps to store <code>4711</code>, and all orders for a store are co-located on the same shard.</p>
+<h2>Beyond xxhash</h2>
+<p><code>xxhash</code> is the recommended sharding algorithm. It distributes rows uniformly across the 64-bit keyspace.</p>
+<p>Neki also supports two other index types. They are less common, but some applications already shard their data this way, and these types let those applications move to Neki seamlessly.</p>
+<p>The first is <code>range</code>, which routes an integer key range directly to shards. For example, a system can allot merchant IDs based on geographical location. Here, merchant IDs 0 to 10,000 (hex <code>0000</code> to <code>2710</code>) go to <code>eu-1</code>, and IDs 10,000 to 20,000 (hex <code>2710</code> to <code>4e20</code>) go to <code>us-1</code>:</p>
+<pre><code>"shard_indexes": \{
+  "by_merchant": \{ "type": "range", "columns": ["merchant_id"] }
+},
+"shard_groups": [\{
+  "uid": "merchants",
+  "default_shard_index": "by_merchant",
+  "key_ranges": [
+    \{ "shard_uid": "eu-1", "start": "0000", "end": "2710" },
+    \{ "shard_uid": "us-1", "start": "2710", "end": "4e20" }
+  ]
+}]
+</code></pre>
+<p>The second is <code>modulo</code>, a pattern common in many sharding textbooks. <code>modulo</code> maps an integer key to a fixed number of buckets with <code>value % modulus</code>. Placement is predictable, but a change to the modulus moves nearly every row. For that reason, we do not recommend it for most systems at scale.</p>
+<pre><code>"shard_indexes": \{
+  "by_region": \{ "type": "modulo", "columns": ["region_id"], "index_params": \{ "modulus": "4" } }
+},
+"shard_groups": [\{
+  "uid": "regions",
+  "default_shard_index": "by_region",
+  "key_ranges": [
+    \{ "shard_uid": "store-1", "start": "00", "end": "02" },
+    \{ "shard_uid": "store-2", "start": "02", "end": "04" }
+  ]
+}]
+</code></pre>
+<h2>Queries without shard keys</h2>
+<p>In our example, say support gets a ticket about a specific order. A query like <code>SELECT * FROM orders WHERE id = 84213;</code> fans out to every shard, because Neki hashes <code>orders</code> on <code>customer_id</code>. Neki supports this query pattern with a global secondary index (GSI).</p>
+<p>A GSI is a lookup table that Neki maintains. It maps one or more columns of a table to that table's shard key. In our case, we define it in the data topology like this:</p>
+<pre><code>"global_secondary_indexes": \{
+  "orders_id_idx": \{
+    "table": "orders_id_lookup",
+    "owner_table": "orders",
+    "columns": ["id"],
+    "owner_sk_columns": ["customer_id"],
+    "unique": true,
+    "enabled": true
+  }
+}
+</code></pre>
+<p>The lookup table is an ordinary Postgres table. It needs its own shard index on the order id, and a table entry that uses it:</p>
+<pre><code>"shard_indexes": \{
+  "by_order_id": \{ "type": "xxhash", "columns": ["id"] }
+},
+"orders_id_lookup": \{ "primary_indexes": [\{ "shard_index": "by_order_id" }] }
+</code></pre>
+<p>The <code>orders</code> table also names the GSI. This switches the GSI on for reads and writes on <code>orders</code>:</p>
+<pre><code>"orders": \{ "secondary_indexes": [\{ "name": "orders_id_idx", "columns": ["id"] }] }
+</code></pre>
+<p>Now <code>id = 84213</code> costs two single-shard reads. The first read gets the lookup table row, which gives us the <code>customer_id</code>. The second read gets the actual row from <code>orders</code>, with both the <code>customer_id</code> and the order <code>id</code>.</p>
+<p>Neki writes the lookup row in the same request as the <code>orders</code> row. Here, <code>orders</code> is the owner of the lookup table. Only DML statements on <code>orders</code> change the lookup table.</p>
+<p>If <code>orders</code> already has rows, a Neki workflow backfills the lookup table before you enable the GSI.</p>
+<h2>Changing data placement</h2>
+<p>Neki workflows change where your data lives. Use them to shard an unsharded table, to change the number of shards, or to change the shard key.</p>
+<p>The MoveTables workflow imports your external Postgres databases into Neki and can shard them in the process. The Reshard workflow changes the shard key or the number of shards.</p>
+<h2>Putting it all together</h2>
+<p>With all the concepts above, the final data topology for our example looks something like this:</p>
+<p>Shard group design starts from your queries, not your tables. Find the key that your most important queries and transactions share, and put every table that carries that key in one group.</p>
+<h2>Need help designing your shard groups?</h2>
+<p>It can be difficult to find a good sharding strategy for your data shapes and query patterns. PlanetScale can help. We have tools that you run in your environment. They examine your live schemas and query logs and give you suggestions.</p>
+<p>Contact us to get help designing your data topology, or sign up for a PlanetScale account to start using Neki today.</p>

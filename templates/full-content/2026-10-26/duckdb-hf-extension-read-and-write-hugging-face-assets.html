@@ -1,0 +1,223 @@
+<h2>DuckDB <code>hf</code> extension — read <em>and</em> write Hugging Face assets with <code>hf://</code></h2>
+<p>A native C++ DuckDB extension to read/write to <code>hf://</code> buckets, datasets, etc.</p>
+<ul>
+ <li><strong>Read</strong>: using the Hub's <code>/resolve/</code> endpoints (range requests + a shared read-ahead cache);</li>
+ <li><strong>Write</strong>: using the Hub's commit API (same as <code>huggingface_hub</code>) and <a href="https://huggingface.co/docs/hub/en/xet/index">Xet</a> for efficient uploads via deduplication.</li>
+ <li>Targets <strong>DuckDB 2.0.0</strong> (<code>v2.0.0</code>, <em>Cyanoptera</em>).</li>
+ <li>Published at <a href="https://hf.co/duckdb-extensions">hf.co/duckdb-extensions</a>.</li>
+</ul>
+<pre><code>INSTALL hf FROM hf_repo; LOAD hf FROM hf_repo;   -- one-time setup: see Installation
+
+SELECT * FROM 'hf://datasets/lhoestq/demo1/*.parquet';
+SELECT * FROM hf_ls('hf://datasets/lhoestq/demo1');
+COPY (SELECT * FROM range(10) t(i)) TO 'hf://datasets/me/demo/out.parquet';
+COPY (SELECT * FROM read_parquet('hf://datasets/me/demo/*.parquet'))
+  TO 'hf://datasets/me/demo/partitioned' (FORMAT PARQUET, PARTITION_BY (kind));</code></pre>
+<h2>Installation</h2>
+<p>Make sure you are using DuckDB 2.0:</p>
+<pre><code>SELECT version();   -- v2.0.0        &lt;- the identifier, and the directory name a repository serves;
+                                     --   a pre-2.0 client answers v2.0.0-alpha47600 instead, and wants
+                                     --   a different binary: one directory per identifier is the mapping
+PRAGMA platform;    -- linux_arm64         &lt;- one of linux_amd64, linux_arm64, osx_amd64, osx_arm64,
+                                            --   windows_amd64, windows_amd64_mingw,
+                                            --   linux_amd64_musl, linux_arm64_musl</code></pre>
+<p>Install the extension:</p>
+<ul>
+ <li>in DuckDB CLI:</li>
+</ul>
+<pre><code>SET allow_extension_repositories = 'allowed';   -- the gate for adding *and* installing from a repository
+CREATE OR REPLACE EXTENSION REPOSITORY hf_repo
+  WITH PREFIX 'https://hf.co/buckets/duckdb-extensions/builds/resolve';
+INSTALL hf FROM hf_repo;</code></pre>
+<ul>
+ <li>in Python:</li>
+</ul>
+<pre><code>import duckdb
+con = duckdb.connect(config=\{"allow_extension_repositories": "allowed"})
+con.execute("CREATE OR REPLACE EXTENSION REPOSITORY hf_repo WITH PREFIX "
+            "'https://hf.co/buckets/duckdb-extensions/builds/resolve'")
+con.execute("INSTALL hf FROM hf_repo");</code></pre>
+<h2>Usage</h2>
+<h3>Load and use</h3>
+<pre><code>LOAD hf FROM hf_repo;
+SELECT * FROM hf_ls('hf://datasets/lhoestq/demo1');</code></pre>
+<h3>Reads and writes, by repo type</h3>
+<p>Reads work for all five types, with or without <code>@revision</code>:</p>
+<pre><code>SELECT * FROM read_parquet('hf://datasets/wikimedia/wikipedia/20231101.ab/*.parquet');
+SELECT content FROM read_text('hf://models/google-bert/bert-base-uncased/config.json');
+SELECT * FROM glob('hf://models/nvidia/**/*.safetensors');
+SELECT * FROM hf_ls('hf://spaces/dalle-mini/dalle-mini');
+SELECT content FROM read_text('hf://kernels/kernels-community/flash-attn3/README.md');
+SELECT * FROM read_parquet('hf://buckets/lhoestq/playground/duckdb/*.parquet');</code></pre>
+<p>A <strong>bucket</strong> file <em>is</em> Xet content — no pointer, no branch, no commit — so a bucket write chunks the file, and uploads it:</p>
+<pre><code>COPY (SELECT * FROM large_table) TO 'hf://buckets/me/playground/export.parquet' (FORMAT PARQUET);
+COPY (SELECT * FROM events) TO 'hf://buckets/me/playground/events/' (FORMAT PARQUET, PARTITION_BY (day));</code></pre>
+<p><code>hf_bucket_copy</code> enables free file copies since files are pointers in Xet.</p>
+<h2>Authentication</h2>
+<ul>
+ <li>with the <code>hf</code> CLI:</li>
+</ul>
+<pre><code>hf auth login</code></pre>
+<ul>
+ <li>manually with a token:</li>
+</ul>
+<pre><code>CREATE SECRET (TYPE HUGGINGFACE, TOKEN 'hf_...');</code></pre>
+<p>Token resolution has the same order as <code>huggingface_hub</code>: a matching <code>CREATE SECRET (TYPE HUGGINGFACE, …)</code> → <code>SET hf_token</code> → <code>HF_TOKEN</code> → <code>HF_TOKEN_PATH</code> → <code>$HF_HOME/token</code> → <code>~/.cache/huggingface/token</code>.</p>
+<h2>Settings</h2>
+<table>
+ <thead>
+  <tr>
+   <th>setting</th>
+   <th>default</th>
+   <th>meaning</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>hf_token</code></td>
+   <td>``</td>
+   <td>API token (secrets and env vars take precedence as above)</td>
+  </tr>
+  <tr>
+   <td><code>hf_endpoint</code></td>
+   <td><code>https://huggingface.co</code></td>
+   <td>Hub endpoint</td>
+  </tr>
+  <tr>
+   <td><code>hf_cache_dir</code></td>
+   <td>``</td>
+   <td>where to buffer files before uploading (falls back to <code>temp_directory</code>/<code>TMPDIR</code>)</td>
+  </tr>
+  <tr>
+   <td><code>hf_read_buffer_size</code></td>
+   <td><code>8388608</code></td>
+   <td>smallest read-ahead window fetched for a <code>hf://</code> file (also one range request when a window is split)</td>
+  </tr>
+  <tr>
+   <td><code>hf_read_cache_size</code></td>
+   <td><code>268435456</code></td>
+   <td>fetched bytes one <code>hf://</code> file may keep in memory (shared by all its readers)</td>
+  </tr>
+  <tr>
+   <td><code>hf_read_cache_total_size</code></td>
+   <td><code>1073741824</code></td>
+   <td>fetched bytes the process keeps over all files, and how that budget splits between files open at once</td>
+  </tr>
+  <tr>
+   <td><code>hf_read_max_parallel_requests</code></td>
+   <td><code>4</code></td>
+   <td>range requests one missing window is pulled with (<code>1</code> disables the fan-out)</td>
+  </tr>
+  <tr>
+   <td><code>hf_max_per_page</code></td>
+   <td><code>0</code> (=1000)</td>
+   <td>page size for tree listings</td>
+  </tr>
+  <tr>
+   <td><code>hf_commit_message</code></td>
+   <td><code>Upload files with DuckDB</code></td>
+   <td>commit message for writes</td>
+  </tr>
+  <tr>
+   <td><code>hf_create_repo</code></td>
+   <td><code>false</code></td>
+   <td>create the target repository when it does not exist</td>
+  </tr>
+  <tr>
+   <td><code>hf_xet_write</code></td>
+   <td><code>true</code></td>
+   <td>send file content through Xet (content-defined, deduplicated chunks). If the content store is unreachable the write falls back to a plain LFS upload, so a dead CAS costs time, not correctness. <code>false</code> forces LFS</td>
+  </tr>
+  <tr>
+   <td><code>hf_write_max_parallel_uploads</code></td>
+   <td><code>3</code></td>
+   <td>how many of a file's xorbs are on the wire at once (<code>1</code> = sequential). Each one waiting costs up to 64 MiB in memory, which is also how far ahead of the network the chunker may run</td>
+  </tr>
+  <tr>
+   <td><code>hf_xet_compression</code></td>
+   <td><code>lz4</code></td>
+   <td>chunk payloads inside an xorb: LZ4 frames, or <code>none</code>. Changes bytes on the wire and nothing else — an xorb's hash covers uncompressed content, so dedup, shards and other clients are unaffected. Incompressible chunks come out ~16 B larger (stored raw inside a frame, as reference clients do). Anything else, including <code>bg4</code>, is refused at the <code>SET</code></td>
+  </tr>
+  <tr>
+   <td><code>hf_xet_upload_dedup</code></td>
+   <td><code>true</code></td>
+   <td>ask the content store whether it already holds a chunk before uploading it, and write a pointer instead of the bytes when it does. Costs one small request per 256 chunks (plus the file's first chunk); <code>false</code> uploads everything and produces the byte-identical shard an upload without the feature would have written</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Table functions</h2>
+<table>
+ <thead>
+  <tr>
+   <th>function</th>
+   <th>result</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>hf_ls(path, recursive := false)</code></td>
+   <td><code>url, path, is_dir, size, sha256</code></td>
+  </tr>
+  <tr>
+   <td><code>hf_meta(path)</code></td>
+   <td><code>url, exists, size, etag, repo_type, repository, revision</code></td>
+  </tr>
+  <tr>
+   <td><code>hf_upload(local_path, hf_path, message := …)</code></td>
+   <td><code>url, size, sha256</code></td>
+  </tr>
+  <tr>
+   <td><code>hf_delete(path_or_list, missing_ok := false)</code></td>
+   <td><code>url</code> — one commit per repository in the list</td>
+  </tr>
+  <tr>
+   <td><code>hf_bucket_copy(source, target[, hash_wait := n])</code></td>
+   <td><code>source, url, path, size, xet_hash, status</code> — points a bucket at content the Hub already holds; <code>hash_wait</code> (default 30s) is how long to wait for the Hub to finish hashing a file committed moments ago</td>
+  </tr>
+  <tr>
+   <td><code>hf_list_revisions(path, max_revisions := 20)</code></td>
+   <td><code>repository, revision, title, author, date</code> (<code>limit</code> is a reserved word)</td>
+  </tr>
+  <tr>
+   <td><code>hf_list_refs(path)</code></td>
+   <td><code>repository, kind, name, ref, target_commit</code></td>
+  </tr>
+  <tr>
+   <td><code>hf_create_repo(path, private := true)</code></td>
+   <td><code>url, created</code></td>
+  </tr>
+  <tr>
+   <td><code>hf_status()</code></td>
+   <td>version, DuckDB version, endpoint, token source, whoami, transport, every read/write setting — never the token</td>
+  </tr>
+  <tr>
+   <td><code>hf_read_stats(reset := false)</code></td>
+   <td>the read path's counters: <code>bytes_fetched / &lt;file size&gt;</code> is the amplification (a scan should be 1.0), <code>evictions</code> says the cache is too small, <code>retained_bytes</code> what it still holds</td>
+  </tr>
+  <tr>
+   <td><code>hf_read_cache_clear()</code></td>
+   <td><code>cleared_bytes, cleared_files</code></td>
+  </tr>
+  <tr>
+   <td><code>hf_xet_upload(path[, scope := 'hf://…'][, publish := bool])</code></td>
+   <td><code>xorb, num_chunks, bytes, uncompressed_bytes, inserted, xet_hash, shard_bytes, shard_hash, shard_result, published, deduped_chunks, dedup_queries, dedup_hits, dedup_shard_failures</code> — the Xet write path by hand; <code>inserted</code>/<code>shard_result</code> are the CAS's dedup answers, <code>scope</code> names the repository whose token the bytes go up against, <code>publish</code> registers it as a bucket file, and the last four are per <em>file</em> (they repeat on every xorb row; a fully deduplicated upload is one row with <code>xorb</code> NULL)</td>
+  </tr>
+  <tr>
+   <td><code>hf_xet_selftest()</code></td>
+   <td>1090 rows of <code>(check_name, assert_passed, expected, got, …)</code> — the Xet port replayed against reference vectors generated from <code>xet-core</code>. Offline, no token</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Limitations</h2>
+<ul>
+ <li><strong>On a released 2.0.0 client, <code>hf_status().duckdb_version</code> answers <code>v2.0.0-alpha49307</code>.</strong></li>
+ <li><strong>Writes buffer to a local temp file first</strong> and upload + commit happen on <code>Close()</code>.</li>
+ <li><strong>Dedup is strong on content that repeats and weak on content that is merely similar.</strong></li>
+ <li><code>hf_write_max_parallel_uploads</code> is a fixed client-side policy.</li>
+ <li>Small files go as base64 in the commit; larger ones use git-LFS basic multipart.</li>
+ <li><strong>A repository cannot be deleted from SQL</strong>.</li>
+ <li>The read cache is in-memory only and retained outside DuckDB's buffer manager.</li>
+ <li>Sequential whole-file reads (<code>read_blob</code> of a big file) are behind httpfs.</li>
+ <li>Every request goes through DuckDB's <code>HTTPUtil</code> and the transport must speak https.</li>
+ <li><code>hf_xet_write</code>'s fallback cannot be <em>made</em> to fail from SQL.</li>
+</ul>

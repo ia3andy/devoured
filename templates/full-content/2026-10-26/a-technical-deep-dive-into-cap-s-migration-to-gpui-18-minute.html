@@ -1,0 +1,65 @@
+<p>Cap 0.6.1 is out. It's the biggest change we've made to the desktop app since we started, and it's the first version that doesn't have a web browser inside it.</p>
+<p>Until now, Cap's desktop app was built with Tauri. Tauri is a lot like Electron, in that you build your app's interface with HTML, CSS and JavaScript. The difference is that Electron ships a full copy of Chromium inside every app, while Tauri uses the browser engine that already comes with your operating system, which is called a web view. So every window in Cap was really a small web page, running on Safari's engine on a Mac, Microsoft Edge's on Windows and WebKitGTK on Linux.</p>
+<p>That kept Cap small and fast for a long time. It also meant our interface was running in three different browsers that we didn't control, and a lot of our bugs came from there. Cap's panels overflowed on Windows if you'd changed your text size, windows showed up blank on some Linux graphics drivers, and area selection on WebKit cancelled itself as soon as you started dragging.</p>
+<p>In 0.6.1 every window is drawn on your GPU by Rust code instead, using GPUI, the UI framework the Zed team built for their code editor. It should look and work like the Cap you're used to.</p>
+<p>We had the first GPUI build working overnight in August. We could have shipped it sooner, but we wanted to roll it out safely, so it spent a few weeks as an experimental option in 0.6.0 first. The engine mostly came across as it was, with a few changes to get the most out of the new app.</p>
+<h2>Drawn like a game</h2>
+<p>If I had to explain it in one line, Cap's interface used to work like a web page, and now it works more like a video game.</p>
+<p>A web page is a document. Each Cap window was a tree of HTML elements, and the browser had to style, lay out, paint and composite all of it, using whatever browser engine your OS shipped with.</p>
+<p>Games work differently. They describe the whole screen and draw it on the GPU each time, and GPUI does the same. When a window changes, GPUI lays it out again and turns it into one flat list of shapes. Cap's main window only uses five kinds of shape.</p>
+<ul>
+ <li><strong>Shadows.</strong> Blurred rounded rectangles under the window and its cards.</li>
+ <li><strong>Quads.</strong> Every box, with its fill, border and rounded corners.</li>
+ <li><strong>Glyphs.</strong> The text. Each letter is cut out of a texture that stays on the GPU.</li>
+ <li><strong>Icons.</strong> SVGs, rasterized once and reused on every frame.</li>
+ <li><strong>Images.</strong> Full-colour pictures, like the Cap logo.</li>
+</ul>
+<p>That list is sent to the GPU in batches and drawn by a handful of small shaders, using Metal on macOS, Direct3D 11 on Windows and Vulkan on Linux. There's no DOM, CSS engine or JavaScript involved. One thing Cap doesn't copy from games is redrawing 60 times a second for no reason. If a window has nothing new to show, it stops asking for frames.</p>
+<h2>Where we started</h2>
+<p>Cap has always been made of two parts.</p>
+<p>The first is the engine. It captures your screen, camera, mic and system audio, writes everything to disk without dropping frames, renders your edits on the GPU and encodes your exports. It's been written in Rust from day one, and it lives in a set of crates (Rust's name for libraries) that don't know anything about windows or buttons.</p>
+<p>The second is the interface. Up to 0.6.0 that was a SolidJS app running inside Tauri. Each Cap window (the main window, the camera bubble, the recording bar, the editor and so on) had its own web view, which is basically a browser tab without the browser around it. The JavaScript running in those web views couldn't touch the recording engine directly, so every click turned into a message to the Rust side, which did the work and sent the result back.</p>
+<h2>Why the rewrite</h2>
+<h3>Three operating systems, three browsers</h3>
+<p>Using the system web view means you're really using three different browsers. The same CSS and JavaScript went through three different layout engines and three different text renderers, and each of them had its own quirks.</p>
+<ul>
+ <li><strong>Blank windows on Linux.</strong> On some graphics drivers, WebKitGTK's DMA-BUF renderer leaves web view windows completely blank.</li>
+ <li><strong>Text size on Windows.</strong> WebView2 picks up its zoom level from the Windows "Text size" setting, so anyone who had turned that up saw Cap's panels overflow.</li>
+ <li><strong>Moving between monitors on Windows.</strong> If you dragged a window onto a monitor with different scaling, WebView2 didn't always pick up the new scale.</li>
+ <li><strong>Area selection on WebKit.</strong> When you clicked and dragged to select an area, WebKit could fire a blur event before it had finished capturing the pointer.</li>
+ <li><strong>Lost clicks.</strong> The overlay you pick a display or window from was its own web view. In some cases it closed itself before the click on the record button had made it across to the Rust side.</li>
+ <li><strong>Crashes in the macOS picker.</strong> Opening and closing the display picker a few times could crash Cap on a Mac.</li>
+</ul>
+<p>All of these came from the browser layer, which we couldn't control or update. Getting rid of that whole category of problem is the main reason for this release.</p>
+<h3>A detour through Electron</h3>
+<p>In August I tried moving Cap from Tauri to Electron, mostly out of curiosity. Electron ships its own copy of Chromium, so at least we'd have the same browser on every platform. After a night of optimising, the Electron build was faster than the Tauri app we had in production. That still got me wondering how far we could go with a fully native interface.</p>
+<h2>Picking a stack</h2>
+<p>Moving off the web view meant we had to draw the interface ourselves. We went with GPUI for four reasons.</p>
+<p><strong>It's Rust.</strong> So is Cap's engine. In Tauri, the interface and the engine talked to each other over a bridge. GPUI doesn't need that. The editor calls the same engine crates as the CLI, with the same types, in the same process.</p>
+<p><strong>Everything is drawn on the GPU.</strong> It's the game approach from earlier. There's no browser engine sitting between Cap and the screen, and we can read and change every part of it.</p>
+<p><strong>There's one implementation for every platform.</strong> Layout, text and drawing all run the same code on Mac, Windows and Linux. The only thing that changes is a thin layer at the bottom.</p>
+<p><strong>It still reads like Tailwind.</strong> Width, height, padding, flex, rounded corners and backgrounds are all written almost the same way.</p>
+<h2>How it's built</h2>
+<p>We rewrote Cap's interface and kept the engine. The old app and the new one share fourteen engine crates, covering screen and camera capture, the recorder, the renderer, the editor's playback engine and the exporter.</p>
+<h3>Getting video frames to the screen</h3>
+<p>The biggest single change is in the editor. When you hit play, Cap's renderer puts together your recording, background, cursor, camera, zooms and captions on the GPU, 60 times a second. What's changed is how each finished frame gets onto your screen.</p>
+<p>A web page has no access to the GPU memory Rust is using, so in the Tauri app every frame went through six steps involving copying into regular memory and passing to a JavaScript worker. On a Mac, the new app copies each frame into an IOSurface, which is a chunk of graphics memory that macOS lets two renderers share, and GPUI draws directly from that. The frame stays on the GPU the whole way.</p>
+<h2>Making it feel like the same app</h2>
+<p>We wanted 0.6.1 to feel like the Cap you already know. So we went through every window and checked it against the old version, one interaction at a time.</p>
+<ul>
+ <li><strong>Text fields.</strong> In GPUI we build the text field ourselves on top of the operating system's text input APIs. Ours is about 2,700 lines of Rust.</li>
+ <li><strong>One-line CSS.</strong> In GPUI some of them became shaders, some needed a patch to the framework, and for some we changed the design.</li>
+ <li><strong>Windows that aren't normal windows.</strong> In the Tauri app the recording bar was a web view. In the new app the bar is a native panel and that logic doesn't exist anymore.</li>
+ <li><strong>Idling properly.</strong> GPUI wakes up on every screen refresh to check if anything needs redrawing. We patched it so that if a window has had nothing to draw for 100 ms, it stops checking.</li>
+</ul>
+<h2>Performance</h2>
+<p>Most of the CPU saving comes from the new frame path. Most of the memory saving comes from dropping the browser engine. Every Tauri window had its own web view, with its own JavaScript runtime, layout engine and caches, even when it was sitting there doing nothing.</p>
+<h2>Trade-offs</h2>
+<ul>
+ <li><strong>We have to build things the browser used to give us.</strong> The new app is about 182,000 lines of Rust, which is almost exactly the size of the 181,000 lines of TypeScript and Rust it replaced.</li>
+ <li><strong>Keyboard navigation isn't everywhere yet.</strong> In GPUI we have to set it up window by window, and we haven't finished.</li>
+ <li><strong>No hot reload.</strong> Rebuilding the GPUI app only takes a few seconds, but you still relaunch it and click back to whatever you were working on.</li>
+ <li><strong>A smaller ecosystem.</strong> GPUI is young and it's built for Zed first.</li>
+</ul>
+<h2>Where we go from here</h2>
+<p>Everything we build from now on will be on top of the native app. Next on the list is full keyboard navigation in every window, Cap in more languages, and more performance work, now that we can change every step from capture to screen.</p>

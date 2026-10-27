@@ -1,0 +1,174 @@
+<h1>Detecting and mitigating ZDI-CAN-33367 and five other Linux flaws</h1>
+<p>A working root exploit for a Linux kernel bug is now public, before it has a CVE or a merged fix. On October 20, 2026, Trend Micro’s Zero Day Initiative (ZDI) sent one report, a bug in the ConnMan network manager, to the public ConnMan mailing list. On October 21, ZDI sent five reports to the Linux kernel security team and copied public mailing lists on every one. The reports included reproduction details, showing that several had no patch attached and no fix in any released kernel. Two of the Linux flaws have been rated as CVSS 9.0.</p>
+<p>None of the six bugs has been assigned a CVE ID yet, and no in-the-wild exploitation has been reported as of the publication of this blog. However, security teams should work to get detections and mitigations in place now. TuxCare has reproduced the public proof of concept (PoC) for ZDI-CAN-33367 from the ZDI report. Exploitation leads to root access on current Ubuntu, Debian, and AlmaLinux distributions.</p>
+<p>The Sysdig Threat Research Team (TRT) reviewed the batch of Linux vulnerabilities and ranked the reports by how much each should affect what defenders do today. This report explores what was disclosed, who may be exposed, what runtime visibility can detect for each bug, and what defenders can do while patches are pending.</p>
+<h2>Timeline</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Date</th>
+   <th>Event</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Sept. 30, 2026</td>
+   <td><code>ksmbd</code> maintainer Namjae Jeon writes a fix for an SMB1/SMB2 dispatch race, credited to a different reporter</td>
+  </tr>
+  <tr>
+   <td>Oct. 20–21, 2026</td>
+   <td>ZDI sends six reports to the kernel security team with public lists copied</td>
+  </tr>
+  <tr>
+   <td>Oct. 21, 2026</td>
+   <td>The <code>ksmbd</code> fix is committed to the maintainer's <code>ksmbd-for-next</code> branch</td>
+  </tr>
+  <tr>
+   <td>Oct. 21, 2026</td>
+   <td>SMB Direct maintainer Stefan Metzmacher asks the reporter to test his Linux 7.5 branch against ZDI-CAN-33549</td>
+  </tr>
+  <tr>
+   <td>Oct. 22, 2026</td>
+   <td>A v2 patch for <code>skb_zerocopy()</code> (ZDI-CAN-33367) is posted to netdev, reviewed by Eric Dumazet</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Affected versions</h2>
+<p>Exposure risk varies greatly across the reports. One affects the mainstream distributions TuxCare tested, including Ubuntu, Debian, and AlmaLinux releases. Two affect only hosts running ksmbd, the in-kernel SMB server. Another affects only VMware guests.</p>
+<p>Organizations should review their inventory before deciding how to prioritize these vulnerabilities.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Report</th>
+   <th>Component</th>
+   <th>Impact</th>
+   <th>Exposure</th>
+   <th>Fix status (as of Oct 22)</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>ZDI-CAN-33367</td>
+   <td><code>skb_zerocopy()</code></td>
+   <td>Local privilege escalation (LPE); public PoC. CVSS 7.8</td>
+   <td>Hosts that allow unprivileged user namespaces and load the specific networking modules the PoC needs</td>
+   <td>Patch posted to netdev, not merged</td>
+  </tr>
+  <tr>
+   <td>ZDI-CAN-33774</td>
+   <td><code>ksmbd</code> protocol dispatch</td>
+   <td>Remote, pre-authentication; PoC leaks heap / crashes. CVSS 9.0</td>
+   <td>Hosts running <code>ksmbd</code></td>
+   <td>Fixed in the <code>ksmbd</code> maintainer tree, not in mainline</td>
+  </tr>
+  <tr>
+   <td>ZDI-CAN-33549</td>
+   <td><code>ksmbd</code> SMB Direct</td>
+   <td>Remote heap overflow; needs RDMA and a writable share. CVSS 9.0</td>
+   <td>Hosts running <code>ksmbd</code> with SMB Direct, an RDMA interface, and a writable share</td>
+   <td>Maintainer believes a 7.5-branch fix covers it, unconfirmed</td>
+  </tr>
+  <tr>
+   <td>ZDI-CAN-34068</td>
+   <td>vmwgfx (VMware guests)</td>
+   <td>LPE. CVSS 8.8</td>
+   <td>Linux guests on VMware</td>
+   <td>No patch</td>
+  </tr>
+  <tr>
+   <td>ZDI-CAN-34076</td>
+   <td>nvmet</td>
+   <td>Information disclosure</td>
+   <td>Unknown</td>
+   <td>Unknown</td>
+  </tr>
+  <tr>
+   <td>ZDI-CAN-32005</td>
+   <td>ConnMan DNS proxy</td>
+   <td>Userspace stack overflow, not a kernel bug</td>
+   <td>Not a kernel-level bug</td>
+   <td>Out of scope</td>
+  </tr>
+ </tbody>
+</table>
+<h2>ZDI-CAN-33367</h2>
+<h3>Fix status</h3>
+<p>A small patch, “<code>net: skbuff: propagate shared-frag marker in skb_zerocopy()</code>”, is on netdev, reviewed by Eric Dumazet and tagged for stable. It has not been merged.</p>
+<h3>How the bug works: Dirty Frag again</h3>
+<p>Earlier this year, Dirty Frag (CVE-2026-43284) showed defenders how an unprivileged user could get the kernel's IPsec ESP code to decrypt <em>in place</em> over pages that belong to the page cache. Those pages back a file the user can only read, and decryption writes the attacker's bytes into the cached copy of that file. Targeting a setuid binary or <code>/etc/passwd</code> this way gives the attacker root without ever opening the file for writing.</p>
+<p>The Dirty Frag fix marked those shared pages with a flag and taught ESP to copy before decrypting when it sees the flag. ZDI-CAN-33367 is a gap in that fix.</p>
+<p><code>skb_zerocopy()</code> moves the same pages into a new socket buffer but does not carry the flag across. ESP never sees the flag, decrypts in place, and the write lands in the page cache. According to TuxCare and Safeguard, the code path dates to kernel 3.14.</p>
+<h3>Not the first gap</h3>
+<p>The Dirty Frag fix only works if every piece of networking code that moves those pages around carries the flag along. Since May, the kernel's CVE team has published six follow-up CVEs where some other path lost it:</p>
+<ul>
+ <li><strong>Frag-copy and shift helpers:</strong> CVE-2026-43503</li>
+ <li><strong>Coalescing:</strong> CVE-2026-46300</li>
+ <li><strong>IPTFS:</strong> CVE-2026-53363, CVE-2026-64566</li>
+ <li><strong>An error-handling helper:</strong> CVE-2026-80977</li>
+ <li><strong>Another error path inside <code>skb_zerocopy() </code>itself:</strong> CVE-2026-90049</li>
+</ul>
+<p>CVE-2026-90049 is a different bug in the same function, so a kernel carrying its fix is not fixed for ZDI-CAN-33367.</p>
+<h3>Exploitation</h3>
+<p>The PoC needs unprivileged user namespaces and a handful of networking modules: <code>nlmon</code>, <code>nft_queue</code>, <code>nfnetlink_queue</code>, <code>cls_u32</code>, <code>act_pedit</code>, <code>act_mirred,</code> and <code>esp4</code>. It does not need a Kernel Address Space Layout Randomization (KASLR) leak, or any capability the user doesn't already get inside their own namespace.</p>
+<p>Each step of exploitation is a system call that can be made by an ordinary user process:</p>
+<ul>
+ <li>Unshare into new user and network namespaces, then write sysctls.</li>
+ <li>Bring up an <code>nlmon</code> interface.</li>
+ <li>Install XFRM state over netlink.</li>
+ <li>Add an nftables <code>NFQUEUE</code> rule.</li>
+ <li>Attach a <code>tc</code> pedit action with a redirect.</li>
+ <li><code>splice() </code>into a socket on <code>127.0.0.1</code>, which triggers the in-place decryption over the page cache.</li>
+</ul>
+<h3>Impact</h3>
+<p>TuxCare reproduced a root shell on AlmaLinux 8–10, CloudLinux 9–10, Debian 12 and 13, and Ubuntu 24.04 and 26.04. AlmaLinux was rooted <em>with</em> the Dirty Frag fix installed. CentOS 6 and 7 kernels are not vulnerable. The vulnerability is a local privilege escalation (LPE), so an attacker needs code execution on the host first.</p>
+<h2>ZDI-CAN-33774 and ZDI-CAN-33549</h2>
+<p>Both CVSS 9.0 reports are in ksmbd, the in-kernel Server Message Block (SMB) server. Samba is not ksmbd.</p>
+<p>If your file servers run <code>smbd</code>, neither report applies to you. To check whether <code>ksmbd</code> is running anywhere, look for the <code>ksmbd</code> kernel module, the <code>ksmbd.mountd</code> userspace daemon, and a kernel-owned listener on TCP 445.</p>
+<h3>ZDI-CAN-33774: The dispatch race</h3>
+<p>ksmbd decides per request whether it is handling SMB1 or SMB2. If an attacker packs a burst of short SMB1 packets and an SMB2 packet into the same TCP write, the worker threads can run an SMB2 handler over SMB1 data and read past the end of the shorter buffer. This works before authentication. The public PoC leaks 28 bytes of kernel heap per attempt and can crash the kernel. ZDI describes a write-past-buffer path that needs share access and labels the bug as remote code execution (RCE), but nothing public shows code execution as of this blog’s publication.</p>
+<p>Maintainer Namjae Jeon says the bug is already fixed, and his tree bears that out. Commit <code>68f410faedaf</code> ("ksmbd: wait for negotiation before receiving another PDU") was written on September 30, credited to a different reporter, and describes exactly this race. It is queued in ksmbd's <code>ksmbd-for-next</code> branch and has not reached a released kernel.</p>
+<h3>ZDI-CAN-33549: SMB Direct</h3>
+<p>An integer underflow in the Remote Direct Memory Access (RDMA) transport turns a crafted buffer descriptor into a heap overflow of up to eight KB. The bar is higher than for 33774. The host needs an RDMA-capable interface (hardware, or the <code>rxe</code> software driver), a client that negotiates SMB Direct, and a writable share. The public PoC crashes the kernel.</p>
+<p>SMB Direct maintainer Stefan Metzmacher believes a fix already in his branch for Linux 7.5 covers it. As of this writing, that hasn't been confirmed. Ubuntu builds SMB Direct support; Debian does not.</p>
+<h2>ZDI-CAN-34068</h2>
+<p>ZDI-CAN-34068 is an out-of-bounds write in vmwgfx, the kernel driver for VMware's virtual GPU, rated as LPE (CVSS 8.8). Only the title is public. Kroah-Hartman's reply on dri-devel points to the dirty-tracking code. There is no patch.</p>
+<p>The exposure is narrow. vmwgfx only binds to VMware's SVGA virtual display adapter, so the bug only matters on VMware guests: vSphere and Workstation VMs, and VMware-based virtual desktop infrastructure (VDI). In Sysdig TRT testing, it does not reproduce on Lima or EC2 instances, which don't present that device.</p>
+<h2>ZDI-CAN-34076 and ZDI-CAN-32005</h2>
+<p><strong>ZDI-CAN-34076 (nvmet)</strong> is an uninitialized-memory information leak in the Non-Volatile Memory Express (NVMe) target's Get Log Page handling. Only the title is public, and the kernel team has said nothing can be done until details arrive.</p>
+<p><strong>ZDI-CAN-32005 (ConnMan)</strong> is a stack overflow in the ConnMan network manager's DNS proxy. It is a userspace bug, not a kernel bug, and is outside the scope of this post.</p>
+<h2>Detection</h2>
+<p>The four bugs that are the most impactful right now differ in what a syscall-level runtime sensor can observe:</p>
+<ul>
+ <li><strong>ZDI-CAN-33367.</strong> The sequence of the exploitation is distinctive. The process unshares into new user and network namespaces, writes sysctls, brings up an <code>nlmon</code> interface, installs <code>XFRM</code> state over netlink, adds an nftables <code>NFQUEUE</code> rule, attaches a <code>tc</code> pedit action with a redirect, and then <code>splice()s </code>into a socket on <code>127.0.0.1</code>. Nothing legitimate does all of that from a single unprivileged process. Of the four, this is the easiest one to detect.</li>
+ <li><strong>ksmbd (33774 and 33549).</strong> A sensor can see that <code>ksmbd</code> is <em>exposed</em>: the module loads, <code>ksmbd.mountd </code>starts, and 445 is listening. It can see what an attacker does <em>after</em> code execution, once something spawns a process or touches files. It cannot see the race or the overflow itself. Runtime detection is the backstop.</li>
+ <li><strong>ZDI-CAN-34068.</strong> The trigger is DRM <code>ioctl()</code> calls on the vmwgfx device node, made by a local process. That narrows where to look, but GPU ioctls are noisy on any desktop or VDI guest, so treat them as context for an investigation, not as a signal on their own.</li>
+</ul>
+<h2>Recommendations</h2>
+<h3><strong>ZDI-CAN-33367</strong></h3>
+<ul>
+ <li><strong>Patch</strong> as soon as your distribution ships the <code>skb_zerocopy() </code>fix. A kernel carrying only the CVE-2026-90049 fix is not covered.</li>
+ <li><strong>Restrict</strong> unprivileged user namespaces. Setting <code>user.max_user_namespaces=0</code> (or <code>kernel.unprivileged_userns_clone=0 </code>on Debian) should block the public PoC, though TuxCare notes it has not yet validated this against the PoC. The cost is real: rootless containers, some browser sandboxes and some build tooling depend on user namespaces, so scope it to hosts that don't need them.</li>
+ <li><strong>Avoid relying on</strong> Ubuntu's AppArmor user-namespace restriction. The PoC got past it through the AppArmor profile of a container launcher package.</li>
+ <li><strong>Block</strong> the <code>nlmon</code> and <code>act_pedit </code>modules where you can. Denying them breaks this PoC, although TuxCare cautions it may not close every path to the bug.</li>
+ <li><strong>Enforce</strong> seccomp <code>RuntimeDefault</code> on Kubernetes pods. The exploit starts by creating a user namespace, so containers that can call <code>unshare(CLONE_NEWUSER)</code> are in play. Docker's default seccomp profile blocks that call, but Kubernetes pods run Unconfined unless you set <code>RuntimeDefault</code> per pod or cluster-wide using the kubelet <code>--seccomp-default </code>option. This is a good week to make it the cluster default.</li>
+</ul>
+<h3><strong>ZDI-CAN-33774 and ZDI-CAN-33549</strong></h3>
+<ul>
+ <li><strong>Inventory</strong> where ksmbd runs. Samba users are unaffected.</li>
+ <li><strong>Unload</strong> ksmbd and block the module on hosts that don't need it.</li>
+ <li><strong>Restrict</strong> TCP 445 to trusted networks where ksmbd must stay.</li>
+ <li><strong>Disable</strong> SMB Direct unless your storage network depends on RDMA.</li>
+</ul>
+<h3><strong>ZDI-CAN-34068</strong></h3>
+<ul>
+ <li><strong>Inventory</strong> Linux guests running on VMware, and watch for the vmwgfx patch.</li>
+ <li><strong>Disable</strong> 3D acceleration, or keep the vmwgfx module from loading, on guests that have no use for it.</li>
+</ul>
+<h3><strong>Across all Linux flaws</strong></h3>
+<ul>
+ <li><strong>Track</strong> the reports by ZDI ID and component name until CVEs are assigned.</li>
+</ul>
+<h2>Conclusion</h2>
+<p>ZDI's decision to copy public lists put reproduction details for six bugs in front of attackers before several of them had fixes. As defenders know, a lack of an assigned CVE ID does not mean a lack of exposure. Only one of the six, ZDI-CAN-33367, combines a public root exploit, broad distribution exposure, and a fix that hasn't yet merged. It is the seventh path found to drop the Dirty Frag flag, reopening a bug class whose protection has already leaked six times since May 2026. The two ksmbd reports carry the highest scores, but they only matter where ksmbd — not Samba — is running.</p>
+<p>For defenders, the practical takeaway is that this week's work is about exposure, not scanners. It’s also important to note that the bugs differ in what defenders should actually watch. The ZDI-CAN-33367 exploit runs as an ordinary user process through a distinctive sequence of systems calls, so teams can catch it in motion. The ksmbd bugs run inside the kernel worker threads with no attacker process on the host, so controlling exposure is key.</p>
+<p>Affected organizations should immediately restrict unprivileged user namespaces and enforce RuntimeDefault seccomp where they can, find out whether ksmbd is running anywhere in their estate, and patch ZDI-CAN-33367 the day their distribution ships the fix.</p>
