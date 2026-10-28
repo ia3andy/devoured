@@ -1,0 +1,56 @@
+<h2>Cloudflare Computer now helps agents recover from interruptions and wait for approval</h2>
+<p><a href="https://github.com/cloudflare/computer"><code>@cloudflare/computer</code> ↗︎</a> gives your agent a workspace to run code in. From v0.7.0, that code can resume after a deploy or crash, and pause on an external action, for example to approve a tool call.</p>
+<h3>Resume interrupted runs</h3>
+<p>Set <code>onInterrupt: "replay"</code> on <code>WorkerJavaScriptBackend</code>, or on a single run.</p>
+<pre><code>import \{ DurableObject } from "cloudflare:workers";
+import \{ Workspace } from "@cloudflare/computer";
+import \{ WorkerJavaScriptBackend } from "@cloudflare/computer/backends/worker-javascript";
+
+export class MyAgent extends DurableObject \{
+	workspace = new Workspace(\{
+		storage: this.ctx.storage,
+		backends: [
+			new WorkerJavaScriptBackend(\{
+				loader: this.env.LOADER,
+				onInterrupt: "replay",
+			}),
+		],
+	});
+}</code></pre>
+<p>When recovery is triggered, the JavaScript runs again from the beginning, reusing recorded results for completed calls without printing previously recorded output again. If a call's result was not recorded before the interruption, recovery may repeat the call — even if its action already succeeded. For retry handling, including <code>unsafeToRepeat()</code> for operations that cannot safely repeat, refer to Calls that must not run twice.</p>
+<p>Recovery starts on the next call to <code>workspace.runtime</code>. To recover without waiting for traffic, call <code>workspace.runtime.recover()</code> from a Durable Object alarm.</p>
+<h3>Wait for approvals</h3>
+<p>Expose your application functions through custom modules. A function can call <code>ctx.interrupt()</code> to pause the run until your application supplies an approval decision.</p>
+<h3>Require approval before posting a comment</h3>
+<p>For example, to provide a GitHub module that allows an agent to post a comment on an issue with approval, an implementation of <code>postComment</code> could look like this:</p>
+<pre><code>new WorkerJavaScriptBackend(\{
+	loader: this.env.LOADER,
+	onInterrupt: "replay",
+	modules: \{
+		// The agent's code imports this with `import \{ postComment } from "ws:github"`.
+		"ws:github": \{
+			postComment: async ([issue, body], ctx) =&gt; \{
+				const \{ approved } = await ctx.interrupt(\{
+					issue,
+					body,
+				});
+				if (!approved) throw new Error("The comment was rejected.");
+				return github.comment(issue, body, \{ idempotencyKey: ctx.callId });
+			},
+		},
+	},
+});</code></pre>
+<h3>Call it from agent code</h3>
+<p>When the agent's code calls <code>postComment()</code>, the run pauses at <code>ctx.interrupt()</code> until your app responds. The agent's code calls it like any other function:</p>
+<pre><code>import \{ postComment } from "ws:github";
+
+export default async function (\{ issue }) \{
+	return postComment(issue, "Hello world");
+}</code></pre>
+<h3>Respond to the approval request</h3>
+<p>The time spent waiting does not count toward its timeout. The wait also survives deploys. Fetch the pending calls with <code>workspace.runtime.pending()</code> and resolve them with <code>respond()</code>:</p>
+<pre><code>for (const call of await workspace.runtime.pending()) \{
+	await workspace.runtime.respond(call.id, call.callId, \{ approved: true });
+}</code></pre>
+<p>The run continues once all pending calls are resolved.</p>
+<p>For setup, current limitations, and how replay works, refer to Resume runs after a restart.</p>
