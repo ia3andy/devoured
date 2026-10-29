@@ -1,0 +1,140 @@
+<h1>InteractiveWorld</h1>
+<h3>A Verifiable Human-Centric Environment for Building Better Interactive MLLM Assistants</h3>
+<h2>Overview</h2>
+<p>InteractiveWorld simulates the interaction that matters for wearable AI assistants: the assistant sees through a person's eyes and talks, the person decides and acts, and a stateful 3D world responds with the next first-person view.</p>
+<table>
+ <thead>
+  <tr>
+   <th>👁️ Closed-loop assistance</th>
+   <th>🧍 Human-centered simulation</th>
+   <th>✅ Verifiable evaluation</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Observe → communicate → act → update the world.</td>
+   <td>An animated human walks, grasps, opens and uses objects in 44 BEHAVIOR-1K homes and venues.</td>
+   <td>Goals are checked against the world state, not judged from text.</td>
+  </tr>
+ </tbody>
+</table>
+<p>The repository has two layers. <strong>InteractiveWorld</strong> is the reusable simulator: open a scene and drive the human with short commands such as <code>[Grab] &lt;cup&gt; (1)</code>. <strong>InteractiveBench</strong> builds 120 frozen multi-turn tasks on top of it, where one model plays the assistant and another plays the human.</p>
+<h3>Repository structure</h3>
+<pre><code>InteractiveWorld/
+├── simulator/              InteractiveWorld simulator
+│   ├── api.py              Python API: Simulator, Action, Observation, Score
+│   ├── physical_world/     Isaac Sim scenes, human motion, manipulation, rendering, BEHAVIOR baking
+│   ├── environment/        Persistent environment: reset, step, observe, native score
+│   ├── interaction/        Human/Assistant turn protocol and prompts
+│   ├── human_model/        SMPL+H skinning and the bundled grasp atlas
+│   └── world_catalog/      44 admitted scenes and the BEHAVIOR asset manifest
+├── benchmark/              InteractiveBench
+│   ├── tasks/              120 frozen TaskPacks (6 categories × 20) and their manifest
+│   ├── runner/             One-command evaluation: model endpoints, multi-GPU, reports, videos
+│   ├── evaluation/         Release rubric, evidence and scoring
+│   └── oracle_videos/      Integrity manifest of the 120 oracle videos
+├── launch/                 Command-line entry points (prepare_assets, simulator, interactiveworld, ...)
+├── examples/               Minimal Python programs
+├── docs/                   Detailed guides
+└── tests/                  Release tests
+</code></pre>
+<h2>InteractiveWorld</h2>
+<h3>1. Preparation</h3>
+<p>InteractiveWorld runs on Linux with an NVIDIA GPU (we test on A100 80 GB; one simulator worker uses about 4 GB of GPU memory) and needs about 100 GB of disk. You download four things; one script then prepares everything else.</p>
+<table>
+ <thead>
+  <tr>
+   <th>What</th>
+   <th>Version</th>
+   <th>Where to get it</th>
+   <th>License</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Isaac Sim + OmniGibson</td>
+   <td>5.1 / 3.9.0</td>
+   <td>BEHAVIOR-1K installer (step 1)</td>
+   <td>NVIDIA Isaac Sim EULA</td>
+  </tr>
+  <tr>
+   <td>BEHAVIOR-1K scenes and objects</td>
+   <td>3.9.0 (31 GB)</td>
+   <td>same installer, <code>--dataset</code></td>
+   <td>BEHAVIOR Data License</td>
+  </tr>
+  <tr>
+   <td>SMPL+H body model</td>
+   <td><code>mano_v1_2.zip</code></td>
+   <td>mano.is.tue.mpg.de → Downloads → <em>Models &amp; Code</em></td>
+   <td>MANO license (registration)</td>
+  </tr>
+  <tr>
+   <td>ACCAD walking motion</td>
+   <td><code>ACCAD.tar.bz2</code></td>
+   <td>amass.is.tue.mpg.de → Downloads → ACCAD → <em>SMPL-X N</em></td>
+   <td>AMASS license (registration)</td>
+  </tr>
+ </tbody>
+</table>
+<p><strong>Step 1 — Isaac Sim 5.1, OmniGibson and the BEHAVIOR-1K dataset.</strong> The official installer creates a conda environment named <code>behavior</code> and downloads the dataset to <code>BEHAVIOR-1K/datasets</code>.</p>
+<p><strong>Step 2 — InteractiveWorld.</strong></p>
+<p><strong>Step 3 — Human model files.</strong> Register on the MANO and AMASS websites and download <code>mano_v1_2.zip</code> and the ACCAD <code>SMPL-X N</code> archive (<code>ACCAD.tar.bz2</code>) from the table above. Both are licensed for non-commercial research and cannot be redistributed.</p>
+<p><strong>Step 4 — Prepare the assets.</strong> This bakes the 6,831 BEHAVIOR objects used by the release, copies the OmniGibson materials, converts the SMPL+H model, extracts the walk clip, verifies every frozen checksum and writes an environment file.</p>
+<h3>2. Your first actions</h3>
+<p>Open a scene and give the human a sequence of commands. <code>--video</code> saves what the human sees (requires <code>ffmpeg</code>), and the JSON on stdout reports the outcome of every action.</p>
+<p>A command is <code>[Verb]</code> followed by object keys, each with an instance number. Run the same command without <code>--action</code> to list the keys of a scene (<code>initial_observation.objects</code>). The human works out where to stand, how to walk there and how to grip the object.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Family</th>
+   <th>Commands</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Move</td>
+   <td><code>[Walk] &lt;target&gt; (1)</code> · <code>[Run]</code> · <code>[Forward]</code> · <code>[TurnLeft]</code> · <code>[TurnRight]</code> · <code>[TurnAround]</code></td>
+  </tr>
+  <tr>
+   <td>Look</td>
+   <td><code>[LookAt] &lt;object&gt; (1)</code> · <code>[LookAround]</code> · <code>[LookScan]</code></td>
+  </tr>
+  <tr>
+   <td>Hands</td>
+   <td><code>[Grab] &lt;object&gt; (1)</code> · <code>[Put] &lt;object&gt; (1) &lt;surface&gt; (1)</code> · <code>[PutInside] &lt;object&gt; (1) &lt;container&gt; (1)</code> · <code>[Drop]</code></td>
+  </tr>
+  <tr>
+   <td>Articulate</td>
+   <td><code>[Open]</code> · <code>[Close]</code> · <code>[OpenDoor]</code> · <code>[CloseDoor]</code> · <code>[TurnOn]</code> · <code>[TurnOff]</code></td>
+  </tr>
+  <tr>
+   <td>Use tools</td>
+   <td><code>[Cut] &lt;target&gt; (1) &lt;tool&gt; (1)</code> · <code>[Stir]</code> · <code>[Pour]</code> · <code>[Wipe]</code> · <code>[Cook]</code> · <code>[UseComputer]</code> · <code>[AnswerPhone]</code></td>
+  </tr>
+  <tr>
+   <td>Body</td>
+   <td><code>[Sit] &lt;seat&gt; (1)</code> · <code>[StandUp]</code> · <code>[Squat]</code> · <code>[Wait]</code></td>
+  </tr>
+ </tbody>
+</table>
+<h3>3. Simulator basics</h3>
+<p>Discovery commands start instantly and do not launch Isaac Sim. The same simulator is available from Python. <code>import simulator</code> is lightweight; <code>Simulator.launch</code> starts Isaac Sim in a separate process, so your application keeps its own Python and CUDA environment.</p>
+<h2>InteractiveBench</h2>
+<p>InteractiveBench freezes <strong>120 multi-turn tasks</strong>, 20 in each of six categories: <strong>Guidance</strong>, <strong>Planning</strong>, <strong>Accessibility</strong>, <strong>Decision</strong>, <strong>Prevention</strong> and <strong>Finding</strong>. The model under test is the <em>Assistant</em>: it sees only the human's first-person view and the dialogue. A second, fixed model is the <em>Human</em>: it follows the Assistant's guidance by issuing simulator actions. A task passes when every goal holds in the final world state.</p>
+<h3>1. Evaluate a model</h3>
+<p>One command selects the two models, the tasks and the GPUs. The Assistant and the Human can each be a local open-source model behind an OpenAI-compatible server (vLLM, Ollama) or a hosted API (<code>openai</code>, <code>anthropic</code>, <code>gemini</code>). API keys are read from the environment variable you name, never from the command line.</p>
+<h3>2. Add your own task</h3>
+<p>A task is one <strong>TaskPack</strong> JSON file: the scene and the objects to place (<code>world</code>), the final state that counts as success (<code>goal</code>), what the human did before asking (<code>story.prologue</code>), how the human reacts to guidance (<code>runtime.human_policy</code>) and an oracle solution (<code>runtime.oracle_commands</code>). The easiest start is to derive a new task from a bundled one.</p>
+<h2>Citation</h2>
+<pre><code>@misc\{wang2026interactiveworld,
+  title         = \{InteractiveWorld: A Verifiable Human-Centric Environment for Building Better Interactive MLLM Assistants},
+  author        = \{Wang, Qinsi and Wen, Wei and Zhou, Chong and Suri, Saksham and Liu, Zechun and Wu, Lemeng and Li, Hai Helen and Chen, Yiran and Krishnamoorthi, Raghuraman and Qian, Qi},
+  year          = \{2026},
+  eprint        = \{2610.33966},
+  archivePrefix = \{arXiv},
+  primaryClass  = \{cs.HC},
+  url           = \{https://arxiv.org/abs/2610.33966}
+}</code></pre>
+<h2>License</h2>
+<p>InteractiveWorld is released under the CC BY-NC 4.0 license. The BEHAVIOR-1K dataset, the SMPL+H/MANO body model and the AMASS motion data are distributed by their owners under their own licenses; obtain and use them according to those terms.</p>
