@@ -1,0 +1,181 @@
+<h2>Gems of DuckDB 2.0.0</h2>
+<p><em>TL;DR: We released DuckDB 2.0.0 last week with an improved Quack protocol and <code>VARIANT</code> support, asynchronous I/O, and many other features. In this blog post, we highlight a few smaller features and improvements that did not make it into the release announcement.</em></p>
+<p>Last week we released DuckDB 2.0.0 LTS, our biggest feature release so far. The announcement covered the headline items: the Quack protocol, asynchronous I/O, the first-class <code>VARIANT</code> type, agent mode, the PEG parser, and triggers. DuckDB 2.0.0 is now available in all primary clients – check the installation page for instructions on installing or upgrading.</p>
+<p>A release of this size ships many smaller improvements that never make it into the original announcement. In this post, we highlight a few of these gems. To find the documentation for everything that is new in 2.0, see the “What's New in the Docs for 2.0” page.</p>
+<h2>Python Appender</h2>
+<p>Inserting rows one at a time is inefficient, and building up a giant <code>INSERT</code> statement is awkward. Therefore, the preferred solution for inserting large amounts of data has been the appender. However, it was only available in some clients (C/C++, Go, Java, etc.) and notably absent from the Python client. DuckDB 2.0.0's Python client ships an appender that collects rows and writes them together in a single operation:</p>
+<pre><code>import duckdb
+
+con = duckdb.connect()
+con.execute("CREATE TABLE duckdb_releases (version VARCHAR, codename VARCHAR);")
+
+with con.appender("duckdb_releases") as appender:
+    appender.append_row("1.4", "Andium")
+    appender.append_rows([("1.5", "Variegata"), ("2.0", "Cyanoptera")])
+
+print(con.execute("FROM duckdb_releases").fetchall())</code></pre>
+<pre><code>[('1.4', 'Andium'), ('1.5', 'Variegata'), ('2.0', 'Cyanoptera')]</code></pre>
+<p>The <code>with</code> block flushes the buffered rows when it exits. For data that already lives in a DataFrame or Arrow table, <code>INSERT INTO ... SELECT</code> is still faster, but the appender is ideal for rows that your Python code produces on the fly.</p>
+<h2>Usability Improvements in the CLI</h2>
+<h3>Pretty-Printed <code>.schema</code></h3>
+<p>As of DuckDB 2.0, the <code>.schema</code> dot command pretty-prints and highlights its output by default, which makes reading the schema of a database much easier. If you prefer the earlier single-line form, for example, to copy a statement verbatim, use <code>--no-indent</code> (or its alias <code>--no-format</code>):</p>
+<pre><code>duckdb mydata.duckdb ".schema --no-indent"</code></pre>
+<h3><code>.manual</code> Dot Command</h3>
+<p>DuckDB 2.0 introduces the <code>.manual</code> dot command, which shows the signatures, description, and examples of a SQL function. For example, to get the details of the <code>bar</code> function, run:</p>
+<pre><code>.manual bar</code></pre>
+<pre><code>  ────────────────────────────────────────────────────────────────────────────────────────────────
+  system.main                                   bar                                scalar function
+
+  SIGNATURE
+
+        bar(x DOUBLE, min DOUBLE, max DOUBLE) -&gt; VARCHAR
+
+        bar(x DOUBLE, min DOUBLE, max DOUBLE, width DOUBLE) -&gt; VARCHAR
+
+  DESCRIPTION
+
+        Draws a band whose width is proportional to (`x - min`) and equal to `width` characters
+        when `x` = `max`. `width` defaults to 80.
+
+  EXAMPLES
+
+        bar(5, 0, 20, 10)</code></pre>
+<p>The same page is available from the command line via <code>duckdb -manual bar</code>, and the name may contain <code>LIKE</code> wildcards, e.g., <code>.manual list_%</code>. In the coming releases, we will extend the manuals to cover more features such as SQL statements and clauses.</p>
+<h3>Calculator</h3>
+<p>You can use the CLI as a calculator. Simply type the expression followed by a semicolon – no more typing into your browser's address bar!</p>
+<pre><code>6*7;</code></pre>
+<pre><code>┌─────────┐
+│ (6 * 7) │
+│  int32  │
+├─────────┤
+│      42 │
+└─────────┘</code></pre>
+<h3>Command History</h3>
+<p>The CLI now exposes its command history in two ways. The <code>.history</code> dot command shows previously executed statements with syntax highlighting, optionally limited to the last <code>N</code> entries:</p>
+<pre><code>.history 10</code></pre>
+<p>The same information is available as a table through the <code>shell_history()</code> table function, so you can query your own history with SQL:</p>
+<pre><code>SELECT sql
+FROM shell_history()
+WHERE sql ILIKE '%copy%';</code></pre>
+<h2>Offline Documentation</h2>
+<p>As a reminder, both the DuckDB documentation and the DuckDB blog are available for offline browsing:</p>
+<ul>
+ <li>Documentation as a Markdown file (approx. 5 MB)</li>
+ <li>Documentation as a PDF file (approx. 10 MB)</li>
+ <li>Blog as a Markdown file (approx. 3 MB)</li>
+ <li>Blog as a PDF file (approx. 35 MB)</li>
+</ul>
+<p>You can download them to your e-reader (we are not affiliated with any particular brand!) or read them on your laptop on the go. You can also use them to supply context to LLMs and coding agents. At approximately 5 MB, the documentation exceeds the context window of most LLMs, so instead of ingesting it in full, point them to specific sections or let them find the parts they need.</p>
+<h2>Unsung SQL Features</h2>
+<h3><code>SHOW</code> for Configuration Settings</h3>
+<p>The <code>SHOW</code> statement can now print a configuration setting by name, PostgreSQL-style, when the name does not refer to a table:</p>
+<pre><code>SET threads = 42;
+SHOW threads;</code></pre>
+<table>
+ <thead>
+  <tr>
+   <th>threads</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>42</td>
+  </tr>
+ </tbody>
+</table>
+<p>This is much more succinct than the previous formulation that used the <code>current_setting</code> function (e.g., <code>SELECT current_setting('threads') AS threads;</code>).</p>
+<p>When a table and a setting share a name, DuckDB prioritizes the table by default. You can control this with the <code>show_behavior</code> setting, which takes <code>'auto'</code> (the default), <code>'table'</code>, or <code>'setting'</code>.</p>
+<blockquote>
+ <p>Deprecated: Using <code>SHOW</code> to describe a table, view, or query (e.g., <code>SHOW my_table</code>) is deprecated as of DuckDB 2.0 and prints a warning. Use <code>DESCRIBE</code> instead.</p>
+</blockquote>
+<h3><code>CREATE SECURE VIEW</code> Statement</h3>
+<p>Regular views can leak information about their underlying tables through statistics and query plans, for example via the <code>stats()</code> function. The new <code>SECURE VIEW</code> does not:</p>
+<pre><code>CREATE SECURE VIEW users AS
+    SELECT username
+    FROM all_users
+    WHERE access_level = 'standard';</code></pre>
+<p>On a secure view, <code>stats()</code> returns only uninformative statistics and <code>EXPLAIN ANALYZE</code> shows a single <code>Secure View</code> node instead of the view's query plan, so neither can be used to reconstruct the rows that the view filters out.</p>
+<h3>Options in <code>regexp_extract</code></h3>
+<p>The <code>regexp_extract</code> function gained an overload that takes regular expression options as the third argument, with no capture group required. For example, you can now match case-insensitively in a single call:</p>
+<pre><code>SELECT regexp_extract('ABC', 'abc', 'i'); -- ABC</code></pre>
+<h3>Setting a Sequence Value</h3>
+<p>Sequences gained a PostgreSQL-style <code>setval</code> function to reset a sequence to a given value, which is useful after a bulk load:</p>
+<pre><code>CREATE SEQUENCE serial START 1;
+SELECT setval('serial', 42);
+SELECT nextval('serial');</code></pre>
+<table>
+ <thead>
+  <tr>
+   <th>nextval</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>43</td>
+  </tr>
+ </tbody>
+</table>
+<p>The next value after <code>setval</code> is <code>value + increment</code> by default. Pass <code>false</code> as the optional third argument (<code>is_called</code>) to make the next <code>nextval</code> return <code>value</code> itself.</p>
+<h3>Session Variables as Default Parameter Values</h3>
+<p>Prepared statements can now fall back to a session variable of the same name when a named parameter is not supplied at execution time:</p>
+<pre><code>SET VARIABLE multiplier = 10;
+SET VARIABLE x = 42;
+PREPARE compute AS SELECT $multiplier * $x AS result;
+EXECUTE compute;</code></pre>
+<table>
+ <thead>
+  <tr>
+   <th>result</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>420</td>
+  </tr>
+ </tbody>
+</table>
+<p>An explicit argument always takes precedence over the variable, and because the fallback is resolved at execution time, changing a variable and re-executing the statement picks up the new value.</p>
+<h3>Custom Partition Paths</h3>
+<p>When writing partitioned data, the <code>PARTITION_BY</code> clause writes each partition to a <code>col=value</code> subdirectory following the Hive convention. The new <code>PARTITION_PATH</code> option gives you full control over the subdirectory that each partition is written to, using an expression over the partitioning columns.</p>
+<pre><code>CREATE TABLE orders AS
+FROM (VALUES
+    (1, 2018, 3, 120.00),
+    (2, 2018, 11, 75.50),
+    (3, 2019, 6, NULL),
+    (4, 2019, 6, 310.25),
+    (5, 2020, 9, 18.75),
+    (6, 2021, 2, 42.00),
+    (7, 2021, 2, 99.90),
+    (8, 2023, 12, 260.00)
+) t(order_id, year, month, amount);</code></pre>
+<p>Let's partition this table based on year:</p>
+<pre><code>COPY orders TO 'orders'
+    (FORMAT parquet,
+     PARTITION_BY (year),
+     PARTITION_PATH CASE
+         WHEN year &lt; 2020 THEN 'archive/' || year
+         ELSE 'recent/' || year
+     END);</code></pre>
+<p>The expression is evaluated once per partition, and its result must be a relative path that does not contain <code>..</code> segments. Each partition must map to a distinct path. A companion <code>ORDER_BY</code> copy option sorts the rows before they are written. When combined with <code>PARTITION_BY</code>, the rows are sorted within each partition:</p>
+<pre><code>COPY orders TO 'orders_sorted'
+    (FORMAT parquet,
+     PARTITION_BY (year, month),
+     ORDER_BY (amount DESC NULLS LAST));</code></pre>
+<h3>Writing GeoJSON</h3>
+<p>DuckDB can now write GeoJSON directly with <code>COPY ... (FORMAT GEOJSON)</code>, which produces a <code>FeatureCollection</code>, or <code>FORMAT GEOJSONL</code> for newline-delimited features:</p>
+<pre><code>COPY (SELECT 'POINT(0 1)'::GEOMETRY AS geom, 10 AS my_field)
+    TO 'test.json' (FORMAT GEOJSON);</code></pre>
+<h2>Extensions</h2>
+<h3>Compatibility Matrix for Community Extensions</h3>
+<p>In the days following the release, once our CI pipelines got some breathing room, we built and deployed the community extensions for DuckDB 2.0.0.</p>
+<p>Not every extension is available for every DuckDB version and platform, so each extension's page now includes a compatibility matrix that shows which DuckDB version and platform combinations the extension was deployed for, covering recent DuckDB releases.</p>
+<h3>Window Function Extensions</h3>
+<p>Every aggregate function can be used as a window function, but not every windowed operation is an aggregate. In DuckDB 2.0, window functions became catalog entries, so extensions can now define their own window functions using the same C++ API as the built-in ones.</p>
+<p>An extension derives from the <code>WindowFunction</code> class, registers it with the <code>ExtensionLoader</code>, and implements a blocking interface, which builds its data structures and evaluates the function in parallel. Optionally, it can also implement a streaming interface for windows without <code>PARTITION BY</code> and <code>ORDER BY</code> clauses. As a side effect, window functions are now listed in <code>duckdb_functions()</code> and can be looked up with the <code>.manual</code> dot command.</p>
+<h2>Summary and Looking Ahead</h2>
+<p>In this blog post, we listed a few of the smaller features in DuckDB 2.0.0. For everything else, see the announcement blog post and the release notes. There are even more things in the release as part our core extensions – we'll release more posts on these in the coming weeks.</p>
+<p>The ecosystem around DuckDB keeps growing: many projects are built both with DuckDB and within it.</p>
+<p>We are also in the process of updating our roadmap with upcoming features. We already picked the codename for DuckDB 2.1, coming in 2027: we will name it after Barrow's goldeneye <em>(Bucephala islandica),</em> so:</p>
+<pre><code>with con.appender("duckdb_releases") as appender:
+    appender.append_row("2.1", "Islandica")</code></pre>
+<p>As always, we are grateful to the contributors who made this release possible. Thank you!</p>

@@ -1,0 +1,106 @@
+<p><em>Under the Hood: The Research Behind Microsoft SQL, part 1</em></p>
+<p>The Microsoft SQL team is always innovating. They do this in day-to-day efforts, but there are also brand new efforts that are constantly being explored, investigated, tested, and researched. Our engineering team partners closely with MSR (Microsoft Research) on some of these efforts. The team writes papers, submits these papers to conferences, and generally gets high recognition for their ingenuity in the databases and cloud space.</p>
+<p>One thing I’ve been thinking about recently is how little I actually have read the papers being written, and what scenarios they unlock for customers – could be security, performance, or availability (you know, the “meat and potatoes” of SQL Server, as Bob Ward would say).</p>
+<p>I’m starting a new blog series where I read some of the papers over the past 5-10 years, and then try to break them down so we all understand. You should know that I am not a database expert, but I love learning and this seemed like a great way to learn and share.</p>
+<p>So enough preamble. I thought it would be fitting to start with the paper about Socrates, which was the codename for Azure SQL Database Hyperscale, since we’ve been talking so much about it lately. Every cloud database vendor eventually hits the same wall. Which wall is that, and how did we get around it?</p>
+<p>In 2019, the Azure SQL team published how they got around the big wall called ‘size of data operations’ and ‘horizontal plus vertical’ scaling. Think about the following scenarios: A database grows past what one machine can hold, and suddenly the things you took for granted stop working. Backups take hours. Failover takes longer. Adding an active replica means copying terabytes across the network before it can serve a single query. The paper is called Socrates: The New SQL Server in the Cloud, and Socrates is the internal name for what shipped as Azure SQL Database Hyperscale.</p>
+<p>If you’ve ever wondered why Hyperscale can restore a 50 TB+ database in minutes vs days, this paper will help us understand the answer.</p>
+<h2>The problem: one machine, four jobs</h2>
+<p>Traditional SQL Server architecture asks a single node to do four things at once, and this applies to the Azure SQL Database Business Critical tier as well (General purpose is slightly different, but for purposes of this blog, I’ll focus on BC). It processes queries. It manages the transaction log. It stores the data. It keeps the copies in sync.</p>
+<p>That works well until you need all four at cloud scale simultaneously, or you want to scale independently. The team was direct about it:</p>
+<blockquote>
+ “It turns out that meeting all these requirements is not possible in the cloud using the traditional monolithic database architecture.”
+</blockquote>
+<p>The design that came before Socrates is what still powers the Business Critical service tier, and it works like this: a database runs as a small cluster of 3-4 replicas, very similar to an always-on availability group. One primary accepts reads and writes, and three secondaries stay current by replaying the primary’s transaction log. Each replica is a complete, self-sufficient SQL Server instance with its own local SSD holding a full copy of the data. If the primary fails, one of the secondaries is promoted, and because it already has everything, it can take over quickly.</p>
+<p>That symmetry is what makes it fast, and also what caps it. Every replica needs local storage big enough for the entire database, so a database can never outgrow a single machine’s disk. Backups run on the primary and compete with live traffic for I/O. Adding a replica means seeding a fresh full copy across the network first. Every one of those operations scales with data size, so the largest database the service could support set the cost of routine operations for everyone. The practical ceiling was around 4 TB.</p>
+<p>For the rest of this post, I’ll call it the full-replica architecture.</p>
+<h2>What they built</h2>
+<p>Socrates separates the database into four tiers, each doing one job well.</p>
+<p><strong>Compute nodes</strong> run the query processor. One primary handles reads and writes. Secondaries serve read-only queries. Critically, a compute node doesn’t need to store a full copy of the database. It keeps data close through two layers of cache: the in-memory buffer pool and a smart local SSD cache called RBPEX (Resilient Buffer Pool Extension). That SSD cache extends the buffer pool beyond memory, so more reads can be served locally instead of making a trip to a page server.</p>
+<p><strong>The XLOG service</strong> owns the transaction log. When the primary commits, log blocks land in a fast SSD “landing zone,” and XLOG fans them out to everyone who needs them. This is where durability lives. One of the key decisions is there is “push” of the log unlike AG technology used in BC. Everyone “pulls” from the log and only apply log records for pages in their caches.</p>
+<p><strong>Page servers</strong> own the data. Each one holds a slice of the database, applies log records to keep its slice current, and serves individual pages on request. These are, for the most part, full covering, which means any page not found on compute node can be fetched here. This is how a new compute can spin up so quickly, there’s no seeding or data copy, just pointing.</p>
+<p><strong>XStore</strong>, built on Azure Storage, holds the long-term durable copy and handles backups through snapshots. It also contains destaged log for longer retention.</p>
+<p>The connective tissue is a call called GetPage@LSN. A compute node (whether it’s a primary or a replica) that needs a page it doesn’t have in cache asks a page server for that specific page, at a specific point in the log. It’s a small idea with large consequences, “the Page Server waits until it has applied log up to that LSN and then returns the page, which guarantees the replica never sees a stale page.”</p>
+<blockquote>
+ “Separating the log and storage tiers separates durability (implemented by the log) and availability (implemented by the storage tier).”
+</blockquote>
+<p>Once those two concerns are separate, backup stops being a compute problem. Restore stops being a copy operation. Adding a replica stops being proportional to database size.</p>
+<h2>What it bought</h2>
+<p>The paper’s own before-and-after table is the clearest summary of the payoff:</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>Full-replica architecture (before)</th>
+   <th>Socrates</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Max database size</td>
+   <td>4 TB</td>
+   <td>100 TB</td>
+  </tr>
+  <tr>
+   <td>Availability</td>
+   <td>99.99%</td>
+   <td>99.999%</td>
+  </tr>
+  <tr>
+   <td>Scale operations</td>
+   <td>O(data)</td>
+   <td>O(1)</td>
+  </tr>
+  <tr>
+   <td>Storage copies</td>
+   <td>4×</td>
+   <td>2×</td>
+  </tr>
+  <tr>
+   <td>Commit latency</td>
+   <td>3 ms</td>
+   <td>under 0.5 ms</td>
+  </tr>
+  <tr>
+   <td>Log throughput</td>
+   <td>50 MB/s</td>
+   <td>100+ MB/s</td>
+  </tr>
+ </tbody>
+</table>
+<p>Two things stand out. Scale operations went from O(data) to O(1). Adding a read replica no longer depends on how big your database is. And storage overhead was roughly cut in half, from four copies to two (note that we also replicate each XStore blob for each replica for resiliency).</p>
+<p>Caching held up better than you’d expect. On that 1 TB database, a cache covering 22% of the data still served 52% of reads. On a 30 TB TPC-E database, a cache covering just 1% of the data served 32% of reads. Real workloads are skewed, and the architecture leans on that.</p>
+<p>Under update-heavy load, Socrates pushed 89.8 MB/s of log versus 56.9 MB/s for the full-replica architecture, roughly 58% higher, because backups moved to XStore snapshots instead of competing with the log.</p>
+<h2>Where you see this today</h2>
+<p>If you run Hyperscale, you’re running the descendants of this design.</p>
+<ul>
+ <li><strong>Backups are near-instant</strong> and don’t consume your compute, because they’re snapshot-based in the storage tier.</li>
+ <li><strong>Restore time is largely independent of database size.</strong> Restoring 50 TB is not 50 times harder than restoring 1 TB.</li>
+ <li><strong>Read replicas come up fast</strong>, which is why named replicas work as a pattern for isolating reporting or AI workloads from your transactional traffic. This is what you’ve heard me call “read scale on the fly”.</li>
+ <li><strong>Storage grows automatically</strong> up to 128 TB, without you pre-provisioning it.</li>
+ <li><strong>Log throughput now reaches 150 MB/s</strong>, up from the 100+ MB/s reported when the paper was published.</li>
+ <li><strong>Continuous priming</strong> is a new concept available that keeps the hottest pages in caches for replicas.</li>
+</ul>
+<p>There’s one more line from the paper worth reading as a design philosophy:</p>
+<blockquote>
+ “Every database function that can be offloaded to storage relieves the Primary Compute node and the log, the two bottlenecks of the system.”
+</blockquote>
+<p>Seven years later, that sentence still describes how the team makes decisions.</p>
+<h2>Why this matters if you’re choosing a database</h2>
+<p>Developers evaluating databases in 2026 tend to sort them into “modern, cloud-native” and “the relational one my company already has.” Socrates is a useful counterexample. Compute-storage separation, log as a service, and page-level remote fetch are the same architectural moves that show up in systems marketed as cloud-native today. Microsoft SQL got there in production, at scale, and kept full T-SQL compatibility while doing it.</p>
+<p>That last part is the interesting trade. Your existing application, your existing queries, and your existing tooling still work. The architecture underneath changed completely.</p>
+<p>And, completely unrelated to this paper – I have to call out a few other things about Hyperscale today:</p>
+<ul>
+ <li>It has no separate software to acquire, purchase, or maintain. We priced it at open source.</li>
+ <li>This architecture is great for large databases but it also works for small databases. It starts at 10GB. You can, as Bob Ward says, “start here, stay here.”</li>
+ <li>We just announced serverless auto-pause and resume support in public preview. This means you can make it scale to zero when inactive, if you want.</li>
+</ul>
+<h2>Credits</h2>
+<p><em>Socrates: The New SQL Server in the Cloud</em> was written by Panagiotis Antonopoulos, Alex Budovski, Cristian Diaconu, Alejandro Hernandez Saenz, Jack Hu, Hanuma Kodavalla, Donald Kossmann, Sandeep Lingam, Umar Farooq Minhas, Naveen Prakash, Vijendra Purohit, Hugh Qu, Chaitanya Sreenivas Ravella, Krystyna Reisteter, Sheetal Shrotri, Dixin Tang, and Vikram Wakade (Microsoft Azure and Microsoft Research).</p>
+<h2>Next steps</h2>
+<ul>
+ <li><strong>Read the paper</strong>: Socrates: The New SQL Server in the Cloud (SIGMOD 2019)</li>
+ <li><strong>Understand the architecture</strong>: Hyperscale distributed functions architecture</li>
+ <li><strong>Try it</strong>: Create a Hyperscale database</li>
+ <li><strong>Next in this series</strong>: Constant Time Recovery, and why a 12-hour recovery became a 3-minute one</li>
+</ul>

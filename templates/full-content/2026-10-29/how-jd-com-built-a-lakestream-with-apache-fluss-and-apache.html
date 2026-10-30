@@ -1,0 +1,52 @@
+<h2>Apache Hudi and Fluss: how JD.com built a Lakestream</h2>
+<p>JD.com runs a large Apache Hudi lakehouse alongside a large Apache Kafka deployment. This post describes how JD links streaming data and lakehouse data with a <strong>Lakestream</strong>: fresh data lives in Fluss tables, and a tiering service continuously writes it into Hudi tables. Readers can then query both together. The Fluss community calls this storage foundation a Lakestream: it unifies fresh data in streams with historical data in open lakehouse tables.</p>
+<p><strong>TL;DR</strong></p>
+<ul>
+ <li><strong>The problem</strong>: separate real-time and batch pipelines for the same data meant duplicated storage and compute and metric definitions that drifted apart. Consumers of one impression log topic had to read 195 GB/min to get the 6 GB/min of selective columns they actually needed.</li>
+ <li><strong>The approach</strong>: a Lakestream on Fluss and Hudi, so one copy of data serves both real-time and batch workloads.</li>
+ <li><strong>The results in recommendation ranking</strong>: batch compute cost down more than 80%, storage cost down more than 50%, end-to-end training-data freshness improved by more than 30%, three training-data sources merged into one, and better click-through and conversion rates in A/B tests.</li>
+ <li><strong>The Fluss integration</strong>: Hudi support for Fluss tiering (being contributed upstream as Fluss Improvement Proposal 24, FIP-24), server-side consumer offset management, and high availability for the Fluss Coordinator.</li>
+</ul>
+<h2>Challenges at JD's Scale</h2>
+<p>Our lakehouse and streaming platforms have grown over many years. The lakehouse runs on Apache Hudi, with <strong>more than 5,000 tables</strong> and <strong>more than 700 PB</strong> of data migrated into it, and a single job peaks at <strong>more than 600 million records per minute</strong>. The streaming platform runs on Apache Kafka, with <strong>more than 8,000 nodes</strong> in production, peak writes of <strong>500 million records per second</strong>, and peak egress of <strong>2 TB/s</strong>.</p>
+<p>At this scale, small inefficiencies get expensive. An extra copy of the data, a few fields read but never used, or one more pipeline to maintain each turns directly into cost, stability risk, and engineering time.</p>
+<h3>Row-Based Consumption Wastes Bandwidth and Compute</h3>
+<p>The first problem is that message queues store data by row. Our impression log topic is a good example: reading all of it means consuming about <strong>195 GB/min</strong>, but downstream jobs actually need only <strong>6 GB/min</strong>. Most jobs use a handful of fields, yet a row-oriented queue makes every consumer pull the full message and then parse, filter, and drop fields in its own compute job.</p>
+<p>That wastes resources in three places:</p>
+<ul>
+ <li><strong>Network</strong>: every consumer pulls the full message to use a few fields.</li>
+ <li><strong>Compute</strong>: deserializing and parsing unused fields burns CPU and memory.</li>
+ <li><strong>Pipeline load</strong>: the bigger the topic and the more consumers it has, the more this repeated reading and parsing adds up.</li>
+</ul>
+<h3>Separate Lakehouse and Stream Pipelines Duplicate Work</h3>
+<p>The second problem is architectural: the lakehouse and the stream are separate systems. Take training data for search and recommendation models as an example. Teams have traditionally run two pipelines side by side. The real-time pipeline quickly turns user activity into fresh training samples and features. The batch pipeline handles backfills, corrections, model training, and analysis. Running both meets different freshness needs, but it creates three problems:</p>
+<ul>
+ <li><strong>Duplicate storage.</strong> Much of the same data is stored more than once, in the message queue and in lakehouse tables.</li>
+ <li><strong>Duplicate compute.</strong> Both pipelines clean the data, join it, assemble features, and generate samples. Only the execution model differs.</li>
+ <li><strong>Inconsistent metric definitions.</strong> The two pipelines evolve separately, so field definitions, filters, error handling, and backfill logic drift apart.</li>
+</ul>
+<h3>Why We Adopted Fluss</h3>
+<p>The goal is to gradually bring real-time streams and the lakehouse onto <strong>the same data model, the same service interfaces, and the same way of consuming data</strong>. One copy of data serves real-time jobs through Fluss streaming and batch reads, and is also written to Hudi tables for long-term analysis, model training, and historical replay with engines such as Apache Spark. Jobs that need both use union reads, which query the Hudi table and the newest Fluss data as one table.</p>
+<h2>Case Study: Recommendation Ranking</h2>
+<p>We chose recommendation ranking as a key production use case. The redesign gradually consolidates several parallel pipelines into <strong>one copy of data, consumed in different ways</strong>. Real-time features and labels stream into Fluss first, which supports low-latency writes and minute-level online learning. The tiering service then writes the same data into Hudi tables, where Hudi's efficient backfills support batch analysis, base model training, and catch-up training.</p>
+<h3>Results</h3>
+<ul>
+ <li><strong>Cost</strong>: batch compute cost <strong>down more than 80%</strong>, storage cost <strong>down more than 50%</strong>.</li>
+ <li><strong>Freshness</strong>: end-to-end training-data pipeline freshness <strong>improved by more than 30%</strong>.</li>
+ <li><strong>Engineering effort</strong>: three training-data sources (batch, catch-up, and real-time) merged into one, and two APIs (batch and real-time) merged into one.</li>
+ <li><strong>Business metrics</strong>: core recommendation metrics, including user click-through rate (UCTR) and order conversion rate (UCVR), improved in A/B tests.</li>
+</ul>
+<h2>What We Built on Fluss</h2>
+<h3>Tiering Fluss Data into Hudi</h3>
+<p>We built a Hudi plugin for the Fluss tiering service, adapting the three stages of the tiering job: the source enumerator, the source reader, and the committer.</p>
+<ul>
+ <li><strong>Runtime</strong>: TieringSourceEnumerator splits each round of tiering work and assigns the splits. TieringSourceReader reads data from Fluss and writes it to the lake table. TieringCommitter commits the lake table and reports the snapshot back to Fluss.</li>
+ <li><strong>Lake abstraction</strong>: a common lake storage interface hides the differences between lake formats.</li>
+ <li><strong>Hudi plugin</strong>: Hudi plugs in as a LakeStorage implementation.</li>
+</ul>
+<h3>Server-Side Consumer Offsets</h3>
+<p>We added consumer offset management to the Fluss server. The offsets live in a primary key system table, <code>consumer_offsets</code>, keyed by group, table_id, partition_id, and bucket_num. An offset record holds the offset, leader epoch, metadata, and commit timestamp.</p>
+<h3>Coordinator High Availability</h3>
+<p>It runs on JD's internal Kubernetes platform, with a Controller daemon deployed as a StatefulSet. In each pod, the Controller runs as PID 1 and registers with ZooKeeper on startup. The pod that registers successfully becomes active and starts the Fluss Coordinator process. The other pods are cold standbys that watch the ephemeral znode and take over if it disappears.</p>
+<h2>What's Next</h2>
+<p>We are contributing Hudi tiering back to the Fluss community as FIP-24: Tiering Service to Hudi. Our next steps include adding per-user quotas, tuning offset management, and achieving feature parity with JD's Hudi stack regarding schema evolution and dynamic bucketing.</p>

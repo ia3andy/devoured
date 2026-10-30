@@ -1,0 +1,100 @@
+<p>At Benchouse, we benchmark different analytics agents with equivalent context. This time, I wanted to go deeper: how far could I push one agent on our evaluation set?</p>
+<p>But the path wasn’t straightforward. Better documentation sometimes made the agent abandon the calculation we expected. It spotted flaws in our data and decided to fix them without being asked.</p>
+<p>Getting past 95% meant figuring out when the agent needed more information and when it needed less freedom.</p>
+<p>Here’s what I changed, what each configuration scored, and what I’d take into a deployment on my own data.</p>
+<p>For this study, I used nao, an open-source analytics agent. It suited this study well: nao keeps its context layer as a file system, and it can work with any kind of context or semantic layer. That made it easy to test every context option side by side, from bare schema to documented business definitions. Setup was straightforward: I connected our evaluation framework through its MCP and managed the context as version-controlled files.</p>
+<p>With Sonnet 5 and bare schema, it got 49.6% of its answers right. After changing the model and building up the context, we reached 96.5%.</p>
+<h2>Same questions, more context</h2>
+<p>To see what each change actually bought us, I kept the test fixed: 90 questions across 59 marts tables.</p>
+<p>The questions covered three tiers:</p>
+<ul>
+ <li><strong>Descriptive:</strong> what happened?</li>
+ <li><strong>Diagnostic:</strong> what happened, and why?</li>
+ <li><strong>Prescriptive:</strong> what happened, why, and what should we do?</li>
+</ul>
+<p>Five questions deliberately asked for information the warehouse doesn’t contain. These tested whether the agent would correctly refuse to answer.</p>
+<p>I tested four configurations, each building on the previous one:</p>
+<ol>
+ <li><strong>Bare schema.</strong> Connect the warehouse. Give the agent only table and column names, without even column descriptions.</li>
+ <li><strong>Add nao sync.</strong> Give it column information, sample rows and profiling.</li>
+ <li><strong>Add full documentation.</strong> Describe the tables, keys, relationships, synonyms and joins to avoid.</li>
+ <li><strong>Add definitions and answering rules.</strong> Apply nao’s Recommendations and Benchouse’s improvements: explicit business definitions, rules for how to answer, clearer synonyms and corrected catalogue guidance. Develop these using a separate training set.</li>
+</ol>
+<p>Customizing the context meant editing files. Luckily, nao gives you plenty of flexibility to add instructions, documentation and answering rules, so I could change what the agent knew and how it used that knowledge.</p>
+<p>Every configuration faced the same 90 questions three times to measure consistency. I scored them with the Benchouse evaluation framework throughout. nao has its own evaluation tools too; I kept ours so the measuring process stayed the same while the context changed.</p>
+<h2>The model made the first big difference</h2>
+<p>Going into this, I thought most of the improvement would come from giving the agent better context. But the baseline I ran on Opus 5.5 already reached 88.2% accuracy with just table and column names, not even descriptions.</p>
+<p>I wasn’t expecting that. Was Opus really that good with so little context? I ran the same setup on Sonnet 5 to check. It performed a lot worse.</p>
+<p>The difference was substantial. I saw that Sonnet was struggling to find its way around the database schema, whereas Opus happily used any tool at its disposal.</p>
+<p>This is what Benchouse does: the same evaluation set, run against different analytics agents with equivalent context, scored by the same judge.</p>
+<h2>Basic context saves money</h2>
+<p>With <code>nao sync</code>, which takes your database context (tables and columns) and stores it locally for the agent, Opus’s accuracy barely moved. That was to be expected: Opus had already made the extra tool calls to figure out the database structure.</p>
+<p>The cost per question did fall. With the context at its fingertips, Opus had less work to do.</p>
+<h2>nao’s <code>write-context-rules</code> skill took accuracy from 90.6% to 92.9%</h2>
+<p>My next hypothesis was that fully documenting the model would bring accuracy to 95%.</p>
+<p>So I added:</p>
+<ul>
+ <li>Descriptions for every table and column</li>
+ <li>Table grain: what each row represents</li>
+ <li>Primary and foreign keys</li>
+ <li>Relationships between tables</li>
+ <li>Business synonyms for tables and columns</li>
+ <li>Joins to avoid, including incompatible keys and grain mismatches</li>
+ <li>Value lists explaining categories, statuses and other coded fields (enums)</li>
+</ul>
+<p>Full documentation brought accuracy to 91.4% across three attempts. Then I tried nao’s <code>write-context-rules</code> skill on top of that documentation.</p>
+<p>On the matching single-attempt comparison, accuracy went from 90.6% to 92.9%: <strong>a gain of 2.3 percentage points</strong>. Cost per question also fell slightly, from $0.247 to $0.239.</p>
+<p>It still left us short of 95%. Time to dig deeper into the remaining mistakes.</p>
+<h2>How we finally got to 96% accuracy</h2>
+<p>For this last configuration, I used a training set of 210 questions on a clean run. I didn’t want to overfit our improvements to the 90 evaluation questions.</p>
+<p>This revealed a few general areas for improvement:</p>
+<ul>
+ <li>The agent proactively works to fix your data issues</li>
+ <li>Business terms leave room for interpretation</li>
+ <li>Ambiguous context sends it down competing paths</li>
+ <li>A thorough analytics agent sometimes misses the point</li>
+</ul>
+<h3>1. The agent proactively works to fix your data issues</h3>
+<p>In the project’s <code>RULES.md</code>, we told the agent to give the business’s figure first, then flag limitations and label any alternative.</p>
+<p>Our warehouse has a holiday flag. The documentation explains that the flag misses some holidays. Once the agent knew that, it built its own calendar instead, on every attempt. It had spotted a real limitation. But the incomplete flag was still the business’s agreed definition of a holiday.</p>
+<p>We saw the same behaviour with blended ROAS: the agent chose store revenue over ad spend rather than the platform-attributed figure.</p>
+<p><strong>A defensible answer can still be the wrong number for your meeting.</strong> We had described the fields without settling which interpretation the agent should lead with.</p>
+<h3>2. Leaving no room for interpretation</h3>
+<p>We started explicitly documenting where our definitions differed from industry standards. For example:</p>
+<ul>
+ <li><strong>Attributed revenue:</strong> we default to the platform-reported figure unless another model is requested, with a warning about overlapping claims.</li>
+ <li><strong>Fill rate</strong> counts purchase-order lines that are due. Lines not yet due are still on order.</li>
+ <li><strong>Money-losing campaigns</strong> must cover the goods sold as well as ad spend.</li>
+</ul>
+<p>We added these definitions to a Definitions section in each relevant table’s <code>annotations.md</code>, alongside its documentation.</p>
+<p>For example, our marketing table notes defined a money-losing campaign:</p>
+<pre><code>## Definitions
+
+- **Money-losing campaign:** attributed revenue does not cover
+  ad spend plus the cost of goods sold.
+  Break-even ROAS = 1 / gross-margin rate.</code></pre>
+<p>A campaign can earn more than its ad spend and still lose money. That distinction belongs in the context, rather than being left for the agent to infer.</p>
+<h3>3. Disambiguate, disambiguate, disambiguate…</h3>
+<p>Terminology needed cleanup too. Some of our context overlapped, understandably confusing the agent. The same synonym pointing to competing columns gives the agent another choice to make. Misleading catalogue guidance sends it down a dead end. Clarity here matters as much as another paragraph of description.</p>
+<p>We corrected the synonyms in the table annotations and updated the misleading column description in the catalogue.</p>
+<h3>4. Agents need to get to the point</h3>
+<p>Agents love to be helpful. Sometimes they jump ahead and answer the question they think you’ll ask next.</p>
+<p>For our benchmark, we instructed the agent to answer our question first. Then it had leeway to take the analysis further.</p>
+<p>The instructions were: <strong>give the house figure first. Only then offer a clearly labelled alternative.</strong> We also asked it to answer the requested period and breakdown, say when data was missing, and put key numbers in the text.</p>
+<p>These instructions went into the project-wide <code>RULES.md</code>, so they applied across questions.</p>
+<h3>Conclusion</h3>
+<p>The final version of the context reached <strong>96.5% accuracy at 100.0% completeness</strong>. That was 5.1 percentage points above full documentation and 8.6 points above bare schema on Opus.</p>
+<p>Consistency improved too. The share of questions answered correctly on all three attempts rose from 77.6% to 92.9%. Getting it right again tomorrow is closer to what I have come to expect from an analytics agent.</p>
+<p>This final setup cost more per question than sync alone, but less per correct answer than the bare setup. We tested its changes together, so we cannot assign a separate accuracy gain to each definition, recommendation or rule.</p>
+<h2>Sonnet vs. Opus on the final context</h2>
+<p>Now for the grand finale: with all this context in place, how does Sonnet perform?</p>
+<p>Switching models meant changing one setting. The context stayed the same.</p>
+<p><strong>Accuracy</strong></p>
+<p>Sonnet 5.5 on the final context reached 92.9% accuracy at $0.164 per correct answer. C3 Opus’s first attempt reached 94.1%. That makes a wider model comparison worth doing.</p>
+<p><strong>Cost</strong></p>
+<p>Cost fell from $0.27 to $0.14 per question, a 48% reduction, while accuracy dropped by 3.6 percentage points.</p>
+<h2>Conclusion: There’s no silver bullet</h2>
+<p>A stronger model gave us the biggest initial improvement. But even Opus needed better context to get past 95%. Once that context was in place, we could try a cheaper model and measure what we gave up.</p>
+<p>There wasn’t one change that solved everything. It was death by a thousand paper cuts: an ambiguous synonym, a misleading description, an unstated definition, an agent answering the question it thought you should have asked. Each needed attention.</p>
+<p>That’s why I’d start with real questions and read the wrong answers. Figure out what caused each miss, improve the context, and test again. Then revisit the model choice. You might be able to spend less, but check what happens to the answers as well as the bill.</p>
+<p>If you’re looking for an analytics agent, nao is well worth trying. It’s easy to set up, and its flexibility makes it a great tool for experimenting with your own data and context.</p>

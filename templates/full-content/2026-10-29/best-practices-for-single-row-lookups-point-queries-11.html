@@ -1,0 +1,106 @@
+<h1>Best Practices for Single Row Lookups (Point Queries)</h1>
+<p>This blog post covers different techniques to improve the performance of point queries in DataFusion. It is based on a talk (<a href="https://nuno-faria.github.io/papers/df-point-queries.pdf">slides</a>, <a href="https://www.youtube.com/watch?v=lpr70D9tmSE">recording</a>) given at the Boston DataFusion meetup, in September 2026.</p>
+<h2>Introduction</h2>
+<p>While DataFusion is commonly seen as an engine to run analytical workloads -- which are comprised by queries that access large sets of data -- some of its users regularly require random lookups to large files. During the DataFusion meetup in Boston, I met several community members that shared their experiences with these types of workloads, and how they hit some of the same challenges I highlighted in my talk.</p>
+<p>For this blog post, I will cover some best practices on how to handle random lookups (aka point reads) based on my past experience with these workloads in DataFusion. Since we usually have many more queries to execute comparatively to analytical workloads, the challenge here is completing each query as fast as possible (&lt; 1ms) to achieve a reasonable throughput.</p>
+<p>The first part goes over optimizations in the storage (in this case, Parquet files), while the second optimizes the execution in DataFusion.</p>
+<h2>Methodology</h2>
+<p>The dataset we will be using here is formed by a single Parquet file with 100M rows (unless otherwise stated), using a key (<code>bigint</code>, unique) and value (<code>varchar</code>, md5 of the key) columns, generated with the following code:</p>
+<pre><code>select i as k, md5(i::varchar) as v
+from generate_series(1, \{rows}) t(i)
+</code></pre>
+<p>Unless otherwise stated, the queries tested retrieve a random row from the table by key (i.e., <code>select v from t where k = \{}</code>). Most tests run on a <code>c4d-standard-4</code> (4 vCPUs, 15GB RAM) Google Cloud virtual machine, using a 100GB <a href="https://docs.cloud.google.com/compute/docs/disks/hyperdisks">HyperDisk</a> (6k IOPS, 500 MB/s) to store the data.</p>
+<h2>Storage (Optimizing Parquet Settings)</h2>
+<h3>File Ordering</h3>
+<p>Having the Parquet file sorted by key will allow random lookups to access the minimum amount of data, assuming our predicate is also based on the key. To confirm this, the first test measures the throughput of random reads against a sorted (<code>True</code>) and non sorted (<code>False</code>) file.</p>
+<p>The overall throughput of the <strong>sorted version is 6000x faster</strong> than the non-sorted one. In this case, the execution plans show that the non-sorted version needs to access, on average, 67 row groups and 122 total pages, while the sorted version only accesses one page in one group.</p>
+<p>In case you are not familiar, Parquet files are divided into multiple row groups, with each column in each group divided into multiple pages. DataFusion uses the min/max statistics for each group/page to determine if it needs to access it or not. If the file is not sorted, the min/max bounds will be wide, forcing more groups/pages to be accessed.</p>
+<h3>Additional Metadata</h3>
+<p>By default, DataFusion writes Parquet files with dictionary encoding enabled. Dictionary encoding maps column values to integers in an attempt to compact the space used, working pretty well for columns that have many duplicate values.</p>
+<p>However, if a column contains many distinct values (which is the case in our dataset), the dictionary will only add overhead. The following test compares enabling (<code>True</code>, default) and disabling (<code>False</code>) the dictionary, showing that the latter achieves a higher throughput.</p>
+<p>Another optional metadata commonly used in Parquet files are bloom filters, which much like min/max statistics help speedup predicates. In the context of Parquet files, a bloom filter is an array of bits that can determine if a value is <em>definitely not</em> or <em>maybe is</em> in a specific row group.</p>
+<p>In our case, since the column we filter by only contains unique values and is already sorted, the min/max statistics suffice, and thus there is no need to add bloom filters. By default, DataFusion already does not add bloom filters when writing Parquet files.</p>
+<p>In summary, at least for sorted files with many unique values, it is better to <strong>disable both of these structures</strong> when writing Parquet files. This can be set in the <a href="https://datafusion.apache.org/user-guide/sql/format_options.html#parquet-format-options"><code>OPTIONS</code> part of the SQL <code>COPY</code> command</a>, or by changing the <a href="https://docs.rs/datafusion/55.2.0/datafusion/common/config/struct.TableParquetOptions.html"><code>TableParquetOptions</code></a> in <code>DataFrame::write_parquet</code>:</p>
+<pre><code>COPY (...) to 't.parquet'
+OPTIONS (
+    DICTIONARY_ENABLED false,
+    BLOOM_FILTER_ON_WRITE false
+)
+</code></pre>
+<h3>File Configuration</h3>
+<p>Next up, we are going to take a look at what should be the optimal row group and data page sizes for point reads. We can conclude that the optimal configurations for point reads are the values around <strong>128k rows per row group</strong> and <strong>1k rows per page</strong>, which are quite different from the defaults used in DataFusion (1M sized row groups and 20k sized pages). Tiny groups or pages will lead to a large number of them, which means more time when pruning. On the other hand, large groups or pages means less data is pruned and thus more rows are scanned.</p>
+<p>But what if we need our Parquet files for both point reads and analytical workloads? While large reads favor larger pages, and smaller reads favor smaller pages, we can use around <strong>2k-4k rows per page</strong> to achieve a good throughput for both workloads, meaning we don't need to sacrifice one over the other.</p>
+<pre><code>COPY (...) to 't.parquet'
+OPTIONS (
+    MAX_ROW_GROUP_SIZE 131072,
+    DATA_PAGE_ROW_COUNT_LIMIT 2048
+)
+</code></pre>
+<h3>Compression</h3>
+<p>Finally, we will examine how compression affects performance. The main conclusion here is that, for our dataset, we should use <strong><code>lz4</code> if we favor faster speeds</strong>, while <strong><code>zstd</code> shows the best space/speed tradeoff</strong> (default used in DataFusion). The <code>snappy</code> algorithm, which is commonly used, uses around the same space as <code>lz4</code> for this dataset but is slower in larger scans in DataFusion.</p>
+<h2>Execution (Optimizing DataFusion Settings)</h2>
+<h3>Target Partitions</h3>
+<p>We are now going to optimize the execution itself, starting with the <code>target_partitions</code> config in DataFusion. Since point reads require so little work, the overhead of distributing load to multiple cores outweighs its benefits. We observe that <strong>small reads are faster with a single partition</strong>. On the other hand, larger reads are faster as they can use the additional parallelism, so this option is very much workload dependent.</p>
+<h3>Pushdown Filters</h3>
+<p>Next up, we are going to take a look at another DataFusion config: <code>pushdown_filters</code>. This config pushes filters directly to the Parquet scan, instead of having an extra <code>FilterExec</code> node. For both smaller (&lt;10k rows) and larger (&gt;100k rows) reads, we conclude that <strong>enabling <code>pushdown_filters</code> results in a higher throughput</strong>.</p>
+<h3>Metadata Cache</h3>
+<p>To find data in a Parquet file, DataFusion first has to retrieve and parse the file's built-in metadata. DataFusion caches Parquet metadata by default since version 50.0.0 to avoid having to do this at every read. It is better to <strong>keep this caching enabled</strong> if we intend to query the same file more than once.</p>
+<h3>Prepared Statements</h3>
+<p>For point reads specifically, the optimization process of building logical and physical plans has quite a significant weight on performance. Reusing the logical plan offers an improvement over not reusing anything, but it's clear that <strong>reusing the physical plan leads to a considerably higher throughput</strong>, doubling or even tripling performance. Currently, this is not available in DataFusion.</p>
+<h3>Memory Allocator</h3>
+<p>Another important contributor to the overall performance in DataFusion is the memory allocator used. The results show that the allocators have widely different throughputs. In our workload, <strong><code>mimalloc</code> appears to be the overall best choice</strong>.</p>
+<h3>Runtime</h3>
+<p>After experimenting with different configurations, I found that having a <strong>separate single-threaded runtime for each client scaled better</strong>. We see in the results that the default version does not really improve with multiple clients, as the CPU is not being fully utilized, unlike the multiple single-threaded runtimes version.</p>
+<h2>Summary</h2>
+<p>Table 1 shows an overview of the main optimizations tested. In total, we managed to improve the throughput in almost 8x over the baseline and reduce the response time to sub 0.2ms, demonstrating that DataFusion is well capable of handling point read workloads.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Optimization</th>
+   <th>Throughput (reads/s)</th>
+   <th>Response time (ms)</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Sorted file</td>
+   <td>698</td>
+   <td>1.43</td>
+  </tr>
+  <tr>
+   <td>Disable Dictionary Encoding</td>
+   <td>1062</td>
+   <td>0.94</td>
+  </tr>
+  <tr>
+   <td>Row Group / Page Configuration</td>
+   <td>1370</td>
+   <td>0.73</td>
+  </tr>
+  <tr>
+   <td>Target Partitions</td>
+   <td>1553</td>
+   <td>0.64</td>
+  </tr>
+  <tr>
+   <td>Pushdown Filters</td>
+   <td>1616</td>
+   <td>0.62</td>
+  </tr>
+  <tr>
+   <td>Prepared Statements</td>
+   <td>4606</td>
+   <td>0.22</td>
+  </tr>
+  <tr>
+   <td>Mimalloc Allocator</td>
+   <td>5192</td>
+   <td>0.19</td>
+  </tr>
+  <tr>
+   <td>Single-threaded Runtimes</td>
+   <td>5433</td>
+   <td>0.18</td>
+  </tr>
+ </tbody>
+</table>
