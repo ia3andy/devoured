@@ -1,0 +1,123 @@
+<p>For years, <em>pull_request_target</em> has been the canonical Pwn request vector: a workflow trigger that runs with repository secrets, yet can be triggered by anyone who opens a pull request from a fork. In 2026, GitHub responded with platform changes that make the default-case exploit significantly harder.</p>
+<p>These changes represent real progress. Checkout protections, read-only cache tokens, and event policies close the paths that made exploitation trivial. <strong>But they don't eliminate the vulnerability class. They shift it.</strong> Attackers who previously exploited any <em>pull_request_target</em> workflow now need to find explicit opt-ins, outdated checkout versions, unprotected triggers, or script injection.</p>
+<p>In Part 1 of our GitHub Actions research, we laid out the threat model and core defenses, and Part 2 covered AI-powered actions. This post updates that threat model for 2026: what GitHub's changes actually protect against, where the gaps remain, and how defenders need to adjust. The audit checklist at the end covers what to look for in your own workflows.</p>
+<h2>The 2026 Security Overhaul: Timeline of Changes</h2>
+<p>Recognizing the endemic risk posed by Pwn requests, GitHub spent 2026 systematically closing the gap through a phased rollout of platform-level protections and action updates.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Date</th>
+   <th>Milestone &amp; Action Taken</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>June 18, 2026</td>
+   <td>Release of actions/checkout@v7.0.0, blocking fork code checkouts by default in untrusted triggers (pull_request_target, and workflow_run triggered by pull requests).</td>
+  </tr>
+  <tr>
+   <td>June 26, 2026</td>
+   <td>GitHub introduces read-only cache tokens at the platform level for untrusted triggers, preventing cache poisoning attacks.</td>
+  </tr>
+  <tr>
+   <td>July 20, 2026</td>
+   <td>Backported fork checkout protections across all active major versions of actions/checkout (v2.8.0, v3.7.0, v4.4.0, v5.1.0, and v6.1.0; v1 excluded). Workflows referencing mutable version tags (e.g., @v4) inherit these defenses automatically.</td>
+  </tr>
+  <tr>
+   <td>September 10, 2026</td>
+   <td>Fine-grained cache controls via cache-mode reached General Availability (GA).</td>
+  </tr>
+  <tr>
+   <td>September 17, 2026</td>
+   <td>Workflow Execution Protections reached GA, enabling fine-grained event policies and actor rules.</td>
+  </tr>
+  <tr>
+   <td>December 2, 2026</td>
+   <td>[Scheduled] GitHub begins enforcing the default event policy that blocks pull_request_target in public repositories without an explicit event policy. The rule has been in evaluate mode since September 17. Private and internal repositories are not affected.</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Residual Risk: What Still Works</h2>
+<p>While this sequence of platform updates significantly strengthens default security configurations for GitHub Actions, they don't remove all risk.</p>
+<p>The December 2 enforcement is a default, not a ban. Maintainers whose automation depends on <em>pull_request_target</em> (labelers, preview deploys, fork CI with secrets) will add an event policy that allows it. Those are exactly the workflows that handle untrusted input with elevated privileges. The default policy also doesn't apply to private and internal repositories or to <em>workflow_run</em>. The rest of this section covers how these surviving workflows can still be exploited.</p>
+<h3>SHA Pinning: The Security Paradox</h3>
+<p>One of the most disconcerting findings in our research is how standard supply chain hardening advice - specifically pinning actions to exact commit SHAs - can inadvertently bypass GitHub's platform defenses.</p>
+<pre><code># "Security-hardened" workflow: SHA-pinned for supply chain safety
+- uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0</code></pre>
+<p>Because GitHub's backported protections rely on logic embedded within <code>actions/checkout</code> itself, pinning to SHA values prior to the July 20, 2026 backport release means the workflow runs legacy code without any safety checks. Our empirical testing across workflow triggers confirmed this discrepancy: referencing mutable tags like @v4 (resolving to v4.4.x) or pinned versions such as @v4.4.0 remain protected, whereas older versions like @v4.3.0 or SHA-pinned references to legacy releases (such as @08eba0b... resolving to v4.3.0) offer no protection.</p>
+<p>To maintain protection, security teams using SHA pinning must ensure their refs are updated to match or exceed the minimum patched release versions: v2.8.0, v3.7.0, v4.4.0, v5.1.0, v6.1.0, or v7.0.0+.</p>
+<h3>Custom Checkout Scripts and Third-Party Actions</h3>
+<p>A second gap concerns workflows that bypass <code>actions/checkout</code> altogether. GitHub's protections are implemented within the action's code - any alternative method of fetching code operates unrestricted. Direct CLI invocations sidestep protections entirely:</p>
+<pre><code>- env:
+    GH_TOKEN: $\{\{ github.token }}
+    PR_REPO: $\{\{ github.event.pull_request.head.repo.full_name }}
+    PR_SHA: $\{\{ github.event.pull_request.head.sha }}
+    PR_NUMBER: $\{\{ github.event.pull_request.number }}
+  run: |
+    # Any one of these fetches fork code without actions/checkout's protections
+    # Bypass 1: Direct git clone
+    git clone "https://github.com/$\{PR_REPO}" pr-code &amp;&amp; git -C pr-code checkout "$\{PR_SHA}"
+    # Bypass 2: gh pr checkout (runs in the base repo's workspace)
+    gh pr checkout "$\{PR_NUMBER}"
+    # Bypass 3: gh repo clone
+    gh repo clone "$\{PR_REPO}" fork-code</code></pre>
+<p>Third-party checkout actions implement their own git logic, so they don't inherit these protections. Any of them configured with a PR head ref will check out fork code unrestricted.</p>
+<h3>Unprotected Privileged Triggers</h3>
+<p>GitHub's checkout protections only cover <em>pull_request_target</em> and <em>workflow_run</em>:</p>
+<blockquote>
+ <p>Pwn requests triggered in other event types besides pull_request_target (such as issue_comment) will not be blocked by this change. Further hardening of additional events may be explored in future releases.</p>
+</blockquote>
+<p>This creates an inconsistent security boundary: GitHub's cache controls explicitly treat <em>issue_comment</em> as a low-trust trigger, while checkout protections do not. Workflows using <em>issue_comment</em> for bot commands (<code>/deploy</code>, <code>/test</code>, <code>/cherry-pick</code>) remain fully exploitable with checkout v7 - no <code>allow-unsafe-pr-checkout</code> flag required:</p>
+<pre><code>on:
+  issue_comment:
+    types: [created]
+jobs:
+  deploy:
+    if: github.event.issue.pull_request &amp;&amp; contains(github.event.comment.body, '/deploy')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/pull/$\{\{ github.event.issue.number }}/merge  # Checks out fork PR code</code></pre>
+<p>Other privileged triggers have the same gap. <em>repository_dispatch</em> also runs with secrets, and it's exploitable when a workflow uses attacker-influenced payload data to choose a checkout ref.</p>
+<p>Until GitHub extends checkout protections, these workflows have to enforce their own authorization, and it needs to hold from the moment the event fires until the code runs:</p>
+<ul>
+ <li><strong>Verify who triggered it.</strong> For comment commands, check the commenter's actual repository permission. Don't rely on <em>author_association</em>, which doesn't reflect current permissions. For <em>repository_dispatch</em>, limit who holds a token that can send the event, and don't treat the payload as proof of who sent it.</li>
+ <li><strong>Pin what was approved.</strong> <code>refs/pull/N/merge</code> is mutable, so an attacker can push a malicious commit after a maintainer comments /deploy. Check out the exact head SHA, and abort if the PR was updated after the comment was posted.</li>
+ <li><strong>Treat the event payload as untrusted input.</strong> Validate comment arguments and dispatch payload fields against a strict, anchored allowlist regex, and pass them to the shell through environment variables, never through <code>$\{\{ }}</code> interpolation.</li>
+</ul>
+<h3>Script Injection: Pwn Request Without Checkout</h3>
+<p>A common misconception is that <em>pull_request_target</em> vulnerabilities require checking out fork code. In reality, attackers can achieve code execution without any checkout step, through script injection.</p>
+<p>When workflow authors interpolate event context directly into shell commands using <code>$\{\{ }}</code> expressions, GitHub substitutes the value into the script before the shell runs, so attacker-controlled data becomes part of the command itself.</p>
+<pre><code>on: pull_request_target
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Thanks for PR: $\{\{ github.event.pull_request.title }}"</code></pre>
+<p>An attacker simply crafts a pull request with a malicious title: <code>"; touch /tmp/pwned; echo INJECTED #</code></p>
+<p>The quote closes the string, the semicolon ends the echo, and everything after it runs as a new command with the job's secrets and token. None of GitHub's 2026 changes touch this: there is no checkout to block, and the vulnerability lies in how the workflow handles untrusted input.</p>
+<p>The fix is to never interpolate untrusted input into a script. Pass it through an environment variable instead, so the shell treats it as data.</p>
+<h3>Persistent Data Channels: Beyond Cache Tokens</h3>
+<p>GitHub's read-only cache tokens protect the Actions cache service, but workflows can still exchange data through channels that remain unaffected.</p>
+<h4>Artifact Poisoning</h4>
+<p>The <code>upload-artifact</code> and <code>download-artifact</code> actions operate independently of cache tokens. The classic attack chain uses an unprivileged <em>pull_request</em> workflow to upload attacker-controlled build outputs, then a privileged <em>workflow_run</em> to download and execute them. This is exactly the workflow_run scenario checkout v7 was built to block, and it doesn't help here. The privileged workflow never checks out fork code; it downloads it. Unlike cache entries, there's no platform equivalent that marks artifacts from untrusted runs as tainted, so any workflow that downloads and executes artifacts from a less-trusted run inherits the risk.</p>
+<h4>Self-Hosted Runner State</h4>
+<p>On non-ephemeral self-hosted runners, filesystem state persists between jobs. Local package manager caches, build directories, and installed tools live on the runner's disk, outside the Actions cache service, so read-only cache tokens don't cover them. Attacker code running under an untrusted trigger can write to these locations and poison the next trusted workflow scheduled on the same machine. Use ephemeral runners, which are wiped after each job, for any workflow that untrusted events can trigger, and keep untrusted and trusted workflows in separate runner groups.</p>
+<h3>The Misconception That Won't Die</h3>
+<p>Many security teams believe they have another safeguard in place: the "Require approval for all external contributors" setting. If enabled, fork PRs need maintainer approval before workflows run. For <em>pull_request_target</em>, GitHub considers the workflow definition trusted, so the approval setting doesn't apply and the run starts immediately.</p>
+<h3>Explicit Opt-In: allow-unsafe-pr-checkout</h3>
+<p>Finally, developers who need to interact with fork code can explicitly disable checkout protections by enabling the <code>allow-unsafe-pr-checkout</code> flag. While the parameter name is deliberately alarming, determined development teams or third-party workflows may still employ it to maintain legacy automation, effectively reopening the exact same execution vector as before.</p>
+<h2>What Changed</h2>
+<p>To sum up, GitHub's 2026 security rollout deserves credit. Default event policies, checkout protections, and read-only cache tokens make the trivial Pwn request (fork, PR, profit) significantly harder. Starting December 2, <em>pull_request_target</em> will no longer run in public repositories unless an event policy explicitly allows it.</p>
+<p>But the vulnerability class isn't eliminated. It shifted. What remains exploitable: explicit opt-ins via <code>allow-unsafe-pr-checkout</code>, SHA-pinned versions predating the July 2026 backport, custom checkout scripts, script injection, unprotected triggers like <em>issue_comment</em> and <em>repository_dispatch</em>, artifact poisoning chains, persistent state on non-ephemeral self-hosted runners, and private/internal repositories. <strong>The attack surface shrinks, but what remains is harder to spot.</strong></p>
+<h2>What To Do About It</h2>
+<h3>Audit Your Workflows</h3>
+<p>Use grep searches to start the audit:</p>
+<pre><code>grep -rnE 'pull_request_target|workflow_run|issue_comment|repository_dispatch|allow-unsafe-pr-checkout|self-hosted|download-artifact|gh (pr checkout|repo clone)|git (clone|fetch)|refs/pull|actions/checkout@v(1|2\.[0-7]|3\.[0-6]|4\.[0-3]|5\.0|6\.0)([^0-9]|$)|\$\{\{[[:space:]]*github\.(event\.|head_ref)' .github/workflows/</code></pre>
+<h3>Preparing for the December 2 <em>pull_request_target</em> Enforcement</h3>
+<ul>
+ <li>Check policy insights to see which <em>pull_request_target</em> runs would be blocked.</li>
+ <li>Decide per workflow whether it actually needs <em>pull_request_target.</em> If not, move it to <em>pull_request</em>. If a privileged follow-up step is still needed, a <em>workflow_run</em> workflow can handle it, but it must treat the PR run's artifacts as untrusted data, never execute them.</li>
+ <li>For workflows that legitimately need fork access, create an explicit event policy and use workflow file targeting to allow <em>pull_request_target</em> only for those files. Treat every file on that allowlist as high-risk.</li>
+</ul>
