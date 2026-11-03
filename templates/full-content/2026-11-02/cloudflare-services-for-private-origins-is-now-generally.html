@@ -1,0 +1,57 @@
+<p>Today, Cloudflare services for private origins is generally available. Point a proxied DNS record at a private IP, and Cloudflare reaches the origin over your existing <a href="https://developers.cloudflare.com/cloudflare-one/networks/connectivity-options/">Cloudflare One connection</a>. Your origin stays private, while web application firewall (<a href="https://www.cloudflare.com/products/waf/">WAF</a>), <a href="https://developers.cloudflare.com/cache/">caching</a>, <a href="https://developers.cloudflare.com/bots/get-started/bot-management/">bot management</a>, and <a href="https://developers.cloudflare.com/workers/">Workers</a> work just as they do for public origins.</p>
+<p>In June, <a href="https://blog.cloudflare.com/private-origins-dns-routing/">we launched this capability in closed beta</a> to address a problem we kept hearing from customers: Their internal APIs, AI agent backends, MCP servers, and operational tools weren’t built to face the Internet, but those services still need to accept requests from partners, customers, or agents over the Internet. Before the beta, putting Cloudflare in front of these services meant exposing a public IP, opening a firewall port, or running <code>cloudflared</code> alongside the origin.</p>
+<p>Those requirements often left private applications without the same protections and controls they used for public applications, including WAF, bot management, rate limiting, caching, traffic acceleration, rewrites, and Workers.</p>
+<h3>What is generally available today</h3>
+<p>During the closed beta, eligible customers requested access through their account team. Today, we’re opening access beyond that beta group.</p>
+<p>Point a proxied A or AAAA record at a private IP, and Cloudflare’s application services work as they do for public origins:</p>
+<ul>
+ <li>WAF and managed rules</li>
+ <li>Bot management</li>
+ <li>Rate limiting</li>
+ <li>Caching</li>
+ <li>Transform and rewrite rules</li>
+ <li>Workers</li>
+</ul>
+<p>Some limitations remain. <a href="https://developers.cloudflare.com/argo-smart-routing/">Argo Smart Routing</a> and <a href="https://developers.cloudflare.com/smart-shield/configuration/dedicated-egress-ips/">Dedicated CDN Egress IPs</a> aren’t supported, and origin health checks require <a href="https://developers.cloudflare.com/load-balancing/">Load Balancing</a>. See the <a href="https://developers.cloudflare.com/dns/private-origins/">developer documentation</a> for the full list of current limitations.</p>
+<p>Your origin keeps its private IP, with no inbound firewall exception required. With <a href="https://developers.cloudflare.com/cloudflare-wan/">Cloudflare WAN</a>, no connector software on the origin is required. With <a href="https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-mesh/">Cloudflare Mesh</a>, a connector runs within your private network and can serve multiple origins.</p>
+<h3>How it works</h3>
+<p>Create a proxied A or AAAA record pointing to your origin. For supported private IP ranges, <strong>use</strong> <strong>private network routing</strong> is enabled automatically. If your origin uses a public IP that’s reachable only through your private network, you can enable the setting manually.</p>
+<p>The rest of the request flow stays the same: TLS termination, WAF, rules, and caching continue to run on Cloudflare’s network.</p>
+<p>The setting turns on automatically for RFC 1918 private IPv4 addresses, RFC 6598 CGNAT addresses (100.64.0.0/10), and RFC 4193 unique local IPv6 addresses (fc00::/7). It can’t be turned off for these ranges; attempts to disable it through the API return an error.</p>
+<h3>What the API looks like</h3>
+<p>For customers automating deployments through the API, private routing is simply an additional attribute on a standard DNS record.</p>
+<pre><code>POST /zones/\{zone_id}/dns_records
+\{
+ "type": "A",
+ "name": "app.example.com",
+ "content": "10.0.0.50",
+ "ttl": 300,
+ "proxied": true,
+ "private_routing": true
+}
+</code></pre>
+<p>Behind the scenes, Cloudflare's proxy platform determines where to send traffic for <code>app.example.com</code> by querying Cloudflare's Origin API. The response includes metadata indicating that the destination should be reached through a private network path:</p>
+<pre><code>\{
+ "zone_name": "example.com",
+ "ipv4_addresses": ["10.0.0.50"],
+ "private_routing": true
+}</code></pre>
+<p>The <code>private_routing</code> flag is the key signal. When our proxy sees it, instead of attempting to connect directly to the private IP address over the public Internet, it hands the request to our private networking layer, which then routes the connection across the customer's existing private network connectivity, whether that's <a href="https://www.cloudflare.com/learning/network-layer/what-is-ipsec/">IPsec</a>, <a href="https://www.cloudflare.com/learning/network-layer/what-is-gre-tunneling/">GRE</a>, <a href="https://developers.cloudflare.com/tunnel/">Cloudflare Tunnel</a>, <a href="https://developers.cloudflare.com/network-interconnect/">CNI</a>, or Cloudflare Mesh.</p>
+<p>The <a href="https://blog.cloudflare.com/private-origins-dns-routing/">beta post</a> covers the routing layer in more detail.</p>
+<h3>Get started</h3>
+<p>Before you begin, you’ll need:</p>
+<ol>
+ <li>The Private Origins entitlement on your account. Ask your account team to turn it on.</li>
+ <li><a href="https://developers.cloudflare.com/cloudflare-one/networks/connectivity-options/">Cloudflare One connectivity</a> using IPsec, GRE, CNI, Cloudflare Tunnel, or <a href="https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-mesh/">Cloudflare Mesh</a>.</li>
+ <li>Unified Routing enabled on your account, unless you connect over Cloudflare Tunnel (Tunnel doesn't need it). New and existing accounts can upgrade through their account team.</li>
+ <li>If you connect over Cloudflare WAN or Cloudflare Mesh, configure a return route for Cloudflare’s source ranges: 100.64.0.0/12 for IPv4 and 2606:4700:cf1:5000::/64 for IPv6. Then, create a proxied A or AAAA record for the private IP and confirm that <strong>Use private network routing</strong> is enabled. Your existing WAF, cache, and bot management configuration applies to that hostname without further changes.</li>
+</ol>
+<p>Then, create a proxied A or AAAA record for the private IP and confirm that <strong>Use private network routing</strong> is enabled. Your existing WAF, cache, and bot management configuration applies to that hostname without further changes.</p>
+<p>One note from the beta: if requests time out and nothing arrives at the origin, check the return route first. A missing route for Cloudflare’s source range was the most common setup failure we saw.</p>
+<p>Once enabled, follow our <a href="https://developers.cloudflare.com/dns/private-origins/">developer documentation</a>, which walks through the full setup.</p>
+<h3>What comes next</h3>
+<p>Today’s release covers public traffic reaching private origins. Next, we’re working on private-to-private traffic: users, services, and AI agents on private networks reaching applications on other private networks through Cloudflare’s application services.</p>
+<p>Engineering work is underway, and we’re targeting a closed beta in early 2027. If you’d like to participate, talk to your account team.</p>
+<p>The goal is to give private applications the same protections and controls as public applications. An employee opening <code>wiki.company.internal</code>, for example, could benefit from WAF, rate limiting, and bot management. Service-to-service traffic between clouds and data centers could use those controls too, even when neither side touches the public Internet.</p>
+<p>For now, today’s release brings the WAF, caching, bot management, and Workers you use for public applications to private origins over connectivity you already operate.</p>
+<p>Questions or feedback? Join the conversation in our <a href="https://community.cloudflare.com/">community forums</a> or reach out to your account team.</p>

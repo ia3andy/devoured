@@ -1,0 +1,65 @@
+<h1>How to troubleshoot GKE workloads faster with VPC Flow Logs</h1>
+<p>Having visibility into your network traffic is essential to operating Kubernetes environments effectively. When a service slows down or loses connectivity, knowing who is talking to whom lets you narrow the problem down quickly. In a standard cloud network, flow logs provide that view by recording connections between IP addresses, ports, and protocols. In Kubernetes, however, pods are temporary. Their IP addresses change constantly as pods scale, crash, or move between nodes, so a raw log entry showing 10.4.2.18 talking to 10.4.8.44 tells you little about which workload (and pod) owned that address, what namespace it was in, or what application it was trying to reach. By the time you search your cluster, the pod may already be gone!</p>
+<p>In a Google Cloud environment, VPC Flow Logs closes this gap at the network layer. Google Cloud's virtual network already sees every connection a pod makes, so each sampled flow is recorded with the Google Kubernetes Engine (GKE) metadata behind the IP address: pod, workload, namespace, and service. You get workload-level attribution for L3/L4 traffic without deploying extra agents or sidecars, and it complements in-cluster Container Network Interface (CNI) and dataplane observability tools you may already run when you need deeper detail. Let’s take a deeper look at how VPC Flow Logs and GKE work together, and how to get started with it.</p>
+<h3>How GKE metadata enriches VPC Flow Logs</h3>
+<p>VPC Flow Logs samples traffic directly inside Google Cloud's virtual network. When flow logs are enabled for a subnet that hosts a GKE cluster, every record of pod traffic that passes through the VPC network is annotated with the Kubernetes context that owned the IP address at the time of sampling. This helps ensure the context is preserved even after the pod is gone:</p>
+<ul>
+ <li><strong>Cluster: </strong>The cluster name and location.</li>
+ <li><strong>Workload: </strong>The pod name and namespace, along with the controller that owns the pod, such as a deployment, StatefulSet, or DaemonSet.</li>
+ <li><strong>Service name: </strong>The Kubernetes service that received the traffic.</li>
+ <li><strong>Node and zone:</strong> The standard VPC fields, including the node VM and its zone on both ends of the flow.</li>
+</ul>
+<p>If you register your GKE workloads in App Hub, each record also carries application-level labels (<code>apphubSource</code> and <code>apphubDestination</code>) that identify the business application, environment, and criticality of each endpoint. This is especially useful when GKE microservices talk to App Hub-registered resources outside the cluster, such as Cloud Run services.</p>
+<h3>Before you start</h3>
+<p><strong>Upgrade your log bucket to Observability Analytics (formerly Log Analytics): </strong>Flow Analyzer reads only from an upgraded bucket, typically <code>_Default</code>. <strong>Note:</strong> This upgrade is permanent.<br><code>gcloud logging buckets update _Default --location=global --enable-analytics</code></p>
+<p><strong>Enable VPC Flow Logs organization-wide:</strong> One organization-level configuration covers every subnet in every VPC network, including future clusters (requires Network Management Admin role). Keep <code>include-all-metadata</code> on so every record carries namespace and pod details. To balance visibility against cost, you can add a secondary sampling rate (<code>--flow-sampling</code>), an aggregation interval (<code>--aggregation-interval</code>), or a filter expression (<code>--filter-expr</code>) to view only the traffic of interest.<br><code>gcloud network-management vpc-flow-logs-configs create CONFIG_NAME --location=global --organization=ORGANIZATION_ID --metadata=include-all-metadata</code></p>
+<p><strong>Turn on intranode visibility:</strong> Autopilot clusters already have it, but you need to enable it on Standard clusters. <strong>Note: </strong>Enabling it restarts control plane and node components and adds some per-node overhead, so test it on a non-production cluster first.<br><code>gcloud container clusters update CLUSTER_NAME --location=LOCATION --enable-intra-node-visibility</code></p>
+<p>Now you’re ready to get started.</p>
+<h3>Analyze traffic visually in Flow Analyzer</h3>
+<p>VPC Flow Logs write every record to Cloud Logging, you can search and query it in Logs Explorer or Log Analytics. For day-to-day work, Flow Analyzer, part of Network Intelligence Center, turns the same records into an interactive chart and table, so you can group and filter traffic by cluster, namespace, workload, pod, or service in a few clicks.</p>
+<p>The walkthroughs below use Online Boutique, an open-source microservices demo, on a GKE Autopilot cluster in us-central1. A <code>loadgenerator</code> deployment sends synthetic shopper traffic to the <code>frontend</code>, which calls <code>productcatalogservice</code>, <code>cartservice</code>, <code>currencyservice</code>, <code>recommendationservice</code>, <code>shippingservice</code>, <code>adservice</code>, and <code>checkoutservice</code>.</p>
+<p><strong>Case 1: Turn IP addresses into workload names</strong><br>
+ Whether you’re investigating an incident or assessing an architecture change, the first question is always the same: Which endpoints are communicating, and at what volume?</p>
+<p>Rather than presenting ephemeral IP address pairs, GKE metadata allows Flow Analyzer to answer this question directly using Kubernetes workload names.</p>
+<p>Steps in Flow Analyzer:</p>
+<ol>
+ <li>Open <strong>Network Intelligence Center</strong> &gt; <strong>Flow Analyzer</strong> and set the time range to <strong>last 1 hour</strong>.</li>
+ <li>Under <strong>Source</strong> and <strong>Destination</strong>, set <strong>Organize flows</strong> <strong>by</strong> to GKE workload.</li>
+ <li>In the filter bar, add the <strong>GKE workload is known</strong> filter so only pod-to-pod traffic is shown.</li>
+ <li>Click <strong>Run new query</strong>.</li>
+</ol>
+<p><strong>Key insights: </strong>Sorted by volume, the table is a ready-made application dependency map: <code>frontend</code> handles incoming requests from <code>loadgenerator</code> (representing user traffic), while <code>productcatalogservice</code> answers calls from both <code>recommendationservice</code> and <code>frontend</code>. Because each row shows workload names instead of raw IP addresses, any unauthorized or unexpected workload-to-workload communication immediately becomes apparent.</p>
+<p><strong>Case 2: Drill into a single service</strong><br>
+ When a service is slow or about to change, you need to know who depends on it and how heavily.</p>
+<p>Steps in Flow Analyzer:</p>
+<ol>
+ <li>Change <strong>Traffic aggregation</strong> to <strong>Client ↔ server (bidirectional)</strong>, so requests and responses between a pair are counted together.</li>
+ <li>Under <strong>Server</strong>, add the filter <strong>GKE workload</strong> = <code>productcatalogservice</code>.</li>
+ <li>Click<strong> Run new query</strong>, then click <strong>Details</strong> on the top row.</li>
+</ol>
+<p><strong>Key insights:</strong> You get every caller of the catalog service, each caller's share of its traffic, and a timeline for every pair, so if one caller's line climbs while the others stay flat, you know where to look first. When the question is latency rather than volume, switch the display mode to latency to rank the same callers by round-trip time.</p>
+<p><strong>Case 3: Find the pods that talk across zones</strong><br>
+ In a regional GKE cluster, chatty services that land in different zones send every request across a zone boundary, adding inter-zone data transfer charges. Because VPC Flow Logs record the zone at both ends of every flow, the pod pairs driving that traffic are easy to spot.</p>
+<p>Steps in Flow Analyzer:</p>
+<ol>
+ <li>Switch from <strong>Basic filters</strong> to <strong>SQL filters</strong>, which let you compare two fields of the same flow.</li>
+ <li>In the <strong>WHERE</strong> box, enter <code>src_gcp_zone &lt;&gt; dest_gcp_zone</code>.</li>
+ <li>Set <strong>Organize flows</strong> by to <strong>Source GCP zone, Source GKE pod, Destination GCP zone</strong>, and <strong>Destination GKE pod</strong>.</li>
+ <li>Click <strong>Run new query</strong>.</li>
+</ol>
+<p><strong>Key insights:</strong> The table displays cross-zone traffic ranked by volume, identifying the exact pods and zones on each end. In our cluster, the top flows occur between a <code>frontend</code> pod in us-central1-b and a <code>currencyservice</code> pod in us-central1-c, followed by <code>checkoutservice</code>, <code>shippingservice</code>, and <code>productcatalogservice</code> pairs. To investigate further, click Explore in Log Analytics to open the underlying SQL query for additional customization, such as adding joins or time buckets.</p>
+<h3>What to keep in mind</h3>
+<ul>
+ <li><strong>Pod-to-internet traffic:</strong> VPC Flow Logs carry no pod annotations, because the masquerade agent replaces the pod IP with the node IP before the flow is sampled. Keeping internal destinations in the non-masquerade list preserves pod names for those flows, and if you run <code>ip-masq-agent</code> with intranode visibility, that list must also include the cluster's node and pod IP ranges to avoid connectivity problems.</li>
+ <li><strong>Blocked traffic:</strong> Traffic blocked by a network policy never reaches the VPC network, so use NetworkPolicy logging to investigate it.</li>
+ <li><strong>Sampling:</strong> Flow logs are sampled, which makes byte and packet counts well suited for ranking and trending rather than per-connection accounting.</li>
+</ul>
+<h3>Next steps</h3>
+<p>If your clusters already have VPC Flow Logs turned on, upgrading the <code>_Default</code> bucket and opening Flow Analyzer is all it takes to reproduce the three walkthroughs above. To learn more, see the documentation:</p>
+<ul>
+ <li>Using VPC Flow Logs</li>
+ <li>VPC Flow Logs record format for GKE</li>
+ <li>Analyzing network traffic with Flow Analyzer</li>
+ <li>Best practices for GKE network observability</li>
+ <li>Troubleshooting GKE network observability</li>
+</ul>

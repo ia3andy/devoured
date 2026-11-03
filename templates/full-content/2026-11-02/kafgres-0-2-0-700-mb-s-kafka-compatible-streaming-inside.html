@@ -1,0 +1,90 @@
+<h2>700 MB/s of Kafka throughput, on Postgres</h2>
+<blockquote>
+ <p>Kafgres is a Postgres extension that embeds a singleton broker directly inside Postgres, allowing both deep integration with DB transactions, as well as allowing external systems to interact with the database, just as they would with real Kafka.</p>
+</blockquote>
+<p>In a previous article introducing Kafgres, I had mentioned that Kafka becomes the suitable choice for demanding architectures of 100K+ evt/s. However, I knew that in theory, Kafgres <em>should</em> be able to handle this load easily, considering it has to do a fraction of the work of a Kafka cluster doing the same throughput: Postgres-style replication is used, rather than a quorum. With this in mind, I rented a large box from Hetzner, and got to work profiling and poking around the extension to drive up data throughput and records per second.</p>
+<p>On an i9 box with PLP-enabled NVME drives (~$0.25/hr via Hetzner server auction), I was able to achieve smooth write throughput of ~700 MB/s, and 600k evt/s.</p>
+<h2>How it works</h2>
+<p>Kafgres lives inside Postgres, in that it is installed in the DB as a Postgres extension, and largely uses Postgres's extension APIs to interact with the OS. However, while taking advantage of a lot of the machinery Postgres provides (to avoid having to write our own WAL for metadata, or completely reimplement leader/follower failover), Kafgres largely works independently of the rest of the database. The vast majority of the Kafgres work is handled by an independent Postgres-spawned background worker, and under default configuration, actually writes topic bytes directly to disk, skipping Postgres internals and overhead for the vast majority of data. This allows us to achieve <em>theoretical</em> performance quite close to that of a regular Kafka singleton running on the same machine.</p>
+<h2>Identifying the bottleneck</h2>
+<p>On the i9 box (and for a few of the profiling rounds, a cheaper i7 box), I drove multiple producers against Kafgres 0.1.0. At a throughput of 100-200MB/s this began to stall the engine (identified by a latency spike). The CPU core for Kafgres was nearing 100%, suggesting the stalling was not from blocking on the drive, but by CPU time.</p>
+<p>We benchmarked the drive on this box, which achieved a throughput of ~1911MB/s, and an fsync rate of ~68K/s. Meanwhile, our broker was performing less than 600 fsyncs/s, which confirmed there was a large amount of drive-write headroom.</p>
+<h2>Profiling</h2>
+<p>In a previous blog, I have detailed profiling a previous Postgres extension to improve throughput. I used a similar technique to profile the saturated Kafgres broker.</p>
+<p>For the on-cpu time (the dominating bottleneck), <strong>40.7%</strong> of our time was spent in parse/analyze/plan, which is quite a lot considering only metadata is carried in tables, and topic data gets written directly to disk.</p>
+<p>For off-CPU, roughly a third of blocked time was spent in commit. This was an issue on the weaker machine I used, with drives with no power-loss-protection, but was less of an issue on the i9 box.</p>
+<h2>Pulling the levers</h2>
+<p>The first change I made was to attack the nearly half of CPU time spent repeating the same, cachable work. A relatively simple change was to use SPI_keepplan for the metadata statements, allowing Postgres to maintain a generic plan for our statements, to reuse rather than to plan per-execution.</p>
+<pre><code>-    Spi::get_one_with_args::&lt;i64&gt;(
++    crate::plan::get_one::&lt;i64&gt;(
+         "SELECT log_start_offset FROM kafgres_partitions
+           WHERE topic_id = $1::oid AND partition = $2",
+         &amp;[topic.into(), partition.into()],
+     )</code></pre>
+<p>The next change I made was to tackle the commit time. Technically, with the configuration we were testing, non-transactional produce did not guarantee the actual topic data had been flushed to drive by the time it acked. However, we <em>were</em> guaranteeing offsets had been synchronously committed. Taking a similar default-relaxed posture towards the offsets would allow more metadata to accumulate in the WAL before flushing to disk. Introducing the GUC <code>relaxed_produce_commit</code> allows this to be turned on/off, and improves throughput.</p>
+<pre><code>pub fn relax_commit_durability() -&gt; Result&lt;(), pgrx::spi::Error&gt; \{
+    pgrx::Spi::run("SET LOCAL synchronous_commit = off")
+}</code></pre>
+<p>An additional change we made was not to <em>optimize throughput</em> per se, but to decrease impact on regular Postgres usage. Reaching these high throughputs is less appealing when it's at the cost of your database performance. The i9 machine we were testing on had 2 NVMEs, so we added a config field to change the directory that kafgres topic data is written to. When that is moved to a different drive than the rest of the database, a throughput of 100 MB/s has very little (~1-5%) impact on the performance of pgbench running against the same database.</p>
+<pre><code>fn log_root() -&gt; PathBuf \{
+    match crate::log_directory() \{
+        Some(dir) =&gt; \{
+            let p = PathBuf::from(dir);
+            if p.is_absolute() \{ p } else \{ PathBuf::from(data_directory()).join(p) }
+        }
+        None =&gt; PathBuf::from(data_directory()).join(LOG_DIR),
+    }
+}</code></pre>
+<p>These changes (alongside a few others, not worth mentioning in depth) all modestly improved throughput, in total from 113 MB/s -&gt; 197 MB/s.</p>
+<p>It was at this point I noticed there was a performance disparity between running the benchmark over docker proxy and hitting the Kafgres sockets directly via host networking. This led me to look into how I was handling work queuing up, and socket readiness. The naive approach opted for in 0.1.0 was to have a 5ms tick-loop, allowing bytes to accumulate during this 5ms of blocked time, and waking the background worker on a schedule to handle the bytes that had accumulated.</p>
+<p>The correct way to do this, as we move on from version 0.1.0 of Kafgres, was to use Postgres's own <code>WaitEventSet</code>. This lets us block not until some period of time has passed, but instead until some socket is ready for us to start work.</p>
+<pre><code>for &amp;(fd, _) in want \{
+    pg_sys::AddWaitEventToSet(self.set, pg_sys::WL_SOCKET_READABLE,
+        fd, null_mut(), null_mut());
+}</code></pre>
+<pre><code>-// epoll set holds the latch self-pipe and postmaster-death pipe. Nothing else.
+-// Every request waits for the next timer edge.
+-while BackgroundWorker::wait_latch(Some(tick)) \{
++// Every client socket is in the wait set; `tick` is now a ceiling, not a cadence.
++while readiness.wait(tick) \{
++    readiness.sync(listener_fd, &amp;conn_fds);</code></pre>
+<p>This change, when we use host networking rather than the docker network, is responsible for the vast majority of the improvement in throughput.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Change</th>
+   <th>1 KiB</th>
+   <th>256 KiB</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>main</code>, before any of it</td>
+   <td>118.8</td>
+   <td>113.3</td>
+  </tr>
+  <tr>
+   <td>+ cached SPI plans</td>
+   <td>139.9</td>
+   <td>135.6</td>
+  </tr>
+  <tr>
+   <td>+ relaxed commit, (&amp; a few other tweaks)</td>
+   <td>169.7</td>
+   <td>197.3</td>
+  </tr>
+  <tr>
+   <td>+ socket readiness</td>
+   <td><strong>597.3</strong></td>
+   <td><strong>703.4</strong></td>
+  </tr>
+ </tbody>
+</table>
+<p>With record sizes of 256 KiB, we have achieved a stable, low-latency throughput of 700 MB/s produce.</p>
+<h2>In comparison</h2>
+<p>With these major changes, alongside a handful of other performance tunings that landed, Kafgres now holds its own against vendor Kafka.</p>
+<p>According to many SaaS Kafka vendors, the vast majority of Kafka workloads are small, estimated at 56% having &lt;= 1 MB/s throughput. Those normally scaling into hundreds of MB/s are mostly large enterprises, who can have a dedicated team for managing Kafka, or can pay fees to vendors to have their Kafka managed for them.</p>
+<p>On AWS MSK, a regular, 3-node (considered the floor to most) Kafka cluster that could handle ~700 MB/s would likely be made up of kafka.m5.8xlarge nodes, coming in at $3.36/hr each. This comes out to $7,357 monthly in broker-compute, <strong>before</strong> accounting for storage and data transfer costs, which at usual AWS rates would cost tens of thousands more ($18,000/mo in storage for just 24 hr retention for this data volume).</p>
+<p>Of course, where MSK (or really, any other vendor) wins is replication. Kafgres can failover to a secondary database, just like the Postgres DB itself, but cannot seamlessly shrug off a zonal outage in the way a 3-zone Kafka cluster can. Additionally, if one chooses to host their Postgres deployment in the cloud, many of the costs incurred for MSK (storage, networking) would still be incurred for the Postgres instance.</p>
+<p>Regardless, this strongly suggests that for the vast majority of use cases, the Postgres-resident Kafgres is sufficient. By the time you hit Kafgres's limits, an equivalent vendor-provided "real Kafka" deployment will cost hundreds of thousands per year.</p>
+<p>Kafgres 0.2.0 has been released, which vastly closes the gap between "real" Kafka 4.0 and Kafgres.</p>

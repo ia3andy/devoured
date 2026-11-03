@@ -1,0 +1,70 @@
+<h1>Do you even benchmark? How we evaluate agents at scale (with real examples)</h1>
+<p>We spend 2 trillion+ LLM tokens per month, with the lion's share going to running agents. We know what they do and how good they are <em>most</em> of the time, but we spend way too much money on them to trust their output based on vibes alone.</p>
+<p>That's why we use benchmarks.</p>
+<p>Labs like Anthropic and OpenAI use them to measure, compare, and market new models on release, like the popular SWE-bench, which is designed to evaluate model performance on general coding tasks.</p>
+<p>But benchmarks aren't just for frontier labs. They're useful for anyone who wants to understand how well a model, harness, or skill works in their given stack. For example, you might run three different models with the same code review prompt on the same PR to choose the best one based on how many known bugs they catch, how long they take, and what they cost.</p>
+<p>The idea is similar to running controlled experiments, but in reality, benchmarking is never that easy. Evaluation is often subjective, behavior is unpredictable, and – perhaps most painful of all – agents love to cheat. They'll search for leaked context, memory, and database query logs to pass benchmark tests with as little work as possible.</p>
+<p>In this post, I'll explain how we benchmark our agents at PostHog, what we learned, and where we messed up (so you don't have to) – all with links to real PRs.</p>
+<h2>A. Define the answer key</h2>
+<p>If a benchmark is like a standardized test, the first thing you need is an answer key: the list of correct answers you grade your against.</p>
+<p>This is the hardest part, in my opinion. If you ask an LLM judge whether an agent's output is "helpful", you'll get polite, useless praise. Especially if the same model generated it.</p>
+<p>For a benchmark to actually be useful, the criteria for what's "good" or not needs to match the complexity they will encounter on the job. Simple yes/no sanity checks won't cut it since agentic tasks are typically more complicated than that.</p>
+<p>Here are the three approaches we tried in increasing order of difficulty and complexity.</p>
+<h3>Level 1: A list of potential bugs from one PR</h3>
+<p>Our first approach was to take a task with clear answers and check which agents succeed, versus which ones fail. Each agent had three variables: the model, effort level, and harness.</p>
+<p>We did this to evaluate our internal code review agent called ReviewHog, which covers a significant part of PostHog PRs. ReviewHog needs to stay up to date for the best results, so we needed a base benchmark to check against when we change models or prompts.</p>
+<p>The best solution we came up with initially was surprisingly effective and simple:</p>
+<ol>
+ <li>First, we took one large PR.</li>
+ <li>Then, we made a "frozen copy" of it.</li>
+ <li>Humans reviewed the frozen PR manually.</li>
+ <li>We then asked several review agents to review it.</li>
+ <li>This produced a pretty exhaustive list of potential bugs from every possible angle.</li>
+</ol>
+<p>So if there were 13 issues worth checking for (structure, performance, security, etc.), we could measure the models on a 0/13 scale, plus compare how much time and money each one cost.</p>
+<h3>Level 2: A larger, golden set from multiple PRs</h3>
+<p>The second approach we used for benchmarking ReviewHog involved the same method, but across a larger percentage of real cases and with more varied examples.</p>
+<p>What if instead of looking for synthetic bugs, we created an answer key by searching for <em>real</em> bugs that actually happened? It would be even better if those bugs caused real messes, like proper incidents, since those are exactly the types of things we want these code review agents to prevent.</p>
+<p>We looked through old PostHog tickets to create a golden set of 33 actual incidents, the PRs that caused them, descriptions of the problem, and the PR that fixed the incident. We analyzed each of them with ReviewHog and other bots to compare their performance.</p>
+<p>Overall, there were still some downsides of this "larger golden set" method, but it was still acceptable:</p>
+<ul>
+ <li>For 33 incidents, we had to resurrect the 33 PRs that caused them and then analyze the 33 PRs that fixed them. This created lots of noise and triggered false alarms from our GitHub bots.</li>
+ <li>We didn't re-add the bugs to the codebase. That would be bad. Instead, we kept them as isolated PRs by properly locking the branch for the agent.</li>
+ <li>With open-source repos like ours, an agent with web access can still look up the public repo, merged PRs, and cheat.</li>
+</ul>
+<h3>Level 3: Targeted, contextual rubrics</h3>
+<p>Benchmarking gets a lot more complicated when you're trying to evaluate agents that can technically do <em>anything</em>.</p>
+<p>Our solution was to build a rubric <em>generator</em> that creates guidelines based on the agent's context. We do this in two steps for scouts.</p>
+<p>First, all scouts follow the same procedures, even if they work across wildly different domains. So we have one set of static rubrics shared across all scouts that checks whether the scout produced a report covering what it found, how actionable the findings are, and what to do next.</p>
+<p>We then also generate rubrics tailored to that specific scout based on context that was been provided to the scout so far, such as:</p>
+<ul>
+ <li>The area it covers (e.g. a feature, an external source, etc.)</li>
+ <li>Skills and instructions it needs to follow during runs</li>
+ <li>Previous runs (e.g. tools it used, reports it generated)</li>
+</ul>
+<h2>B. Isolate benchmark runs</h2>
+<p>The surprisingly nasty problem we learned is that when you benchmark multiple models against real data, they'll quickly do everything they can to learn about and piggyback off of each other. They might source answers from LLM traces, DB queries, or any other logs the agentic run generates.</p>
+<h3>Level 1: Parallel runs with no shared state</h3>
+<p>This approach is only valid if your agents don't generate meaningful artifacts (like traces, memory files, and logs) beyond the output that gets graded. In most cases, our agents are complex and have many potential places to leak information, such as through observability tools or error logs.</p>
+<h3>Level 2: Sequential runs with state cleanup</h3>
+<p>A simple approach to isolate the runs is to just run them sequentially with cleanup between each run – i.e. run a trial, record the output, reset the agent's context, and then start the next run.</p>
+<h3>Level 3: Parallel runs with total isolation</h3>
+<p>Every trial needs complete isolation across <em>everything</em> the agent can touch:</p>
+<ul>
+ <li>Identical starting context across all runs</li>
+ <li>Private writable state (scratchpads, memory, vector stores, and DBs)</li>
+ <li>Separate evaluation so scoring happens independently</li>
+</ul>
+<h2>C. Freeze the environment (a.k.a., offline evals)</h2>
+<p>We solved this by moving benchmarks from a "production environment that changes all the time" to a "production environment with the same starting state" – i.e. frozen environments. To do this, we had to replicate or simulate our app, inject real (or real-enough) data, and make the agent believe it's a real thing.</p>
+<h3>Level 1: Mocked MCP replies</h3>
+<p>We tried to create mock MCP calls of the agent, so when agent thinks it's querying the DB, it's actually just getting a pre-stored answer to what it asked for before in prod. This failed miserably on any meaningful production-like work because agents aren't deterministic.</p>
+<h3>Level 2: Trajectory-based mocked MCP replies</h3>
+<p>We based the mock replies on every trajectory the agent picked. Drift would happen due to nondeterminism, and an outlier query would return nothing. The agent gets confused, and the run fails.</p>
+<h3>Level 3: Restored real-data slices</h3>
+<p>The solution that actually worked for us was to spin up an isolated PostHog sandbox seeded with a restored, real-world data slice. We query a couple of DB tables (Postgres, ClickHouse), store them as Parquet files in S3, and then restore them in the VM with a local PostHog instance.</p>
+<h2>Conclusion</h2>
+<p>Building quality benchmarks sounds like a lot of work because it is, but it's entirely worth it. If you take anything away from this blog, it's that agents will happily exploit whatever mess you leave behind and cheat. Watch for unexpected parameters, iterate a lot, and pay attention to traces.</p>
+<blockquote>
+ PostHog is your product's context layer. With a full suite of developer tools – AI observability, product analytics, session replay, feature flags, experiments, error tracking, logs, and more – PostHog ingests and stores all the data agents need to diagnose problems, uncover opportunities, and ship fixes. A data warehouse and CDP tie it all together, unifying that context into one source agents can read across. You can steer it all from Slack, the web app, the desktop, or your own editor via the MCP.
+</blockquote>

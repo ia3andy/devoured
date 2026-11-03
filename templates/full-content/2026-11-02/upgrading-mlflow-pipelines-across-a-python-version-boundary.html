@@ -1,0 +1,52 @@
+<p>Picture this: you are running automated daily Machine Learning pipelines at scale, and it is time for a critical environment upgrade, such as moving to a new Python version. Consequently, you need to upgrade your Databricks Runtime from LTS 14.3 to LTS 17.3. However, the upgrade cannot proceed because the logs show a cryptic error:</p>
+<pre><code>TypeError: code() argument 13 must be str, not int.
+</code></pre>
+<p>This was the exact challenge our team faced recently during a Databricks upgrade that uses MLflow. At our core, we manage daily automated pipelines spanning data preparation, training, and inference across separate Dev, Staging, and Prod Databricks workspaces managed via Declarative Automation Bundles (DAB).</p>
+<p>This post covers our journey identifying the root cause of Python version serialization failures, our "Load and Repack" technique to recover production models, and the architectural refinements we made to ensure our MLflow artifacts are forward-compatible.</p>
+<h2>When cloudpickle meets a Python upgrade</h2>
+<p>Our upgrade path was clear: transition our machine learning workflows from DBR 14.3 (Python 3.10) to DBR 17.3 (Python 3.12). Python 3.12 introduces excellent language features, such as PEP 695's simplified generic types. This syntax is fully embraced by Pydantic V2 to enforce data validity at runtime using type hints, which prompted us to implement more comprehensive type hints across our codebase.</p>
+<p>However, modernizing the runtime introduced a breaking change for our legacy machine learning models in the registry. The root cause is how MLflow traditionally serializes Python models.</p>
+<p>When MLflow logs a Python model, it uses <code>cloudpickle</code> to freeze the entire wrapper object, including inner models like CatBoost classifiers or PyTorch modules, into a single serialized artifact. Crucially, this process embeds Python version metadata and bytecode directly into that file. Because bytecode structures shifted significantly between Python 3.10 and 3.12, the new interpreter could no longer safely parse the older pickle files. This resulted in an immediate <code>TypeError</code> whenever the upgraded inference logic attempted to pull an existing model from the registry.</p>
+<h2>Mapping our ML landscape</h2>
+<p>To understand why a naive approach like "just retrain all the models" was not viable, consider the scale we operate at: our product classification system alone uses multiple TB of training data.</p>
+<p>In our case, that system processes and classifies product data across a large and continuously growing catalogue. For every active product category, our system trains and runs five distinct model types in parallel:</p>
+<ul>
+ <li><strong>CatBoost</strong>: a tree-based classifier.</li>
+ <li><strong>TF-IDF Regression</strong>: a logistic regression model operating on cleaned raw text.</li>
+ <li><strong>Neural Network (NN)</strong>: a PyTorch Lightning model that processes dense vector representations from <code>all-mpnet-base-v2</code>, an open-source sentence embedding model.</li>
+ <li><strong>Image Model</strong>: another PyTorch Lightning classifier that processes dense image embeddings, trained only for image-eligible categories and integrated into the voting ensemble via late fusion with a configurable weight parameter.</li>
+ <li><strong>Voting Ensemble</strong>: a final logistic regression model that aggregates the predictions of the base models into a single, optimized binary tag assignment.</li>
+</ul>
+<p>Our infrastructure uses Databricks to train these category models concurrently. Heavy NN, Image Model and CatBoost tasks run on dedicated GPU clusters, while TF-IDF and Voting tasks run on CPU clusters. Models are governed inside the Databricks Unity Catalog using secure Service Principals and strictly named aliases (like <code>@Production</code>) rather than numeric version tags.</p>
+<p>Retraining this entire matrix across all environments and categories from scratch would have consumed immense time and compute resources.</p>
+<h2>The "Load and Repack" strategy</h2>
+<p>Bypassing the costly retraining phase, we developed a methodology for migrating and relogging our models to ensure operational continuity. We orchestrated this recovery across two foundational stages.</p>
+<h3>Stage 1: Load</h3>
+<p>We created a temporary, one-time migration job using an environment that matched DBR 14.3. By installing the old libraries directly into this environment, we avoided version conflicts. This allowed the system to easily read the problematic pickle files and separate the raw model weights from their restrictive <code>pyfunc</code> wrappers.</p>
+<h3>Stage 2: Repack</h3>
+<p>With the models loaded, we unwrapped the inner artifacts from the old <code>pyfunc</code> wrapper. We encapsulated the loaded model artifacts within a streamlined, file-based wrapper class in our <code>model_wrappers.py</code> module. This architectural shift prioritized pure Python logic, removing dependencies on outdated pickle structures to ensure native compatibility with Python 3.12.</p>
+<p>By relogging this refined wrapper to MLflow with dependencies managed via <code>uv</code>, we preserved the trained artifacts while promoting the upgraded model back to the <code>@Production</code> alias.</p>
+<p>Each of our model types originally used different serialization patterns, so our migration tool applied specialized extraction strategies per model type. With new dummy DataFrame inputs, we could also infer fresh MLflow model signatures.</p>
+<h2>Future-proofing: long-term architectural wins</h2>
+<p>While our migration tool was designed to run only once per environment, solving this immediate blocker yielded two architectural improvements for our production ML systems going forward.</p>
+<h3>Standardized wrapper interfaces</h3>
+<p>Previously, models were logged using framework-native MLflow flavors with ad-hoc wrapper logic. We introduced a dedicated <code>model_wrappers.py</code> file, establishing consistent <code>mlflow.pyfunc.PythonModel</code> subclasses (e.g. <code>CatBoostModelWrapper</code>, <code>NNModelWrapper</code>). This ensures a uniform <code>predict()</code> interface regardless of the underlying model type. Every model developed post-migration natively adopts this pattern.</p>
+<h3>Self-contained model artifacts</h3>
+<p>In our legacy workflow, MLflow artifacts lacked embedded code dependencies and explicit manifest files. To fix this, we pinned package versions explicitly and included <code>model_wrappers.py</code> directly via <code>code_paths</code> at log time. We have since adopted <code>uv</code> for dependency management. Since MLflow 3.11.1, MLflow auto-detects <code>uv.lock</code> and <code>pyproject.toml</code> and exports a precise, reproducible set of requirements at log time via <code>uv export</code>.</p>
+<p>By embedding specialized dependencies and internal deserialization logic directly within the artifact, every logged model is now fully autonomous. This architectural shift ensures that future environment transitions or runtime upgrades proceed smoothly, eliminating the need for costly retraining or manual recovery efforts.</p>
+<h2>Next iteration: eliminating pickle</h2>
+<p>While our "Load and Repack" strategy solved the immediate DBR upgrade issue, encapsulating models inside custom <code>PythonModel</code> subclasses still relies on <code>cloudpickle</code> to serialize the wrapper object itself. To ensure we never face a version boundary issue again, we are evolving our architecture to eliminate pickle entirely through two advanced MLflow patterns:</p>
+<h3>Native serialization formats</h3>
+<p>Instead of wrapping inner models, we can migrate to MLflow's native serialization flavors, which avoid <code>cloudpickle</code>:</p>
+<ul>
+ <li><code>mlflow.catboost.log_model()</code> saves directly to CatBoost's native .cbm format</li>
+ <li><code>mlflow.pytorch.log_model(..., serialization_format="pt2")</code> utilizes <code>torch.export.save</code> (available in PyTorch ≥ 2.4)</li>
+ <li><code>mlflow.sklearn.log_model(..., serialization_format="skops")</code> secures TF-IDF and Voting ensemble models natively</li>
+</ul>
+<h3>Adopting "Models from Code"</h3>
+<p>To maintain our unified <code>predict()</code> interface without pickling the wrapper, we can transition to MLflow's Models from Code concept. Rather than logging an instantiated object, MLflow stores the wrapper as a raw Python source file. At runtime, the wrapper script uses the <code>load_context()</code> method to fetch the native model artifacts (like the <code>.cbm</code> file). Because the wrapper is executed as pure source code and the weights are native, the entire artifact becomes independent from future Python bytecode changes.</p>
+<h2>Lessons learned</h2>
+<p><strong>Coordinate library shifts early.</strong> Upgrading a major runtime means foundational open-source libraries change under the hood as well. Always align early with your Applied Scientists to review respective package lists before scheduling data engineering upgrades.</p>
+<p><strong>Prioritize rigorous dependency management.</strong> Establish a disciplined workflow when configuring your environments. By thoroughly reviewing LTS documentation and modernizing your manifests, such as updating <code>pyproject.toml</code> and running <code>uv sync --upgrade</code>, you ensure that your Python, PySpark, and Delta Lake layers remain harmonized and resilient against system-wide changes.</p>
+<p><strong>Embrace native formats over pickles.</strong> Whenever possible, utilize native framework serializers (like <code>.cbm</code> or <code>pt2</code>) and avoid serializing Python objects. The closer your artifacts remain to pure configuration and native weights, the easier your next runtime upgrade will be.</p>
+<p>By pivoting from a disruptive serialization bottleneck toward a unified architectural standard, future runtime transitions are now engineered to be as seamless as a simple version increment.</p>

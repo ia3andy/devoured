@@ -1,0 +1,96 @@
+<p>Serverless should be the first execution model teams evaluate for AI agent workloads. Many agents spend much of their lifetime waiting, and always-on compute forces teams to pay for every idle minute. In a study of more than 35,000 production coding-agent sessions, the median session ran LLM or tool calls for only 20% of its lifetime. The rest of the time, it sat idle between steps, with its sandbox still allocated.</p>
+<p>According to Gartner’s 2026 CIO and Technology Executive Survey, AI agents have the most aggressive adoption curve of all technologies measured, but momentum is outpacing platform maturity, making it difficult to run agents at scale. When Google Cloud surveyed over 1,400 senior IT leaders for their 2026 State of AI Infrastructure report, 83% said they would need infrastructure upgrades to support production-grade agentic AI. Teams can interpret a readiness problem as a reason to provision persistent compute, adopt a new cluster, expand an existing platform, or even choose a different deployment topology. Serverless offers a less invasive path to scale agentic AI.</p>
+<p>In a serverless model, the platform provisions capacity as requests arrive and scales to zero when they stop, so teams can add agent workloads without managing a cluster. While some agents require dedicated capacity, many of them can run serverless. Longer runs can use durable serverless workflows to save progress and release compute during a wait, then resume once the next step is ready.</p>
+<p>In this post, we’ll explain how to test the serverless default against your own agent workloads and adjust your approach as production data becomes available. We’ll cover how to:</p>
+<ul>
+ <li>Determine whether an agent uses compute intermittently</li>
+ <li>Compose longer or resumable agent runs as a durable serverless workflow</li>
+ <li>Compare its production behavior and cost with warm or dedicated capacity</li>
+ <li>Use production evidence to move only the steps whose latency or runtime requirements justify a different workload placement</li>
+</ul>
+<h2>Estimate whether your AI agent workload needs continuously available compute</h2>
+<p>Treating agent workloads as if they all belong in the same category can cause teams to provision continuously available compute before they know whether the workload requires it. By creating a workload execution profile, you can determine if the agent needs dedicated workers or can run safely on demand.</p>
+<h3>Create a workload execution profile for the placement decision</h3>
+<p>An <strong>execution profile</strong> records the workload characteristics and runtime requirements that inform where and how the agent’s workload should run. <strong>Workload placement</strong> describes the process of choosing the execution model for an agent workflow or an individual step, such as on-demand compute, minimum instances, a warm service, or a dedicated worker pool.</p>
+<p>Creating an execution profile clarifies which resources must remain available when no agent step is actively running. For example, if only durable state and a trigger for the next step need to be available, a serverless workflow may be the best fit.</p>
+<p>We recommend including the following inputs in your execution profile:</p>
+<ul>
+ <li>Trigger and arrival pattern</li>
+ <li>Response pattern, such as synchronous, asynchronous, or streaming</li>
+ <li>Peak arrival rate and burst duration</li>
+ <li>Peak concurrency</li>
+ <li>Response-time objective, such as the maximum acceptable time to first output or completion</li>
+ <li>Active compute time per run</li>
+ <li>Total elapsed time per run</li>
+ <li>Compute utilization over the expected operating window</li>
+ <li>Maximum step duration</li>
+ <li>Memory and CPU requirements</li>
+ <li>Accelerator, local storage, persistent connection, and private network requirements</li>
+</ul>
+<p>The inputs in your execution profile show you when demand arrives and how quickly it accumulates. If you only rely on daily averages, you may choose an execution model that doesn’t suit the workload.</p>
+<h3>Separate active compute from total elapsed time</h3>
+<p>The ratio of active compute time per run to total elapsed time per run is an early workload placement signal. A low ratio strengthens the case for on-demand execution, while a high ratio can indicate that dedicated workers may be more economical, especially when paired with steady arrivals.</p>
+<p>For a new agent workload, build the initial execution profile from expected traffic, the representative prototype, or load-test runs. If you’re using Datadog, Agent Observability and APM traces can help you measure the total elapsed time per run and the duration of individual steps at the model, tool, and application level. Serverless Monitoring can measure the execution duration of each serverless component, which contributes to the run’s active compute time. It can also report invocation volume, concurrency, CPU, and memory. If you’re using AWS Lambda, enhanced metrics also report CPU utilization and CPU time. After deployment, update the execution profile with production measurements.</p>
+<h2>Compose longer or resumable agent runs as durable serverless workflows</h2>
+<p>An agent run that completes within a single invocation may not require durable orchestration. In those cases, using a function or serverless container avoids unnecessary cost and complexity. If runs span multiple steps or need to pause and resume, a durable serverless workflow can be the optimal choice.</p>
+<p>A durable serverless workflow combines components with different roles. For example:</p>
+<ul>
+ <li>An orchestrator records progress and decides when each unit is eligible to run.</li>
+ <li>Serverless execution primitives, such as functions, serverless containers, or managed jobs, perform the active work.</li>
+ <li>External stores retain artifacts and application data that outlives the execution process.</li>
+</ul>
+<p>We recommend dividing the agent run into bounded units of work. Each unit of work should have defined inputs, outputs, and completion or failure conditions. After each bounded unit of work finishes or a workflow pauses, the orchestrator can record its progress. The workflow can later resume from the checkpoint instead of restarting the entire run. If a step fails, the orchestrator can retry it without rerunning the steps already completed. Design each step so that a retry doesn’t repeat external side effects, such as sending a duplicate email or charging a customer twice.</p>
+<p>To decide where the workflow can pause, map the agent run from trigger to completion and classify each wait as a tool response, rate-limit backoff, or human approval. The workflow can release compute at a wait if it can save its state and resume from a timer, event, or callback. If a step must keep a process running, such as to stream a response or maintain a persistent connection, it can’t pause and may require warm capacity instead.</p>
+<h3>Separate the agent framework from the workflow’s durable orchestration</h3>
+<p>Many teams use agent frameworks, such as LangChain or Vercel AI SDK, to accelerate deployment. Datadog’s State of AI Engineering report found that agent framework adoption has nearly doubled from 2025 to 2026. Agent frameworks can vary widely in scope, with some managing model calls, tool selection, and the agent loop, while others support checkpointing or persistent workflow state.</p>
+<p>When an external durable orchestrator coordinates the workflow, we recommend that it owns the workflow state, scheduling, and resumption, while the agent framework handles model and tool interactions within each bounded step. This separation of duties allows the framework process to end without losing the workflow’s progress and prevents an in-agent loop from staying alive for the entire workflow.</p>
+<h2>Compare on-demand execution with warm and dedicated capacity for AI agent workloads</h2>
+<p>The execution profile can help you compare each workload placement option against the same demand. On-demand costs generally increase with active compute time and workflow activity, while warm and dedicated capacity incur costs while provisioned compute is idle.</p>
+<p>When comparing on-demand execution with warm and dedicated capacity, include compute duration, orchestration transitions, state storage, network transfer, and telemetry data. You can exclude model and tool charges if they remain unchanged across placements, but include the charges when retries, failures, or repeated work cause one placement to generate more calls.</p>
+<p>Instead of invocation prices, compare cost per successful run. Add the costs generated by every attempted execution during the same operating window, including successful, failed, and abandoned runs. Then divide the total by the number of runs that reached the workload’s completion condition.</p>
+<h2>Use production evidence to change the placement of your AI agent workload</h2>
+<p>Once in production, monitor the agent’s behavior as it executes in a serverless workflow. By comparing production metrics with your execution profile, you can identify when the architecture should change to address emerging latency or runtime constraints.</p>
+<p>Before you change a step’s placement, confirm the source of the problem. For example, if a trace shows that unnecessary retrieval calls or model turns account for most of the delay, keeping the worker warm won’t address that source of latency. By contrast, if compute startup consumes a substantial amount of the response-time budget, warm capacity can help.</p>
+<h3>Match each operating signal to a placement response</h3>
+<p>When reviewing signals, analyze startup latency, active compute time, sustained concurrency, and cost per successful run together. Interpret each signal according to the workload’s response-time objective and relevant capacity or cost limits.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Signal</th>
+   <th>Interpretation</th>
+   <th>Potential response</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Startup time consumes a significant share of the response-time objective</td>
+   <td>The step must begin on already initialized compute</td>
+   <td>Configure minimum instances or move the path to a warm service</td>
+  </tr>
+  <tr>
+   <td>Active compute is a small share of total workflow duration</td>
+   <td>The workload spends a significant amount of its lifetime waiting</td>
+   <td>Continue releasing compute between steps</td>
+  </tr>
+  <tr>
+   <td>Concurrency remains high for long periods and idle time remains low</td>
+   <td>Demand is predictable enough for a dedicated worker pool</td>
+   <td>Compare on-demand and dedicated capacity over the same demand window</td>
+  </tr>
+  <tr>
+   <td>Cost per successful run remains higher than a right-sized worker estimate</td>
+   <td>On-demand pricing or orchestration overhead may not suit the workload</td>
+   <td>Test the consistently busy path on dedicated capacity</td>
+  </tr>
+  <tr>
+   <td>A workflow step’s accelerator, cache, connection, or execution-duration requirements exceed the provider’s limits</td>
+   <td>The current placement can’t satisfy the step’s runtime requirements</td>
+   <td>Move the constrained step while leaving the remaining steps in the serverless workflow</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Move only the steps that require a different placement</h3>
+<p>The operating signals can apply to one step rather than the entire workflow. If startup latency, sustained compute use, or a runtime constraint affects a specific step, move that step to warm or dedicated capacity while keeping the durable orchestration and intermittent steps serverless.</p>
+<h2>Key takeaways for running AI agents on serverless</h2>
+<p>Serverless is a strong starting point for agent workloads that use compute intermittently. Durable execution allows workflows to preserve progress during pauses and release compute between steps. Warm or dedicated capacity becomes appropriate when measured latency, sustained utilization, or runtime requirements justify it.</p>
+<p>Begin with one representative agent workload and create its execution profile. Use that profile to evaluate serverless placement, then compare production behavior and cost per successful run with the alternatives. When a constraint affects an individual step, change that step’s placement while keeping the remaining workflow serverless.</p>

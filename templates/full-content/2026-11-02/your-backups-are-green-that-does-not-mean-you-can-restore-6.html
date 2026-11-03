@@ -1,0 +1,53 @@
+<h2>Your backups are green. That does not mean you can restore.</h2>
+<p>Most teams I work with have a backup dashboard, and most days it is green. The job ran; it finished; nothing failed. That green tick feels like safety, and it is the reason nobody thinks about backups again until the day they need one. Then something breaks, someone asks how long it will take to get the database back, and the room goes quiet. Nobody knows. The backups have been running for a year, and nobody has ever brought one back.</p>
+<p>I am writing this because that gap, the space between having backups and being able to recover, is the most common serious problem I find in production PostgreSQL, and hardly anyone is measuring it.</p>
+<h2>A Monday that goes badly</h2>
+<p>Here is the shape of it. I have put this timeline together from the kind of incident customers keep running into, so treat it as a pattern rather than one company’s story.</p>
+<ul>
+ <li>At <strong>09:38</strong>, a new feature is rolled out. One statement drops a column that still holds live data.</li>
+ <li>At <strong>09:44</strong>, support tickets start coming in because customer records look incomplete.</li>
+ <li>At <strong>10:05</strong>, after trying a few smaller fixes, the team decides to restore to just before <strong>09:38</strong>.</li>
+</ul>
+<p>The backups have been green for fourteen months, so everyone is fairly relaxed.</p>
+<ul>
+ <li>At <strong>10:20</strong>, they find out there is no restore host. Nobody had ever needed one. Someone starts building it.</li>
+ <li>At <strong>13:50</strong>, the restore finishes and recovery stops earlier than it should, because a WAL segment from months ago is missing from the archive.</li>
+ <li>At <strong>16:30</strong>, they give up on the exact point in time, recover to a copy that is six days old, and spend the next two days putting the difference back by hand.</li>
+</ul>
+<p>The business had expected this to take about an hour, with no visible data loss. Instead, the restore took more than two days, and data loss was certain.</p>
+<h2>What a green backup actually tells you</h2>
+<p>A successful backup job is not a lie. It is just a much smaller claim than people think.</p>
+<p>It tells you a process started and finished without an error. It tells you bytes were read from one place and written to another. It tells you the backup catalog has a new entry, and that a retention rule ran. All useful. None of it is about recovery.</p>
+<p>Here is what it does not tell you. It does not tell you whether all the files outside the data directory that a restore needs are actually in the backup. It does not tell you the WAL needed to bring that backup to a consistent state still exists. It does not tell you the pages inside are healthy. It does not tell you that you can stop at a chosen moment in the past. And it says nothing at all about whether any of this fits in the time you have promised somebody.</p>
+<h2>Analogy: The fire extinguisher on the wall</h2>
+<p>There is probably a fire extinguisher near you. The pressure gauge is green. It has an inspection tag signed every month for years. Nobody has ever pulled the pin.</p>
+<p>The gauge measures pressure. It cannot tell you whether the nozzle is blocked, whether the powder has gone solid, or whether the person nearest the fire knows how to use it. Your backup dashboard is that gauge. A restore test is pulling the pin.</p>
+<p>A backup is only useful if you know you can actually restore it when you need it.</p>
+<h2>Ways a green backup fails when you need it</h2>
+<p>These are the ones customers hit most often.</p>
+<ul>
+ <li><strong>The WAL chain is broken.</strong> Archiving quietly failed for a week. The base backup is perfectly fine. The path from it to the present is not.</li>
+ <li><strong>Corruption was copied faithfully.</strong> A damaged page has been in every backup for months, and your backup tool did its job correctly every time by copying it.</li>
+ <li><strong>Retention does not line up.</strong> The WAL expired before the backup it belongs to, or a full backup expired while its increments are still sitting there.</li>
+ <li><strong>The surroundings are missing.</strong> Roles, configuration files, extensions, tablespaces, certificates. None of that lives in the data directory.</li>
+ <li><strong>The key is gone.</strong> The backup repository is encrypted, and the only copy of the key lives in a system that is also part of the outage.</li>
+ <li><strong>There is nowhere to restore to.</strong> No machine with the disk, memory, and network to take two terabytes at short notice.</li>
+ <li><strong>There is nobody who can.</strong> The engineer who built it has left, and the runbook is a wiki page on a server that is down.</li>
+</ul>
+<h2>The corruption that gets backed up perfectly</h2>
+<p>Picture a cluster that was created years ago with data checksums turned off, and has since moved across two generations of storage. One day a report that only runs every few months starts failing. A single page has been damaged for a long time, and nothing noticed because the normal workload never reads that part of the table.</p>
+<p>Now check the backups. Every one of them copied the damaged page correctly. The oldest backup still inside the retention window already contains it. There is no clean copy left to go back to.</p>
+<p>This is why I push people to think about retention differently. Most people read thirty days of retention as thirty days of protection. Against corruption, it is the opposite. It is thirty days to notice, after which your last clean copy is gone, and the damage is in every copy you hold.</p>
+<h2>The archive gap nobody was watching</h2>
+<p>This one is common enough that I look for it first in every assessment.</p>
+<p>Archiving to object storage is set up and working. One day a credential gets rotated, and archiving starts failing.</p>
+<p>It fails silently because a broken archive does not stop the database and does not stop the backup job.</p>
+<p>PostgreSQL just keeps the segments and retries. The first thing anyone sees is disk pressure on <code>pg_wal</code>, and the natural reaction to disk pressure is to free space, which is the one action that turns a temporary problem into a permanent issue.</p>
+<p>The alerting was watching the backup job. Archiving is a different mechanism with its own failure mode, and nothing was watching it. A week or two later, the dashboard is green again, and nobody knows there is a stretch of time you can no longer recover to.</p>
+<p>Watch three things separately: the archive failure count, the age of the newest successfully archived segment, and the size of <code>pg_wal</code>.</p>
+<h2>There is only one test that proves anything</h2>
+<p>Restore the files. Start the cluster. Replay to a chosen point in the past. Then prove the data is correct. Everything else is a stand-in for that, and stand-ins drift.</p>
+<h2>Where to start</h2>
+<p>If you only do a few things after reading this, do these.</p>
+<p>Check that your archive chain is monitored separately from your backup job. Confirm your retention window covers what you promised, for backups and WAL together. Write down everything you would need that is not in the data directory, and where it is kept. Then pick one database and restore it to a timestamp from last week, on a clean machine, with somebody else at the keyboard.</p>
+<p>The goal is not to feel confident about your backups. It is to be able to show somebody why you are confident, and to know the date it was last true.</p>
