@@ -1,0 +1,146 @@
+<p>The <a href="https://noma.security/noma-labs/gitlost-how-we-tricked-githubs-ai-agent-into-leaking-private-repos">GitLost disclosure</a> showed how an agent with access to public and private repos can leak private data. Researchers at Noma Labs created an agent with permission to read public and private repositories across an organization and respond to issues in a public repo. They then opened a malicious public issue that caused the agent to post the contents of a private repo in a public comment.</p>
+<p>The attack did not require breaking out of a sandbox or stealing an auth token. Once the agent had permission to read from a private repository and write to a public one, the attacker persuaded it to use its permissions in a way that the maintainer did not intend or want.</p>
+<p><a href="https://gh.io/gh-aw">GitHub Agentic Workflows</a> became <a href="https://github.blog/changelog/2026-10-28-github-agentic-workflows-generally-available/">Generally Available</a> during <a href="https://githubuniverse.com/">GitHub Universe</a> last week, and the release includes a new way to prevent private-to-public leaks like GitLost in cross-repo workflows. Our solution is an experimental security primitive called an <strong>enclave</strong>, which allows an agent to access private data and deterministically constrain what it can say about it.</p>
+<p>An enclave is a single-use sandbox that allows the primary agent in an agentic workflow to isolate itself from work in another repository. An enclave’s purpose is to prevent the primary agent from seeing private information so that it cannot inadvertently over-share. Military and intelligence organizations apply the principle of <em>need-to-know</em> by compartmentalizing operations so that personnel working on one mission don’t necessarily have access to information about another. Even someone with a high security clearance doesn’t automatically get access to every classified operation. Enclaves allow the same compartmentalization among agents.</p>
+<h2>Overview of enclaves</h2>
+<p>An agentic workflow’s primary agent can only access the repo in which it executes, but it can use enclaves to perform work in repos outside of its own. Primary agents launch an enclave by specifying the enclave’s repo, the computation to be performed, and a response schema. Interactions between the primary agent and enclaves are handled by a trusted broker that validates the primary’s launch request, runs enclaves in isolation, and validates enclave responses to the primary agent.</p>
+<p>Like <a href="https://arxiv.org/html/2505.23643#S5.SS2">FIDES</a>’s constrained output schemas for LLM calls, the primary agent specifies response schemas for its enclaves. The response schema defines the vocabulary the enclave uses to communicate with the primary agent. Schemas are typically limited to Booleans, enumerations, bounded integers, and structured combinations of those base types. The enclave cannot add explanations, attach files, or return arbitrary strings. The broker checks every response against the schema and rejects anything outside it.</p>
+<p>The amount of information the response schema can carry is constrained by an <strong>information budget</strong> that is measured in bits. The workflow configuration determines the budget via the enclave repository’s sensitivity. For example, a sensitivity of <code>confidential</code> permits 8 bits per repository per workflow run.</p>
+<p>The broker validates the primary agent’s response schema to ensure that it cannot reveal more bits than the workflow author budgeted. A Boolean has two possible values and can convey one bit through its successful result. A choice among four categories can convey two bits. Combining fields increases the number of possible responses and the information the result can carry. Importantly, a single bit in the schema is always reserved for errors. Validation errors, runtime errors, budget overflow errors, and timeout errors all set the error bit.</p>
+<p>While the workflow author sets the budget, <strong>the primary agent defines the schema’s semantics and chooses how to spend the available budget.</strong> It might ask whether an API is used, classify compatibility, or request a bounded count. It chooses the field names, allowed values, and task instructions that give those values meaning. This flexibility lets the agent tailor a narrow response to the work at hand without receiving unrestricted access to the repository.</p>
+<p>Before launching an enclave, the broker calculates a schema-compliant response’s information charge, including the constrained status and timing channels, and checks it against the repository’s remaining budget. The charge is reserved before execution rather than determined by the answer that comes back. Calls share the same per-repository ledger for the run, so the primary agent can adapt its questions but cannot grow the budget or reset it by choosing a new schema. If an enclave response would exceed the balance, the broker denies it.</p>
+<h2>Two kinds of enclave work</h2>
+<p>Agentic workflows support two enclave executors:</p>
+<p><strong>Script enclaves</strong> run bounded Python programs over read-only repository snapshots, without network access. They are useful for deterministic checks, such as whether a file exists, whether a dependency appears in a manifest, or whether a configuration satisfies a rule.</p>
+<p><strong>Agent enclaves</strong> run a separate coding agent for tasks that need reasoning. An agent enclave might inspect an implementation and classify whether a reported bug applies. Its network access is restricted to the configured model-provider path and, when explicitly enabled, a narrow GitHub tool interface. It does not receive general-purpose GitHub credentials or unrestricted network access.</p>
+<p>Enclaves are declared in workflow front matter. This configuration excerpt enables both kinds for the same private repository:</p>
+<pre><code>sandbox:
+  agent:
+    id: awf
+enclaves:
+  - script:
+    repos:
+      - repo: myorg/private-service
+        sensitivity: confidential
+    timeout: 45
+  - agent:
+      model: gpt-5
+    repos:
+      - repo: myorg/private-service
+        sensitivity: confidential
+    timeout: 180</code></pre>
+<p>The workflow must separately provide credentials that authorize access to the repository. Declaring an enclave cannot expand what those credentials can read. The primary agent receives enclave tools through the MCP gateway. The primary never sees private repository snapshots or any auth credentials.</p>
+<p>The maintainer chooses the repository policy, sensitivity, and execution limits. A tool call cannot override those settings merely because the agent asks for a different runtime or broader access.</p>
+<h2>GitLost with enclaves</h2>
+<p>Let’s return to GitLost. The attack depended on an agent reading a private repository and posting its contents in a public issue. With enclaves, the primary agent handles the public issue, and the enclave inspects the private repository. The broker controls what information passes between them.</p>
+<p>Suppose a workflow in <code>contoso/public-repo</code> needs to answer questions about an integration in <code>contoso/private-repo</code>. The maintainer could use this front matter configuration excerpt:</p>
+<pre><code>---
+engine: copilot
+sandbox:
+  agent:
+    id: awf
+tools:
+  github:
+    allowed-repos: [contoso/public-repo]
+safe-outputs:
+  add-comment:
+    max: 1
+enclaves:
+  - agent:
+      model: gpt-5
+    repos:
+      - repo: contoso/private-repo
+        sensitivity: confidential
+    timeout: 180
+---</code></pre>
+<p>The two repository declarations serve different purposes. <code>tools.github.allowed-repos</code> confines the primary agent’s GitHub reads to the public repository. The enclave’s <code>repos</code> entry permits private analysis, and <code>sensitivity: confidential</code> sets an 8-bit disclosure budget for that repository for the run. <code>safe-outputs</code> lets the primary agent propose a public comment; it does not give the enclave a way to post one.</p>
+<p>This excerpt leaves out the workflow trigger, task instructions, and credential setup. The trusted infrastructure must be authorized to prepare the private repository snapshot for the enclave, without exposing those credentials or the snapshot to the primary agent. The private repository must not also be checked out into the primary agent’s workspace or accessible through another tool.</p>
+<p>Now imagine the public issue asks whether version 2 of a dependency is compatible with the private integration. The primary agent could ask the enclave for a simple yes-or-no answer with this response schema:</p>
+<pre><code>\{"type":"boolean"}</code></pre>
+<p>The same schema could support many different questions. The task prompt supplies its meaning: here, <code>true</code> means the upgrade is compatible. The broker does not need to understand that meaning; it can determine that the successful result has only two possible values. The workflow author set the disclosure limit, while the primary agent chose this particular use of it.</p>
+<p>Alternatively, the primary agent might need to distinguish an uncertain result and know whether migration is required. It could make an <code>enclave_run_agent</code> call with a more expressive schema:</p>
+<pre><code>\{
+  "privateRepo": "contoso/private-repo",
+  "prompt": "Check whether version 2 is compatible with our integration and whether migration is required.",
+  "schema": \{
+    "type": "object",
+    "fields": [
+      \{
+        "name": "compatibility",
+        "schema": \{
+          "type": "enum",
+          "values": ["compatible", "incompatible", "unknown"]
+        }
+      },
+      \{
+        "name": "migrationRequired",
+        "schema": \{ "type": "boolean" }
+      }
+    ]
+  }
+}</code></pre>
+<p>Three compatibility values and two migration values produce <strong>only six possible successful answers</strong>. The successful-result portion requires three bits of budget. Adding four bits reserved for timing and one for success/error brings the total charge to <strong>eight bits</strong>, exactly the <code>confidential</code> repository’s per-run budget. It charges the worst-case amount before execution, not just for whichever result the enclave eventually returns.</p>
+<p>Once admitted, the enclave reads the private repository and performs the analysis. It might encounter both compatibility notes and an unrelated confidential project name or launch date. Its response must still fit the schema:</p>
+<pre><code>\{"compatibility":"compatible","migrationRequired":false}</code></pre>
+<p>The broker validates that response and returns it to the primary agent, which can propose a public comment: “Version 2 is compatible with our internal integration. No migration is required.” The private files and the enclave’s analysis never enter the primary agent’s context.</p>
+<p>What happens if the issue contains the GitLost instruction to retrieve a private README and paste it into the public comment? A direct read by the primary agent is outside its repository scope. Delegating the instruction to the enclave does not open an unrestricted return channel. A free-form response schema such as <code>\{"type":"string"}</code> is rejected for a <code>confidential</code> repository. A finite schema with more possible answers than the remaining budget permits is also denied.</p>
+<p>If the enclave follows an injected instruction and appends the README to the compatibility result, the response fails validation. It cannot add an <code>explanation</code> field, hide text in the Boolean, or replace <code>compatible</code> with an arbitrary string. The primary agent gets a constrained error rather than the rejected response or an excerpt from it. Changing schemas or making more calls does not refill the repository’s budget.</p>
+<p>This blocks the unrestricted private-file-to-public-comment path demonstrated by GitLost without requiring either agent to recognize the attack. It does not mean that no information leaves the private repository: the compatibility answer is an intentional disclosure. A compromised agent could also use its permitted answers to signal other information, but only within the enforced budget. The guarantee is a bound on communication, not a judgment that every possible question or answer is safe.</p>
+<h2>Repeated questions need a shared budget</h2>
+<p>A finite schema alone does not solve the problem. An attacker could repeatedly ask Boolean questions about individual bits of a secret until the secret has been reconstructed.</p>
+<p>Enclaves account for disclosure across the workflow run, not just within an individual response. Each repository has a shared information budget determined by its sensitivity:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Sensitivity</th>
+   <th>Per-repository, per-run budget</th>
+   <th>Response policy</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>trusted</code></td>
+   <td>Unmetered</td>
+   <td>Bounded structured responses may include free-form strings</td>
+  </tr>
+  <tr>
+   <td><code>public</code></td>
+   <td>Unmetered</td>
+   <td>Finite structured responses; no free-form strings</td>
+  </tr>
+  <tr>
+   <td><code>internal</code></td>
+   <td>64 bits</td>
+   <td>Larger, but bounded, finite answer spaces</td>
+  </tr>
+  <tr>
+   <td><code>confidential</code></td>
+   <td>8 bits</td>
+   <td>Tightly constrained results, such as the compatibility example</td>
+  </tr>
+  <tr>
+   <td><code>sealed</code></td>
+   <td>0 bits</td>
+   <td>No repository-derived disclosure; no invocations admitted</td>
+  </tr>
+ </tbody>
+</table>
+<p>The broker charges for the possible response transcript before running the computation, including the bounded status and timing channels, rather than charging only for the value that happened to be returned. A request that cannot fit within the remaining budget is denied.</p>
+<p>Script and agent enclaves debit the same repository ledger. Switching executors does not refill the budget, and repeated calls cannot silently turn a narrow question into an unrestricted conversation.</p>
+<p><code>trusted</code> is appropriate only when the repository’s contents are already approved for unrestricted return to the primary agent. It is not a workaround for making confidential answers more convenient. Likewise, <code>public</code> and <code>trusted</code> here are disclosure-policy settings, not grants of access or changes to a repository’s GitHub visibility.</p>
+<p>These are per-run budgets. Maintainers still need to consider how often a workflow runs and what repeated runs might reveal.</p>
+<h2>The response is not the only channel</h2>
+<p>Restricting the JSON result would accomplish little if an enclave could print private data into a public Actions log. Nor would a finite schema help if a computation could communicate arbitrary values through detailed error messages or precisely chosen response delays.</p>
+<p>The communication boundary therefore includes more than the successful result. Instead of exposing arbitrary completion times, responses use fixed timing buckets, such as <strong>100 milliseconds; 1 and 10 seconds; and 1, 2, and 5 minutes</strong>. Each response also receives a secret-independent random delay of 0-1,000 milliseconds. The delay adds jitter, but does not eliminate the timing channel: the budget conservatively reserves <strong>four bits</strong> for the twelve distinguishable buckets.</p>
+<p>Another <strong>one bit</strong> accounts for the success/error distinction. Failures use a canonical error rather than exposing detailed diagnostics that could carry private content. Normal enclave audit transcripts also redact free-form engine output rather than copying private tool results and model transcripts into workflow artifacts.</p>
+<p>The infrastructure also separates the primary agent from repository seeds, enclave control endpoints, and ledger state. A script enclave has no network connection; an agent enclave’s connections are limited to its explicitly configured peers. These restrictions are enforced by the surrounding infrastructure, not by instructions asking the enclave to behave.</p>
+<p>This is the same principle behind safe outputs and <a href="https://githubnext.com/posts/integrity-filtering/">integrity filtering</a>: put the security decision in a component that does not need to understand or obey the agent’s prose.</p>
+<h2>Beyond GitLost</h2>
+<p>Cross-repository security is broader than private-to-public leaks. Two private repositories can belong to different teams, contain different classes of information, or have different audiences. An agent authorized to work in one should not automatically receive everything in another.</p>
+<p>Enclaves allow cross-repo workflows to embrace the principle of need-to-know. A dependency-maintenance agent can check whether an internal service has adopted an interface. A compliance agent can classify repositories against a fixed policy. A release agent can combine readiness results from several projects without assembling their private implementations in one context.</p>
+<p>Each result still discloses information, and maintainers must decide whether that disclosure is appropriate. The benefit is that the disclosure is explicit and bounded. A request for a readiness classification need not also become permission to read and repeat the entire repository.</p>
+<h2>Limitations and looking ahead</h2>
+<p>A disclosure budget is not a guarantee of harmless disclosure. Even one bit can answer a sensitive question. Finite schemas also constrain communication, not correctness. A misdirected agent can return the wrong classification within a perfectly valid schema.</p>
+<p>Agent enclaves necessarily send repository-derived content to the configured model provider. The budget limits what the calling agent learns, not what that provider sees. Provider selection and data-handling requirements remain part of the maintainer’s security decision. The runner and trusted enforcement infrastructure also remain in the trust boundary.</p>
+<p>Finally, giving the primary agent a way to read a private repository defeats the purpose of enclaves. Enclaves complement least-privilege credentials, integrity filtering, the network firewall, and safe outputs.</p>
+<p>We’d love to hear which cross-repository tasks you’d like to run with enclaves. Share your experience in the <a href="https://gh.io/aw-tp-community-feedback">Community discussion</a>.</p>

@@ -1,0 +1,146 @@
+<h1>Why Agents Are Soon Only Going to Have 1 Tool</h1>
+<p>For the past two years, building capable Agents meant designing tools, figuring out which actions help the model complete a task, deciding how granular each tool schema needs to be, or iterating on system instruction templates. This is changing. Agents are moving in the opposite direction by collapsing their entire tool catalog into <strong>one tool</strong>: <code>exec</code>.</p>
+<p>This is called <strong>Code Mode</strong> (or Programmatic Tool Calling). Instead of forcing the model to trigger tools one at a time across turns, the harness gives the model a single <code>exec(code)</code> tool. The model writes a short TypeScript or Python script that chains, combines, and awaits actions inside an isolated sandbox.</p>
+<h2>From single actions to chaining workflows in code</h2>
+<p>To understand why agents are converging on a single <code>exec</code> tool, we should look at how tool calling evolved.</p>
+<p>Initially, we only gave agents a handful of tools because they couldn't reliably choose or filter across a large catalog. As models improved, we connected dozens of tools or MCP servers, but ran into context window limits. We solved that with tool search and progressive disclosure, letting agents look up tools on demand.</p>
+<p>Even with dynamic tool loading, we still had dozens of individual tools, and were still stuck with the limitation of standard tool calling: <em>one</em> action per turn.</p>
+<p>In standard tool calling, the model generates a structured object (typically JSON) that defines a single action (or at best a flat batch of independent calls, like reading three files), waits for the raw output to come back, adds it into the prompt history, reasons again, and decides what to do next.</p>
+<p>From my own experience, we made a big jump recently in how reliably models can combine and chain dependent actions in a single pass:</p>
+<ul>
+ <li><strong>Research and filtering:</strong> Instead of fetching a list of sources in Turn 1, reading them in Turn 2, and cross-referencing them in Turn 3, the model can write a script that queries the sources, filters out irrelevant hits, and extracts the exact answer in one step.</li>
+ <li><strong>Multi-file edits and inline verification:</strong> Standard edit tools typically operate on one file per tool call. With Code Mode, the model can apply coordinated changes across multiple files, run a verification check, inspect the output, or branch on pass or fail inside the same script.</li>
+ <li><strong>Browser and computer use:</strong> In UI automation, the chain of actions is often obvious: click a button, fill a form, wait for a selector, or paginate through a table in a loop. Instead of paying a full model round-trip for every click or keystroke, the model can script the entire sequence or loop in one turn and only return when the page state changes.</li>
+ <li><strong>Parallel fan-out and sub-agents:</strong> When a task requires running 20 lookups or calling specialist sub-models in parallel and feeding those outputs into a second API, the model can <code>await Promise.all(...)</code>, transform the array, and call the next function without round-tripping through the LLM context window between steps.</li>
+</ul>
+<p>Several shifts came together to enable this. Frontier models are trained heavily on code, and providers have started post-training models for Code Mode. At the same time, MCP servers now increasingly ship <code>outputSchema</code> alongside <code>inputSchema</code>, giving the model upfront knowledge of return types so it can chain Tool A into Tool B inside the same script <em>before</em> seeing runtime output.</p>
+<h2>How Code Mode works</h2>
+<p>Code Mode collapses the tool catalog into a single tool on the model surface: <code>exec(code)</code>.</p>
+<p>Instead of passing 80 separate JSON Schema tool objects to the model API, the agent compiles those schemas into compact type declarations (<code>declare namespace tools \{ ... }</code>). When the model needs to combine actions across external systems, it calls <code>exec</code> and writes a script that invokes <code>await tools.&lt;server&gt;.&lt;tool&gt;(args)</code>.</p>
+<pre><code>// Pseudo-code: TypeScript declarations exposed to the model
+declare namespace tools \{
+  namespace linear \{
+    function listProjects(): Promise&lt;Array&lt;\{ id: string; name: string }&gt;&gt;;
+    function listIssues(args: \{ projectId: string }): Promise&lt;Array&lt;\{ id: string; title: string; assignee?: string }&gt;&gt;;
+    function archiveIssue(args: \{ id: string }): Promise&lt;\{ ok: boolean }&gt;;
+  }
+}
+ 
+// Optional: when wrapping hundreds of tools, omit full namespaces upfront and expose
+// a global map in the sandbox that the model can iterate and filter over in code
+declare const ALL_TOOLS: Record&lt;string, \{ description: string; signature: string }&gt;;
+ 
+// Multimodal output helpers: only what is passed here enters the model context window
+declare function text(output: string): void;
+declare function image(data: string | Uint8Array, mimeType?: string): void;
+declare function audio(data: string | Uint8Array, mimeType?: string): void;
+ 
+// Cross-turn state helpers: persist data in host memory without paying token costs
+declare function store(key: string, value: unknown): void;
+declare function load&lt;T = unknown&gt;(key: string): T;</code></pre>
+<p>To save context across a large catalog, we don't have to expose every tool directly. We can leverage principles we already built, like tool search, or expose a global <code>ALL_TOOLS</code> map inside the sandbox. Similarly, multimodal output helpers (<code>text()</code>, <code>image()</code>, <code>audio()</code>) let the script pass text, images, or audio directly back into the model's context window.</p>
+<pre><code>// Pseudo-code: What the model emits inside a single exec() call
+const projects = await tools.linear.listProjects();
+const issueBatches = await Promise.all(
+  projects.map((p) =&gt; tools.linear.listIssues(\{ projectId: p.id }))
+);
+ 
+const unassigned = issueBatches.flat().filter((issue) =&gt; !issue.assignee);
+await Promise.all(unassigned.map((issue) =&gt; tools.linear.archiveIssue(\{ id: issue.id })));
+ 
+text(`Archived $\{unassigned.length} unassigned issues across $\{projects.length} projects.`);</code></pre>
+<p><em>The sandbox executes all 55 underlying API calls, filters the payloads in memory, and returns only the one-line <code>text()</code> string to the model's context window.</em></p>
+<h3>Why a JS/Python sandbox instead of just <code>bash</code>?</h3>
+<p>You can build a tool proxy in <code>bash</code> too, but orchestrating tools inside a language runtime like JavaScript or Python can bring benefits that are harder to achieve in <code>bash</code> environments.</p>
+<ul>
+ <li><strong>Typed functions:</strong> MCP servers and internal APIs map directly to typed <code>await tools.&lt;service&gt;.&lt;method&gt;(args)</code> calls with native objects, <code>Promise.all</code>, and <code>try</code>/<code>catch</code> error handling instead of fragile bash string escaping.</li>
+ <li><strong>No CLI exploration tax:</strong> When given custom CLIs or scripts in <code>bash</code>, models tend to over-explore before acting, burning turns and tokens running <code>--help</code> across subcommands or reading script source code just to figure out flags and output formats. Typed interface definitions give the agent a contract upfront so it can act immediately.</li>
+ <li><strong>Multimodal context:</strong> A shell only returns stdout text. If a multimodal model wants to inspect an image, it cannot run <code>cat screenshot.png</code>, which is why <code>bash</code> harnesses still had to bolt on separate <code>read</code> or <code>view_media</code> tools. In an <code>exec</code> sandbox, calling <code>image(screenshot)</code> or <code>audio(clip)</code> tells the host runtime to attach the actual media part directly to the model's next turn.</li>
+ <li><strong>Credential and policy proxy:</strong> Every <code>await tools.*</code> call crosses a structured bridge to the host runtime, which can inject OAuth tokens outside the sandbox, validate schemas, or pause for user confirmation on destructive calls.</li>
+ <li><strong>State management:</strong> In standard tool calling, the prompt history is the only state store, so reusing a large query result in Turn 2 means keeping the raw JSON in the context window on every turn. Exposing a KV interface lets the agent persist state outside of the context window across turns.</li>
+</ul>
+<h2>Building a 1-tool agent with the Gemini Interactions API</h2>
+<p>Here is a minimal, runnable pseudo example that provides <code>gemini-4-argon</code> with a single execution tool.</p>
+<pre><code>import vm from "node:vm";
+import \{ GoogleGenAI } from "@google/genai";
+ 
+const client = new GoogleGenAI(\{});
+ 
+// Underlying host functions (e.g., MCP clients or internal APIs)
+const tools = \{
+  listPRFiles: async (\{ pr }: \{ pr: number }) =&gt; [
+    \{ path: "src/auth.ts", additions: 120 },
+    \{ path: "src/payments.ts", additions: 85 },
+    \{ path: "src/utils.ts", additions: 12 },
+    \{ path: "README.md", additions: 60 },
+  ],
+  runSecurityScan: async (\{ path }: \{ path: string }) =&gt; (\{
+    findings: path.includes("auth") ? ["Missing token expiry check"] : [],
+  }),
+  postPRComment: async (\{ pr, body }: \{ pr: number; body: string }) =&gt; (\{ posted: true }),
+};
+ 
+// 1. Expose a single `exec` tool with TypeScript .d.ts signatures
+const execTool = \{
+  type: "function" as const,
+  name: "exec",
+  description: `Run an async JavaScript body in an isolated sandbox (no imports; call text() to output).
+Available globals:
+declare namespace tools \{
+  function listPRFiles(args: \{ pr: number }): Promise&lt;Array&lt;\{ path: string; additions: number }&gt;&gt;;
+  function runSecurityScan(args: \{ path: string }): Promise&lt;\{ findings: string[] }&gt;;
+  function postPRComment(args: \{ pr: number; body: string }): Promise&lt;\{ posted: boolean }&gt;;
+}
+declare function text(summary: string): void;`,
+  parameters: \{
+    type: "object",
+    properties: \{ code: \{ type: "string" } },
+    required: ["code"],
+  },
+};
+ 
+// 2. Turn 1: Gemini 4 Argon emits a single script to fetch, filter, scan, and comment
+const turn1 = await client.interactions.create(\{
+  model: "gemini-4-argon",
+  input: "Scan all modified .ts files with &gt;50 additions in PR #42, post a PR comment with any findings, and output a 1-line summary.",
+  tools: [execTool],
+});
+ 
+// 3. Run the script in a separate context (use QuickJS or isolated-vm for untrusted code)
+const fcStep = turn1.steps?.find((s: any) =&gt; s.type === "function_call") as any;
+const output: string[] = [];
+await vm.runInNewContext(`(async () =&gt; \{\n$\{fcStep.arguments.code}\n})()`, \{
+  tools,
+  text: (msg: string) =&gt; output.push(msg),
+});
+ 
+// 4. Turn 2: Send only the 1-line summary back via previous_interaction_id
+const turn2 = await client.interactions.create(\{
+  model: "gemini-4-argon",
+  previous_interaction_id: turn1.id,
+  tools: [execTool],
+  input: [
+    \{
+      type: "function_result",
+      name: fcStep.name,
+      call_id: fcStep.id,
+      result: [\{ type: "text", text: output.join("\n") }],
+    },
+  ],
+});
+ 
+console.log(turn2.output_text);</code></pre>
+<p>When <code>vm.runInNewContext</code> executes the script generated by <code>gemini-4-argon</code>:</p>
+<ol>
+ <li>The script calls <code>await tools.listPRFiles(\{ pr: 42 })</code> and filters the list in memory down to the <code>.ts</code> files with more than 50 additions.</li>
+ <li>It runs <code>tools.runSecurityScan</code> on just those matching files, checks whether any findings exist, posts the PR comment via <code>tools.postPRComment</code>, and emits a single line via <code>text()</code>.</li>
+ <li>None of the intermediate file objects or raw scanner payloads ever enter the <code>gemini-4-argon</code> context window; only the one-line <code>output</code> summary is sent back in Turn 2.</li>
+</ol>
+<h2>Agent harnesses are already defaulting to Code Mode</h2>
+<p>Across the ecosystem, coding agents and developer frameworks are converging on Code Mode as their default way to orchestrate tools.</p>
+<p>Harnesses like Pi, Factory Droid, and OpenAI Codex now ship with or default to Code Mode. Factory switched Droid 1.0 to Code Mode, improving their Terminal-Bench 4 accuracy and cutting model spend.</p>
+<p>Agent frameworks like Pydantic AI, LangChain, or Cloudflare's Agents SDK support similar Code Mode tools already.</p>
+<h2>What comes next</h2>
+<p>Does this mean every agent will soon only have a single <code>exec</code> tool? Not necessarily. This is as much a research and product question as an agent harness engineering one.</p>
+<p>When you start experimenting with Code Mode, you will also quickly notice that many of the tools, CLIs, and Agent Skills we built might not integrate cleanly out of the box because they were optimized for <code>bash</code> and human-readable text rather than typed code execution.</p>
+<p>This might force you to take a step back and audit what your agent actually needs. Happy building!</p>
