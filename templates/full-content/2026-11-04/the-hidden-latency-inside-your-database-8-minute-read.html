@@ -1,0 +1,67 @@
+<h1>The hidden latency inside your database</h1>
+<p>Network-attached storage is a fine choice and a bad default.</p>
+<p>Application performance 101 says you want to move your application as close as possible to your database. The shorter that distance across the network, the faster reads and writes move between them.</p>
+<p>But did you know there is network latency <em>inside</em> your database cluster?</p>
+<p>Most commonly, cloud-hosted databases have <strong>network-attached</strong> storage: a disk on a separate server, connected over the network, with impressively small, but still measurable, latency.</p>
+<p>Alternatively, it's possible to have <strong>locally attached</strong> storage: a disk inside the same machine as the CPU, connected directly to the motherboard.</p>
+<p>Network-attached storage powers an extraordinarily high volume of data throughput with flexibility and durability. But local disks are closer, closer is faster, and faster is better.</p>
+<h2>How'd we get here</h2>
+<p>The work performed by the device you're reading this blog post on has two separate yet equally important components: a processor to perform work, and storage to save it. <em>Dun dun</em>.</p>
+<p>It's also extremely likely these two are contained in one piece of hardware, like a smartphone or laptop. Computers have been like this forever.</p>
+<p>Internet infrastructure started this way, too. The original database servers, like Sun's SPARC servers, had their own disks inside the chassis or in a cabinet next to it, connected by SCSI and later SAS cables. Storage and compute were in the same physical hardware.</p>
+<h3>Separating compute and storage</h3>
+<p>But a single entity for storage is not <em>durable</em>. RAID (Redundant Array of Inexpensive Disks) was popularized in the late 1980s. With multiple storage disks being kept in sync, should one die, it could be swapped out for another. The system relied on the still-active disks while the fresh one caught up.</p>
+<p>Into the 1990s and early 2000s, enterprises put storage in dedicated arrays. A SAN (Storage Area Network) connected storage to compute over a network. But these were tremendously expensive and often maintained by the enterprise itself.</p>
+<h3>The cloud</h3>
+<p>a.k.a. <em>renting someone else's computer</em>.</p>
+<p>(For simplicity, we're focusing on AWS offerings in this post, but PlanetScale also runs on Google Cloud Platform and Azure.)</p>
+<p>The most notable cloud storage service is AWS S3 (Simple Storage Service). It is a key-value store for objects. You can't attach it as a block device or modify subsets of objects in place.</p>
+<p>Enter AWS EBS (Elastic Block Store), which mounts like a disk and can be provisioned on demand. EBS solves for typical storage use cases like that of a database at a lower cost than the previous generations' enterprise SANs.</p>
+<p>Dedicated storage like EBS is durable, in that data is replicated across multiple disks within the same availability zone. Losing any one disk within that availability zone won't lead to data loss.</p>
+<p>Note that for this reason PlanetScale replicates data <em>across</em> availability zones, as the failure of a single zone would be a data unavailability or loss event.</p>
+<p>It's also flexible: you aren't constrained to a single volume's storage size as adding capacity is as simple as resizing the same volume.</p>
+<h3>Disks got fast</h3>
+<p>At launch in 2008, EBS used spinning disks like the enterprise servers of the past. And so throughout the history of network-attached storage, the speed of the spinning disk was often of more significance than the speed of data transfer over the network. The average random read on an HDD is 10-20ms, whereas a network round trip in the same data-center is usually 1 millisecond or less.</p>
+<p>In 2012, EBS began swapping out spinning disks for SSDs. Disk operations got ~100x faster and suddenly network latency was the biggest bottleneck to performance.</p>
+<p>Initially the swap to SSDs didn't yield the sort of free speed increase you might expect.</p>
+<blockquote>
+ <p>... it certainly did address the problems that came from the mechanics of hard drives. But what surprised us was that the system didn't improve nearly as much as we had hoped ...</p>
+</blockquote>
+<p>— <a href="https://www.allthingsdistributed.com/2024/08/continuous-reinvention-a-brief-history-of-block-storage-at-aws.html">Continuous reinvention: A brief history of block storage at AWS</a>, Marc Olson, All Things Distributed</p>
+<p>To address this, engineers at AWS created new custom hardware and a unique network transfer protocol (SRD). Network latency improved.</p>
+<p>So, over the brief history of data centers, storage and compute got separated when storage was slower than the network and were then penalized for that once the opposite was true.</p>
+<p>You can continue to try and solve problems, or you can eliminate them.</p>
+<h2>Hops hiding in plain sight</h2>
+<p>Back to our original Performance 101 lesson. Moving your application closer to your database makes as much sense as moving your database's compute closer to its storage.</p>
+<p>Network latency is a long-established expectation of working with remote servers and cloud storage, but it doesn't have to be.</p>
+<p>In a typical cloud-hosted database scenario, you buy an EC2 instance for compute to perform work and attach it to an EBS volume for storage.</p>
+<p>The EBS volume shows up in the operating system as if it were an attached storage device. On current-generation instances, a dedicated Nitro card turns every read and write into a network request.</p>
+<p>For every non-Metal PlanetScale database, this is what you have and it works just fine.</p>
+<p>However, some EC2 instance types also come with local NVMe disks, physically attached to the host server. These aren't EBS volumes. As they're locally attached, there's no network hop for reads and writes.</p>
+<p>If all you wanted was speed, it <em>just makes sense</em> to put your database and its storage on a self-contained instance.</p>
+<p>But if this is so obvious, why is it so rarely offered? Because without careful management the risk is too high. Locally attached storage lives and dies with compute. Its size is rigid and its data is not automatically replicated.</p>
+<p>It's no good being fast if you're not also flexible, reliable, and durable. That's what we solved with PlanetScale Metal.</p>
+<h2>Durable local disks</h2>
+<p>So, for a faster database you want to eliminate the network hop between storage and compute. But you can't afford to lose data, so storage still has to be durable.</p>
+<p>Get you somebody who can do both.</p>
+<p>Firstly, every Metal database cluster has a primary and at least two replicas. Each runs on its own VM with its own local NVMe drive, spread across distinct availability zones.</p>
+<p>Each replica is treated as a potential primary that can be failed over to. To ensure the integrity and suitability of these replicas and the durability of this storage, commits must be acknowledged on at least one replica before the primary sends acknowledgement to the client.</p>
+<p>You might ask, doesn't this introduce a network hop into every commit? Yes, but it happens only once per commit. A Metal database confirming a write landed in a replica in another availability zone ensures durability. EBS-backed databases require network hops for every disk operation, including something as simple as a cache miss in a read query. It's also likely the majority of your queries are reads, and reads on Metal will never cross the network.</p>
+<p>With each replica treated like a primary in waiting, should the primary fail, a replica is immediately promoted. On Vitess, queries are buffered during the switch. On Postgres, queries through PgBouncer are buffered and then directed to the new primary.</p>
+<p>PlanetScale Metal is a mature alternative to network-attached storage and has already powered trillions of queries across petabytes of data.</p>
+<h2>Network vs local vs your budget</h2>
+<p>Incredibly, we haven't yet touched on IOPS (Input/Output Operations Per Second). That is, the throughput limits of your database. On EBS your IOPS are limited, defaulting to 3,000. This makes sense: the transfer of data across the network between the two services has to be curbed to some number or else one noisy neighbor risks flooding the network.</p>
+<p>But with locally attached disks this isn't a problem. Unlike network-attached, there's no artificial cap on IOPS.</p>
+<p>In our <a>Postgres 17 vs 18 benchmarks</a>, an <code>r7i</code> with a 700 GB <code>io2</code> volume provisioned for 16,000 IOPS cost $1,513.82 a month on demand. An <code>i7i</code> with a 1.8 TB local NVMe drive, capable of around 300,000 IOPS, cost $551.15.</p>
+<p>At launch, PlanetScale Metal only offered large compute and storage sizes. But with the launch of $50 Metal in December 2025, you can provision virtual machines as small as 1/8 vCPU with 1 GB of memory and 10 GB NVMe storage. vCPU and memory sizes go up from there, but storage can be individually configured in different sizes.</p>
+<p>So while I spent much of this article telling you how inflexible local disks can be, we've done the hard work to make using them easy and reliable.</p>
+<h2>You might not need Metal</h2>
+<p>More incredible than the late mention of IOPS in this article is finally getting around to RAM. Volatile storage that also lives and dies with compute, but which can hold the most frequently and recently requested data as a cache.</p>
+<p>Our own documentation for PlanetScale Metal mentions that you simply might not need Metal if the majority of your read workloads fit in RAM and you have a low volume of writes. Reads stay fast because they're read from memory, not storage, and so never make that annoyingly slow network hop to EBS.</p>
+<p>And so truthfully, depending on your workload, network-attached storage might be just fine, and you can use both on PlanetScale.</p>
+<h2>Signs you absolutely need Metal</h2>
+<p>If your most frequently requested data is too large or changes too often to fit in RAM, as in frequent cache misses, you want to eliminate those network-storage round-trips. Retrieving data from locally attached storage is closer to RAM speeds than a network round-trip.</p>
+<p><em>PlanetScale Insights can reveal the cache hit ratio of your queries. Also available to your agents via the MCP server.</em></p>
+<p>Or if you're hitting those expensive IOPS limits on EBS, it's likely your workload will not only be faster on Metal, but cheaper, too.</p>
+<p>Or if your CPU usage is low but latency is high, you're being throttled by disk reads and paying for compute you can't use. In <a>some cases</a> we've seen CPU usage go from 20-25% to 80% or more after moving to Metal.</p>
+<p>Whether you want network-attached or locally attached storage, you can get either from PlanetScale. But if you've not considered the benefits of locally attached storage before, there's never been a better time to <a>get in touch</a>.</p>

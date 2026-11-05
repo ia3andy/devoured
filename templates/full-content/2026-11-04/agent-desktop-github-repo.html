@@ -1,0 +1,160 @@
+<h1>agent-desktop</h1>
+<p>Computer use for AI agents: see and operate desktop apps on macOS, Windows, and Linux through the OS accessibility tree.</p>
+<p>agent-desktop gives an AI agent computer use without screenshots or pixel matching. It reads the accessibility tree of a desktop app and returns it as JSON, with a ref for every element the agent can act on. The agent clicks or types on a ref, reads the UI again to check the result, and repeats. The loop lives in your agent; agent-desktop has no model inside. It ships as a CLI and a C library.</p>
+<p>Snapshots, clipboard reads, screenshots, command output, and debug artifacts can contain private desktop content. Keep them out of public logs and uploads.</p>
+<h2>Install</h2>
+<pre><code>npm install -g agent-desktop
+agent-desktop status                # platform, permissions, supported surfaces
+agent-desktop permissions --guide   # macOS: walks you through the Accessibility grant</code></pre>
+<p>Bun, Yarn and pnpm can install the same package. It includes native binaries and platform helpers for x64 and ARM64. For direct execution without a JavaScript launcher, download the matching native archive from GitHub Releases and keep its helper beside the executable.</p>
+<p>On macOS and Linux, Homebrew also works: <code>brew install agent-desktop</code>. There is no official Scoop package yet. The repository no longer maintains a custom Homebrew tap or Scoop bucket.</p>
+<p>Release archives and building from source are covered in Installation.</p>
+<h2>Quick start</h2>
+<pre><code>agent-desktop snapshot --app Finder -i      # interactive elements, each with a ref
+agent-desktop click @s8f3k2p9:e8            # act on a ref from that snapshot
+agent-desktop snapshot --app Finder -i      # observe again to verify</code></pre>
+<p>Each command prints one JSON envelope. A trimmed snapshot:</p>
+<pre><code>\{
+  "version": "2.6",
+  "ok": true,
+  "command": "snapshot",
+  "data": \{
+    "app": "Finder",
+    "snapshot_id": "s8f3k2p9",
+    "ref_count": 59,
+    "complete": true,
+    "tree": \{
+      "role": "window",
+      "name": "Downloads",
+      "children": [
+        \{ "role": "treeitem", "name": "Documents", "ref_id": "@s8f3k2p9:e8", "available_actions": ["Click"] }
+      ]
+    }
+  }
+}</code></pre>
+<ul>
+ <li><strong>Refs belong to their snapshot.</strong> A bare <code>@e8</code> is rejected with <code>INVALID_ARGS</code>. When the UI changes, an action returns <code>STALE_REF</code> or <code>AMBIGUOUS_TARGET</code>: take a new snapshot and use its refs.</li>
+ <li><strong>Several windows</strong> give <code>AMBIGUOUS_TARGET</code>; <code>snapshot</code> lists the candidate window ids in <code>error.details</code>. Pass one with <code>--window-id</code>.</li>
+ <li><strong>Dense apps:</strong> map first with <code>snapshot --skeleton --app Slack -i --compact</code>, then drill into one region with <code>snapshot --root @s8f3k2p9:e3 -i --compact</code>.</li>
+ <li><strong>Headless by default.</strong> Ref actions use the accessibility API without moving the pointer or taking focus. The global <code>--headed</code> flag allows physical input.</li>
+ <li><strong>Post-action waits</strong> observe the ref's original process. Window-owned refs stay pinned to their original window, including refs captured from a sheet, alert, popover, focused view, or Linux menu. macOS application menus keep their application-owned surface and need no document window. The wait reads the whole pinned window, so overlay selectors share its scope.</li>
+ <li><code>type</code>, <code>set-value</code>, and <code>clipboard-set</code> accept <code>--stdin</code> for piped text, keeping it out of process arguments. Run secret steps as separate commands; batch JSON text appears in process arguments.</li>
+ <li><strong>PowerShell.</strong> Quote every ref (<code>'@s8f3k2p9:e8'</code>), because a bare <code>@token</code> is the splatting operator.</li>
+</ul>
+<p>The full walkthrough is in the quick start.</p>
+<h2>How it works</h2>
+<p>Your agent calls the CLI, or the C library in process. Both run the same core, which reaches the OS only through <code>PlatformAdapter</code>. Each binary is built for one OS and talks to that OS's accessibility API.</p>
+<h2>For AI agents</h2>
+<p>The binary carries guides that match its version:</p>
+<pre><code>agent-desktop skills get desktop      # the loop, refs, verification and retry rules
+agent-desktop skills get platform     # what differs on the OS you run on
+agent-desktop &lt;command&gt; --help        # flags for one command</code></pre>
+<p>Install the skill into an agent harness from skills.sh:</p>
+<pre><code>npx skills add https://github.com/vercel-labs/agent-desktop --skill agent-desktop</code></pre>
+<p>Or add this to your <code>AGENTS.md</code>:</p>
+<pre><code>Use `agent-desktop` to see and operate desktop apps. Before the first use, run
+`agent-desktop skills get desktop` and `agent-desktop skills get platform`, and follow them.</code></pre>
+<p>Retry a failed command only when <code>error.disposition.retry</code> is <code>safe</code>. See JSON output for the envelope, error codes, and exit codes.</p>
+<h3>MCP</h3>
+<p><code>agent-desktop mcp</code> serves every command as an MCP tool over stdio. A tool is named after its command (<code>desktop_snapshot</code>, <code>desktop_click</code>, <code>desktop_session_start</code>), takes that command's arguments, and returns its JSON envelope:</p>
+<pre><code>\{ "mcpServers": \{ "agent-desktop": \{ "command": "agent-desktop", "args": ["mcp"] } } }</code></pre>
+<p>Global flags given to <code>mcp</code>, such as <code>--session</code>, <code>--headed</code> or <code>--trace</code>, apply to every call.</p>
+<h2>Commands</h2>
+<p>agent-desktop has 60 command names, 56 operational commands. The other four (<code>key-down</code>, <code>key-up</code>, <code>mouse-down</code>, <code>mouse-up</code>) refuse to run until a daemon can release a held key or button.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Group</th>
+   <th>Commands</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Observe</td>
+   <td><code>snapshot</code>, <code>find</code>, <code>get</code>, <code>is</code>, <code>screenshot</code>, <code>list-surfaces</code></td>
+  </tr>
+  <tr>
+   <td>Act on a ref</td>
+   <td><code>click</code>, <code>double-click</code>, <code>triple-click</code>, <code>right-click</code>, <code>type</code>, <code>set-value</code>, <code>clear</code>, <code>focus</code>, <code>select</code>, <code>toggle</code>, <code>check</code>, <code>uncheck</code>, <code>expand</code>, <code>collapse</code>, <code>scroll</code>, <code>scroll-to</code></td>
+  </tr>
+  <tr>
+   <td>Keyboard and mouse</td>
+   <td><code>press</code>, <code>hover</code>, <code>drag</code>, <code>mouse-move</code>, <code>mouse-click</code>, <code>mouse-wheel</code>, <code>key-down</code>, <code>key-up</code>, <code>mouse-down</code>, <code>mouse-up</code></td>
+  </tr>
+  <tr>
+   <td>Apps and windows</td>
+   <td><code>launch</code>, <code>close-app</code>, <code>list-apps</code>, <code>list-windows</code>, <code>list-displays</code>, <code>focus-window</code>, <code>resize-window</code>, <code>move-window</code>, <code>minimize</code>, <code>maximize</code>, <code>restore</code>, <code>open-system-surface</code></td>
+  </tr>
+  <tr>
+   <td>Notifications</td>
+   <td><code>list-notifications</code>, <code>dismiss-notification</code>, <code>dismiss-all-notifications</code>, <code>notification-action</code></td>
+  </tr>
+  <tr>
+   <td>Clipboard</td>
+   <td><code>clipboard-get</code>, <code>clipboard-set</code>, <code>clipboard-clear</code></td>
+  </tr>
+  <tr>
+   <td>Wait</td>
+   <td><code>wait</code></td>
+  </tr>
+  <tr>
+   <td>Sessions</td>
+   <td><code>session</code>, <code>trace</code>, <code>cursor-overlay</code></td>
+  </tr>
+  <tr>
+   <td>System</td>
+   <td><code>status</code>, <code>permissions</code>, <code>version</code>, <code>batch</code>, <code>skills</code></td>
+  </tr>
+ </tbody>
+</table>
+<h2>Platform support</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Platform</th>
+   <th>Requirement</th>
+   <th>Accessibility API</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>macOS</td>
+   <td>macOS 13 or later, Intel or Apple Silicon</td>
+   <td>AX API</td>
+  </tr>
+  <tr>
+   <td>Windows</td>
+   <td>Windows 10 1809 or later, x64 or ARM64</td>
+   <td>UI Automation</td>
+  </tr>
+  <tr>
+   <td>Linux</td>
+   <td>Ubuntu 24.04 or later, x86_64 or aarch64, X11 or Wayland</td>
+   <td>AT-SPI</td>
+  </tr>
+ </tbody>
+</table>
+<p>Each platform page lists what works headless, what needs <code>--headed</code>, and what refuses.</p>
+<h2>C library</h2>
+<p>Each release ships <code>libagent_desktop_ffi</code>, so a program can call agent-desktop in process.</p>
+<pre><code>import ctypes
+lib = ctypes.CDLL("./lib/libagent_desktop_ffi.dylib")
+lib.ad_adapter_create.restype = ctypes.c_void_p
+lib.ad_adapter_destroy.argtypes = [ctypes.c_void_p]
+assert lib.ad_init(7) == 0  # AD_RESULT_OK when the header's AD_ABI_VERSION_MAJOR matches the library
+adapter = lib.ad_adapter_create()
+lib.ad_adapter_destroy(adapter)</code></pre>
+<h2>Development</h2>
+<p>Each platform adapter builds only on its own OS, so scope cargo to the host's packages. On macOS:</p>
+<pre><code>HOST_PKGS=(-p agent-desktop-core -p agent-desktop-macos -p agent-desktop -p agent-desktop-ffi)
+cargo test "$\{HOST_PKGS[@]}"
+cargo clippy "$\{HOST_PKGS[@]}" --all-targets -- -D warnings</code></pre>
+<h2>Documentation</h2>
+<ul>
+ <li>Introduction: what it is and how it works</li>
+ <li>Snapshots and refs</li>
+ <li>Errors and recovery</li>
+ <li>Skills</li>
+</ul>
+<h2>License</h2>
+<p>Apache-2.0</p>
