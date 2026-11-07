@@ -1,0 +1,80 @@
+<h1>What Is the OpenTofu MCP Server and How to Use It</h1>
+<p>The Model Context Protocol (MCP) has become an industry standard, especially after Anthropic donated it to the Linux Foundation at the end of 2025. PulseMCP, for example, hosts over 21,000 MCP servers, many of which are available for DevOps and infrastructure-as-code tooling.</p>
+<p>Every engineer who has asked a large language model (LLM) to write OpenTofu code knows models can produce code that looks correct but no longer works because the latest provider version removed an attribute.</p>
+<p>The OpenTofu MCP server exists to solve exactly this issue. In this article, we will discuss the OpenTofu MCP server, what it exposes, how it compares with HashiCorp’s Terraform MCP server, how to wire it into your assistant, and how to combine it with a platform like Spacelift.</p>
+<p>What we’ll cover:</p>
+<ol>
+ <li>What is the OpenTofu MCP server?</li>
+ <li>What the OpenTofu MCP server exposes</li>
+ <li>OpenTofu MCP server vs Terraform MCP server</li>
+ <li>Using the OpenTofu MCP server in practice</li>
+ <li>Third-party OpenTofu MCP servers for CLI operations</li>
+</ol>
+<p>TL;DR</p>
+<p>The OpenTofu MCP server is an official, read-only Model Context Protocol server that lets any MCP-compatible AI assistant search the OpenTofu Registry and pull live docs for providers, modules, resources, and datasources, so generated code uses current arguments instead of deprecated ones. It never runs <code>tofu</code> commands, reads state, or handles credentials, so you can leave it connected permanently. Point your client at <code>https://mcp.opentofu.org/mcp</code>, or run it locally with <code>npx @opentofu/opentofu-mcp-server</code>.</p>
+<h2>What is the OpenTofu MCP server?</h2>
+<p>The OpenTofu MCP server is an official project from the OpenTofu organization that implements MCP on top of the OpenTofu registry. It enables all MCP-compatible assistants to search the registry and pull live documentation for providers, modules, resources, and datasources.</p>
+<p>This matters because OpenTofu providers update constantly, and if you use AI assistants to generate OpenTofu code, the MCP server keeps your documentation current and reduces the chance of errors. When your AI assistant uses the OpenTofu MCP server, it gets current registry data as text, and what it does with that text depends entirely on the assistant and its configuration.</p>
+<p>The OpenTofu MCP server doesn’t touch your state file, your cloud credentials, or your working directory; only other tool calls that your AI assistant might make will touch them, so ensure you configure your agent accordingly to minimize the chances of issues. With the OpenTofu MCP server, the worst-case scenario is a wrong search result, so it is safe to leave it connected permanently.</p>
+<h2>What the OpenTofu MCP server exposes</h2>
+<p>The OpenTofu MCP server offers the following registry search and information tools:</p>
+<ul>
+ <li><strong>search-opentofu-registry</strong>: You can search for providers, modules, resources, and datasources.</li>
+ <li><strong>get-provider-details</strong>: Helps you get detailed information about a specific provider</li>
+ <li><strong>get-provider-versions</strong>: Helps you get a list of available versions for a provider</li>
+ <li><strong>get-module-details</strong>: Helps you get detailed information about a specific module</li>
+ <li><strong>get-module-versions</strong>: Helps you get a list of available versions for a specific module</li>
+ <li><strong>get-resource-docs</strong>: Helps you get documentation for a specific resource</li>
+ <li><strong>get-datasource-docs</strong>: Helps you get documentation for a specific datasource</li>
+</ul>
+<h3>Search the OpenTofu Registry (search-opentofu-registry)</h3>
+<p><strong>search-opentofu-registry</strong> is a discovery tool that lets your AI assistant search the OpenTofu registry for providers, modules, resources, and datasources.</p>
+<h3>Get provider details (get-provider-details)</h3>
+<p>After you identify a provider with the <strong>search-opentofu-registry</strong>, the <strong>get-provider-details</strong> can be used to get more detailed information about it. The tool identifies providers by their namespace and provider name, and it can help you determine which provider to use, which resources and datasources belong to that provider, and which examples are available.</p>
+<h3>Get provider versions (get-provider-versions)</h3>
+<p>If everything you need is just a list of versions a provider has published, the lighter option you can use is <strong>get-provider-versions</strong>. This identifies providers in the same way as <strong>get-provider-details</strong>, but it returns only the available versions and the date each one was released instead of returning the full documentation for a provider. When you are pinning a provider version, this is the tool you should use to ensure the constraint is based on what is actually published in the registry.</p>
+<h3>Get module details (get-module-details)</h3>
+<p>With <strong>get-module-details</strong>, it will retrieve the latest information about a specific module from the registry, enabling it to construct a module block that works with that particular version.</p>
+<h3>Get module versions (get-module-versions)</h3>
+<p><strong>get-module-versions</strong> works in the same way that <strong>get-provider-versions</strong> does, only for modules. It returns every published version of a module together with its release date. This makes it easy to confirm what module versions actually exist before your AI assistant fills in the version argument of a module block with something that isn’t published.</p>
+<h3>Get resource documentation (get-resource-docs)</h3>
+<p><strong>get-resource-docs</strong> is one of the most useful tools for generating the actual OpenTofu infrastructure docs.</p>
+<p>With the MCP server, it will retrieve the docs for the resources before deciding which blocks and arguments to use, reducing the chance of generating configurations that don’t work or have deprecated fields.</p>
+<h3>Get datasource documentation (get-datasource-docs)</h3>
+<p>Datasources enable OpenTofu configurations to get information about existing infrastructure. <strong>get-datasource-docs</strong> performs the same retrieval as <strong>get-resource-docs</strong>, but for datasources.</p>
+<h3>What the official server does not do</h3>
+<p>The OpenTofu MCP server does <strong>not</strong>:</p>
+<ul>
+ <li><strong>Run OpenTofu commands</strong> like init, plan, apply, or destroy. The tofu binary isn’t invoked at all.</li>
+ <li><strong>Read or write state:</strong> The OpenTofu MCP server does not have the concept of a backend or a state file.</li>
+ <li><strong>Touch your filesystem:</strong> It will need to read your OpenTofu configuration or write new ones; Your AI assistant does that part using the OpenTofu MCP Server’s knowledge.</li>
+ <li><strong>Handle credentials:</strong> There is no cloud authentication or provider authentication, so there is nothing to leak.</li>
+ <li><strong>Access your private registries:</strong> The OpenTofu MCP Server will only query the public OpenTofu Registry.</li>
+</ul>
+<h2>OpenTofu MCP server vs Terraform MCP server</h2>
+<p>HashiCorp also ships a Terraform MCP server. Its capabilities are pretty similar to the OpenTofu MCP server’s, but the Terraform one will query HashiCorp’s registry, whereas the OpenTofu MCP server queries the OpenTofu registry.</p>
+<p>The Terraform MCP server can also interact with HCP Terraform (formerly Terraform Cloud) and Terraform Enterprise, enabling you to create/update/delete workspaces, create runs, get run details, and even get apply logs.</p>
+<h2>Using the OpenTofu MCP server in practice</h2>
+<h3>How to install the OpenTofu MCP server</h3>
+<p>You can either install the OpenTofu MCP server locally, or you can use the hosted service, which is the path recommended by the OpenTofu team. The hosted service is available at https://mcp.opentofu.org/mcp.</p>
+<p>To install it locally, you can do it with npx:</p>
+<pre><code>npx @opentofu/opentofu-mcp-server</code></pre>
+<h3>How to connect the OpenTofu MCP server to your AI assistant</h3>
+<p>For Claude Code, you simply need to run this one-liner command, and then the OpenTofu MCP server will connect to it:</p>
+<pre><code>claude mcp add opentofu -t streamable-http https://mcp.opentofu.org/mcp </code></pre>
+<h3>How to generate OpenTofu code with the MCP server</h3>
+<p>Once the OpenTofu MCP server is connected, you should be explicit about what resources you need. By leveraging the OpenTofu MCP server, the AI can perform dynamic lookups for resources like <code>s3_bucket</code> or <code>s3_bucket_versioning</code> rather than relying on potentially outdated training data.</p>
+<h2>Third-party OpenTofu MCP servers for CLI operations</h2>
+<p>The official OpenTofu MCP server deliberately stops before CLI execution, but third-party projects fill that gap. One of these examples is the <em>cloud-pilot-mcp</em>, which exposes tofu CLI operations (init, plan, apply, destroy).</p>
+<p>While doing CLI operations through an MCP server might seem appealing, these operations can be dangerous and require strong controls around state, credentials, and filesystem access.</p>
+<h2>How Spacelift complements the OpenTofu MCP server</h2>
+<p>Spacelift also has its own MCP server that exposes five tools: <em>discover</em> and <em>query</em> for the GraphQL API, <em>mutate</em> for changing Spacelift resources, <em>intent</em> for managing cloud resources using plain language, and <em>provider</em> for inspecting providers, resources, and datasource schemas from the OpenTofu registry.</p>
+<p>The OpenTofu MCP server gives your assistant knowledge, while the Spacelift MCP server gives it a governed path to act on that knowledge.</p>
+<h2>Key takeaways</h2>
+<p>With the OpenTofu MCP server, your AI assistant no longer has to guess which arguments your configuration needs because it can easily look them up. It is read-only by design, which is why you can leave it connected without the risk of something going wrong.</p>
+<h2>Frequently asked questions</h2>
+<ul>
+ <li><strong>Is the OpenTofu MCP server free to use?</strong> Yes. The local OpenTofu MCP server is open-source under the Mozilla Public License 2.0 (MPL-2.0).</li>
+ <li><strong>Where is the OpenTofu MCP server hosted?</strong> The official hosted OpenTofu MCP server runs on Cloudflare Workers and is accessible at https://mcp.opentofu.org/mcp.</li>
+ <li><strong>Can the OpenTofu MCP server run tofu plan or tofu apply?</strong> No. The official OpenTofu MCP server is a Registry-focused server and does not execute OpenTofu CLI commands.</li>
+</ul>
