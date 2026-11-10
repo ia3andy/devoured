@@ -1,0 +1,107 @@
+<h2>How to Import Existing Resources to OpenTofu [Tutorial]</h2>
+<p>Your infrastructure estate probably features infrastructure resources that were created outside of your infrastructure-as-code (IaC) process. Luckily, if you are using OpenTofu, you can easily import these resources by either using the CLI or the <code>import</code> block inside your configuration.</p>
+<p>In this article, we will cover what OpenTofu import is and when to use it, how to import a resource using the CLI and the <code>import block</code>, best practices for OpenTofu import, and how to manage imports at scale using Spacelift.</p>
+<h3>TL;DR</h3>
+<ul>
+ <li>OpenTofu import brings existing infrastructure under OpenTofu management by recording it in your state file, without changing the resource.</li>
+ <li>You can import in two ways: 
+  <ul>
+   <li>The <code>tofu import</code> CLI command handles one resource at a time and writes straight to state, with no preview.</li>
+   <li>An <code>import</code> block is reviewed in <code>tofu plan</code> and executed in <code>tofu apply</code>.</li>
+  </ul></li>
+ <li>Use the <code>import</code> block. It’s the recommended method, supports <code>for_each</code> (OpenTofu 1.7+) and the <code>identity</code> argument (OpenTofu 1.12+), and leaves a record in code.</li>
+ <li><code>tofu plan -generate-config-out</code> can write resource configuration for you, but it’s experimental and doesn’t work with <code>for_each</code>.</li>
+ <li>Find each resource’s import ID in the “Import” section of its OpenTofu Registry page.</li>
+</ul>
+<h2>What is OpenTofu import and when to use it?</h2>
+<p>With OpenTofu import, you bind an infrastructure resource in your provider to an OpenTofu resource. If the import is successful, your state file will contain a record of that object’s attributes, and you’ll be able to manage its lifecycle through OpenTofu, as you would do with any other resource created directly through it.</p>
+<p>You will need to use the OpenTofu import whenever infrastructure exists outside of your OpenTofu configuration. Here are the most common use cases:</p>
+<ul>
+ <li>You have created infrastructure manually or with custom scripts.</li>
+ <li>You want to migrate from other tools like CloudFormation, Pulumi, Crossplane, or Azure Bicep.</li>
+ <li>State recovery that occurs through accidental deletes or corruption</li>
+ <li>Splitting the state when you have a large stack, and you need to move objects to smaller configurations</li>
+ <li>Emergency changes performed manually</li>
+</ul>
+<p>OpenTofu provides two mechanisms for implementing a resource import:</p>
+<h3>Using the <code>tofu import</code> CLI command</h3>
+<p>Using the <code>tofu import</code> CLI command was the original approach, inherited from Terraform. If you use this command with an OpenTofu resource address and an ID from your cloud provider, it will write to your state file immediately. However, you will have not plan, preview, or approval step.</p>
+<pre><code>tofu import aws_instance.this i-06bf85ad3b9f…</code></pre>
+<h3>Using the <code>import</code> block</h3>
+<p>The <code>import</code> block is a configuration-driven import, and you write it in your OpenTofu configurations. It is evaluated during <code>tofu plan</code>, showing you exactly what will happen, and the import itself happens during <code>tofu apply</code>.</p>
+<p>The import block has been available since OpenTofu 1.6. It gained <code>for_each</code> support in OpenTofu 1.7, and it gained the identity argument in OpenTofu 1.12.</p>
+<p><strong>Note</strong>: The identity argument is useful for resources whose identifier is some sort of compound key.</p>
+<h2>Prerequisites before importing</h2>
+<p>Before doing an OpenTofu import, you’ll need to ensure you use an OpenTofu version that supports the capabilities you are looking for in the import.</p>
+<p>You will need to set up your provider, a remote backend if you are working in a production setup, and read access to the resources. You must also ensure that the resource type supports import (this information is in the documentation).</p>
+<h3>How to find the right import ID for your resource</h3>
+<p>Some resources will be simply imported by their IDs, like an EC2 instance. Others, like an <code>aws_security_group_rule</code>, will be a compound key (in this case, you will need the security group ID, the rule type, protocol, ports, and source, all joined by underscores).</p>
+<p>In any case, you should always check the “Import” section of a resource at the bottom of the relevant page in the provider documentation in the OpenTofu registry. For your resources, you can also use the cloud provider CLI to find their actual IDs and other parameters without navigating the console.</p>
+<h2>Method 1: Importing a resource with the tofu import CLI command</h2>
+<p>Let’s now review how to use the CLI approach to import a resource in OpenTofu.</p>
+<h3>Basic syntax</h3>
+<p>To find out what parameters you can use, you can run:</p>
+<pre><code>tofu import --help
+Usage: tofu [global options] import [options] ADDR ID</code></pre>
+<h3>Step-by-step example</h3>
+<p>Now let’s take a look at an example. For this one, I will create an S3 bucket using the CLI:</p>
+<pre><code>aws s3api create-bucket \
+  --bucket spacelift-tofu-import-demo-2026 \
+  --region eu-west-1 \
+  --create-bucket-configuration LocationConstraint=eu-west-1</code></pre>
+<p>After the bucket is created successfully, let’s create the OpenTofu configuration that will import this resource:</p>
+<pre><code>provider "aws" \{
+ region = "eu-west-1"
+}
+
+resource "aws_s3_bucket" "my_bucket" \{
+ bucket = "spacelift-tofu-import-demo-2026"
+}</code></pre>
+<p>Now I’ll initialize the configuration with <code>tofu init</code>. Let’s import the resource now:</p>
+<pre><code>tofu import aws_s3_bucket.my_bucket spacelift-tofu-import-demo-2026</code></pre>
+<h3>Limitations of CLI import</h3>
+<ul>
+ <li>You have one object per invocation, so if you need to import 50 resources, you will need to run the command 50 times.</li>
+ <li>There is no preview, so this command actually mutates the state directly.</li>
+ <li>There is no configuration generation, so you’ll need to write every resource block manually.</li>
+ <li>There is no record in code, so you won’t know in six months if a resource was imported or created.</li>
+ <li>It aligns poorly with CI/CD pipelines.</li>
+</ul>
+<h2>Method 2: Importing a resource with an import block</h2>
+<p>The <code>import</code> block is the recommended way to import a resource. It works perfectly with any kind of resource address, so you can still use modules, counts, and <code>for_each</code>.</p>
+<h3>Basic syntax</h3>
+<pre><code>import \{
+ to = aws_s3_bucket.my_bucket
+ id = "spacelift-tofu-import-demo-2026"
+}</code></pre>
+<h3>The id argument vs the newer identity argument</h3>
+<p>The <code>id</code> argument and the <code>identity</code> one help you track what object you want to import in OpenTofu. For example, importing the same S3 bucket would look like this:</p>
+<pre><code>import \{
+ to = aws_s3_bucket.my_bucket
+ identity = \{
+   bucket = "spacelift-tofu-import-demo-2026"
+ }</code></pre>
+<h2>Generating configuration with -generate-config-out in OpenTofu</h2>
+<p>You can generate the configuration automatically by leveraging the <code>-generate-config-out</code> parameter. Note that this is currently experimental and does not work for resources that use <code>for_each</code> or <code>count</code>.</p>
+<pre><code>tofu plan -generate-config-out=generated_resources.tf</code></pre>
+<h2>Best practices for OpenTofu import</h2>
+<ul>
+ <li>Use <b>import blocks</b> instead of the CLI command.</li>
+ <li>Use remote state for your OpenTofu configurations.</li>
+ <li>Enable state versioning before running <code>tofu import</code>.</li>
+ <li>Import resources in small batches using your CI workflow.</li>
+ <li>Treat generated configuration as a draft.</li>
+ <li>Review imports as you would review any other change.</li>
+</ul>
+<h2>Frequently asked questions</h2>
+<ul>
+ <li>
+  <h3>What is the difference between tofu import and the import block?</h3>
+  <p>The tofu import command imports one resource per run and writes it directly to state with no plan or preview. The import block lives in your configuration, so imports show up in tofu plan, run during tofu apply, support for_each, and can generate configuration.</p></li>
+ <li>
+  <h3>Can OpenTofu generate configuration automatically when importing?</h3>
+  <p>Yes. Running tofu plan -generate-config-out=&lt;file&gt; with import blocks writes HCL for resources that don’t exist in your configuration yet, but the feature is experimental and its output should be treated as a draft.</p></li>
+ <li>
+  <h3>Does OpenTofu support importing all resources?</h3>
+  <p>No. Import support depends on whether the provider implements it for that resource type.</p></li>
+</ul>

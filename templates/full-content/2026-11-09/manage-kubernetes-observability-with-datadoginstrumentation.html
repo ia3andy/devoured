@@ -1,0 +1,129 @@
+<p>For teams that own an application running on Kubernetes, updating its observability configuration should be as straightforward as updating any other Kubernetes resource. But configuring integration checks, log collection, and tracing often means working across multiple configuration paths. If those settings live in pod annotations, adding a metric check or changing log processing rules requires a Deployment rollout. If they live in Datadog Agent configuration files, an application team must coordinate the change with the platform team, which may need to restart the Agent.</p>
+<p>The DatadogInstrumentation custom resource provides a Kubernetes-native way to manage observability configuration for individual workloads. DatadogInstrumentation brings integration checks, log collection, and Application Performance Monitoring (APM) settings into a single Kubernetes custom resource. Unlike pod annotations, which require an application rollout to change, DatadogInstrumentation applies check and log changes at runtime, without restarting the application or the Agent. Application teams can configure observability by using the same tools and workflows they use to manage their Deployments. Platform teams retain control of the Datadog Agent deployment.</p>
+<p>In this post, we’ll show you how to use DatadogInstrumentation to:</p>
+<ul>
+ <li>Configure observability for a specific Kubernetes workload</li>
+ <li>Define metrics, logs, and traces in one resource</li>
+ <li>Change observability configuration independently of application releases</li>
+</ul>
+<h2>Configure observability for a specific Kubernetes workload</h2>
+<p>Instead of spreading observability settings across pod annotations and Agent configuration, teams consolidate them in one DatadogInstrumentation manifest for each workload and manage that manifest through version control.</p>
+<p>Consider an example team that operates a <code>checkout</code> application and manages it with a Deployment in the <code>apps</code> namespace. To configure the application’s observability, the team uses a DatadogInstrumentation resource alongside its Deployment manifest. When the team needs to change what telemetry data it collects, it edits the resource and reviews the change in a pull request. It then applies the change through its GitOps workflow, just as it does for its Deployment.</p>
+<h2>Define metrics, logs, and traces in one resource</h2>
+<p>Moving the <code>checkout</code> service to DatadogInstrumentation replaces two separate configuration sources with one resource. The following example walks through the equivalent DatadogInstrumentation resource, then shows how the team applies and verifies it.</p>
+<h3>Without DatadogInstrumentation: Settings split across the <code>DatadogAgent</code> resource and annotations</h3>
+<p>The checkout team’s observability settings live in two places. The platform team deploys the Agent with the Datadog Operator and maintains APM targeting rules in the Operator’s <code>DatadogAgent</code> resource, including a rule that selects the <code>checkout</code> pods and configures their Java SDK and trace settings. The checkout team configures its HTTP check and log collection as JSON in annotations on the Deployment’s pod template.</p>
+<p>With this split, a tracing change means asking the platform team to edit its <code>DatadogAgent</code> resource. A change in checks or log configuration requires editing the pod template, which triggers a rollout of the application.</p>
+<h3>With DatadogInstrumentation: Checks, logs, and APM in one resource</h3>
+<p>After adopting the DatadogInstrumentation custom resource definition (CRD), the checkout team consolidates these settings into a single Kubernetes resource. In the following example, the <code>spec.targetRef</code> points to the <code>checkout</code> Deployment and the <code>spec.config</code> specifies how the Datadog Agent collects metrics, logs, and traces from that application.</p>
+<pre><code>apiVersion: datadoghq.com/v1alpha1
+kind: DatadogInstrumentation
+metadata:
+  name: checkout-instrumentation
+  namespace: apps
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: checkout
+  config:
+    checks:
+      - integration: http_check
+        containerName: checkout
+        instances:
+          - name: checkout-health
+            url: "http://%%host%%:8080/health"
+            collect_response_time: true
+    logs:
+      - containerName: checkout
+        source: java
+        service: checkout
+        tags:
+          - env:production
+          - team:checkout
+    apm:
+      enabled: true
+      ddTraceVersions:
+        java: "default"
+      ddTraceConfigs:
+        - name: DD_SERVICE
+          value: checkout
+        - name: DD_ENV
+          value: production</code></pre>
+<p><strong>Metrics</strong>: The <code>spec.config.checks</code> section defines the HTTP check as structured YAML instead of embedded JSON. The check polls the <code>checkout</code> container’s <code>/health</code> endpoint and records response times, and <code>containerName</code> selects the container to check. The Autodiscovery template variable <code>%%host%%</code> resolves the container’s IP address at runtime, so the configuration doesn’t depend on hardcoded addresses that change as pods are replaced.</p>
+<p><strong>Logs</strong>: The <code>spec.config.logs</code> section sets the logs’ <code>source</code> and <code>service</code> values for the <code>checkout</code> container and adds tags.</p>
+<p><strong>Traces</strong>: The <code>spec.config.apm</code> section enables Single Step Instrumentation (SSI) for the workload. <code>ddTraceVersions</code> selects the Java SDK, and <code>ddTraceConfigs</code> sets the service name and environment—the same settings the platform team set in its <code>DatadogAgent</code> targeting rule, but the checkout team now owns them. The resource’s <code>targetRef</code> selects the workload. SSI adds the specified SDK to eligible application pods when they’re created.</p>
+<h3>Apply the resource and verify the configuration</h3>
+<p>DatadogInstrumentation provides configuration feedback through Kubernetes. The Cluster Agent validates the resource at apply time, so in the case of an invalid configuration, <code>kubectl apply</code> returns an error.</p>
+<p>After successfully applying the resource, the team checks its <code>ChecksReady</code>, <code>LogsReady</code>, and <code>APMReady</code> status conditions with <code>kubectl describe</code> to diagnose any issues:</p>
+<pre><code>kubectl describe datadoginstrumentation checkout-instrumentation -n apps</code></pre>
+<p>The status conditions confirm that the Cluster Agent accepted each section of the configuration:</p>
+<pre><code>Status:
+  Conditions:
+    Message:  1 check(s) configured for Deployment/checkout
+    Reason:   Configured
+    Status:   True
+    Type:     ChecksReady
+    Message:  1 log config(s) configured for Deployment/checkout
+    Reason:   Configured
+    Status:   True
+    Type:     LogsReady
+    Message:  APM settings configured for Deployment/checkout; restart the workload to apply them
+    Reason:   Configured
+    Status:   True
+    Type:     APMReady</code></pre>
+<p>To verify the data collection, the team checks Datadog to see <code>network.http.can_connect</code> and <code>network.http.response_time</code> metrics, logs from the <code>checkout</code> service, and, once the pods have been replaced, traces from <code>checkout</code> in APM.</p>
+<h2>Change observability configuration independently of application releases</h2>
+<p>Suppose the checkout team is investigating intermittent slow requests and needs to change what it collects. It wants to see additional application metrics to understand the cause of any backlogs, mask customer email addresses in its logs, and enable profiling to identify where requests spend time. The team makes all three changes in its existing DatadogInstrumentation resource following its GitOps workflow, without changing the Deployment or the Agent configuration.</p>
+<h3>Add an OpenMetrics check</h3>
+<p>To see whether slow requests correlate with a growing backlog, the team adds an OpenMetrics check alongside its existing HTTP check. The new <code>integration: openmetrics</code> entry shown here collects <code>checkout_active_requests</code> and <code>checkout_queue_depth</code> from the application’s <code>/metrics</code> endpoint and reports them as <code>checkout.active_requests</code> and <code>checkout.queue_depth</code>.</p>
+<pre><code>config:
+  checks:
+    - integration: http_check
+      containerName: checkout
+      instances:
+        - name: checkout-health
+          url: "http://%%host%%:8080/health"
+          collect_response_time: true
+    - integration: openmetrics
+      containerName: checkout
+      instances:
+        - openmetrics_endpoint: "http://%%host%%:8080/metrics"
+          namespace: checkout
+          metrics:
+            - checkout_active_requests: active_requests
+            - checkout_queue_depth: queue_depth</code></pre>
+<p>After the team applies the updated resource, the new check takes effect without requiring an application rollout or Agent restart.</p>
+<h3>Mask sensitive data in logs</h3>
+<p>Next, the team adds a processing rule that masks email addresses so logs can be viewed and shared without compromising privacy:</p>
+<pre><code>logs:
+   - containerName: checkout
+     source: java
+     service: checkout
+     tags:
+       - env:production
+       - team:checkout
+     log_processing_rules:
+       - type: mask_sequences
+         name: mask_email_addresses
+         pattern: '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]\{2,}'
+         replace_placeholder: '[REDACTED_EMAIL]'</code></pre>
+<p>The <code>mask_sequences</code> rule replaces any email address in a log message with <code>[REDACTED_EMAIL]</code> before the Agent sends the log to Datadog, so customer email addresses in logs aren’t stored. As with the new check, the updated log configuration takes effect without an application rollout or Agent restart. The team can inspect the resource status for configuration feedback, then check logs in Datadog to verify that data is being redacted.</p>
+<h3>Enable Continuous Profiler</h3>
+<p>Finally, the team enables profiling in its APM configuration so they can troubleshoot any backlogs by visualizing where requests spend their time:</p>
+<pre><code>apm:
+  enabled: true
+  ddTraceVersions:
+    java: "default"
+  ddTraceConfigs:
+    - name: DD_SERVICE
+      value: checkout
+    - name: DD_ENV
+      value: production
+    - name: DD_PROFILING_ENABLED
+      value: "auto"</code></pre>
+<p>Adding <code>DD_PROFILING_ENABLED</code> to <code>spec.config.apm.ddTraceConfigs</code> enables Continuous Profiler through the Java tracer, and the <code>auto</code> value profiles only eligible processes. Because the change applies only to new pods, the team triggers a rollout to replace the existing ones. The Continuous Profiler shows that most threads’ wall time is spent waiting for a payment worker to become available, represented by the <code>acquirePaymentWorker</code> span.</p>
+<h2>Get started with DatadogInstrumentation</h2>
+<p>With DatadogInstrumentation, application teams change checks and logs on their own schedule, without an application rollout or an Agent restart. Every change in this post’s example happened in the same resource. Changes to tracing and profiling take effect when pods are created, so the team applies them with its next rollout. Platform teams continue to manage the Datadog Agent deployment, while workload owners configure the checks, logs, and traces their services need.</p>
+<p>The example in this post, which combines checks, logs, and APM, requires Datadog Agent and Datadog Cluster Agent (both v7.85 or later), with Datadog Operator v1.31 or later or Datadog Helm chart v3.255.0 or later. To get started, install the DatadogInstrumentation CRD with the Datadog Operator or the Datadog Helm chart.</p>
+<p>Next, follow the DatadogInstrumentation Autodiscovery setup guide, which lists version requirements and supported workloads. For configuration options, see the documentation for Kubernetes log collection and workload-specific APM instrumentation.</p>
