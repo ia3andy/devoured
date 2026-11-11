@@ -1,0 +1,116 @@
+<h1>chrome-capture</h1>
+<p>Record a Chrome tab at 60-120fps (up to 2160p) straight to a AV1 <code>.mp4</code>. Tab audio too. No ffmpeg.</p>
+<pre><code>npx chrome-capture https://paulirish.github.io/chrome-capture/ demo.mp4 4s</code></pre>
+<h2>Chrome 153+ has a native MP4 tab recorder! 😻</h2>
+<p>For the past ~decade, <code>Page.startScreencast</code> was the only way to get video frames out of CDP. That API is from ~2013, built so DevTools could show a live preview of a USB-tethered Android. (So good!) Both Playwright (<code>recordVideo</code>) and Puppeteer (<code>page.screencast()</code>) built their video capture on top of it: Chrome JPEG-encodes each frame, base64s it into JSON over CDP, waits for an ack, and the library pipes those JPEGs into <code>ffmpeg</code>. It's served us well.</p>
+<p>In Sept 2026… the new <code>Page.startScreenRecording</code> landed (thx alex rudenko!). Frames go <strong>straight from the compositor</strong> to an out-of-process encoder over shared memory, and Chrome <strong>writes AV1 into the mp4</strong> as it goes (plus optional tab audio). 💅 Stopping is ~instant because the encoding is already done (no multi-second <code>ffmpeg</code> flush at the end). And you can start/stop recording whenever you want: log in, warm up the page, then record just the interaction.</p>
+<p><strong>In short: It's hot. It's good. really good.</strong></p>
+<p><em>(Thx github.com/Sam1983Aing/senna-800kg for this Gemini Argon generation.)</em></p>
+<p>Puppeteer v25.10+ wraps this in an experimental <code>page.record()</code> (deprecating <code>page.screencast()</code>). <em>(Update: Nov 10th... Playwright now has an open PR (#43999) bringing <code>Page.startScreenRecording</code> to Chromium! :fingers_crossed:)</em></p>
+<p>Feel free to install this from npm.. or tbh just point your agent at <code>src/index.ts</code> and steal the implementation. It's tiny.</p>
+<h2>CLI</h2>
+<pre><code># 720p @ 60fps for 4s, with tab audio
+npx chrome-capture https://paulirish.github.io/chrome-capture/ demo.mp4 4s
+
+# 1080p @ 120fps (needs a 120Hz display and headful Chrome, e.g. a ProMotion MacBook)
+npx chrome-capture https://paulirish.github.io/chrome-capture/ 120fps.mp4 5s --fps=120 --width=1920 --height=1080 --headful
+
+# Record the page with DevTools open next to it
+npx chrome-capture https://paulirish.github.io/chrome-capture/ devtools.mp4 5s --with-devtools</code></pre>
+<p>The CLI records audio by default and runs headless (<code>--headless=new</code>) for <code>&lt;= 60fps</code>, automatically switching to <code>--headful</code> on macOS when <code>--fps &gt; 60</code> so Chrome can lock onto ProMotion's 120Hz <code>CVDisplayLink</code>. <code>--help</code> for the rest.</p>
+<h2>Playwright, Puppeteer, or raw CDP</h2>
+<p><code>startRecording()</code> takes a Playwright <code>Page</code>, a Puppeteer <code>Page</code>, or a CDP session. It defaults to 60fps and works with <code>await using</code>, so the mp4 is written when the block exits:</p>
+<pre><code>import \{startRecording} from 'chrome-capture';
+
+// `page` can be a Playwright Page, a Puppeteer Page, or a CDP session!!
+\{
+  await using rec = await startRecording(page, \{
+    outputPath: 'flow.mp4',   // optional: omit to get a Buffer from rec.stop()
+    frameRate: 60,            // default: 60 (up to 120 on a 120Hz display)
+    maxWidth: 1280,           // default: 1280
+    maxHeight: 720,           // default: 720
+    captureArea: 'target',    // 'target' (viewport) or 'browserWindow'
+    audio: false,             // 48kHz stereo Opus tab audio
+  });
+  await page.goto('https://paulirish.github.io/chrome-capture/');
+  await page.click('a');
+}</code></pre>
+<h3><code>@playwright/test</code> fixture</h3>
+<p>Records every test and attaches the mp4 to the report:</p>
+<pre><code>import \{test as base} from '@playwright/test';
+import \{screenRecordingFixture} from 'chrome-capture/playwright';
+
+export const test = base.extend(\{
+  recordVideo60fps: screenRecordingFixture(\{auto: true, audio: true}),
+});</code></pre>
+<p>(Drop <code>auto: true</code> if you'd rather call <code>recordVideo60fps.start()</code> yourself, mid-test.)</p>
+<h3>Raw CDP</h3>
+<pre><code>import \{CdpScreenRecorder, connectCdpSession} from 'chrome-capture';
+
+const session = await connectCdpSession(pageWebSocketDebuggerUrl);
+const recorder = new CdpScreenRecorder(session);
+
+await recorder.start(\{maxWidth: 1920, maxHeight: 1080});
+// ... do stuff
+const mp4 = await recorder.stop();
+session.close();</code></pre>
+<h3>Visible cursor</h3>
+<p>With Playwright, <code>await page.screencast.showActions()</code> draws its cursor, element highlights, and click badges right into the DOM (without starting <code>Page.startScreencast</code>), so <code>startRecording(page)</code> captures them natively. To restyle the cursor SVG and click ring yourself, inject a custom DOM overlay instead.</p>
+<h2>Benchmarks</h2>
+<p>Same 6.4s UI replay (typing, clicks, drag-and-drop, scroll) at 1280x800, comparing the <code>Page.startScreencast</code> + <code>ffmpeg</code> pipeline (<code>recordVideo</code>) against <code>Page.startScreenRecording</code> (<code>chrome-capture</code> at its default 60fps) on an M4 Max.</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th><code>recordVideo</code> (<code>startScreencast</code>)</th>
+   <th><code>chrome-capture</code> (<code>startScreenRecording</code>)</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Output fps</td>
+   <td>25 (up to 60)</td>
+   <td>60 (up to 120)</td>
+  </tr>
+  <tr>
+   <td>Total wall-clock</td>
+   <td>21s</td>
+   <td>11s</td>
+  </tr>
+  <tr>
+   <td>Stop + finalize</td>
+   <td>3,800ms</td>
+   <td>17ms</td>
+  </tr>
+  <tr>
+   <td>WebSocket traffic</td>
+   <td>10.5 MB</td>
+   <td>450 KB</td>
+  </tr>
+  <tr>
+   <td>Final file size</td>
+   <td>480 KB</td>
+   <td>330 KB</td>
+  </tr>
+  <tr>
+   <td>PSNR vs. lossless screenshot</td>
+   <td>32 dB</td>
+   <td>34 dB</td>
+  </tr>
+  <tr>
+   <td>Audio</td>
+   <td>none</td>
+   <td>optional</td>
+  </tr>
+ </tbody>
+</table>
+<p>Because Chrome encodes the video in-flight instead of piping JPEGs to <code>ffmpeg</code>, stopping takes 17ms instead of 3.8s (or 91ms vs 20.5s at 2160p), and the whole test finishes ~10s quicker.</p>
+<p><strong>What about bitrate and visual quality?</strong> There's no bitrate/CRF knob (yet). Under the hood, Chrome encodes on the fly with <code>libaom</code> AV1 in realtime 1-pass VBR and scales target bitrate linearly with pixel rate.</p>
+<p>The <strong>high bitrate sweet spot</strong> is 1080p60 (<code>9 Mbps</code>) and up. If you ever need lossless 1px text fidelity and only care about ~10-15fps, an offline <code>Page.startScreencast(\{format: 'png'})</code> -&gt; <code>ffmpeg</code> pipeline still has a place.</p>
+<h3>How high can it go?</h3>
+<ul>
+ <li><strong>Mac (<code>--headless=new</code>)</strong>: <strong>2160p @ 60fps</strong>. Headless Chrome still gets full Metal GPU acceleration.</li>
+ <li><strong>Mac (<code>--headful</code> on 120Hz ProMotion)</strong>: <strong>1080p @ 120fps</strong> and <strong>2160p @ 120fps</strong>.</li>
+ <li><strong>Headless Linux (no GPU / CI)</strong>: <strong>1080p @ 60fps</strong> or <strong>1440p @ 60fps</strong> on standard 60Hz vsync.</li>
+</ul>
+<p>One macOS gotcha: don't pass <code>--disable-frame-rate-limit --disable-gpu-vsync</code> on a GPU-accelerated Mac. Leave native vsync alone; it's what gets you to 120.</p>
