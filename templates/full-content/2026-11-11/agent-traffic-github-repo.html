@@ -1,0 +1,217 @@
+<h1>agent-traffic</h1>
+<p>Tell agents, AI crawlers, search crawlers and bots apart from people.</p>
+<p>Mintlify hosts documentation for thousands of companies, and those sites serve hundreds of millions of requests a month. For years almost all of that came from developers reading docs in a browser. Now a growing share comes from agents: Claude Code pulling a page into a coding session, ChatGPT answering a question with your docs, Cursor checking an API reference before it writes a call.</p>
+<p>As that traffic grew, we kept needing to answer questions our tools couldn't. How much of our traffic is agents, and which ones? Is that request from GPTBot really OpenAI, or someone borrowing the name? Is a coding agent reading the docs, or is an AI company crawling them for training data, or a script mirroring <code>llms.txt</code> every hour? The bot lists we started with matched user agent substrings, put everything automated into one bucket, and believed whatever a request claimed to be.</p>
+<p>So we built our own. We studied our traffic, tested the existing open-source bot lists against it, and kept track of which signals actually separate one kind of request from another. agent-traffic is what came out of that: a tested dataset of the user agents, headers and official verification sources of real agents and crawlers, plus a small classifier that applies it. We're open-sourcing it so you don't have to learn all of this from scratch.</p>
+<h2>Get started with your agent</h2>
+<p>Install the skill in Claude Code, Cursor, Codex or any agent the skills CLI supports:</p>
+<pre><code>npx skills add mintlify/agent-traffic
+</code></pre>
+<p>The skill teaches your agent how classification works and how to use the package and dataset, from request handlers to stored logs. Then ask it for whatever you need. You can also paste the skill's URL straight into any agent.</p>
+<h2>What it does</h2>
+<pre><code>import \{ classify } from '@mintlify/agent-traffic'
+
+classify(\{ userAgent: 'Claude-User (claude-code/2.1.308; +https://support.anthropic.com/)' })
+// \{ category: 'agent', kind: 'coding', name: 'Claude Code', operator: 'Anthropic', version: '2.1.308', ... }
+
+classify(\{ userAgent: 'axios/1.13.2' })
+// \{ category: 'bot', kind: 'http-client', name: 'axios', ... }</code></pre>
+<ul>
+ <li>A curated, tested dataset of the user agents, headers and official verification sources of real agents and crawlers</li>
+ <li>Verifies crawlers against their operators' published IP ranges and catches impersonators</li>
+ <li>Every result explains itself</li>
+ <li>Zero dependencies, and runs anywhere <code>fetch</code> does: Node, Bun, Deno, Cloudflare Workers, Vercel Edge</li>
+</ul>
+<h2>Install it yourself</h2>
+<pre><code>npm i @mintlify/agent-traffic
+</code></pre>
+<h2>Usage</h2>
+<p>In a Cloudflare Worker, pass the request headers and the real client IP:</p>
+<pre><code>import \{ classify, loadIpRanges } from '@mintlify/agent-traffic'
+
+let ipRanges
+
+export default \{
+  async fetch(request) \{
+    ipRanges ??= loadIpRanges()
+
+    const result = classify(
+      \{ headers: request.headers, ip: request.headers.get('cf-connecting-ip') },
+      \{ ipRanges: await ipRanges, headersComplete: true }
+    )
+
+    if (result.category === 'agent') \{
+      return serveMarkdown(request)
+    }
+
+    return fetch(request)
+  }
+}</code></pre>
+<p>The ranges load on the first request because Workers can't fetch at startup, and caching the promise keeps concurrent requests from each downloading them. <code>headersComplete</code> turns on the fake-browser checks, which is safe when browser headers reach the Worker untouched over HTTPS; leave it off if plain HTTP or a proxy in front can strip them.</p>
+<p>Someone spoofing a crawler gets caught:</p>
+<pre><code>classify(\{ userAgent: 'Mozilla/5.0 (compatible; GPTBot/1.4; +https://openai.com/gptbot)', ip: '73.12.4.9' }, \{ ipRanges })
+// \{ category: 'bot', kind: 'impersonator', verified: false, confidence: 'high',
+//   reasons: ["claims to be GPTBot but 73.12.4.9 is outside OpenAI's published ranges"] }</code></pre>
+<p>Agents that hide behind a browser user agent still ask for markdown:</p>
+<pre><code>classify(\{ headers: \{ 'user-agent': 'Mozilla/5.0 (Macintosh; ...) Chrome/149.0.0.0 Safari/537.36', accept: 'text/markdown, text/html;q=0.9' } })
+// \{ category: 'agent', kind: 'unidentified', confidence: 'medium',
+//   reasons: ['Accept header prefers markdown over HTML, which browsers never do'] }</code></pre>
+<p>Just need a quick check? Each category is also available as a single regular expression:</p>
+<pre><code>import \{ patterns } from '@mintlify/agent-traffic'
+
+patterns.agent.test(userAgent)
+patterns['ai-crawler'].test(userAgent)</code></pre>
+<h2>Querying your logs</h2>
+<p>Your agent can do this for you with the skill. It translates the patterns for your database; ClickHouse, DuckDB and Postgres are verified.</p>
+<p>To do it yourself, classify each distinct user agent once and join the results:</p>
+<pre><code>import \{ classify } from '@mintlify/agent-traffic'
+
+const rows = distinctUserAgents.map((ua) =&gt; (\{ user_agent: ua, ...classify(\{ userAgent: ua }) }))
+// load rows into a table, then: SELECT ... FROM logs JOIN user_agent_classes USING (user_agent)</code></pre>
+<p>Logs usually keep only the user agent. That still identifies known agents, crawlers and HTTP clients, but agents that borrow a browser user agent will look like people unless you also log the <code>Accept</code> header.</p>
+<h2>Categories</h2>
+<table>
+ <thead>
+  <tr>
+   <th><code>category</code></th>
+   <th>Meaning</th>
+   <th><code>kind</code></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>agent</code></td>
+   <td>An AI product fetching a page right now, for a person</td>
+   <td><code>assistant</code>, <code>coding</code>, <code>browser</code>, <code>unidentified</code></td>
+  </tr>
+  <tr>
+   <td><code>ai-crawler</code></td>
+   <td>An AI company collecting pages ahead of time</td>
+   <td><code>training</code>, <code>ai-search</code>, <code>ingest</code></td>
+  </tr>
+  <tr>
+   <td><code>crawler</code></td>
+   <td>A search engine</td>
+   <td><code>search</code></td>
+  </tr>
+  <tr>
+   <td><code>bot</code></td>
+   <td>Any other automation</td>
+   <td><code>seo</code>, <code>preview</code>, <code>ads</code>, <code>monitor</code>, <code>scanner</code>, <code>archiver</code>, <code>feed</code>, <code>http-client</code>, <code>headless</code>, <code>fake-browser</code>, <code>impersonator</code>, <code>unidentified</code></td>
+  </tr>
+  <tr>
+   <td><code>human</code></td>
+   <td>A person in a browser</td>
+   <td></td>
+  </tr>
+  <tr>
+   <td><code>unknown</code></td>
+   <td>Nothing to classify (no user agent or headers)</td>
+   <td></td>
+  </tr>
+ </tbody>
+</table>
+<h2>API</h2>
+<h3><code>classify(request, options?)</code></h3>
+<p><code>request</code>:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Field</th>
+   <th>Type</th>
+   <th></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>userAgent</code></td>
+   <td><code>string</code></td>
+   <td>Read from <code>headers</code> when omitted</td>
+  </tr>
+  <tr>
+   <td><code>headers</code></td>
+   <td><code>Headers | Record&lt;string, string | string[]&gt;</code></td>
+   <td>Any casing</td>
+  </tr>
+  <tr>
+   <td><code>ip</code></td>
+   <td><code>string</code></td>
+   <td>The real client IP. Ports and IPv4-mapped IPv6 addresses are handled</td>
+  </tr>
+ </tbody>
+</table>
+<p><code>options</code>:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Field</th>
+   <th>Default</th>
+   <th></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>ipRanges</code></td>
+   <td>none</td>
+   <td>From <code>loadIpRanges()</code>. Turns on IP verification</td>
+  </tr>
+  <tr>
+   <td><code>headersComplete</code></td>
+   <td><code>false</code></td>
+   <td>Set when browser headers reach you untouched over HTTPS. Turns on fake-browser checks</td>
+  </tr>
+  <tr>
+   <td><code>maxRangeAgeDays</code></td>
+   <td><code>180</code></td>
+   <td>An operator's range file older than this can verify a request, but never flag it as an impersonator</td>
+  </tr>
+ </tbody>
+</table>
+<p>Returns:</p>
+<pre><code>\{
+  category: 'agent' | 'ai-crawler' | 'crawler' | 'bot' | 'human' | 'unknown'
+  kind?: string
+  id?: string
+  name?: string
+  operator?: string
+  version?: string
+  verified: boolean | null
+  confidence: 'high' | 'medium' | 'low'
+  reasons: string[]
+}</code></pre>
+<ul>
+ <li><code>verified: true</code> means the IP is in the operator's published ranges.</li>
+ <li><code>verified: false</code> means it's provably not who it claims to be.</li>
+ <li><code>verified: null</code> means it wasn't checked, or can't be. Coding agents like Claude Code run on the user's own machine, so they're never IP-checked.</li>
+</ul>
+<h3><code>loadIpRanges(fetch?)</code></h3>
+<p>Downloads the IP range files published by OpenAI, Anthropic, Google, Perplexity, Apple, Microsoft, Common Crawl and DuckDuckGo. Call it once at startup, refresh it about daily, and pass the result to <code>classify</code>. Files that fail to load are skipped, so requests from those operators come back unverified rather than flagged.</p>
+<h3><code>agents</code>, <code>httpClients</code>, <code>headers</code></h3>
+<p>The dataset, also importable as plain JSON from <code>@mintlify/agent-traffic/data/*.json</code> for use from other languages or SQL:</p>
+<ul>
+ <li><code>agents.json</code> lists known agents and crawlers. Each entry has user agent patterns, Accept and <code>Signature-Agent</code> fingerprints, verification sources, docs, real example user agents, and the date it was last verified.</li>
+ <li><code>http-clients.json</code> lists generic HTTP libraries and headless browsers.</li>
+ <li><code>headers.json</code> says what each request header tells you, and who controls it.</li>
+</ul>
+<h3><code>patterns</code>, <code>userAgents</code></h3>
+<p><code>patterns</code> is one case-insensitive <code>RegExp</code> per category: <code>agent</code>, <code>ai-crawler</code>, <code>crawler</code> and <code>bot</code>. <code>userAgents</code> holds the same patterns as arrays of strings, for building your own matchers. They match user agents only. Use <code>classify</code> to get verification, <code>Accept</code> and header checks.</p>
+<h3><code>prefersMarkdown(accept)</code></h3>
+<p><code>true</code> when an <code>Accept</code> header ranks <code>text/markdown</code> above <code>text/html</code>.</p>
+<h2>How it works</h2>
+<ol>
+ <li>Known agent or crawler, verified by IP when possible</li>
+ <li>Asks for markdown</li>
+ <li>Generic HTTP client or headless browser</li>
+ <li>Browser, unless its headers contradict it</li>
+ <li>Otherwise a bot</li>
+</ol>
+<p>GUIDELINES.md covers the full rules, why they work this way, and how to apply them without this package.</p>
+<h2>Caveats</h2>
+<ul>
+ <li><strong>Some products share an identity.</strong> Codex has been reported to fetch as <code>ChatGPT-User</code>, and Cursor through Exa as <code>ExaUser</code>. Results name only what can be proven.</li>
+ <li><strong>Some agents are invisible at the HTTP level.</strong> Agentic browsers that run inside a person's own Chrome (Atlas, Comet, Claude in Chrome) look exactly like that person.</li>
+</ul>
+<h2>Contributing</h2>
+<p>Agents change their fetchers often. If you see one that's missing or wrong, open a PR against <code>data/agents.json</code> with a real example user agent and a source. See CONTRIBUTING.md.</p>
+<h2>License</h2>
+<p>MIT © Mintlify</p>

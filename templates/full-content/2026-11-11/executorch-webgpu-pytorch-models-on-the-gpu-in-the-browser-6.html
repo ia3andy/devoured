@@ -1,0 +1,54 @@
+<h2>TL;DR</h2>
+<ul>
+ <li>PyTorch models now run in the web browser on the GPU through ExecuTorch, with no conversion to another framework’s format. You export with torch.export to an ExecuTorch .pte file, and the same file runs in any WebGPU browser via ExecuTorch’s new WebGPU backend.</li>
+ <li>It works across a broad range of models: LLMs (e.g. Llama 3.2, Qwen3, Gemma 3), vision-language (e.g. SmolVLM), segmentation, depth, object detection, super-resolution and speech-to-text (e.g. Whisper). Everything runs locally in the tab, and no data leaves the device. Try it in the ExecuTorch WebGPU Playground.</li>
+ <li>On the same machine, WebGPU is 4–7× faster than ExecuTorch’s CPU path (Webassembly + XNNPACK) on prefill and 2–10× faster on decode.</li>
+</ul>
+<h2>Why the Browser?</h2>
+<p>The web is the largest deployment surface with billions of users on Chrome, Firefox and Safari. Browser inference ensures privacy by keeping users’ prompts, model inputs, and outputs on the user’s device rather than the server. This reduces network latency, enables offline use-cases, and lowers server-side inference costs. With the ExecuTorch WebGPU backend, PyTorch models get a native path to GPU-accelerated inference in WebGPU-enabled browsers on desktop, laptop and mobile.</p>
+<p>WebGPU, the modern successor to WebGL, provides native compute shaders, shared memory, storage buffers, and barriers, making it viable for high-performance ML inference directly in the browser. Today, running a PyTorch model in the browser usually means first converting it to another framework’s format, such as GGUF, ONNX or TFLite. The ExecuTorch WebGPU backend lets PyTorch models reach the browser without leaving the PyTorch toolchain.</p>
+<h2>Backend Design</h2>
+<p>Three principles guided the WebGPU backend’s design:</p>
+<ul>
+ <li>Architecture, export, and dynamic runtime. Models export through ExecuTorch’s <code>torch.export()</code> and WebGPUPartitioner and run via WGSL compute shaders. At runtime, the WebGPU runtime allocates GPU buffers and dispatches compute shaders into command buffers. Dynamic shapes are handled via allocate-at-max buffers with per-dispatch workgroup recalculation to enable batched prefill, and the runtime routes shapes to specialized WGSL kernels at runtime.</li>
+ <li>Same artifact across multiple devices and browsers. One model (.pte file) runs in WebGPU browsers such as Chrome and Safari, natively on Metal (macOS), Vulkan (Linux/Android) and D3D12 (Windows), translating WGSL to Metal Shading Language, SPIR-V or HLSL depending on the platform. For browser deployment, the dynamic C++ runtime compiles to Webassembly via Emscripten and <code>emdawnwebgpu</code> bridges its WebGPU API calls to any browser’s WebGPU JavaScript API.</li>
+ <li>Zero friction for the end user. With WebGPU, models run in the browser sandbox with no native installation, backend server, and no data leaving the device. For developers, deployment is a .pte file served over CDN on a web page. Pipeline compilation, memory management, and dispatch scheduling are all handled through the WebGPU backend, with all data staying in GPU device memory within the browser tab.</li>
+</ul>
+<h2>Performance</h2>
+<p>We benchmarked ExecuTorch WebGPU against ExecuTorch’s own Webassembly (wasm) CPU backend (XNNPACK, multi-threaded) on the same machine, using quantized Llama 3.2 1B and Qwen3-0.6B in Google Chrome on Apple M1 Pro. Each data point is the median of 5 runs after 3 warmups, across 128 to 8K tokens of context, with identical token IDs for both backends. Both are timed with wall-clock time, since GPU timestamps aren’t available for CPU execution. WebGPU uses 4-bit groupwise weights (group size 64) with fp32 activations; the CPU uses XNNPACK’s 4-bit weights with 8-bit dynamic activations.</p>
+<h2>Models in Practice</h2>
+<p>We’ve validated the WebGPU backend across models with very different architectures, demonstrating that the operator coverage generalizes beyond autoregressive text generation:</p>
+<h3>LLM Inference</h3>
+<ul>
+ <li>Llama 3.2 1B (4-bit quantized)</li>
+ <li>Qwen2.5-0.5B (4-bit quantized)</li>
+ <li>Qwen3-0.6B (4-bit quantized)</li>
+ <li>Gemma 3 1B</li>
+</ul>
+<h3>Vision-Language Understanding</h3>
+<ul>
+ <li>SmolVLM: image question answering and captioning</li>
+</ul>
+<h3>Vision</h3>
+<ul>
+ <li>Depth Anything V2: monocular depth estimation</li>
+ <li>SAM 2 (SAM 2.1 Hiera Tiny): promptable image segmentation</li>
+ <li>D-FINE: object detection</li>
+ <li>Real-ESRGAN: super-resolution</li>
+ <li>Background Removal (MODNet): foreground segmentation</li>
+</ul>
+<h3>Voice</h3>
+<ul>
+ <li>Whisper (base): speech-to-text</li>
+ <li>Phonon-31M-EN: text-to-speech</li>
+</ul>
+<h3>On-Device Training</h3>
+<ul>
+ <li>LoRA and DiReFT fine-tuning for Llama 3.2 1B, Qwen2.5 0.5B and Qwen3 0.6B, aimed at personalized assistants and domain adaptation on-device</li>
+</ul>
+<h2>Try it: ExecuTorch WebGPU Playground</h2>
+<p>The ExecuTorch WebGPU Playground runs many of the models above, all on the same WebAssembly + WebGPU runtime. All the prompts, photos, camera frames and audio never leave your device. Each model’s Hugging Face repo includes the .pte files, a model card, and the exact export recipe.</p>
+<h2>What’s Next</h2>
+<p>The backend is still in early development. We’ll keep making the backend faster and more stable, and expand operator, data type, and model coverage.</p>
+<h2>Contributions / Feedback</h2>
+<p>ExecuTorch is open source, and we’d love your contributions to the WebGPU backend. If something breaks or a model you care about isn’t supported, open an issue or reach us on the ExecuTorch Discord. Contributions are welcome too, whether that’s new operators, new models or performance improvements.</p>

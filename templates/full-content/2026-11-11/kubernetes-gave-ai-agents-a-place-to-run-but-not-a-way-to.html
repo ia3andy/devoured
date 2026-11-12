@@ -1,0 +1,39 @@
+<h2>TL;DR — Key Takeaways</h2>
+<p>– Restarting an agent doesn’t mean recovering its work. Kubernetes can restore the environment, but without execution history, an agent may repeat payments, API calls or other critical actions.</p>
+<p>– Sandboxes protect the runtime. Durable execution protects the business. Production agents need both secure isolation and a reliable record of completed work to survive failures safely.</p>
+<p>There’s an implicit bargain associated with Kubernetes. Applications run as interchangeable replicas, and if a pod dies, the controller starts another. Nobody cares which copy handled which request.</p>
+<p>That bargain carried a decade of microservices into production.</p>
+<p>But as we’re seeing up and down the tech stack, AI agents are making the old ways of doing things obsolete. Luckily, the cloud-native community has responded typically fast, and much of that work will be on display at KubeCon + CloudNativeCon North America 2026, where the CNCF added a dedicated AI Inference + Agentic track this year.</p>
+<p>Yet as the agent runtime is rebuilt, those efforts often address only half of the problem. Many cloud-native applications are built around being stateless, offloading state to external stores so any replica can pick up a request. Agents are the opposite. They hold context and execution state, they run for hours or days, and they are non-deterministic. Agents have pushed statefulness back to the top of the design discussion.</p>
+<h3>A New Place for Agents to Live</h3>
+<p>There are two open-source initiatives that illustrate where the energy is headed.</p>
+<p>Kubernetes SIG Apps’ Agent Sandbox launched last year to give agents three things:</p>
+<ul>
+ <li>A stateful pod with stable identity and storage.</li>
+ <li>Reusable templates with resource limits and security policies defined.</li>
+ <li>A claim API for frameworks to call without managing provisioning.</li>
+</ul>
+<p>More recently, Google made Agent Substrate available on GKE. The open-source runtime runs on any Kubernetes cluster, isolating each agent in a microVM or a gVisor sandbox. It suspends idle agents and snapshots their state to disk and object storage, with the ability to resume them in under 500 milliseconds.</p>
+<p>These projects address tangible problems: where untrusted code can safely run, how not to overpay for compute when an agent waits hours for a reply, and how fast agents can start up again.</p>
+<p>What they don’t address is what the agent has already done. They don’t track which execution steps completed, so a recovered agent has no way to avoid repeating or duplicating critical actions.</p>
+<h3>A Restored Sandbox Can’t Tell You What Happened</h3>
+<p>A common example is an agent that distributes customer refunds. It might receive a dispute, pull the transaction, check the refund policy, look at the account history, call a fraud service, then ask the customer for more information. When the customer replies a few days later, the agent decides the refund qualifies and calls the payment API.</p>
+<p>It’s a straightforward workflow, but this time, the worker node fails.</p>
+<p>When the sandbox layer does its job, the agent comes back on a new worker with its filesystem and most recent snapshot. But the snapshot was taken when the agent was idle last, which was before the refund call. The payment API may have already accepted the request before the crash happened, but the restored agent doesn’t know that, so it issues it again.</p>
+<p>Now the customer has two refunds, and the business has a distributed systems problem. Restoring a disk or memory image brings back the machine, but it doesn’t record which steps finished, which tool calls executed, or which actions are safe to repeat.</p>
+<h3>Put Durable Execution Above the Sandbox</h3>
+<p>The answer is durable execution. The runtime records each step of an agent’s work as it completes, including LLM calls, tool calls, decisions made, inputs and outputs. If the process crashes, a new process picks up at the next unfinished step, meaning completed steps don’t run twice.</p>
+<p>In the refund example, the runtime would know whether the payment call finished before it does anything else. Open source options already exist for Kubernetes; Dapr’s workflow engine, for example, runs as a sidecar alongside the agent and persists each step to a state store.</p>
+<p>This is different from framework checkpointing. Checkpointing saves state, but the application team still owns recovery: detecting that a process failed, deciding what to retry, and handling partial writes and idempotency for every tool the agent touched. With durable execution, the runtime owns all of that.</p>
+<p>There’s another benefit that every team loves to hear: cost savings. Without durable execution, a failure at step 30 would mean starting over from the beginning and paying for 29 steps’ worth of tokens twice. You only pay for completed work once with durable execution, no matter how many times the environment fails.</p>
+<p>Furthermore, proof of what an agent did is critical for regulated industries like banking and healthcare. The execution history that powers recovery is also a record that can be cryptographically signed, with each step tied to the workload identity of the agent that produced it. That cryptographic proof of what each agent did and when is also useful when an auditor or the customer asks why the refund went out.</p>
+<p>This agentic durable execution, where work survives failure and every step can be proven afterward, is particularly timely as regulations such as the EU AI Act require providers of high-risk systems to keep automatic event logs in addition to human oversight.</p>
+<h3>The Community Has Solved This Before</h3>
+<p>Cloud-native teams have already lived through a similar cycle. When microservices moved onto Kubernetes, teams gained a platform to handle scheduling and scaling. Agentic AI is now craving a similar stack. Here’s how it’s shaping up:</p>
+<ul>
+ <li><strong>Kubernetes</strong> manages the machines.</li>
+ <li><strong>Agent Sandbox and Agent Substrate</strong> manage the agent’s environment (isolation, density and fast suspend/resume).</li>
+ <li><strong>Frameworks</strong> such as LangGraph, Microsoft Agent Framework, Google ADK, Dapr Agents and CrewAI define how the agent reasons, with an agentic loop and agent harness.</li>
+ <li><strong>A Durable Execution Layer</strong> such as the workflow engine in Dapr, a CNCF graduated project, tracks the work itself. It guarantees each step runs once, resumes after failure, and can be proven later.</li>
+</ul>
+<p>Ultimately, they’re complementary layers. A sandbox without durable execution restarts work without knowing what happened before. And durable execution without a sandbox could leave untrusted code without a safe place to run. Teams are starting to understand that agents in production need both. For platform teams, the practical step is to treat execution state as a first-class concern alongside isolation and scaling. Before an agent touches a payment API, a patient record, or anything else that can’t be undone, ask your stack one question: if this node dies right now, will the agent know what it already did?</p>

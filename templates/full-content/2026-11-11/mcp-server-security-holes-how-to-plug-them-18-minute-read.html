@@ -1,0 +1,197 @@
+<p>Model Context Protocol (MCP), has officially hit one year old as of November 25th and although there have been some amazing innovations within MCP, one issue still persists - the gaping security hole. This is no secret as just about every organization is talking about it. The long-running joke so far has been “The S in MCP stands for security”.</p>
+<p>Aside from prompt injections, MCP Server security is arguably the biggest issue in the AI security world right now.</p>
+<p>In this blog post, you’ll learn how to fix the gaps.</p>
+<h2>Prerequisites</h2>
+<p>To follow along with this blog post, you should have:</p>
+<ol>
+ <li>A Kubernetes cluster running (it can be local).</li>
+ <li>Kubernetes Gateway API CRDs installed, which you can find here.</li>
+</ol>
+<h2>Why Security Matters for MCP</h2>
+<p>There are two forms of MCP servers:</p>
+<ol>
+ <li><code>stdio</code></li>
+ <li><code>StreamableHTTP</code></li>
+</ol>
+<p><code>stdio</code> (the communication method) stands for standard input/output. When using standard input/output, you’re typically targeting a pre-built MCP Server that’s written in, typically, Python or JS (Go is up and coming in this space) that’s called to locally via a command like <code>uvx</code> or <code>npx</code> (depending on how the MCP Server is built). It’s not a standard library download (like a <code>pip install</code>), but instead stored in cache (e.g. <code>~/.local/share/uv</code>).</p>
+<p><code>StreamableHTTP</code> is an external (or even internal) server that you’re reaching out to that’s not cached locally. A good example of this is the GitHub Copilot MCP Server. It’s an MCP Server that you’re reaching out to over the HTTP protocol instead of via a local cache.</p>
+<p>Regardless of which option you choose, there are many security holes.</p>
+<p>One (of the many) problem with <code>stdio</code> MCP Servers is that you can't run them through a Gateway. That means no AuthN/Z, no rate limiting, and no tool control. The MCP Servers are effectively open and usable by anyone in an organization unless you’re manually locking each computer down with Claude Desktop configurations (which, spoiler alert: no one's doing).</p>
+<p>With <code>StreamableHTTP</code>, you’re in the dark. You’re connecting Agents to some black box running in someone's datacenter with who knows what (if any) security protocols, and even if there are security protocols, that doesn’t help from an overall AuthN/Z perspective for your organization. There’s also no way to even test the security without a proper pentest, which wouldn’t be legal without explicit permission from the organization hosting the MCP Server. The only way to do it would be to put an Agent in front of the MCP Server, but then you're not actually securing the MCP Server, you're securing the Agent.</p>
+<p>As Model Context Protocol stands right now, there’s only one true way to secure it - with a proper AI Gateway.</p>
+<p>Solo Enterprise For agentgateway implements everything from locking down tools to proper user and system-level authentication to MCP Servers with or without Agents. In the following sections, you’ll see how to configure security for MCP.</p>
+<h2>Deploy an MCP Server and agentgateway</h2>
+<p>The first step is to deploy an MCP Server and a Gateway via agentgateway enterprise so we not only have an MCP Server to test with, but a proper AI gateway to secure our MCP connectivity.</p>
+<p>1. Create a new Kubernetes Deployment pointing to the test MCP Server that is containerized. You’ll also see a Service that gets deployed so the Gateway can properly connect to it.</p>
+<pre><code>kubectl apply -f - &lt;&lt;EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-website-fetcher
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: mcp-website-fetcher
+  template:
+    metadata:
+      labels:
+        app: mcp-website-fetcher
+    spec:
+      containers:
+      - name: mcp-website-fetcher
+        image: ghcr.io/peterj/mcp-website-fetcher:main
+        imagePullPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-website-fetcher
+  namespace: default
+spec:
+  selector:
+    app: mcp-website-fetcher
+  ports:
+  - port: 80
+    targetPort: 8000
+    appProtocol: kgateway.dev/mcp
+EOF</code></pre>
+<p>2. Deploy the Backend so agentgateway knows what to route to. In this case, it’s routing to the MCP Server service that you deployed in step 1.</p>
+<pre><code>kubectl apply -f - &lt;&lt;EOF
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: Backend
+metadata:
+  name: mcp-backend
+  namespace: gloo-system
+spec:
+  type: MCP
+  mcp:
+    targets:
+    - name: mcp-target
+      static:
+        host: mcp-website-fetcher.default.svc.cluster.local
+        port: 80
+        protocol: StreamableHTTP
+EOF</code></pre>
+<p>3. Deploy the Gateway using the agentgateway enterprise class. This Gateway is what will be used for MCP Inspector to connect to (more on Inspector coming up).</p>
+<pre><code>kubectl apply -f - &lt;&lt;EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: agentgateway
+  namespace: gloo-system
+spec:
+  gatewayClassName: agentgateway-enterprise
+  listeners:
+  - name: http
+    port: 8080
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: Same
+EOF</code></pre>
+<p>4. Create an HTTP route so you can route the traffic to the backend, which you created in step 3.</p>
+<pre><code>kubectl apply -f - &lt;&lt;EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mcp-route
+  namespace: gloo-system
+spec:
+  parentRefs:
+  - name: agentgateway
+  rules:
+  - backendRefs:
+    - name: mcp-backend
+      group: gateway.kgateway.dev
+      kind: Backend
+EOF</code></pre>
+<p>5. Capture the Gateway ALB IP in an environment variable to be used when connecting to the MCP Server. If you’re running this locally, you can do a port-forward on the Gateway and use <code>localhost</code> within the IP address section when connecting to it.</p>
+<pre><code>export GATEWAY_IP=$(kubectl get svc agentgateway -n gloo-system -o jsonpath='\{.status.loadBalancer.ingress[0].ip}')
+echo $GATEWAY_IP</code></pre>
+<p>6. Open MCP Inspector to connect to the MCP Server.</p>
+<pre><code>npx modelcontextprotocol/inspector#0.16.2</code></pre>
+<p>The URL to put into MCP Inspector is: <code>http://YOUR_ALB_LB_IP:8080/mcp</code> or if you’re running locally, <code>http://localhost:8080/mcp</code></p>
+<p>You’re now connected to the MCP Server via Inspector (the MCP client), but as you can see, it’s fully open. There’s no security at all. In the next section, that’ll be fixed.</p>
+<h2>Secure MCP Server Auth</h2>
+<p>With a properly deployed MCP Server and agentgateway in front of it, let’s begin the journey of securing MCP Server connectivity. The first step is to enable token-based authentication. In this case, you’ll use a JWT token.</p>
+<p>1. Add in a traffic policy for auth based on a JWT token.</p>
+<pre><code>kubectl apply -f- &lt;&lt;EOF
+apiVersion: gloo.solo.io/v1alpha1
+kind: GlooTrafficPolicy
+metadata:
+  name: jwt
+  namespace: gloo-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: agentgateway
+  glooJWT:
+    beforeExtAuth:
+      providers:
+        selfminted:
+          issuer: solo.io
+          jwks:
+            local:
+              key: '\{"keys":[\{"kty":"RSA","kid":"solo-public-key-001","use":"sig","alg":"RS256","n":"AOfIaJMUm7564sWWNHaXt_hS8H0O1Ew59-nRqruMQosfQqa7tWne5lL3m9sMAkfa3Twx0LMN_7QqRDoztvV3Wa_JwbMzb9afWE-IfKIuDqkvog6s-xGIFNhtDGBTuL8YAQYtwCF7l49SMv-GqyLe-nO9yJW-6wIGoOqImZrCxjxXFzF6mTMOBpIODFj0LUZ54QQuDcD1Nue2LMLsUvGa7V1ZHsYuGvUqzvXFBXMmMS2OzGir9ckpUhrUeHDCGFpEM4IQnu-9U8TbAJxKE5Zp8Nikefr2ISIG2Hk1K2rBAc_HwoPeWAcAWUAR5tWHAxx-UXClSZQ9TMFK850gQGenUp8","e":"AQAB"}]}'
+EOF</code></pre>
+<p>2. Save the token for auth via MCP Inspector.</p>
+<pre><code>eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InNvbG8tcHVibGljLWtleS0wMDEifQ.eyJpc3MiOiJzb2xvLmlvIiwib3JnIjoic29sby5pbyIsInN1YiI6ImJvYiIsInRlYW0iOiJvcHMiLCJleHAiOjIwNzQyNzQ5NTQsImxsbXMiOnsibWlzdHJhbGFpIjpbIm1pc3RyYWwtbGFyZ2UtbGF0ZXN0Il19fQ.GF_uyLpZSTT1DIvJeO_eish1WDjMaS4BQSifGQhqPRLjzu3nXtPkaBRjceAmJi9gKZYAzkT25MIrT42ZIe3bHilrd1yqittTPWrrM4sWDDeldnGsfU07DWJHyboNapYR-KZGImSmOYshJlzm1tT_Bjt3-RK3OBzYi90_wl0dyAl9D7wwDCzOD4MRGFpoMrws_OgVrcZQKcadvIsH8figPwN4mK1U_1mxuL08RWTu92xBcezEO4CdBaFTUbkYN66Y2vKSTyPCxg3fLtg1mvlzU1-Wgm2xZIiPiarQHt6Uq7v9ftgzwdUBQM1AYLvUVhCN6XkkR9OU3p0OXiqEDjAxcg</code></pre>
+<p>3. Try to reconnect to the MCP Server and you’ll see an error similar to the below:</p>
+<pre><code>Connection Error - Check if your MCP server is running and proxy token is correct</code></pre>
+<p>4. Within MCP Inspector, click on Authentication and add in the following:</p>
+<ul>
+ <li>Header Name: Authorization</li>
+ <li>Bearer Token: Bobs Token from step 2</li>
+</ul>
+<p>You should now be able to connect to the MCP Server successfully.</p>
+<p>With proper auth set up, you now know that not just anyone can use your agentgateway to connect to an MCP Server. This allows you to ensure that the traffic you’re observing from an AuthN/Z perspective is valid in comparison to the “anyone can do whatever they want” nature of MCP Servers without agentgateway in place.</p>
+<h2>Locking Down MCP Tool Lists</h2>
+<p>The final step is to specify what MCP Tools are available. One of the main issues for organizations is they want to use Tools within an MCP Server, but not all Tools. For example, maybe a person or an AI Agent connecting to an MCP Server only needs the ability to view/list/get resources (like a readonly Agent), but with the current architecture out of the box available for MCP, that’s not doable.</p>
+<p>However, with traffic policies via agentgateway, it is.</p>
+<p>1. Create a policy that specifies no tools available for use. This will help in testing the ability to lock down tools via the Gateway.</p>
+<pre><code>kubectl apply -f- &lt;&lt;EOF
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: jwt-rbac
+  namespace: gloo-system
+spec:
+  targetRefs:
+    - group: gateway.kgateway.dev
+      kind: Backend
+      name: mcp-backend
+  rbac:
+    policy:
+      matchExpressions:
+        - 'mcp.tool.name == ""'
+EOF</code></pre>
+<p>2. Disconnect and reconnect via the MCP Inspector and you should see no tools available.</p>
+<p>3. Update the policy to include the fetch tool.</p>
+<pre><code>kubectl apply -f- &lt;&lt;EOF
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: jwt-rbac
+  namespace: gloo-system
+spec:
+  targetRefs:
+    - group: gateway.kgateway.dev
+      kind: Backend
+      name: mcp-backend
+  rbac:
+    policy:
+      matchExpressions:
+        - 'mcp.tool.name == "fetch"'
+EOF</code></pre>
+<p>4. Reconnect to the MCP Server via Inspector and you’ll now see the tool available.</p>
+<h2>Conclusion</h2>
+<p>With all of the security concerns around MCP Servers, it reminds us of a very important aspect of cyber security - it’s not about trying to block all bad actors, it’s about mitigating as much risk as possible. That should be the goal for every organization and with these implementations, your MCP security posture should be in a much better place.</p>
+<p>If you're interested in learning more about AI gateways or agentgateway, check out these resources:</p>
+<ul>
+ <li>Video: Introducing Agent Gateway</li>
+ <li>Hands-on Lab: Secure your MCP servers with OAuth</li>
+ <li>Blog: MCP Authorization is a Non-Starter for Enterprise</li>
+ <li>Whitepaper: Introduction and Best Practices to AI Gateways</li>
+</ul>

