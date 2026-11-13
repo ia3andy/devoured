@@ -1,0 +1,53 @@
+<p><em>Research update of a project done as part of <a href="https://caish.org/mars">MARS 5</a> and the <a href="https://www.meridiancambridge.org/visiting-researchers">Meridian Visiting Researcher Programme</a>.</em></p>
+<p>Filler-token reasoning is the ability to use extra tokens (such as a chain of thought) to reason about a task without using the words emitted at those token positions. This is possible because attention can move information between token positions without routing it through the words the LLM emits. This can give a model more parallel, but not more serial, computation.</p>
+<p>The canonical demonstration of this is the "Let's Think Dot by Dot" paper (<a href="https://arxiv.org/abs/2404.15758">Pfau, Merrill &amp; Bowman, 2024</a>). There, the authors train models to solve completely parallelizable (TC⁰) tasks with chains of thought made only of "." tokens.</p>
+<p>Our contributions:</p>
+<ul>
+ <li>We change Pfau et al.'s training method so that models can learn multi-step reasoning on filler tokens.</li>
+ <li>We demonstrate this on two models and three out of seven multi-step reasoning tasks.</li>
+ <li>We provide a theoretical analysis of how many layers a transformer needs to solve each of our multi-step reasoning tasks, depending on the length of the task.</li>
+ <li>We measure empirically how many reasoning steps we can train Qwen3.6-35B-A3B and gpt-oss-20b to do on filler tokens for each task.</li>
+</ul>
+<p>Overall, this project has informed which side tasks we use to study steganographic reasoning. We also hope this writeup shows that filler-token reasoning is not confined to fully parallelizable tasks.</p>
+<h2>Motivation</h2>
+<p>Using the same token over and over guarantees that the filler tokens carry no information about the reasoning. But you could also imagine the same hidden computation happening while the LLM writes text that has nothing to do with its reasoning.</p>
+<p>Our main research is on steganographic reasoning (the model uses its words for reasoning, but hides the reasoning in innocuous-looking text): when can models learn to reason steganographically through simple multi-step tasks? When we see a model write some unrelated text and then correctly answer a multi-step question it could not answer immediately, we have to be careful not to attribute to steganographic reasoning what could simply be filler-token reasoning.</p>
+<p>The dot-by-dot paper looked at tasks that are in TC⁰, i.e. in theory parallelizable (3SUM, 2SUM-Transform), and showed that models can learn to do them on filler tokens. The authors argue that filler tokens cannot help beyond TC⁰. They found that when they train on serial reasoning (where later reasoning steps depend on earlier reasoning steps) they could not teach their models to do so on filler tokens.</p>
+<p>This did not line up with our experience: filler-token reasoning kept cropping up as a failure mode in our experiments. In this small project, we set out to extend Pfau et al.'s setting to multi-step reasoning on filler tokens.</p>
+<h2>Methods</h2>
+<h3>Training filler-token reasoning</h3>
+<p>Pfau et al. trained their models to output dots after the problem statement, followed by the answer, and mixed this data with open-reasoning samples.</p>
+<p>We instead train models with dots as the input and the open reasoning as the output: at each dot position, the target is one reasoning step. This means the models we train are no longer next-token predictors. We have to prefill their CoT with dots, since they would be reasoning openly otherwise.</p>
+<p>Another difference: they train their models from scratch, while we train LoRAs on top of existing LLMs.</p>
+<p>We use two training setups here:</p>
+<ul>
+ <li><strong>Curriculum:</strong> we start at a number of task steps the model can definitely learn and train it on that distribution. Once answer accuracy reaches 0.9, we increase the length, bit by bit. We can then see how far the curriculum gets before it stops working.</li>
+ <li><strong>Direct:</strong> we train the model at full length from the start. By default this is 100 steps, but shorter for tasks where we don't have enough data, or where the prompt grows superlinearly with the number of reasoning steps. Here we can see up to which position the model still predicts the reasoning steps correctly.</li>
+</ul>
+<h3>Models</h3>
+<p>We train Qwen3.6-35B-A3B and gpt-oss-20b with rank-32 LoRAs.</p>
+<h3>Tasks</h3>
+<p>We use a selection of multi-step reasoning tasks for which prompts, correct step-by-step reasoning and answers can easily be generated synthetically.</p>
+<p><strong>Mod sum:</strong> compute the sum of a list of numbers modulo n.</p>
+<p><strong>A5:</strong> track a ball under five cups through a sequence of shuffles. The task is a game of Thimblerig: There are 5 cups, and in the beginning a ball is under the cup at position 0. Each 'step' is one of these operations: Rotate (every cup moves from position p to p+1 mod 5) or Double-Swap (We swap the cups at positions 0,1 as well as 3,4). These two moves generate the group A5. The answer is the final position of the ball.</p>
+<p><strong>GL(3,2):</strong> track the on/off pattern of three lamps through a sequence of moves. The task is a scenario where there are three lamps in a ring: A, B and C. Only lamp A is on at the start. Then we do a series of moves: Shift (every lamp passes its state to the next) or Couple (if A is on, B toggles). These two moves generate the group GL(3,2), of order 168.</p>
+<p><strong>Modular arithmetic:</strong> evaluate a chain of +, −, × operations modulo 8.</p>
+<p><strong>ProntoQA:</strong> follow rules of the form "every A is a B" to decide whether an entity belongs to a category. This is an adjusted version of Saparov &amp; He with problems of arbitrary lengths and no shortcut strategies that let models easily perform better than chance with no serial reasoning.</p>
+<p><strong>HornQA:</strong> derive new categories with rules of the form "A and B ⇒ C", where a rule may need a fact derived arbitrarily far back. A variant of our ProntoQA setup based on Horn-clause reasoning, which is P-complete.</p>
+<p><strong>Function composition:</strong> push a value through a sequence of lookup tables. A start value in 0–7, followed by a sequence of lookup tables of 8 entries each (permutations of 0–7). Each table maps a value v to its entry at index v. The answer is the value after applying all tables in order.</p>
+<p>Since our setup comes from steganographic reasoning, where our vocabulary to express the reasoning steps is limited, all numbers in the reasoning that have no fixed maximum are encoded in binary.</p>
+<h2>Results</h2>
+<h3>Models can learn multi-step reasoning on filler tokens</h3>
+<p>To test whether models can learn multi-step reasoning on filler tokens, we train three model/task combinations (mod sum and GL(3,2) on Qwen3.6-35B-A3B, mod sum on gpt-oss-20b) in three settings: our method, Pfau et al.'s method, and an answer-only baseline that outputs the final answer directly, with no extra tokens.</p>
+<p>We can see that on all of these tasks, our method lets us train the models to reason on filler tokens.</p>
+<p>Of course, this only works up to some task length: the model has a fixed number of layers, and these tasks need more successive computation the longer they get.</p>
+<h3>Theoretical limits to learning multi-step reasoning on filler tokens</h3>
+<p>For every task, the shallowest algorithm we found gets deeper as the task gets longer, so we found no way to fully parallelize any of them. And for every task except HornQA the depth grows much more slowly than the number of steps, which is why the curves stay below the model's depth far beyond 40 or 24 steps.</p>
+<p>We see that different tasks scale very differently. In particular, the modular sum task scales very gently, i.e. it is easy to do on filler tokens.</p>
+<h3>Empirical limits to learning multi-step reasoning on filler tokens</h3>
+<p>Again, tasks differ a lot in how well they can be learned. And again there are outliers: HornQA, which theory predicted to be hard to learn on filler tokens, fails after very few steps, and the popular modular sum is learned very easily.</p>
+<p>But theoretical and empirical limits don't line up in general: some tasks are theoretically easy but empirically hard (modular arithmetic and function composition hit a wall at 1–3 steps). The pattern seems to be that models have a hard time learning tasks on filler tokens when large packets of information need to be transported across token positions.</p>
+<h2>Conclusion</h2>
+<p>Multi-step reasoning can also be done on filler tokens. Recent models such as Astra have shown an increased ability to answer reasoning questions without reasoning about them. If that trend continues, it could endanger CoT monitorability even without the specters of looped architectures or steganographic reasoning coming true.</p>
+<p>Our experiments serve as a demonstration, and shed some light on which tasks can be learned on filler tokens, and how easily. Any pressure not to verbalize certain multi-step reasoning could, with enough training, lead to similar results.</p>
+<p>We also learned a lot about constructing tasks for studying steganographic reasoning. We recommend that others researching steganographic or encoded reasoning put the tasks they use through a test like this.</p>

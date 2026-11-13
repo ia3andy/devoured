@@ -1,0 +1,168 @@
+<h1>Shopify’s generative discovery model</h1>
+<p>How we train and serve a shared generative model for personalized search and recommendation at Shopify scale.</p>
+<p>Two people open their phones and search for “backpack.” One of them has been comparing waterproof laptop bags ever since an airborne-coffee-on-bus incident. The other has been exploring larger packs for traversing the Colorado Rockies.</p>
+<p>The query is a starting point.</p>
+<p>But what each buyer has explored and purchased tells us what <em>matters</em> to them. We can use that context to personalize the search results they see and the recommendations they get, so each buyer discovers relevant products from both familiar merchants and merchants they haven’t visited before.</p>
+<p>Commerce activity across millions of participating Shopify merchants provides insights into how shoppers discover and purchase products across categories, and our commerce ecosystem spans many merchant storefronts, the Shop app, and the Catalog API designed for conversational commerce and AI agents.</p>
+<p>The challenge is using those search, browsing, and purchase signals to find relevant products for each buyer across a catalog of billions, all within the latency budget of a live request.</p>
+<p>Our approach builds on what search and recommendation have in common: both use product knowledge and buyer context to identify relevant products. A search query adds an explicit signal of intent; recommendation relies more on behavior to infer what may be useful next. These shared inputs and objectives make them natural tasks to train together.</p>
+<p>We put this into practice with <strong>a shared generative discovery model</strong>, trained jointly on Shopify’s search and recommendation data. It generates product candidates for both experiences and is now deployed in production, bringing significant gains both offline and online.</p>
+<p>This post explains the product representations, training recipe, and serving decisions that brought it into production.</p>
+<p>For the full methodology and experimental results, see our <a href="https://arxiv.org/pdf/2611.08804">detailed technical report</a>.</p>
+<h2>One foundation model for search and recommendation</h2>
+<p>An open-weight pretrained language model provides the starting point. Its general world knowledge offers a base for understanding product descriptions, attributes, and buyer queries. We then adapt the model using commerce data available to Shopify for this purpose, including our product catalog and eligible buyer interactions across search and recommendation.</p>
+<p>To evaluate the model, we measure buyer outcomes online and retrieval quality offline.</p>
+<h3>Current model performance</h3>
+<p>For recommendation, adding the generative model delivered the following online gains on the Shop home feed:</p>
+<table>
+ <thead>
+  <tr>
+   <th><strong>Online home feed recommendation metric</strong></th>
+   <th><strong>Relative lift</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <th>Orders</th>
+   <td>+7.95%</td>
+  </tr>
+  <tr>
+   <th>Converters</th>
+   <td>+8.60%</td>
+  </tr>
+  <tr>
+   <th>Conversion rate (CVR)</th>
+   <td>+9.85%</td>
+  </tr>
+ </tbody>
+</table>
+<p>In offline evaluation, the generative model contributes <strong>2.65pp Incremental Pool Recall</strong> to the recommendation production system. It is also our <strong>strongest standalone candidate generator</strong>.</p>
+<p>For search, the model delivers strong quality on its own and further improves the production system, with a <strong>2.1-point gain in OneDCG@10 overall</strong>. For signed-in users where the model can personalize the buyer's results, it delivers a <strong>2.7-point gain in OneDCG@10</strong>, with <strong>25% of queries improving on net in top 10 relevance</strong>.</p>
+<table>
+ <thead>
+  <tr>
+   <th><strong>Search configuration</strong></th>
+   <th><strong>Combined</strong><br><strong>OneDCG@10</strong></th>
+   <th><strong>Personalized only</strong><br><strong>OneDCG@10</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <th>Current production system without the generative model</th>
+   <td>30.6</td>
+   <td>33.0</td>
+  </tr>
+  <tr>
+   <th>Current production system with the generative model</th>
+   <td><strong>32.7</strong> (+2.1)</td>
+   <td><strong>35.7</strong> (+2.7)</td>
+  </tr>
+  <tr>
+   <th>Generative model only</th>
+   <td>28.5</td>
+   <td>33.6</td>
+  </tr>
+ </tbody>
+</table>
+<p>These results rest on decisions about product representation, training, and serving. <strong>We’ll walk through each decision,</strong> starting with a practical way for the model to represent products.</p>
+<h2>Giving the model a product vocabulary</h2>
+<p>Shopify’s catalog contains several billion products. A raw product ID distinguishes a database record, but its digits carry no information about the product. Treating every product as an independent output would create a vocabulary with billions of entries, each with its own representation to learn. Training examples are sparse for many products, making it inefficient to learn a useful representation for each ID independently.</p>
+<p>Our <a href="https://shopify.engineering/generative-recommendations">earlier post on generative recommendations</a> outlined a next step: representing products as semantic-ID tokens alongside text. We build on that direction by encoding product content into an embedding, which is a vector representation of the product. A tokenizer converts that embedding into a <strong>semantic ID</strong>: a short sequence of discrete codes that the model can learn and generate.</p>
+<p>We evaluated RQ-VAE and RQ-KMeans, two common tokenizer methods, and selected <strong>RQ-KMeans</strong> because it produced better downstream performance at the same codebook shape. RQ-KMeans clusters product embeddings, subtracts the selected cluster centers, and repeats on the remaining residuals. Each level captures information left over from the previous one. Our selected configuration uses <strong>three codebooks of 8,192 entries each</strong>, giving each product a three-token semantic ID.</p>
+<p>Related products can share codes, allowing their training examples to update shared representations. This gives products with few interactions a way to benefit from training on their neighbors.</p>
+<h2>Training for product meaning and buyer intent</h2>
+<p>Our training recipe builds commerce knowledge into a pretrained language model: connecting semantic IDs to product meaning, learning from buyer journeys, refining predictions for each task, and bringing specialized experts back into one shared model.</p>
+<p>We uncovered <strong>four key lessons while developing this recipe</strong>.</p>
+<h3>Lesson 1: Search and recommendation learn from each other</h3>
+<p>We train search and recommendation together using a common product vocabulary.</p>
+<table>
+ <thead>
+  <tr>
+   <th><strong>Training mix</strong></th>
+   <th><strong>Search relevance OneDCG@10</strong></th>
+   <th><strong>Search purchases Recall@10</strong></th>
+   <th><strong>Recommendation Recall@50</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <th>Baseline</th>
+   <td><strong>28.8</strong></td>
+   <td><strong>33.4</strong></td>
+   <td><strong>21.0</strong></td>
+  </tr>
+  <tr>
+   <th>No search data</th>
+   <td>—</td>
+   <td>—</td>
+   <td>20.9</td>
+  </tr>
+  <tr>
+   <th>No recommendation data</th>
+   <td>28.5</td>
+   <td>32.6</td>
+   <td>—</td>
+  </tr>
+ </tbody>
+</table>
+<p>These results show that <strong>search and recommendation improve each other through shared training</strong>.</p>
+<h3>Lesson 2: Discovery needs explicit training</h3>
+<p>Our existing rule-based candidate generators already handle retargeting products in the buyer’s interaction history. The harder recommendation problem is finding useful products a buyer has <em>never</em> interacted with. Histories contain many repeat visits, so a model trained on them can overemphasize products the buyer already knows.</p>
+<p>To teach discovery explicitly, we <strong>upsample training streams built around first purchases</strong>: a buyer’s first purchase of a product, their first purchase from a merchant, or their first purchase in a category. This gives discovery events more weight during fine-tuning. We also compress histories by dropping old clicks and other stale interactions while retaining purchases, leaving more room for recent behavior in the context.</p>
+<h3>Lesson 3: Reinforcement learning improves retrieval quality</h3>
+<p>Supervised fine-tuning teaches the model to reproduce historical examples, but <strong>predicting the next token accurately doesn’t fully capture retrieval quality</strong>. Multiple products can satisfy the same intent, even when the training example contains only one observed purchase or click.</p>
+<p>For search, we use an <strong>LLM relevance judge to provide the reward signal</strong>. The model generates candidates, the judge evaluates their relevance, and reinforcement learning uses that feedback to refine the model’s choices. This brings training closer to what we care about: the quality of the products we retrieve for the buyer. Applying reinforcement learning for search delivered a <strong>+1.5 lift in OneDCG@10</strong>.</p>
+<h3>Lesson 4: Specialized experts can strengthen a shared model</h3>
+<p>Joint training gives us a shared understanding of products and buyers. Task-specific fine-tuning and post-training build on that foundation to develop specialized search and recommendation experts. Our goal is <strong>one shared discovery model that retains the quality improvements achieved by optimizing each task separately</strong>.</p>
+<p>We apply <strong>multi-teacher distillation</strong> to transfer both experts’ capabilities into a shared student.</p>
+<h2>Serving generative discovery at production speed</h2>
+<p>A live search or recommendation request leaves little time for candidate generation. We optimize the serving path for both quality and latency, starting with the model and then reducing the work needed to generate valid product codes.</p>
+<h3>Choosing a base model for the serving budget</h3>
+<p>We serve our model as a candidate generator, sharing the live request’s latency budget with downstream ranking. For that role, we chose <strong>Liquid AI’s LFM2-2.6B</strong> because it offered the best balance of quality and latency while leaving enough time for the remaining stages.</p>
+<table>
+ <thead>
+  <tr>
+   <th><strong>Model</strong></th>
+   <th><strong>Search relevance</strong><br><strong>OneDCG@10</strong></th>
+   <th><strong>Search purchases</strong><br><strong>Recall@10</strong></th>
+   <th><strong>Recommendation</strong><br><strong>Recall@50</strong></th>
+   <th><strong>p95 latency</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <th><strong>LFM2-2.6B — selected</strong></th>
+   <td>24.9</td>
+   <td>32.3</td>
+   <td>25.3</td>
+   <td><strong>25.5 ms</strong></td>
+  </tr>
+  <tr>
+   <th>Qwen3-1.7B</th>
+   <td>24.9</td>
+   <td>32.5</td>
+   <td>26.0</td>
+   <td>46.1 ms</td>
+  </tr>
+  <tr>
+   <th>Qwen3-14B</th>
+   <td>25.3</td>
+   <td>35.0</td>
+   <td>26.7</td>
+   <td>108.4 ms</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Making constrained decoding fast</h3>
+<p>The model also needs to generate codes that resolve to eligible products. Only some token combinations correspond to products in the catalog, so we constrain generation with an index of valid semantic-ID paths.</p>
+<p>Checking those paths can become expensive. We build on <a href="https://arxiv.org/abs/2602.22647">STATIC</a>, which represents the catalog’s prefix tree, or trie, as a sparse index on the GPU. This lets the engine check valid continuations through vectorized operations. A CUDA/C++ plugin inside TurboMind enforces these decoding constraints. In our setting, <strong>constraint overhead fell from over 50 ms to about 1 ms per request</strong>.</p>
+<h3>Predicting a semantic ID sequence in one pass</h3>
+<p>Our output has a useful structure: we need many candidate products, but each product is represented by just three codewords. Autoregressive (AR) generation predicts those codewords one at a time.</p>
+<p><strong>Multi-token prediction (MTP)</strong> predicts distributions for all three positions in a single model pass, then combines them into valid semantic IDs. This reduces the sequential model work needed to generate candidates.</p>
+<h2>Where we go next</h2>
+<p>Today, product discovery runs through a <strong>multi-stage funnel</strong>. Retrieval selects candidates from a large catalog, and successive ranking stages narrow and order them for the buyer. Our shared generative discovery model currently serves as a candidate generator within that stack.</p>
+<p>Looking ahead, our goal is to incorporate more of that discovery stack into <strong>one discovery model</strong>. The model would reason about a buyer’s situation, infer shopping intent, generate product candidates through semantic IDs, and rank them.</p>
+<p>We’re<strong> making three bets</strong> that build on this shared context.</p>
+<p>The first is <strong>reasoning about intent</strong>. For someone furnishing a small apartment, buying a table changes what might be useful next. We want the model to connect those clues across the journey and carry that understanding through candidate generation and ranking.</p>
+<p>The second is <strong>richer multimodal representations</strong>, with a focus on visual information. Connecting these visual signals with text and the products a buyer has explored would help the model understand their preferences and identify other products that match.</p>
+<p>The third is <strong>online continuous training</strong>. We want fresh clicks, purchases, and other outcomes to feed ongoing updates to the shared model, so it can adapt as buyer preferences and the catalog change.</p>
