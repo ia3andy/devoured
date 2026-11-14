@@ -1,0 +1,84 @@
+<h1>What an Independent Threat Model Found in Linkerd, and What You Should Do Next</h1>
+<p>Earlier this year, ControlPlane, a cloud native security consultancy, decided to build a threat model of open source Linkerd on their own volition. They tried to anticipate every way an attacker or a bad configuration could undermine it, and shared the results with our team as creators of Linkerd, before publishing this for anyone to read. In this blog, I will summarize the findings and share actions you can take right now. The full report can be found here → Linkerd Threat Model and End-User Hardening Guide</p>
+<h2>Overview</h2>
+<p>The ControlPlane review covers the parts of Linkerd that most users run i.e. the control plane, the data plane proxies and how Linkerd connects traffic between clusters. ControlPlane typically works with regulated organizations, especially financial institutions, and the guide reflects that. Every threat is mapped to MITRE ATT&amp;CK and NIST 800-53, the frameworks security and audit teams use.</p>
+<p>It should be noted that the authors clearly state their evaluation did not include penetration testing or code audits. It focuses on specific deployment related risks and mitigation.</p>
+<h2>What ControlPlane discovered</h2>
+<p>The guide lists 30 threats (28 categorized as medium/high), and 33 recommendations to address them.</p>
+<p>Of these, only one finding is a software bug, CVE-2025-43915. This bug is a metrics issue the maintainers addressed in edge-25.2.1 in February 2025 by turning off the affected metric labels by default. The guide still details for anyone running the older version with steps to mitigate it. All other threats can be boiled down to how Linkerd is set up and how the Kubernetes cluster around it is configured. In other words, nearly all of these can be fixed by a user without waiting on a release.</p>
+<p>The threats can be broadly classified into 5 groups below.</p>
+<ol>
+ <li><strong>Linkerd’s own settings.</strong> These are install options, mostly Helm values, that are open by default so a first install doesn’t break anything.</li>
+ <li><strong>How Linkerd is operated over time.</strong> These come from processes rather than settings, like rotating certificates before they expire or cleaning up after unlinking a cluster.</li>
+ <li><strong>The Kubernetes cluster underneath.</strong> Linkerd depends on Kubernetes permissions, secrets, and pod settings, so weaknesses there carry over into the mesh.</li>
+ <li><strong>The tools around Linkerd.</strong> Other components, such as your ingress controller, can undermine the mesh if they’re configured in a way Linkerd doesn’t expect.</li>
+ <li><strong>Tradeoffs built into how a service mesh works.</strong> A few findings describe limits that no setting removes, though you can reduce their impact.</li>
+</ol>
+<h2>Why Linkerd’s defaults work the way they do</h2>
+<p>Some of these findings are about defaults, so it’s worth explaining where they come from. Linkerd has always aimed to work the moment you install it, without breaking the applications already running in your cluster. For teams that add Linkerd one namespace at a time, a default that rejects every unmeshed connection would break traffic on the first day. Similarly, the proxy injector defaults to letting workloads start when it’s unavailable, so a control plane problem doesn’t stop every deployment in the cluster.</p>
+<p>These defaults ensure a Linkerd deployment is quick and immediately operational. However, once deployed, you should consider tightening Linkerd’s security controls, as reinforced by ControlPlane’s guide.</p>
+<p>Let us go through the findings and recommendations at a high-level. I strongly recommend going through the full report for detailed information.</p>
+<h3>1. Linkerd’s default settings</h3>
+<p><strong>The risk.</strong> Easy-install defaults leave services open, and give some components too much access.</p>
+<ul>
+ <li>The Prometheus bundled with the optional <code>linkerd-viz</code> dashboard has cluster permissions that could become compromised to run commands in other pods.</li>
+ <li>Linkerd accepts connections from workloads outside the mesh to any service that doesn’t have a policy of its own. If the proxy injector (the component that adds Linkerd’s proxy to new workloads) is unavailable, Kubernetes starts those workloads without the proxy, so they skip the mesh’s encryption and access rules entirely.</li>
+ <li>In multicluster setups, the gateway accepts traffic from any remote identity by default, and the credential each cluster uses to watch the other can see every service and endpoint in the remote cluster.</li>
+</ul>
+<p><strong>What to do.</strong></p>
+<ul>
+ <li>In production, use your own Prometheus dashboards. For multicluster, double check the policies to make sure they only allow traffic from identities you expect. Make sure the link from credentials to namespaces are as limited as needed.</li>
+ <li>Set the injector to fail closed (<code>webhookFailurePolicy: Fail</code>) so workloads can’t start without the proxy, and run the control plane in high availability mode so that setting doesn’t block deployments.</li>
+ <li>Change the cluster-wide default inbound policy to <code>deny</code>, so services only accept traffic that a policy explicitly allows. While you’re still writing policies for each service, the guide suggests <code>cluster-authenticated</code> or <code>all-authenticated</code> as a temporary step, since both reject clients without a valid mesh identity.</li>
+</ul>
+<h3>2. How Linkerd is operated over time</h3>
+<p><strong>The risk.</strong> Expired, stolen, or out-of-sync certificates can take down the mesh or let attackers impersonate services.</p>
+<ul>
+ <li>Linkerd’s identity system rests on a root certificate (the trust anchor) and a signing certificate (the identity issuer). If the issuer expires, meshed traffic fails gradually over the next day. If the trust anchor expires, it stops all at once, and anyone who steals the trust anchor’s private key can impersonate any service in the mesh.</li>
+ <li>Multicluster adds its own process risks. If trust anchors are rotated in one cluster but not the others, cross-cluster traffic breaks. Unlinking a cluster can leave old credentials and mirrored services behind, and policies can drift apart between clusters until the weakest one sets the bar.</li>
+</ul>
+<p><strong>What to do.</strong></p>
+<ul>
+ <li>Create the trust anchor outside the cluster and keep its private key in a key management service, a hardware security module, or a secrets manager such as OpenBao or HashiCorp Vault. Let cert-manager rotate the issuer automatically, set alerts well before either certificate expires, and document your trust anchor rotation procedure and test it regularly.</li>
+ <li>Rotate trust anchors in all linked clusters together, clean up fully when you unlink a cluster, and manage policies through GitOps so every cluster gets the same reviewed changes.</li>
+</ul>
+<h3>3. The Kubernetes cluster underneath</h3>
+<p><strong>The risk.</strong> Weak permissions or overprivileged pods can give attackers a mesh identity or a way around the proxy.</p>
+<ul>
+ <li>Linkerd gives each workload an identity based on its Kubernetes service account. Anyone who can steal a service account token, or who has permission to create workloads in a namespace, can get a valid identity in the mesh.</li>
+ <li>A workload with too many privileges can rewrite its own network rules and bypass the proxy, and anyone who can edit Linkerd’s policy resources can loosen access rules for everyone.</li>
+</ul>
+<p><strong>What to do.</strong></p>
+<ul>
+ <li>Limit who can read secrets, create workloads, and edit Linkerd policy resources. Perform periodic audits to monitor permissions of users who can create service account tokens and to remove inactive users.</li>
+ <li>Stop workloads that don’t need the Kubernetes API from mounting service account tokens. Encrypting secrets at rest and alerting on unusual access to Linkerd’s namespace add a further layer. Enforce Kubernetes Pod Security Standards so application containers can’t change network settings, and enable the Linkerd CNI plugin so Linkerd itself doesn’t need those privileges either.</li>
+</ul>
+<h3>4. The tools around Linkerd</h3>
+<p><strong>The risk.</strong> A misconfigured ingress controller can let outsiders reach services they shouldn’t.</p>
+<ul>
+ <li>When Linkerd’s proxy runs in ingress mode, it decides where to send a request partly from a header called <code>l5d-dst-override</code>. If your ingress controller passes that header through from the outside world, an attacker can set it themselves and send requests to services they were never meant to reach.</li>
+</ul>
+<p><strong>What to do.</strong></p>
+<ul>
+ <li>Use ingress mode only if your ingress controller needs it. If you do use it, configure the controller to remove or overwrite <code>l5d-dst-override</code> on every incoming request, and add a policy that limits which services the ingress controller can reach.</li>
+</ul>
+<h3>5. Tradeoffs built into how a service mesh works</h3>
+<p><strong>The risk.</strong> Some limits can only be reduced, not removed.</p>
+<ul>
+ <li>In gateway mode, the receiving service sees the gateway’s identity instead of the original caller’s, which makes precise access rules harder to write.</li>
+ <li>In flat network mode, workloads keep their own identities, but a breach in one cluster can reach further into another.</li>
+ <li>On a single pod, traffic between the application and its proxy isn’t encrypted yet, so an attacker who already controls that pod can read it.</li>
+</ul>
+<p><strong>What to do.</strong></p>
+<ul>
+ <li>With gateway mode, expose only the services that need cross-cluster access, and consider separate gateways for different trust levels.</li>
+ <li>The guide also suggests flat network mode if keeping the original caller’s identity matters, paired with network policies that work across clusters.</li>
+ <li>To limit what an attacker can do inside a compromised pod, drop the Linux capabilities application containers don’t need and enforce Pod Security Standards. For your most sensitive services, add access checks in the application itself, so the mesh isn’t your only line of defense.</li>
+</ul>
+<h2>What happens next</h2>
+<p>Our team is working through the report now. Any changes will be discussed in the open on GitHub, where you can follow along and weigh in.</p>
+<p>In the meantime, read the report and take action. The full report has the complete recommendations, architecture diagrams, and the framework mappings your security team will want to see.</p>
+<p>If you’ve hardened Linkerd in production and have opinions about which defaults should change, or where the docs left you guessing, please share it on Linkerd Slack.</p>
+<h2>Thank you</h2>
+<p>Thanks to Tom Cope, Gabriela Georgieva, and Samuel Holmes at ControlPlane for taking this on and sharing it with the project first. Independent work like this makes Linkerd better for everyone who runs it.</p>
+<p>Questions about the findings are welcome in the Linkerd Slack.</p>

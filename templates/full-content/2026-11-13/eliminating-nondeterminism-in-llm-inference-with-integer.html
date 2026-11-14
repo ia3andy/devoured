@@ -1,0 +1,218 @@
+<p>A while back, Thinking Machines published Defeating Nondeterminism in LLM Inference, which explained why greedy decoding isn’t deterministic in production. In theory, at temperature 0 a model always picks its single most likely next token, so the same prompt gives the same answer every time. In practice, when they sent one prompt 1,000 times, they got 80 different answers.</p>
+<p>The problem is that <strong>floating-point addition is not associative</strong>. $(a + b) + c$ and $a + (b + c)$ can round differently. A GPU sums thousands of numbers for every token, and the order it sums them in depends on things like how many other requests are in the batch. Change the order, change the rounding, and occasionally change which token wins.</p>
+<p>Their fix was to pin the order: rewrite the kernels so that a given GPU always adds numbers in the same order, no matter what else is in the batch. That works, but only on that GPU with those kernels. An H100 and an A100 use different matrix-multiply kernels, a CPU uses different instructions entirely, and each one rounds its own way. Run the same model on all three and you still get three different answers.</p>
+<p>I always wondered, <em>what if we just didn’t use floats?</em> Integer addition is exact, so the order can’t matter. If every operation in the model used integers, the output should be bit-identical everywhere: any batch size, any GPU, any CPU, any vendor.</p>
+<p>Eventually I found time to work on this during a SpaceXAI hackathon. The project, DetLLM, worked well enough to become a paper at two NeurIPS 2026 workshops. In this post I’ll walk through why LLM inference is nondeterministic, why integers fix it, and how to run every part of an LLM (matmuls, softmax, normalization, rotary embeddings) without a single floating-point operation.</p>
+<h2>Why are GPUs not deterministic?</h2>
+<h3>Every float addition rounds</h3>
+<p>A floating-point number stores a fixed number of significant digits and a separate exponent. When you add two numbers with very different exponents, the small one has to be shifted to line up with the big one, and the digits that fall off the end are gone. Every addition rounds. The consequence is that $(a + b) + c$ is not always equal to $a + (b + c)$:</p>
+<pre><code>&gt;&gt;&gt; (0.1 + 1e20) - 1e20
+0.0
+&gt;&gt;&gt; 0.1 + (1e20 - 1e20)
+0.1</code></pre>
+<p>An LLM’s forward pass is mostly sums: every matmul, softmax, and layer norm adds up long lists of numbers, rounding at each step. The order of those additions is up to the kernel. Below, the same eight fp32 values are summed two ways: left to right, and as two halves combined (what a “split-K” matmul kernel does).</p>
+<h3>Why kernels don’t always add in the same order</h3>
+<p>The natural guess is that GPU threads finish in a random order, so the sum lands in a random order. That can happen with atomic adds, but it’s mostly not what goes on in an LLM forward pass. Run the same matmul on the same inputs a thousand times and you get the same bits a thousand times. Most inference kernels are run-to-run deterministic.</p>
+<p>What they aren’t is <strong>batch invariant</strong>. cuBLAS doesn’t have one matmul kernel; it has a catalog, and it picks one based on the problem’s shape. A small batch can’t keep every streaming multiprocessor busy, so the library splits the reduction into chunks and sums them separately. A big batch has enough rows to go around, so each row is reduced in one pass. Your row is the same either way. The order it gets added in is not.</p>
+<p>On a serving endpoint, batch size depends on how many other people are sending requests at that moment. So your output depends on traffic you can’t see or control. Batch size isn’t the only cause, either. Prefill processes your whole prompt in one big matmul while decode handles one token at a time, so the same tokens go through different kernels. And if the KV cache is split into chunks differently, attention gets summed in a different order.</p>
+<h3>Across devices, there is no shared order</h3>
+<p>On a single GPU, the problem is solved. Thinking Machines’ <strong>batch-invariant kernels</strong> fix every reduction’s order regardless of batch size or chunking, at about a 20% matmul slowdown, and all 1,000 of their completions came back identical.</p>
+<p>Across devices, there’s nothing to pin. An A100 and an H100 have different tensor cores, accumulation widths, and kernel catalogs, and a CPU doesn’t do fp16 math like a tensor core at all. PyTorch’s reproducibility notes promise nothing across platforms. Reproducible floating-point libraries try to close the gap, but only if every kernel on every platform is written to their standard.</p>
+<h2>What if we don’t use floats at all?</h2>
+<p>Integer addition is associative. It is also commutative. $(a + b) + c = a + (b + c)$ holds for every $a$, $b$, $c$ as long as you do not overflow, and overflow is something you can bound ahead of time. That means every reduction, in any order, on any correct hardware, yields the same bits. Here are the same eight values as before, scaled by 4 so they are integers, going through the same two devices.</p>
+<p>With integers, determinism comes from the arithmetic itself. You don’t need special kernels or a pinned order, and two vendors only have to agree that integer multiply-add is exact.</p>
+<p>But int8 inference already exists (SmoothQuant, LLM.int8, OmniQuant), and it isn’t deterministic across hardware. That’s because it’s <strong>simulated quantization</strong>: matmuls run in int8, but everything between them (softmax, RMSNorm, SwiGLU, rotary embeddings) drops back to float. Every one of those float steps is a place for reduction order to leak back in.</p>
+<p>Integer <em>storage</em> is not integer <em>arithmetic</em>. One float step anywhere breaks it, so the entire forward pass has to be integers, from input ids to logits.</p>
+<h2>DetLLM</h2>
+<p>DetLLM runs Qwen3-0.6B with exact integer arithmetic for every operation between the input ids and the int32 logits: every matmul, normalization, activation, softmax, and rotary embedding. The integer operators come from I-LLM, part of a line of work (I-BERT, I-ViT, I-LLM) on integer-only transformers for edge hardware that cared about efficiency, not determinism. At 8 bits it needs no fine-tuning, just a calibration pass and two closed-form smoothing tricks. The pieces that matter:</p>
+<p><strong>Dyadic scales.</strong> Every tensor carries a scale $m / 2^k$, with an integer mantissa $m$ and shift $k$, so rescaling is an integer multiply and a shift with one fixed rounding rule. Exp, softmax, RMSNorm, and SwiGLU are shift-based integer algorithms on these values, and RoPE uses precomputed int16 sine and cosine tables.</p>
+<p><strong>Batch invariance by construction.</strong> Each token’s activations are quantized from that token’s own values, so its bits can’t depend on the rest of the batch, with no special kernels needed. The exception is the KV cache, where a per-token scale would land inside the softmax or the probs·V sum, so K and V use fixed scales calibrated offline. A cached value is quantized once and never again, so prefill and decode see the same bits.</p>
+<p><strong>One hardware-specific function.</strong> Only the int8 × int8 → int32 matmul dispatches on hardware (<code>torch._int_mm</code> on CUDA, a plain int32 matmul on CPU). Since integer accumulation is exact, matching across devices comes down to whether that matmul returns exact results, which the tests check. A <code>TorchDispatchMode</code> guard turns any float tensor in the forward pass into an error, and argmax breaks ties toward the lowest token id instead of trusting the backend.</p>
+<h2>One prompt, nine configurations, one hash</h2>
+<p>The demo takes the first 64 tokens of Sonnet 18, greedy-generates 512 more, and chain-hashes the logits at every step. Each configuration targets a different source of nondeterminism: batch 1; batch 8, with seven random prompts sharing the batch; a prefill split in half, with the second half fed one token at a time; and a pure-CPU backend with no cuBLAS, Triton, or CUDA graphs. They run on three machines: an A100 server, an H100 server, and a MacBook.</p>
+<table>
+ <thead>
+  <tr>
+   <th>device</th>
+   <th>configuration</th>
+   <th>int8 hash</th>
+   <th>fp16 hash</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>NVIDIA A100</td>
+   <td>batch 1</td>
+   <td><code>64430dd985f8</code></td>
+   <td><code>af3ffdc1592d</code></td>
+  </tr>
+  <tr>
+   <td>NVIDIA A100</td>
+   <td>batch 8, 7 random co-prompts</td>
+   <td><code>64430dd985f8</code></td>
+   <td><code>12cf67ceecbb</code></td>
+  </tr>
+  <tr>
+   <td>NVIDIA A100</td>
+   <td>split prefill + token-by-token</td>
+   <td><code>64430dd985f8</code></td>
+   <td><code>229b14ee3995</code></td>
+  </tr>
+  <tr>
+   <td>NVIDIA H100</td>
+   <td>batch 1</td>
+   <td><code>64430dd985f8</code></td>
+   <td><code>88b7a5544ac5</code></td>
+  </tr>
+  <tr>
+   <td>NVIDIA H100</td>
+   <td>batch 8, 7 random co-prompts</td>
+   <td><code>64430dd985f8</code></td>
+   <td><code>b1a5a93c743d</code></td>
+  </tr>
+  <tr>
+   <td>NVIDIA H100</td>
+   <td>split prefill + token-by-token</td>
+   <td><code>64430dd985f8</code></td>
+   <td><code>246e001ebbfd</code></td>
+  </tr>
+  <tr>
+   <td>AMD EPYC 7J13 (CPU)</td>
+   <td>batch 1</td>
+   <td><code>64430dd985f8</code></td>
+   <td><code>02880fd41404</code></td>
+  </tr>
+  <tr>
+   <td>Intel Xeon 8480+ (CPU)</td>
+   <td>batch 1</td>
+   <td><code>64430dd985f8</code></td>
+   <td><code>22af55b4f422</code></td>
+  </tr>
+  <tr>
+   <td>Apple M1 Pro (CPU)</td>
+   <td>batch 1</td>
+   <td><code>64430dd985f8</code></td>
+   <td><code>54ed3db507f9</code></td>
+  </tr>
+  <tr>
+   <td></td>
+   <td></td>
+   <td><strong>1 unique hash</strong></td>
+   <td><strong>9 unique hashes</strong></td>
+  </tr>
+ </tbody>
+</table>
+<p>Nine integer runs, one hash. Nine fp16 runs, nine hashes, every pair disagreeing from the first token. Four vendors and three instruction sets produce bit-identical logits, with nothing tuned per platform. The arithmetic has no freedom left to disagree.</p>
+<h3>Divergent logits, matching tokens</h3>
+<p>There’s a twist in the fp16 column. The demo also hashes the generated <em>token ids</em>, and eight of the nine fp16 runs produce the same 512 tokens despite disagreeing on the logits at every step. Greedy decoding is an argmax, and an argmax ignores any perturbation smaller than the gap between the top two candidates. On this prompt, batch composition shifts the step-0 logits by at most 0.094, while the top-two gap is 2.66, a 28× cushion.</p>
+<p>That cushion is unusually generous. Most steps are much closer: 45 of the 512 have a top-two gap under 0.5. At step 457, <em>" introduces"</em> leads <em>" is"</em> by just 0.03 on the A100. On the M1 Pro the two land in an exact tie, the argmax picks the lower token id, <em>" is"</em>, and the text forks:</p>
+<blockquote>
+ <p><strong>A100:</strong> The first line <em>introduces</em> the question…</p>
+ <p><strong>M1 Pro:</strong> The first line <em>is</em> “Shall I compare thee to a summer’s day?"…</p>
+</blockquote>
+<p>Every generated token is another chance for a near tie, so the longer the generation, the more likely it forks. Float nondeterminism is usually latent, not absent.</p>
+<h2>Perplexity and speed</h2>
+<p>The obvious worry is that removing every float hurts the model. It barely does: WikiText2 perplexity is 20.72 against 20.95 for fp16, and C4 is 0.4% worse.</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>WikiText2 (A100)</th>
+   <th>WikiText2 (H100)</th>
+   <th>C4</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>fp16</td>
+   <td>20.9549</td>
+   <td>20.9552</td>
+   <td>31.5696</td>
+  </tr>
+  <tr>
+   <td>int8 (DetLLM)</td>
+   <td><strong>20.7170</strong></td>
+   <td><strong>20.7170</strong></td>
+   <td>31.6966</td>
+  </tr>
+ </tbody>
+</table>
+<p>Speed is a different story. The fp16 baseline runs on heavily optimized kernels like cuBLAS and FlashAttention. Integer inference has almost nothing: PyTorch ships an int8 matmul and that’s it, so softmax, RMSNorm, SwiGLU, and attention had to be hand-built out of small integer ops. After fusing the integer ops, adding CUDA graphs, and writing a fused Triton attention kernel, decode went from 0.8 tokens per second to 106.</p>
+<table>
+ <thead>
+  <tr>
+   <th>decode tok/s</th>
+   <th>fp16 eager</th>
+   <th>int8 eager</th>
+   <th>int8 compiled</th>
+   <th>int8 final</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>A100, batch 1</td>
+   <td>29.3</td>
+   <td>0.8</td>
+   <td>5.6</td>
+   <td><strong>106.3</strong></td>
+  </tr>
+  <tr>
+   <td>A100, batch 8</td>
+   <td>233.8</td>
+   <td>5.5</td>
+   <td>42.9</td>
+   <td><strong>783.3</strong></td>
+  </tr>
+  <tr>
+   <td>H100, batch 1</td>
+   <td>19.5</td>
+   <td>2.8</td>
+   <td>5.8</td>
+   <td><strong>73.8</strong></td>
+  </tr>
+  <tr>
+   <td>H100, batch 8</td>
+   <td>157.9</td>
+   <td>22.3</td>
+   <td>43.4</td>
+   <td><strong>566.7</strong></td>
+  </tr>
+ </tbody>
+</table>
+<h2>Limitations and what’s next</h2>
+<p>It’s a proof of concept, but I was surprised how well it held up: perplexity is on par with fp16, and with enough kernel work, decode isn’t stuck at eager speeds. Larger models, other architectures, integer sampling, prefill speed, and phone or NPU hardware are all open, and there are probably plenty of tricks left on the kernel side.</p>
+<p>The guarantee is tied to one prepared artifact, since the float-to-int conversion isn’t itself reproducible. Code’s on GitHub if you want to try it. Run the int8 configuration anywhere and you should get <code>64430dd985f8</code>. If you don’t, let me know.</p>
+<h2>Citation</h2>
+<p>Please cite this work as:</p>
+<pre><code>Barry, Nathan. "Eliminating Nondeterminism in LLM Inference with Integer-Only Arithmetic".
+nathan.rs (Nov 2026). https://nathan.rs/posts/detllm.</code></pre>
+<pre><code>@article\{barry2026detllm,
+  title   = "Eliminating Nondeterminism in LLM Inference with Integer-Only Arithmetic",
+  author  = "Barry, Nathan",
+  journal = "nathan.rs",
+  year    = "2026",
+  month   = "Nov",
+  url     = "https://nathan.rs/posts/detllm"
+}</code></pre>
+<ol>
+ <li>
+  <p>Horace He et al., Defeating Nondeterminism in LLM Inference, Thinking Machines Lab, 2025. The first half of this post leans heavily on their diagnosis, which is the clearest explanation of the problem I have read.</p></li>
+ <li>
+  <p>The workshop paper is <em>Eliminating Nondeterminism in LLM Inference via Integer-Only Arithmetic</em>, at the ML for Systems and On-Device Intelligence workshops at NeurIPS 2026. The post follows the paper’s structure but spends more time on the “why” and less on the engineering appendices.</p></li>
+ <li>
+  <p>The magnitudes are contrived so the rounding is visible in eight adds instead of eight million. $2^\{24}$ is where fp32 runs out of integer precision, so $2^\{24} + 1$ rounds back to $2^\{24}$. Every partial sum shown is a genuine <code>Math.fround</code> result; nothing is faked.</p></li>
+ <li>
+  <p>Thinking Machines work through the attention case in detail: a KV cache of 80 tokens plus 48 new ones gets reduced in five blocks of 32, while the same 128 tokens processed at once get reduced in four, which changes the order.</p></li>
+ <li>
+  <p>The same post shows why this matters beyond reproducibility: with a bitwise-identical sampler and trainer, RL becomes truly on-policy, and the KL divergence between the two drops to exactly zero.</p></li>
+ <li>
+  <p>ReproBLAS makes summation order-independent under IEEE-754 assumptions, and RepOps (from the Verde paper) fixes the order of every floating-point operation across supported hardware. Both keep the float model, which integer execution does not; in exchange, every kernel on every platform has to implement the reproducible operators.</p></li>
+ <li>
+  <p>Batch invariance, prefill/decode invariance, and cross-device bit-exactness are not claims anywhere in that literature. To my knowledge DetLLM is the first pipeline built and verified end-to-end for all of them at once.</p></li>
+ <li>
+  <p>Error attribution found that int8 quantization of $QK^\top$ was the dominant error source: after QK-Norm and RoPE, the per-channel ranges of the keys span about 85×, so the median channel was getting 1.5 of its 127 int8 levels. Rescaling keys per channel and applying the inverse to the queries fixes this and cancels exactly in the dot product, taking perplexity from 44.9 to 25.2 on the ablation subset. I-LLM’s 7-bit attention probabilities cost another 2 points of perplexity; DetLLM uses 15-bit probabilities computed exactly as two int8 GEMMs.</p></li>
+ <li>
+  <p>Behind the table is a zero-tolerance test suite: ten repeated runs, a prompt alone versus padded into batches of 2, 8, and 32 with random co-prompts, prefill versus token-by-token compared at every position, CUDA versus CPU reference, and a 4k-token context through all of the above. Every check compares token ids and the full int32 logits for exact equality. All 79 tests pass on both GPU machines.</p></li>
+ <li>
+  <p>Not an apples-to-apples comparison. The fp16 baseline has no compile or CUDA graphs, and int8 has no FlashAttention-style kernel for prefill, which still runs at about 0.13× fp16.</p></li>
+</ol>

@@ -1,0 +1,52 @@
+<h2>How Agent Anomaly Detection scores on benchmarks we didn't write</h2>
+<p>AI agents now read email, book travel and move money for the people who use them. Every tool call also pulls in text that someone else wrote, and whoever controls that text can try to steer the agent. OWASP calls this agent goal hijack and ranks it first in its <a href="https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/">Top 10 for Agentic Applications (2026)</a>.</p>
+<p>In September we <a href="https://developers.googleblog.com/agent-anomaly-detection-now-in-private-preview-on-the-gemini-enterprise-agent-platform/">announced</a> Agent Anomaly Detection in Private Preview on Gemini Enterprise Agent Platform. It reads your agents' traces and logs asynchronously, without adding latency, and flags sessions where an agent acts outside its intended boundaries. We tested this feature against benchmarks for this top risk of agent goal hijack.</p>
+<p>Security tools tend to look good on tests their own team wrote, so we ran five non-Google-written, public agent-security benchmarks through Agent Anomaly Detection without changing anything. In four of them, the harmful instruction hides in data that a tool returns. In the fifth, the user asks for harm directly.</p>
+<p>The model itself didn't follow about half of the harmful instructions it read. It refused three in four direct requests for harm, and ignored or failed at about 30% of the instructions hidden in tool output. Of the ones that were executed, Agent Anomaly Detection flagged 87% for post-execution review. It raised false alarms on 2% to 16% of benign sessions, depending on the tools the agent uses. Poisoned memory is the clear gap: when instructions planted in the agent’s long-term memory made it act, Agent Anomaly Detection caught 4 of 18.</p>
+<h3>How we ran the test</h3>
+<p>We ran each benchmark case through an agent built with the Agent Development Kit (ADK) using <code>gemini-2.5-flash</code>, on the benchmark's simulated apps. The agent sent its traces and logs to Agent Anomaly Detection, as a customer's agent would. Then the benchmark's own Python check read the final state of the apps, such as whether money left the account, and labeled the session. Deterministic code decides the label, not a model, so an injected instruction can't mislead the grader, and Agent Anomaly Detection cannot cheat the benchmark. Each agent first ran at least 300 benign sessions, because Agent Anomaly Detection learns how each agent usually behaves.</p>
+<p>We also recorded whether a tool returned the harmful instruction to the agent. In many cases, the agent never opens the email or file that holds it. So each harmful session ends one of three ways:</p>
+<ul>
+ <li><strong>Never read</strong>: no tool returned the instruction, so the agent never saw it.</li>
+ <li><strong>Resisted</strong>: the agent read the instruction but didn't follow it. This includes an agent that tried and failed.</li>
+ <li><strong>Carried out</strong>: the agent read the instruction and followed it. The benchmark's own check decides this.</li>
+</ul>
+<p>In AgentHarm, the user sends the request, so the agent always reads it.</p>
+<p>The five benchmarks are <a href="https://arxiv.org/abs/2406.13352">AgentDojo</a> (NeurIPS 2024), <a href="https://arxiv.org/abs/2403.02691">InjecAgent</a> (ACL 2024 Findings), <a href="https://arxiv.org/abs/2410.02644">Agent Security Bench</a> (ASB, ICLR 2025), <a href="https://arxiv.org/abs/2602.03117">AgentDyn</a> (2026) and <a href="https://arxiv.org/abs/2410.09024">AgentHarm</a> (ICLR 2025). ASB plants the instruction in the agent's long-term memory. In all, Agent Anomaly Detection scored 1,774 sessions.</p>
+<h3>What we found</h3>
+<p>Agent Anomaly Detection flagged 87% of the harmful instructions that the agent carried out, and raised a few false alarms on ordinary office work. It's strongest on goal hijack and tool misuse, and weakest on poisoned memory.</p>
+<h3>Results by OWASP category</h3>
+<p>Each finding carries a threat category, and four of Agent Anomaly Detection’s five categories align with the OWASP Top 10 for Agentic Applications. We graded each OWASP category on what this study showed, not on what Agent Anomaly Detection is designed to catch.</p>
+<p>Public benchmarks concentrate on goal hijack and tool misuse, so our evidence is strongest there. We did not find public benchmarks with labeled agent traces for cascading failures or for identity and privilege abuse. Shared benchmarks for those categories would help the whole field.</p>
+<h3>Agent Anomaly Detection flags most of what gets past the model</h3>
+<p>By benchmark, Agent Anomaly Detection flagged 85% of the carried-out harmful instructions on AgentDojo, 87% on InjecAgent, 99% on AgentDyn and 81% on AgentHarm. Over all harmful sessions, including the ones that the agent never read or resisted, it flagged 45% to 62%. In the 141 sessions where the agent never read the instruction, nothing happened, and it flagged just 1.</p>
+<p><strong>Results held across the apps</strong>. In 8 of the 11 apps, Agent Anomaly Detection flagged at least 95% of the carried-out harmful instructions. The lowest rate was in AgentDojo's Slack app, at 63%. Many of those instructions ask for one small action, such as a page visit, which looks like normal browsing.</p>
+<h3>A refused request still leaves a record</h3>
+<p>Agent Anomaly Detection also flags many requests that the agent refuses. In AgentHarm, the agent refused most requests and carried out 108 of 412, and Agent Anomaly Detection still flagged 55% of the refused sessions, because the request sits in the user's own message, which it reads. When the agent didn't follow an instruction hidden in tool output, it flagged only 11% to 25%, because the instruction sits deep inside a tool result.</p>
+<h3>False alarms depend on the agent's everyday tools</h3>
+<p>False alarms were rare on ordinary office work: on the three injection benchmarks, whose benign sessions are office tasks, Agent Anomaly Detection flagged 2% to 4% of benign sessions. On AgentHarm it flagged 16%. Those benign tasks are twins of the harmful ones, so they post to social media, run terminal commands and download files. High-impact tools in normal use look more like misuse.</p>
+<h3>Where we're still improving</h3>
+<p>Agent Anomaly Detection did less well in five areas. It flagged only 11% to 25% of the instructions that the agent resisted, because a resisted instruction changes little in how the agent behaves. It missed more small actions, like single page visits, because they look like normal work. And it raised more false alarms for agents whose everyday work uses high-impact tools. If your agent is one of them, expect more findings at first, and triage them by severity and threat category.</p>
+<p>The other two areas are new agents and poisoned memory. Some Agent Anomaly Detection methods need a few hundred sessions of history: on AgentDyn, it flagged 33% of carried-out harmful instructions when each agent had about 220 benign sessions, and 99% with 360. And it caught only 4 of the 18 sessions where poisoned memory made the agent act.</p>
+<p>Here's what we're working on:</p>
+<ul>
+ <li>Report attempts that the agent resisted, at a lower severity, so you can see when someone is probing your agent.</li>
+ <li>Catch small actions that reach an untrusted destination, such as a single visit to an unknown web page.</li>
+ <li>Tell normal use of high-impact tools apart from misuse.</li>
+ <li>Give new agents full coverage sooner.</li>
+ <li>Detect instructions planted in long-term memory more reliably.</li>
+</ul>
+<h3>What this means for your agents</h3>
+<p><strong>Protect your agents with defense in depth.</strong> Use controls that stop harmful actions before they run, and Agent Anomaly Detection to find what gets through.</p>
+<ul>
+ <li><strong>Send complete telemetry.</strong> Enable ADK tracing and logging, including prompt and response content.</li>
+ <li><strong>Screen untrusted content.</strong> Check prompts and tool results for prompt injection with a filter such as Model Armor.</li>
+ <li><strong>Block risky tool calls before they run.</strong> <a href="https://docs.cloud.google.com/gemini-enterprise-agent-platform/govern/policies/semantic-governance-overview">Semantic Governance Policy</a>, in Preview, checks each proposed tool call against the user's request and your rules, and denies the ones that don't fit. Agent Anomaly Detection then reports what gets past it.</li>
+ <li><strong>Require approval for high-impact actions.</strong> Ask a person to approve payments, outbound email, data sharing, or other actions that should have a human in the loop.</li>
+ <li><strong>Limit each agent's tools.</strong> Give each agent only the tools and permissions its task needs.</li>
+ <li><strong>Review what gets through.</strong> Agent Anomaly Detection doesn’t block actions. It reports anomalous sessions, and its findings also appear in Security Command Center; route the Critical and High ones to your incident team.</li>
+</ul>
+<h3>Limits of this study</h3>
+<p>We used one agent model and simulated apps, and the benchmarks' benign tasks are likely simpler than your production traffic, so your false-alarm rate can differ. Agent Anomaly Detection returned no result for about 6% of the sessions we sent; counting those as misses lowers the overall rates by 1 to 2 points.</p>
+<h3>Try Agent Anomaly Detection</h3>
+<p>Agent Anomaly Detection is in Private Preview. To request access, read the <a href="https://docs.cloud.google.com/gemini-enterprise-agent-platform/agent-anomalies-overview">Agent Anomaly Detection overview</a>.</p>

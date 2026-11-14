@@ -1,0 +1,50 @@
+<h1>Don't just flag it, fix it: How to run CodeMender in your pull requests</h1>
+<p>As many developers use agentic tools to create more code faster than ever before, the code has gotten more complex and they’re taking longer to find and fix software flaws.</p>
+<p>Helping to address that pressure is a key concern at Google. We know that software development velocity is increasing, as much as 2x for some teams, and the average developer fix time for software flaws expanded from approximately 59 days a decade ago to more than 170 days in 2025, according to the Mandiant M-Trends 2026 Report.</p>
+<p>To help you secure more code, more quickly, we’ve built CodeMender, our autonomous code-security agent that can find and fix software flaws at machine speed.</p>
+<p>We also know that developer tools only succeed if they fit into existing routines. That’s why CodeMender, part of our AI Threat Defense platform, brings automated code fixes directly into the developer workflow. Today, we’re sharing this reference architecture that wires automated CodeMender remediation straight into Git pull requests via Google Cloud Run.</p>
+<h3>What the developer sees</h3>
+<p>Everything happens in the timeline. The scan posts one comment, a table of findings, each finding with an ID, and the two things you can type next.</p>
+<p>Figure 1: A pull request triggers the scan on Cloud Run. Findings, exploit traces, and proposed patches all come back to the same timeline.</p>
+<p>Reply <code>/verify 612424da</code> and the exploit attempt comes back in the thread, folded into a collapsible View Exploit Steps &amp; Response Trace block so it doesn't bury the conversation.</p>
+<p>Reply <code>/fix 612424da</code> and the patch arrives the same way, behind Preview Proposed Code Diff, with a draft pull request already open <code>/approve</code> there. Both commands take <code>all</code> in place of an ID.</p>
+<p>Figure 2: The initial scan comment provides a table of findings and the actionable slash commands, keeping the developer entirely within the pull request timeline.</p>
+<p>Nothing asks the developer to leave the pull request or learn a console.</p>
+<h3>Ship evidence, not just a severity</h3>
+<p>CodeMender <code>cm find</code> runs return a confidence score on the vulnerability finding during the code analysis. If the confidence score is below 100%, you can use <code>cm verify</code> to have CodeMender build and simulate an exploit in a sandbox to determine if the vulnerability is actually exploitable.</p>
+<p>The simulation results can change the severity. Because the verification sandbox is ephemeral, the pipeline automatically streams these artifacts to Google Cloud Storage to preserve an audit trail for compliance and security operations reviews.</p>
+<p>Figure 3: The /verify command returns a trace of the sandboxed exploit attempt, giving reviewers actionable evidence rather than abstract alerts.</p>
+<p>Engineer for failure modes in your verification pipeline. If your harness only searches for a successful exploit string, then any test failure — such as a crashed mock server or an execution timeout — can cause the pipeline to fail open and mistakenly label a real vulnerability as safe.</p>
+<p>Ensure your parser separates true negative results from test crashes. If an exploit fails to complete cleanly, flag the status as inconclusive rather than giving it a clean bill of health.</p>
+<h3>Propose the patch, preview the diff</h3>
+<p>When an exploit proves a finding is real, the next step isn't a ticket, it's a patch: <code>cm fix a1b2c3d4</code> instructs CodeMender to author one.</p>
+<p>Figure 4: The /fix command returns a unified code diff, giving reviewers meaningful context to evaluate the patch.</p>
+<p>If the diff looks good, applying it takes one step. The developer replies <code>/approve</code>. The agent commits the patch to the branch, pushes it, and sets a commit status <code>security/codemender-gate</code> to green. Branch protection is what turns that status into a merge block; without it, the gate is advisory.</p>
+<h3>No stored keys between GitHub and Cloud Run</h3>
+<p>None of this happens until GitHub and Google Cloud trust each other. This agent needs write access to your source code, precisely the credential you don't want sitting in a secret store waiting to leak. GitHub Actions can mint a short-lived OIDC token instead, and Google can be configured to accept it, so nothing long-lived exists to steal.</p>
+<p>Nearly all the security here rests on one line:</p>
+<pre><code>resource "google_iam_workload_identity_pool_provider" "github" \{
+  workload_identity_pool_provider_id = "github-provider"
+  oidc \{
+    issuer_uri = "https://token.actions.githubusercontent.com"
+  }
+  attribute_mapping = \{
+    "google.subject"       = "assertion.sub"
+    "attribute.repository_id" = "assertion.repository_id"
+  }
+  # Without this, any repository on GitHub can exchange a token against your pool
+  attribute_condition = "assertion.repository_id == '123456789'"
+}</code></pre>
+<p>Every GitHub Actions workflow shares that issuer URL, so validating the issuer alone buys you nothing. The condition is the part doing the work.</p>
+<p>Note what it matches on. <code>assertion.repository</code> would also work here, but it matches a name and names get renamed, or claimed by someone else once you release them. <code>repository_id</code> and <code>repository_owner_id</code> are immutable, which is why Google recommends mapping those instead.</p>
+<h3>Give the exploit somewhere safe to run</h3>
+<p>Verification runs attack code that nobody reviewed, written on demand, pointed at a mock target, doing what the vulnerability class implies. As recent headlines have reminded everyone, the last thing you want is an autonomous agent deciding the fastest way to complete a task is to break out of its container and port-scan your internal network.</p>
+<p>Before you can trust the verdict, you have to answer two important questions: Where does that code execute, and what can it reach while it does? The answer is to run it as a Cloud Run job.</p>
+<p>Every Cloud Run instance is sandboxed, and jobs always run in the second-generation execution environment, a microVM with full Linux compatibility. The execution starts, does one thing, and exits.</p>
+<p>Figure 5: The exploit runs in an instance that holds nothing and lives for one finding. Only the verdict leaves.</p>
+<p>Then empty the room. Give the job a service account of its own and grant it nothing beyond the API that writes the exploit. It needs no registry access, because Cloud Run imports the container image when you deploy rather than pulling it at the instance start.</p>
+<p>Skip the Compute Engine default account, which may carry <code>roles/editor</code> depending on your organization policy. Take the network away too: Direct VPC egress into a subnet with no route out means code that can't call anywhere can't exfiltrate what it finds or fetch a second stage.</p>
+<p>Run one job per finding. The execution ends, the instance goes with it, and the verdict is the only thing that outlives either.</p>
+<p>Cloud Run sandboxes or agent sandboxes close the last gap. In the instance, process execution is isolated from the parent workload, its environment variables, its secrets, and the Google Cloud metadata server, so the credential the platform hands out by default is out of reach as well. It's built for agents running code they just wrote.</p>
+<h3>Get started today</h3>
+<p>You can build an autonomous GitOps security agent today. Start with the reference implementation at codemender-gitops.</p>

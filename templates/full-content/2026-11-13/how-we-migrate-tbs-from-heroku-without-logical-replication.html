@@ -1,0 +1,77 @@
+<h2>How we migrate TBs from Heroku without logical replication</h2>
+<p>Since we launched PlanetScale Postgres, companies have been moving to it from just about every Postgres provider out there, and Heroku Postgres is no exception. Our team has helped many customers leave Heroku, ranging from small databases on the order of hundreds of gigabytes to others with many terabytes of data.</p>
+<p>Migrations from Heroku present an extra challenge: its standard plans offer no logical replication. This leaves a lot of Heroku customers stuck. They want to move away from Heroku, but a typical offline database migration requires several hours of downtime, which their mission-critical applications cannot tolerate, and neither can we.</p>
+<p>So we took a different route. We've equipped our customers with an open source tool that not only quickly transfers your data but also provides a replication-based experience, so that any user can migrate from Heroku without extended downtime or the need to purchase a third-party product. That's how our Heroku Migrator was born.</p>
+<p>This post covers how it works, the problems that we encountered on large migrations, and how v2.0 of the migrator solves these: more reliable, production-tested and faster than ever before.</p>
+<h2>Why leaving Heroku is unique</h2>
+<p>Most online Postgres migrations rely on logical replication. You take a consistent snapshot, copy data, then stream changes from the source's WAL until the target catches up, and do a clean, seconds-scale cutover. Tools like pgcopydb are built based on this model.</p>
+<p>Unfortunately, Heroku's standard tiers don't give you WAL access or logical replication. Without them, a slot-based migration is off the table. Logical replication is available on Heroku Postgres Advanced since October 2026, but that doesn't help the databases already running on the standard tiers. To use it, you'd first have to move to the Advanced tier, which means yet another migration!</p>
+<p>For everyone on a standard plan, there's really only one good online migration option: trigger-based replication. Triggers on every table record changes and a distinct process replays those changes on the target. The problem is that it tends to be more fragile than WAL-based replication. We are set on solving this pain for our customers and have built and continue to iterate on tooling to make this process effortless.</p>
+<h2>Before you migrate: the discovery tool and Liftoff</h2>
+<p>Before you begin, you need to do your homework, and that starts with a discovery phase. We help customers move their data every day, and that experience led us to build tooling that spots problems early.</p>
+<p>The PlanetScale discovery tool (<code>ps-discovery</code>) is an open-source CLI you run against a source database. It has two components:</p>
+<ul>
+ <li>The database component connects with a dedicated read-only user and collects statistics about your setup. Version, configuration, extensions, schemas, tables, indexes and sizes. It doesn't read row data, so your security team can be at peace.</li>
+ <li>The cloud component takes a Heroku API key and lists your Heroku Postgres add-ons with their plan, size, replicas and connection pooling.</li>
+</ul>
+<p>After setting up a configuration file with your database info, run:</p>
+<pre><code>./ps-discovery --config config.yaml</code></pre>
+<p>The results go into a JSON output file, for example <code>planetscale_discovery_results_&lt;timestamp&gt;.json</code>.</p>
+<p>The next step is to plug this information into PlanetScale's Liftoff tool. You upload it and get a migration assessment back. The analysis runs entirely in your browser.</p>
+<p>Liftoff shows extension compatibility issues, schema defects and blockers, and a recommended migration path with steps and an estimated duration. For a Heroku source it recommends our internal tool, the Heroku Migrator. It also flags tables without a primary key or unique index, since trigger-based replication can't migrate these.</p>
+<p>In essence, discovery collects the facts and Liftoff turns them into action items:</p>
+<ul>
+ <li>Which extensions to enable on PlanetScale before you start</li>
+ <li>Which tables need a primary key first</li>
+ <li>What indexes can be removed before migration because they're unused or duplicates</li>
+ <li>How to size the cluster: match the CPU and RAM of your Heroku plan, and provision enough storage</li>
+ <li>Where to run the migrator: on a Heroku dyno, or on EC2 if the copy could run close to a day (Heroku restarts every dyno at least once every 24 hours)</li>
+</ul>
+<h2>The Heroku Migrator</h2>
+<p>The Heroku Migrator is a temporary app you deploy for the duration of a migration. Small and medium databases can run it on Heroku with the Deploy button. Larger ones (starting from 500 GB) should run it on a high-performance EC2 instance, because the last thing we want is for our migration tool to become a bottleneck. You can drive the migration from the web dashboard, or you can have your agent handle this for you if clicking buttons isn't your thing.</p>
+<p>The migrator copies the schema into PlanetScale based on the results of a <code>pg_dump --schema-only</code> against Heroku, skipping Heroku-specific and extension-owned schemas. You have to <strong>freeze schema changes during the migration.</strong> Making changes will break the migration.</p>
+<p>Under the hood, the migrator runs Bucardo, an open-source trigger-based replication tool. First, the migrator installs a <code>bucardo_delta</code> trigger on every source table. From that moment on, every insert, update and delete is recorded in per-table delta and track tables. Next, a one-time <code>COPY</code> loads the existing data into PlanetScale. This part can take hours on a large database. Once the copy finishes, a Bucardo worker process (Bucardo calls it a <code>KID</code>) reads the recorded deltas and applies them to PlanetScale. It first works through the backlog that built up during the copy, then continuously applies new changes, so the target stays up to date.</p>
+<p>We use triggers because they're the only change-capture mechanism available on a standard Heroku plan. With this technique, every replicated table needs a primary key or a unique index. Otherwise, Bucardo can't identify which row to update on the target.</p>
+<p>In addition, the tool incorporates a verification step. You can compare Heroku and PlanetScale side by side and check:</p>
+<ul>
+ <li>That every table exists on both sides with the same columns</li>
+ <li>That indexes and constraints match</li>
+ <li>That sequences are in place, so new IDs won't collide</li>
+ <li>That extensions are at the same versions</li>
+ <li>That row counts match on a sample of tables</li>
+ <li>That no replicated changes are still waiting to be applied</li>
+</ul>
+<h2>The migration path, step by step</h2>
+<ol>
+ <li><strong>Run the discovery tool and review the result in Liftoff.</strong></li>
+ <li><strong>Deploy the migrator.</strong> On a Heroku dyno (Performance-L for anything over 100 GB), or run the same container on an EC2 instance or VM instead.</li>
+ <li><strong>Start Migration.</strong> The migrator copies your schema to PlanetScale and sets up replication. This usually takes a minute or two, then it waits for you before continuing. From this point until the migration is complete, don't run any DDL on Heroku, including your framework's auto-migrations. If you use pg_partman, pause its maintenance job too.</li>
+ <li><strong>Click Start Data Copy, then wait.</strong> This ranges from minutes to hours depending on data size. You can close the browser and come back here no problem. When the table data copy is finished, the migrator automatically rebuilds the indexes and shows you the progress. Bucardo applies all the changes your app wrote to Heroku during the copy and the rebuild. From then on it applies new writes as they happen.</li>
+ <li><strong>Switch Traffic.</strong> Once you switch, writes to Heroku will fail, while reads still work. For a production app, turn on Heroku maintenance mode first.</li>
+ <li><strong>Click Verify Migration.</strong> If it reports a backlog of pending changes, wait a minute and run it again.</li>
+ <li><strong>Point your app at PlanetScale.</strong> Set <code>DATABASE_URL</code> to the PlanetScale connection string and test your app. If something is wrong, the Revert Switch makes Heroku writable again.</li>
+ <li><strong>Click Complete Migration and delete the migrator app.</strong> This removes the triggers from Heroku. Remove the Heroku Postgres add-on once you're confident.</li>
+</ol>
+<h2>Three problems, three solutions</h2>
+<h3>Copy restarting from zero</h3>
+<p>Here, the symptom is simple and painful. After hours of data copying, the migration encounters an unexpected failure near the end. In this case, Bucardo needs to re-start copying again from the first table.</p>
+<pre><code>DBD::Pg::db pg_putcopyend failed: ERROR: index row size 3328 exceeds btree version 4 maximum 2704
+for index "index_&lt;table&gt;_on_&lt;col_a&gt;_and_&lt;col_b&gt;"
+CONTEXT: COPY &lt;table&gt;, line 3732862 ... DB planetscale state: 54000 Error: 7</code></pre>
+<p>As a solution, we decided to split this stage into two phases: transferring the data and rebuilding the indexes.</p>
+<p>Before the copy, the migrator drops every secondary and unique index on the target database (PlanetScale). Primary keys are necessary, because Bucardo needs them to apply changes later. The dropped index definitions are saved from <code>pg_get_indexdef</code> into a <code>_ps_migrator.dropped_indexes</code> table on the target, together with their build status.</p>
+<p>After the copy, the migrator pauses replication and rebuilds the indexes on the target database with parallel workers. Each worker runs with <code>maintenance_work_mem = 1GB</code> and 2 parallel maintenance workers. Foreign keys that depended on a dropped unique index come back as <code>NOT VALID</code> and are validated afterwards. Only when every index is rebuilt does Bucardo resume and catch up on the changes that queued on Heroku in the meantime.</p>
+<h3>Silent network drops</h3>
+<p>This was the most confusing problem we hit, because initially nothing appeared broken. About 30 hours into copying a huge table, Bucardo was gone. The controller processes and the worker doing the copy were all dead.</p>
+<p>The migrator now sets keepalives on Bucardo's connections, so a dropped connection turns into an error in about a minute instead of a hang:</p>
+<pre><code>bucardo set tcp_keepalives_idle=60
+bucardo set tcp_keepalives_interval=10
+bucardo set tcp_keepalives_count=6</code></pre>
+<h3>The delta_check stall</h3>
+<p>This one surfaces after the initial data copy. After completing, we observed the migrator stall completely.</p>
+<p>The fix is a plain B-tree index on <code>txntime</code> for every track table. The migrator now builds it during setup, right after Bucardo creates the track tables and before the sync starts. At that point the tables are empty, so each index builds instantly and takes no locks your application would notice.</p>
+<pre><code>CREATE INDEX IF NOT EXISTS dex4_public_&lt;table&gt;
+  ON bucardo.track_public_&lt;table&gt; (txntime);</code></pre>
+<h2>All of this is in the latest Heroku Migrator</h2>
+<p>Everything above is in the latest version of the Heroku Migrator on GitHub. We also recently added support for Postgres 18 as the source, and for the pg_partman extension.</p>
+<p>Heroku, unfortunately, attempts to keep you "locked in" to their database on the standard plan by not offering logical replication. No customer likes vendor lock-in. However, we have the tools and expertise to get you off Heroku Postgres and onto a faster and more reliable Postgres platform.</p>
