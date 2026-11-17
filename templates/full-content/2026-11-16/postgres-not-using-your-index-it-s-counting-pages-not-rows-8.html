@@ -1,0 +1,99 @@
+<p><em>Slow Postgres, part 1 of 8. The SQL and raw numbers for every test are on GitHub.</em></p>
+<p>You add an index on <code>status</code>, run <code>EXPLAIN</code>, and Postgres reads the whole table anyway. <code>ANALYZE</code> doesn't change the plan. Someone suggests <code>SET enable_seqscan = off</code>, the plan finally shows your index, and the query gets slower.</p>
+<p>Usually the planner is right. It prices a plan by the 8 KB pages it has to read and by whether it reads them in order or jumps around between them, and once you count pages the same way, you can answer most "why is it ignoring my index" tickets yourself.</p>
+<p>This series started as my notes from an open lesson on slow Postgres queries by balun.courses. The tests and numbers are my own.</p>
+<p>The short version:</p>
+<ul>
+ <li>Postgres prices a plan in pages, and in my test table a status with 0.9% of the rows sits on 94% of them, so its index saves 12 page reads out of 221.</li>
+ <li>On 5 million rows in RAM, the index beat a full scan up to 10% of the rows when the matches were scattered, and at every share I tried (up to 50%) when they were stored together.</li>
+ <li>Read cold from disk, the scattered lookups at 0.5% and 1% of rows ran 2 to 5 times slower than a full scan, and Postgres still picked them.</li>
+ <li>A 200-row table gets a Seq Scan even when 2 rows match, so a plan from a tiny test copy says nothing about production.</li>
+ <li>Keep <code>enable_seqscan</code> out of app code, read <code>pg_stats</code> before <code>CREATE INDEX</code>, and if you only query the rare values, index only those rows.</li>
+</ul>
+<h2>What a B-tree index stores</h2>
+<p>A regular B-tree index keeps only keys, the values it is sorted by, and next to each key a TID: the row's address in the heap, which is the table's main storage.</p>
+<p>A TID is a page number plus a slot on that page. You can see it as the hidden <code>ctid</code> column:</p>
+<pre><code>SELECT ctid, id, status FROM orders WHERE status = 'chargeback' ORDER BY id LIMIT 3;</code></pre>
+<pre><code>  ctid   |  id  |   status
+---------+------+------------
+ (7,48)  | 1000 | chargeback
+ (14,96) | 2000 | chargeback
+ (22,8)  | 3000 | chargeback</code></pre>
+<p>Row 1000 is slot 48 on page 7. An index lookup for <code>'chargeback'</code> returns a list of addresses like these, and Postgres then visits each of those heap pages to fetch the row and check that your transaction can see it.</p>
+<p>The second step is the one people forget. To fetch one row, Postgres has to read the whole 8 KB page it sits on.</p>
+<h2>The lab: 30,000 orders on 221 pages</h2>
+<p>The lab runs on PostgreSQL 17.11 in Docker with default settings. My numbers come from a 4-vCPU, 8 GB cloud VM, but any small VPS or a laptop will do.</p>
+<pre><code>CREATE TABLE orders (
+  id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  created_at   timestamptz NOT NULL,
+  amount_cents int NOT NULL,
+  status       text NOT NULL
+);
+
+INSERT INTO orders (created_at, amount_cents, status)
+SELECT now() - (30000 - i) * interval '1 minute',
+       (random() * 10000)::int,
+       CASE
+         WHEN i % 1000 = 0 THEN 'chargeback'  -- 30 rows, 0.1%
+         WHEN i % 100  = 0 THEN 'failed'      -- 270 rows, 0.9%
+         WHEN i % 10   = 0 THEN 'created'     -- 2,700 rows, 9%
+         ELSE 'paid'                          -- 27,000 rows, 90%
+       END
+FROM generate_series(1, 30000) AS i;
+
+CREATE INDEX orders_status_idx ON orders (status);
+ANALYZE orders;
+
+SELECT relpages, reltuples FROM pg_class WHERE relname = 'orders';</code></pre>
+<pre><code> relpages | reltuples
+----------+-----------
+      221 |     30000</code></pre>
+<p>136 rows fit on a page, so 30,000 rows take 221 pages. I picked 30,000 because <code>ANALYZE</code> samples 300 × <code>default_statistics_target</code> rows, which is 30,000 at the default. On this table it reads every row, so the statistics are exact and your plans should come out the same as mine.</p>
+<h2>What a Seq Scan costs</h2>
+<p>Ask for the most common value and the index goes unused:</p>
+<pre><code>EXPLAIN SELECT * FROM orders WHERE status = 'paid';
+
+Seq Scan on orders  (cost=0.00..596.00 rows=27000 width=25)
+  Filter: (status = 'paid'::text)
+
+221 pages  × seq_page_cost     1.0    = 221
+30000 rows × cpu_tuple_cost    0.01   = 300
+30000 rows × cpu_operator_cost 0.0025 =  75
+                                        ---
+                                        596</code></pre>
+<p>Cost has no unit you can convert to milliseconds. It only means something next to another plan's cost.</p>
+<p>The value you filter on appears nowhere in that formula. Ask for <code>'chargeback'</code> with the index paths switched off and the Seq Scan still costs 596. Only the index path's price moves with the value, so the planner is choosing between a fixed price and a sliding one.</p>
+<p>For <code>'paid'</code>, every one of the 221 pages holds paid rows, so the index path would read the whole heap plus the index. Force it with <code>enable_seqscan = off</code> and you get a Bitmap Heap Scan at cost 872.</p>
+<h2>How many pages each status sits on</h2>
+<p>Selectivity is the share of rows that pass the filter. The usual rule of thumb goes: one row, use the index; 1%, usually; 20%, it depends; 70%, Seq Scan. Here is the same table counted by pages as well as by rows:</p>
+<pre><code>SELECT status,
+       count(*)                               AS rows,
+       count(DISTINCT (ctid::text::point)[0]) AS pages
+FROM orders
+GROUP BY status
+ORDER BY rows DESC;</code></pre>
+<p>The rule of thumb says index <code>failed</code>, and Postgres agrees: Index Scan at cost 235 against 596. Run both with <code>EXPLAIN (ANALYZE, BUFFERS)</code>, though, and the index path touches 209 buffers to the Seq Scan's 221, a saving of twelve page reads.</p>
+<p>It still finished faster, 0.19 ms versus 0.93, because checking 270 rows is less CPU work than filtering 30,000. For <code>'chargeback'</code>, 30 rows on 30 pages, the index path needs 32 buffers instead of 221.</p>
+<h2>Timing it on 5 million rows in RAM</h2>
+<p>On 221 pages everything finishes in a couple of milliseconds, so for timings I built a bigger table: 5 million rows, 326 MB, about 120 rows per page.</p>
+<p>A <code>bucket</code> column holds a random number from 0 to 999,999, so <code>WHERE bucket &lt; 10000</code> matches 1% of the rows. I loaded the same rows twice, once in random order and once sorted by <code>bucket</code>, and forced each plan with the <code>enable_*</code> settings at shares from 0.01% to 50%. <code>shared_buffers</code> was 2 GB, which kept the whole table in memory.</p>
+<p>For scattered rows Postgres picked a bitmap scan, which collects all the TIDs first and then reads each heap page once, in page order. Up to 10% of the rows it beat the Seq Scan, 98 ms to 124. At 25% it lost, 174 against 139, and the planner still chose it. A plain Index Scan, one heap visit per row, lost from 5% on.</p>
+<h2>The same queries with a cold cache</h2>
+<p>RAM is the friendly case. For the cold runs I restarted Postgres and dropped the OS page cache before every run, so every page came off the VM's disk.</p>
+<p>The Seq Scan got about twice as slow, 250 to 350 ms at every share. The clustered index won everywhere again, 23 ms versus 263 at 5%.</p>
+<p>The scattered bitmap scan took 748 ms at 0.5% of rows, to the Seq Scan's 349. At 1% it took 1.27 seconds against 255 ms, five times slower, and that's the plan Postgres picks.</p>
+<h2>Seq Scans on a 200-row table</h2>
+<p>A 200-row copy shows the other end of the scale, where the table is too small for any index to win.</p>
+<h2>A partial index instead of enable_seqscan</h2>
+<p>The one place for <code>enable_seqscan = off</code> is a scratch session, where it shows you what the other plan would cost. It applies to every query in the session, so in app code it also overrides the plans that were right, like 596 against 872 for <code>'paid'</code>.</p>
+<p>If the queries you care about only ask for the rare values, say a failed-payments dashboard or a chargeback queue, index only those rows:</p>
+<pre><code>CREATE INDEX orders_status_not_paid_idx ON orders (status)
+  WHERE status &lt;&gt; 'paid';</code></pre>
+<h2>The planner's statistics in pg_stats</h2>
+<p>Before adding an index, look at the column in <code>pg_stats</code>:</p>
+<pre><code>SELECT null_frac, n_distinct, most_common_vals, most_common_freqs
+FROM pg_stats
+WHERE schemaname = 'public' AND tablename = 'orders' AND attname = 'status';</code></pre>
+<p>That's what the planner believes about <code>status</code> as of the last <code>ANALYZE</code>. If most of your queries filter on <code>paid</code>, at 0.9, they get a Seq Scan, and no extra index will change that.</p>
+<h2>Run it on your own server</h2>
+<p>All the numbers above come from one 4-vCPU AMD EPYC cloud VM with 8 GB of RAM, so yours will differ. The SQL, the scripts, the raw output and the chart code are on GitHub. Run them on your own server, and if you get a different picture or think I got something wrong, open an issue or a PR.</p>

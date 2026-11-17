@@ -1,0 +1,49 @@
+<p>Most multimodal models see through a pretrained vision encoder, which bundles three design choices: a <strong>visual prior</strong> from separate pretraining, <strong>dedicated vision capacity</strong>, and <strong>pre-fusion placement</strong> of that capacity. We test each choice by training every model from scratch with the same data, backbone architecture, and training recipe, and compare the choices at matched <em>lifetime</em> compute.</p>
+<h2>What we find</h2>
+<ul>
+ <li><strong>The prior is optional.</strong> An encoder trained from scratch with the language model is on par with encoders pretrained on the same data. More encoder pretraining raises ImageNet accuracy but not VQA, even when it is free.</li>
+ <li><strong>Dedicated capacity is key.</strong> Encoder-free models trail on visual understanding even when their backbone gets the encoder's parameters. From 1.7B to 6.4B backbones, they need about 3× the compute to match the encoder's Avg. VQA.</li>
+ <li><strong>Vision capacity can sit inside the backbone.</strong> Vision-only modules in early backbone layers perform comparably to a pre-fusion encoder.</li>
+ <li><strong>The findings hold beyond lifetime compute.</strong> Added to a pretrained 1.7B language model, in-fusion stays comparable to the scratch encoder, while encoder-free falls further behind. In-fusion can also lower time to first token.</li>
+</ul>
+<h2>What a vision encoder bundles</h2>
+<p>Most multimodal models acquire visual understanding from a vision encoder pretrained for a separate objective, such as image recognition or image–text alignment. Recent recipes discard parts of that setup. Kimi K3 trains its encoder from scratch with the multimodal backbone, and encoder-free models feed image patches straight into the backbone. Each recipe implies a different answer to what the encoder contributes, if anything at all.</p>
+<h3>One controlled protocol</h3>
+<p>Published models differ in data, architecture, training stages, and compute, so comparing them cannot isolate any one choice. Controlled studies of pretrained encoders hold the multimodal stage fixed, but they vary <em>which</em> prior an encoder imports rather than <em>whether</em> it needs one. They also treat encoder pretraining as free, though SigLIP 2, for example, trains on 40B image–text samples. We instead run every training stage ourselves, from random initialization.</p>
+<p>Every recipe pretrains on the same text and image–text pairs, with images at 224×224. <strong>Avg. VQA</strong> averages four category means over 16 Cambrian benchmarks, after instruction tuning on Cambrian-7M with 448×448 images. <strong>Avg. Text</strong> does the same over 12 language benchmarks.</p>
+<h2>Separate pretraining is optional</h2>
+<p>Under a fixed lifetime budget, encoder pretraining competes with multimodal training for compute. We pretrain the same encoder with four objectives (contrastive MetaCLIP, self-supervised WebSSL, and captioning with Cap and CapPa) on the same images, update it during multimodal training, and compare it with the encoder trained from scratch with the backbone.</p>
+<p>At 1.7B and 4B, MetaCLIP trails the scratch encoder at every budget, by 1.8 Avg. VQA points at the largest 4B budget.</p>
+<h2>Dedicated vision capacity is key</h2>
+<p>Encoder-free models drop the encoder and map each image patch directly into the backbone with a linear embedding. Removing the encoder also removes its parameters and changes how raw patches enter the backbone, so a gap could reflect fewer parameters, a weak patch embedding, or missing dedicated capacity.</p>
+<p>Across budgets, encoder-free trails by 4.1–6.4 Avg. VQA points at 1.7B and 2.8–6.8 at 4B. To test whether the gap is simply due to the encoder's extra parameters, we give the encoder-free backbone the encoder's 0.4B parameters as extra width, depth, or both.</p>
+<p>Matching total parameters doesn't close the gap to a scratch encoder. The added parameters improve Avg. Text, since text tokens use them too, but move Avg. VQA by at most 0.4 points.</p>
+<p>A richer patch embedding doesn't close it either. Trained on the same 224×224 images, a two-layer projection inspired by Gemma 4 helps, scoring 40.5 Avg. VQA against 39.0 for the linear default, but stays well below the encoder's 44.4. A four-layer hierarchical MLP, as in Inkling, matches the encoder only when it compresses 640×640 images into the same 256 tokens.</p>
+<h2>Vision capacity can move in-fusion</h2>
+<p>An encoder's parameters are <em>dedicated</em>, used only by vision tokens, and <em>pre-fusion</em>, run before vision and text interact. To separate the two, we move the encoder's 0.4B-parameter budget <em>in-fusion</em>, into vision-only modules inside the shared backbone.</p>
+<p>Holding the budget at 0.4B parameters, we vary where it goes and which tokens use it.</p>
+<p>Placed in the first eight layers, the vision-only FFN branch matches the scratch encoder (45.0 vs. 44.4), while the other placements do no better than encoder-free. Early placement also helps most on OCR and chart questions (36.0 vs. 25.2 for encoder-free), which depend on fine visual detail. With the first eight layers as the default, in-fusion, which also adds vision-only attention projections, holds the same dedicated budget as the encoder.</p>
+<h2>The comparisons hold with scale</h2>
+<p>We also train the three recipes on a ladder of backbone sizes and token budgets, growing the vision module with the backbone, and fit one law per recipe in model size and training tokens.</p>
+<h2>The findings carry over to midtraining, and in-fusion can be faster to serve</h2>
+<h3>Midtraining: adding vision to a pretrained language model</h3>
+<p>We continue our own 1.7B text-only model from 1T to 1.33T token-equivalents, adding each recipe at equal compute, and include mixture-of-transformers (MoT) for comparison.</p>
+<p>MoT with vision-only copies of all 28 layers falls behind MoT on the first eight layers alone, despite 3.5× as many vision-only parameters, consistent with late placement not helping.</p>
+<h3>Time to first token</h3>
+<p>A separate encoder must finish each image before the backbone can start, which adds a serial step to inference. We measure time to first token for a 1.7B backbone on one H200 serving 16 concurrent requests, each with one 448-px image and 256 text tokens.</p>
+<p>In-fusion's advantage over the encoder grows with the vision-only budget, which scales with the backbone. MoT, which copies whole backbone layers for vision tokens, is about as fast as in-fusion up to 0.4B vision-only parameters, but its added time grows faster with the budget, while staying below the encoder's. The encoder-free model is fastest, but at 1.7B and 2.6×1021 FLOPs it trails the encoder by 5.4 Avg. VQA points.</p>
+<h2>Common questions</h2>
+<p><strong>Why count lifetime compute?</strong> A pretrained encoder brings compute and data of its own that comparisons usually leave out. SigLIP 2, for example, trains on 40B image–text samples. Counting only the multimodal stage lets a recipe look better just because it spent more in total. Lifetime compute counts every stage that produces the final model: encoder pretraining, any text-only training, and multimodal training.</p>
+<p><strong>How do your encoders compare to released ones like CLIP and SigLIP?</strong> Every encoder is a 27-layer, 0.4B-parameter ViT, about the size of SigLIP's So400m, and pretrained encoders see only our own training images, so every recipe learns from the same data. Pretrained four different ways, these encoders are on par with an encoder trained from scratch with the backbone at matched lifetime compute.</p>
+<p><strong>How is in-fusion different from mixture-of-transformers?</strong> Mixture-of-transformers (MoT) gives each modality its own modules, so the two streams meet only in attention. In-fusion processes every token with the shared weights and adds zero-initialized vision-only weights on top, sized to the encoder's 0.4B-parameter budget, in the first eight layers only.</p>
+<p><strong>Why train from scratch instead of starting from a pretrained language model?</strong> Training every stage ourselves lets us change one design choice at a time on common data and charge each recipe for all of its compute.</p>
+<p><strong>Why do other studies find encoder-free as good as an encoder, or better?</strong> Most compare a pretrained encoder with an encoder-free model, which removes separate pretraining, dedicated capacity, and pre-fusion placement at once, so it can't show which choice matters. Some studies train both designs from scratch and find that encoder-free matches or slightly beats the encoder, mainly at smaller sizes, often due to using a reduced learning rate for the encoder or evaluating with metrics less sensitive to visual processing design choices.</p>
+<pre><code>@article\{brown2026unbundling,
+  title   = \{Unbundling Multimodal Vision Encoding},
+  author  = \{Brown, Ellis and Hoang, Chris and Qian, Shengyi and
+             Li, Shang-Wen and Lewis, Mike and Ghazvininejad, Marjan and
+             Zettlemoyer, Luke and Beyer, Lucas and Ren, Mengye and
+             Verbeek, Jakob and Xie, Saining and Xu, Hu},
+  journal = \{arXiv preprint arXiv:2611.17334},
+  year    = \{2026}
+}</code></pre>

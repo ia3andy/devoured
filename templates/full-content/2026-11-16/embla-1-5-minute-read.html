@@ -1,0 +1,219 @@
+<h1>Embla 1: A reasoning model built for phones</h1>
+<p>Embla 1 runs on a phone, private, offline and free per request. This is how we trained it, and how it compared with other small models in our tests at 4 bits.</p>
+<p><strong>At 4 bits Embla 1 averages 57.4 on BFCL, IFBench, AA-Omniscience, GPQA and MATH-500 and answers in 1.77 s end to end on an iPhone 18 Pro.</strong> In our measurements, the models that scored higher took at least twice as long on the same phone.</p>
+<p>Embla 1 is a reasoning model built to run on a phone, private, offline and free per request. We designed it to be fast and to use few tokens per answer, and trained it on 16 nodes of 8× H100.</p>
+<h3>Architecture</h3>
+<p>Embla 1 is built to be fast on a phone in both prefill and decode. It has 32 layers of width 2048, with 8 of 96 routed experts and one shared expert per token. We use 15 sliding-window layers of 128 tokens, 12 sparse attention layers and 5 full attention layers. It is built around the following:</p>
+<ul>
+ <li><strong>Sevren Sparse Attention.</strong> Full-attention layers use ReLU² instead of softmax. About 95% of attention weights are exactly zero and decode skips their values.</li>
+ <li><strong>Shared K/V caches.</strong> Sparse layers keep no cache of their own. They read from the preceding full-attention layer. K/V bridges build every second-half cache after layer 15 so prefill skips layers 16 to 31.</li>
+ <li><strong>Engram.</strong> The last two and three tokens are hashed into a 3B-parameter table. Rows they hit form a second input next to the token embedding for every layer.</li>
+</ul>
+<h3>Training</h3>
+<p>The model is pretrained on 1.4T tokens followed by a 20B-token extension to 256K context. For post-training we run SFT on 123B tokens. During the last 2,000 SFT steps we train with quantization-aware training (QAT) and all later stages run at 4 bits. For RL we run 100 steps of on-policy distillation (OPD), 800 + 200 steps of GRPO and 300 steps of multi-teacher on-policy distillation (MOPD). Every stage before GRPO distils from a larger model.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Stage</th>
+   <th>Tokens or steps</th>
+   <th>Teacher or signal</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Pretraining</td>
+   <td>1.4T tokens</td>
+   <td>Qwen3.5-35B-A3B-Base</td>
+  </tr>
+  <tr>
+   <td>Long-context extension</td>
+   <td>20B tokens</td>
+   <td>Qwen3.5-35B-A3B</td>
+  </tr>
+  <tr>
+   <td>SFT with QAT</td>
+   <td>123B tokens</td>
+   <td>Qwen3.5-35B-A3B</td>
+  </tr>
+  <tr>
+   <td>OPD</td>
+   <td>100 steps</td>
+   <td>Qwen3.8-27B and Qwen3.5-35B-A3B</td>
+  </tr>
+  <tr>
+   <td>GRPO</td>
+   <td>800 + 200 steps</td>
+   <td>Verifiers and a judge</td>
+  </tr>
+  <tr>
+   <td>MOPD</td>
+   <td>300 steps</td>
+   <td>GRPO-trained domain specialists</td>
+  </tr>
+ </tbody>
+</table>
+<h4>Pretraining</h4>
+<p>We pretrain at 4K context in two phases: 1T tokens without document masking, then 400B tokens with it. We use Qwen3.8's tokenizer pruned to 65,536 tokens. From the first step the model distils from Qwen3.5-35B-A3B-Base with 0.9 × KL on its top-256 logits plus 0.1 × cross-entropy. Its embeddings and output head start from the teacher's top principal components. Muon trains the weight matrices and AdamW the rest with 4M-token batches and a constant learning rate. We then extend the context to 256K over 20B tokens with Qwen3.5-35B-A3B Instruct as teacher.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Pretraining</th>
+   <th>Phase 1</th>
+   <th>Phase 2</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Web text, filtered and synthetic</td>
+   <td>50%</td>
+   <td>43%</td>
+  </tr>
+  <tr>
+   <td>Code</td>
+   <td>19%</td>
+   <td>19%</td>
+  </tr>
+  <tr>
+   <td>STEM, reasoning and QA (synthetic)</td>
+   <td>10%</td>
+   <td>10%</td>
+  </tr>
+  <tr>
+   <td>Math</td>
+   <td>9%</td>
+   <td>8%</td>
+  </tr>
+  <tr>
+   <td>PDFs</td>
+   <td>8%</td>
+   <td>14%</td>
+  </tr>
+  <tr>
+   <td>Multilingual web (10 European languages)</td>
+   <td>5%</td>
+   <td>5%</td>
+  </tr>
+ </tbody>
+</table>
+<h4>Post-training</h4>
+<p><strong>SFT.</strong> We train on 123B tokens in 32K packed sequences with Qwen3.5-35B-A3B Instruct as teacher on assistant tokens. Reasoning traces in math, code and STEM are capped at 8K tokens. One in ten reasoning prompts gets no reasoning. The last 2,000 steps run QAT in the phone runtime's 4-bit format: round-to-nearest in groups of 64 with a bf16 scale and offset per group.</p>
+<table>
+ <thead>
+  <tr>
+   <th>SFT</th>
+   <th>Share</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Chat</td>
+   <td>25.5%</td>
+  </tr>
+  <tr>
+   <td>Math</td>
+   <td>16%</td>
+  </tr>
+  <tr>
+   <td>Tool use</td>
+   <td>14%</td>
+  </tr>
+  <tr>
+   <td>Instruction following</td>
+   <td>12%</td>
+  </tr>
+  <tr>
+   <td>Code</td>
+   <td>12%</td>
+  </tr>
+  <tr>
+   <td>STEM</td>
+   <td>10%</td>
+  </tr>
+  <tr>
+   <td>Multilingual</td>
+   <td>6%</td>
+  </tr>
+  <tr>
+   <td>Long context, safety, other</td>
+   <td>4.5%</td>
+  </tr>
+ </tbody>
+</table>
+<p><strong>OPD.</strong> We run 100 steps with answers up to 8K tokens. Qwen3.8-27B and Qwen3.5-35B-A3B score each answer token by token. Both are pruned to our vocabulary and keep 99.1% of their probability mass.</p>
+<p><strong>GRPO.</strong> We run 800 steps with 16 answers per prompt and no reference model. Verifiers score math, code, tool calls and instruction following. Another 200 steps add knowledge questions judged by gpt-oss-120b: +1 correct, 0 abstain, −1 wrong. The last 180 of them add a loop penalty of −10−4 per token in a repeated 40-gram of a correct answer up to 0.5. Answers hitting the 16K limit fell from 20.7% to 1.8%.</p>
+<p><strong>MOPD.</strong> We run 300 steps with GRPO-trained specialists as teachers for four domains: tool use, instruction following, math and abstention.</p>
+<h3>Results</h3>
+<p>Score is the mean of BFCL, IFBench, AA-Omniscience, GPQA and MATH-500 with up to 16K tokens per answer and reasoning on. All models run at 4 bits: Embla 1 in the phone runtime's format, the others from their official Q4_K_M GGUF weights. Each model uses its lab's recommended sampling settings. Latency uses 4-bit builds on an iPhone 18 Pro with a 1,024-token prompt and 256 output tokens.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Model</th>
+   <th>Mean tokens per answer</th>
+   <th>vs Embla 1</th>
+   <th>Score</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Embla 1</strong></td>
+   <td>888</td>
+   <td>1.0×</td>
+   <td>57.4</td>
+  </tr>
+  <tr>
+   <td>Gemma 4 E4B</td>
+   <td>1,577</td>
+   <td>1.8×</td>
+   <td>60.4</td>
+  </tr>
+  <tr>
+   <td>Gemma 4 E2B</td>
+   <td>1,611</td>
+   <td>1.8×</td>
+   <td>52.8</td>
+  </tr>
+  <tr>
+   <td>LFM2.5-8B-A1B</td>
+   <td>3,129</td>
+   <td>3.5×</td>
+   <td>58.8</td>
+  </tr>
+  <tr>
+   <td>LFM2.5-2.6B</td>
+   <td>3,557</td>
+   <td>4.0×</td>
+   <td>62.7</td>
+  </tr>
+  <tr>
+   <td>Granite 4.2 3B</td>
+   <td>5,633</td>
+   <td>6.3×</td>
+   <td>61.0</td>
+  </tr>
+  <tr>
+   <td>MiniCPM5-1B</td>
+   <td>6,461</td>
+   <td>7.3×</td>
+   <td>43.1</td>
+  </tr>
+  <tr>
+   <td>Qwen3.5-4B</td>
+   <td>6,619</td>
+   <td>7.5×</td>
+   <td>60.0</td>
+  </tr>
+ </tbody>
+</table>
+<p>Embla 1 is clearly behind on math: 76.1 on MATH-500 against 89.6 for LFM2.5-8B-A1B and 90.5 for LFM2.5-2.6B. There is still a lot to improve.</p>
+<h3>References</h3>
+<ol>
+ <li>Benoit Jacob et al., "Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference", CVPR, 2018.</li>
+ <li>Rishabh Agarwal et al., "On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes", ICLR, 2024.</li>
+ <li>Zhihong Shao et al., "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models", arXiv:2402.03300, 2024.</li>
+ <li>Xiaomi LLM-Core Team, "MiMo-V2-Flash Technical Report", arXiv:2601.02780, 2026.</li>
+ <li>Geoffrey Hinton, Oriol Vinyals and Jeff Dean, "Distilling the Knowledge in a Neural Network", arXiv:1503.02531, 2015.</li>
+ <li>Zhiqiu Xu et al., "Initializing Models with Larger Ones", ICLR, 2024.</li>
+ <li>Keller Jordan et al., "Muon: An optimizer for hidden layers in neural networks", blog post, 2024.</li>
+ <li>OpenAI, "gpt-oss-120b &amp; gpt-oss-20b Model Card", arXiv:2508.10925, 2025.</li>
+ <li>Edward Yeo et al., "Demystifying Long Chain-of-Thought Reasoning in LLMs", arXiv:2502.03373, 2025.</li>
+</ol>

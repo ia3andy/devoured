@@ -1,0 +1,93 @@
+<p>Spend controls have been at the top of the list of most requested features from developers building on our developer platform for quite some time now. With more than 10 million developers now building on Cloudflare, this matters more than ever.</p>
+<p>Although we’ve had usage notifications and budget alerts available to paid plans for a while, this doesn’t solve the problem completely; informing is not the same as controlling.</p>
+<p>You can now set spending thresholds and choose to have Cloudflare pause activity when those limits are reached, thus avoiding unexpected bills from unplanned usage. Today, we're introducing <strong>Spend Management</strong> in Beta, for any pay-as-you-go (PayGo) customer, starting with Workers and Durable Objects.</p>
+<p>Use Spend Management alongside AI Gateway spend limits to manage compute and AI inference costs across your application. AI Gateway already supports per-user and per-model budgets for Workers AI and other AI providers, applied to requests routed through your gateway.</p>
+<h2>How it works</h2>
+<p>You can start using Spend Management using the dashboard, cf CLI, or REST API.</p>
+<p>In the dashboard, head over to Manage <strong>Account</strong> &gt; <strong>Billing</strong> &gt; <strong>Spend limits</strong> and enable the products for which you want to control spending.</p>
+<p>When you enable controls on a product, you can define a spending limit, specify a recipient email for notifications, and set one or more alert thresholds.</p>
+<p>If you configure a recipient email, Cloudflare will send notifications when the evaluated spend reaches one of the thresholds or your spending limit. When the limit is reached, a blocking policy is enforced and your product is paused automatically.</p>
+<p>If you go to the dashboard, you can see the current billing cycle costs for each supported product in near real time (under 10 minutes), and manage your settings and thresholds from there. The overview panel tells you which products have thresholds and limits configured. In this example, you can see that Workers triggered two alerts before hitting the hard limit.</p>
+<p>Note that the billing cycle starts when the paid subscription begins, not when you deploy a Worker or create a spending cap; a subscription starting October 10 generally has a cycle of October 10-November 10 — not a calendar month.</p>
+<p>The dashboard also shows an audit log, so you can see who changed a limit and when, or when a cap was reached.</p>
+<p>As with most Cloudflare services, Spend Management is also an API that you can use programmatically; the documentation can be found in our Developer Documentation. Here’s an example, but using the API:</p>
+<pre><code>curl --fail-with-body --request POST \
+  "https://api.cloudflare.com/client/v4/accounts/$\{CLOUDFLARE_ACCOUNT_ID}/billing/spend-policies" \
+  --header "Authorization: Bearer $\{CLOUDFLARE_API_TOKEN}" \
+  --header "Content-Type: application/json" \
+  --data '\{
+    "name": "Workers spending cap",
+    "product_id": "workers",
+    "enabled": true,
+    "threshold_cents": 10000,
+    "action": "usage_block",
+    "notification_email": "me@example.com"
+  }'</code></pre>
+<p>And, of course, you can use cf, the CLI for the entire Cloudflare API:</p>
+<pre><code>cf billing spend-policies list
+cf billing spend-policies create
+cf billing spend-policies get
+cf billing spend-policies update
+cf billing spend-policies delete
+cf billing spend-policies audit list
+cf billing spend-policies activity list
+
+cf billing spend-policies create --body '\{
+  "name": "Workers spending cap",
+  "product_id": "workers",
+  "enabled": true,
+  "threshold_cents": 10000,
+  "action": "usage_block",
+  "notification_email": "me@example.com"
+}'</code></pre>
+<p>Once a cap is enforced, new invocations of that product are rejected. Note that we only pause customer-code invocations that incur costs — in Workers, for example, Cron Triggers and Queue consumer invocations are paused, but static assets continue to be served.</p>
+<p>To resume service, you can:</p>
+<ul>
+ <li>Raise the limit above the current cycle’s accumulated spend.</li>
+ <li>Disable or delete the blocking policy.</li>
+ <li>Wait until the next billing cycle, when the existing block expires.</li>
+</ul>
+<p>That’s it. You can start using Spend Management for Workers and Durable Objects today, and other products will follow soon.</p>
+<p>Read on to learn how we built the system, and what’s going to happen next.</p>
+<h2>How we built Spend Management</h2>
+<p>As easy and straightforward as it seems on the surface, building a system like this at Cloudflare scale was no small feat. From an invocation anywhere on our distributed network to a blocking decision that we need to apply globally, building Spend Management required working with multiple teams, changing code in existing systems, and creating new systems from scratch.</p>
+<h2>Collecting and aggregating close to the source</h2>
+<p>Each invocation produces usage measurements: requests, CPU time, execution duration, or storage operations, depending on the product. But transporting and processing this volume of raw data all the way from the sources down to the rating engine would not scale or be efficient.</p>
+<p>So what we do is we collect and aggregate the measurements as close to the source as possible using a two-stage metering pipeline that combines events into usage aggregates, so the engine sees accumulated usage rather than having to process all the events one by one.</p>
+<p>The first stage reduces raw-event volume close to parsing down to one-minute windows. Each metering parser converts raw events into usage measurements, then combines matching measurements into typically one-minute buckets. Still, several records can describe the same account and time window.</p>
+<p>In the second stage, a separate service merges those first-stage partial aggregates using the same grouping rules, but over typically five-minute windows, and further reduces the volume before downstream processing by the Usage Engine. Here we also archive the consolidated aggregates; this gives us a durable dataset for later analytics and reconciliation.</p>
+<h3>Usage Engine: account-partitioned processing</h3>
+<p>The <strong>Usage Engine</strong> translates aggregated measurements into usage records, which are standardized records containing the account, usage window, metric, quantity, and relevant dimensions. In other words, it maps product-specific meters into supported usage metrics.</p>
+<p>We partition processing by account, so an account’s usage and subscription information meet in the same place. That lets us maintain its accumulated usage and apply included allowances without coordinating across pricing processors on every update.</p>
+<p>As you can see, we run different partitions in parallel, giving us a way to spread the work across accounts while keeping each account’s pricing state together. Also note that each partition keeps both a local state for fast access, and also a durable write-ahead logging (WAL) changelog on disk. This buys us:</p>
+<ul>
+ <li><strong>Less cross-partition coordination</strong>: each account’s usage and subscription state stay together.</li>
+ <li><strong>Consistent pricing</strong>: usage updates share the same allowance and accumulated-spend state.</li>
+ <li><strong>Parallel processing</strong>: different partitions calculate spend independently.</li>
+ <li><strong>Recoverability</strong>: durable state lets replacement processors rebuild and resume after failures, if necessary.</li>
+</ul>
+<h3>The Rating Engine</h3>
+<p>The Rating Engine is the most important block of Spend Management; it turns usage into monetary value and it’s what’s able to answer the question: “Given what this account has consumed, its subscription, and its pricing, how much has it spent so far?”</p>
+<h3>Usage data and subscriptions are independent streams</h3>
+<p>Usage and subscription updates arrive as independent streams, so we can’t assume they reach the Rating Engine in order. Furthermore, we have to be able to recover from a data processing failure or missing subscription information from, say, a failed webhook.</p>
+<p>If usage arrives before the subscription information needed to price it, we retain it as pending and revisit it when that information becomes available. This lets us tolerate temporary delays without treating unpriced usage as free.</p>
+<h3>Tracking accumulated spend</h3>
+<p>Finally, we calculate and track accumulated spend. The Rating Engine uses a product catalog database that defines usage metrics, including allowances, rates, and rounding rules, alongside the account’s subscription information. One million CPU milliseconds doesn’t necessarily mean an extra charge: the engine first applies the account’s included CPU allowance, then prices any excess. It prices accumulated usage rather than rounding and charging for each request independently.</p>
+<h3>Asynchronous cap enforcement</h3>
+<p>The Rating Engine doesn’t sit in the request path or directly reject requests. Instead, the policy service sends the cap to our runtime configuration service and Quicksilver, our internal key-value store developed to enable fast global replication and low-latency access at planet scale. This propagates it to all our nodes asynchronously.</p>
+<p>Once the cap reaches Quicksilver, the runtime picks it up during its periodic refresh and starts rejecting capped invocations or operations.</p>
+<p>In other words, <strong>enforcement uses local state</strong>, so requests never have to wait on the Rating Engine. By reusing our existing runtime account-limit architecture, we keep rating out of the request path while distributing caps across the global network.</p>
+<h2>What’s next</h2>
+<p>Any pay-as-you-go customer can start using Spend Management today. While this is a major milestone in our roadmap, it’s also just the start. Let us share some of our plans for the next few weeks and months ahead.</p>
+<h3>More products</h3>
+<p>We are starting with caps for Workers and Durable Objects, but you’ll be able to measure and cap many other Cloudflare products and primitives in the near future. We’ve built the system in a way that makes it easy and familiar for our products to onboard, so expect the catalog to grow.</p>
+<h3>Closer to real time</h3>
+<p>While near real time under 10 minutes is a great benchmark, we’re not satisfied with it, and being the stubborn engineers we are, we have pretty good ideas on how to reduce that time even further. Expect us to shorten the gap between measurement and enforcement over time, hopefully to under a minute.</p>
+<h3>Agent and application-based budgets</h3>
+<p>Right now, we measure spend by products and primitives, but there are other useful dimensions to explore when controlling costs. For example, a developer might want to monitor the costs of a specific application — such as a Worker script that uses other primitives like R2 or Workers AI. How can we measure the aggregated cost of an entire application and pause that application, rather than disabling the underlying primitives across all customer applications?</p>
+<p>Another compelling use case for cost controls is AI agents. We’ve all read horror stories about rogue agents entering unconstrained recursive reasoning loops to brute-force a problem — generating thousands of dollars in costs from high-frequency, expensive API calls, not to mention causing denial-of-service (DoS) issues on databases and other services. AI Gateway already lets you give an agent a budget for AI requests routed through it. A task can also consume compute, database, and storage resources. We want to make it possible to budget for that broader resource use across products.</p>
+<p>You’ll be able to tag the calls from your agents and our pipeline will carry that metadata from the runtime through to the Rating Engine. That will let us attribute spend and pause an application or an agentic task across products, without interrupting other unrelated applications.</p>
+<h2>Get started</h2>
+<p>This launch is a first step toward making spend controls a normal part of building on Cloudflare, alongside deploying code and monitoring your applications.</p>
+<p>Check out the billing developer documentation for more information. Start using Spend Management and tell us what works, what’s missing, or where more granular budgets would help.</p>
+<p>Join us on Discord or our socials. We’re listening!</p>

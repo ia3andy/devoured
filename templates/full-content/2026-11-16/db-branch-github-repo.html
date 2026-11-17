@@ -1,0 +1,72 @@
+<h1>db-branch</h1>
+<p>Instant database branches for MySQL and PostgreSQL, on your own servers.</p>
+<p>Test a migration, let an AI agent loose, or give every pull request its own copy of the database. db-branch creates a copy-on-write branch of a large database in seconds, with nothing copied. Break it, reset it, throw it away. Built on ZFS clones, self-hosted, Apache-2.0.</p>
+<p><strong>Status: Beta.</strong> db-branch is usable today, but APIs and command-line details may still change before 1.0. It is an independent open-source project, built from scratch.</p>
+<h2>Try it</h2>
+<ol>
+ <li>
+  <p><strong>In your browser, 0 minutes.</strong> A live console demo runs entirely in the page (nothing real is created): <a href="https://demo.db-branch.com/">https://demo.db-branch.com/</a></p></li>
+ <li>
+  <p><strong>On a Mac or Windows machine, about 2 minutes.</strong> db-branch needs Linux and ZFS, so run it in an Ubuntu VM with <a href="https://multipass.run/">Multipass</a>. One command makes the VM, installs db-branch, initialises it on a file-backed ZFS pool and loads a small sample base, <code>shop</code> (MySQL 8.4):</p>
+  <pre><code>multipass launch 24.04 --name db-branch-eval --memory 4G --disk 30G --timeout 900 \
+  --cloud-init https://raw.githubusercontent.com/db-branch/db-branch/main/scripts/eval-cloud-init.yaml
+multipass exec db-branch-eval -- cloud-init status --wait
+multipass exec db-branch-eval -- cat /etc/motd
+multipass shell db-branch-eval                               # then: sudo db-branch branch create try --base shop --ttl 1h --record</code></pre>
+  <p>On Windows (PowerShell or cmd), put the <code>multipass launch</code> command on one line and drop the <code>\</code>:</p>
+  <pre><code>multipass launch 24.04 --name db-branch-eval --memory 4G --disk 30G --timeout 900 --cloud-init https://raw.githubusercontent.com/db-branch/db-branch/main/scripts/eval-cloud-init.yaml</code></pre>
+  <ul>
+   <li>The history module is turned on, and the paid modules run for 30 days without a key. <code>--record</code> records a branch so it can be restored to any point.</li>
+   <li>The pool is a file, so it is slower and not meant for real data. The first admin password is <code>admin</code>; the console asks for a new one at the first sign-in.</li>
+   <li>On Apple Silicon (and other arm64 machines) the setup downloads about 800 MB for MySQL, against 80 MB on Intel, because Oracle ships no minimal build for arm64. <code>--timeout 900</code> keeps <code>launch</code> from giving up on a slow connection.</li>
+   <li>If the setup fails, <code>/etc/motd</code> says so, and <code>sudo tail -n 30 /var/log/cloud-init-output.log</code> in the VM shows why.</li>
+   <li>Delete the VM with <code>multipass delete --purge db-branch-eval</code>.</li>
+  </ul></li>
+ <li>
+  <p><strong>On your own Ubuntu server.</strong> See Install.</p></li>
+</ol>
+<h2>Use cases</h2>
+<ul>
+ <li><strong>AI agent sandboxes.</strong> The built-in MCP server lets an LLM agent create a branch, run a risky query or migration on it, and delete the branch, so production data is never touched.</li>
+ <li><strong>A database per pull request.</strong> Each CI run or PR gets its own copy of a large database, ready in seconds, and removed by <code>--ttl</code> when it is no longer needed.</li>
+ <li><strong>Version-upgrade checks.</strong> Run a major-version upgrade (for example MySQL 8.0 to 8.4) on one branch first, with <code>branch upgrade --check-only</code> to see what it would run into, before touching the base.</li>
+</ul>
+<h2>What it does</h2>
+<ul>
+ <li><strong>Branches in seconds.</strong> On our own 3-node test cluster a PostgreSQL branch is ready in about 0.5 s and a MySQL branch in about 3 s, with 0 bytes copied at creation (copy-on-write).</li>
+ <li><strong>Reset and expire.</strong> <code>branch reset</code> returns a branch to its creation state; <code>--ttl</code> deletes it automatically.</li>
+ <li><strong>Checkpoints.</strong> <code>branch checkpoint</code> saves a running branch's state instantly; <code>branch restore</code> puts it back. Restoring replaces the current state, and every checkpoint you already have stays restorable.</li>
+ <li><strong>Per-branch upgrades.</strong> <code>branch upgrade</code> moves one branch to a newer MySQL or PostgreSQL version while the base and the other branches stay put. A checkpoint is saved first, and a failed upgrade rolls back by itself.</li>
+ <li><strong>MySQL and PostgreSQL, several versions at once.</strong> Engine runtimes are installed by version and can live side by side.</li>
+ <li><strong>One interface everywhere.</strong> CLI, REST API, web console and an MCP server (so LLM agents can create and query their own branches) all use the same API.</li>
+ <li><strong>Single node or cluster.</strong> A Raft cluster of VMs, with optional ProxySQL routing so applications keep one address.</li>
+</ul>
+<h2>Install</h2>
+<p>Requirements: Ubuntu 24.04 LTS or 26.04 LTS, and a ZFS pool (the <code>zfsutils-linux</code> package is installed as a dependency).</p>
+<pre><code>curl -fsSL https://apt.db-branch.com/db-branch.gpg | sudo tee /usr/share/keyrings/db-branch.gpg &gt;/dev/null
+echo "deb [signed-by=/usr/share/keyrings/db-branch.gpg] https://apt.db-branch.com stable main" | sudo tee /etc/apt/sources.list.d/db-branch.list
+sudo apt update &amp;&amp; sudo apt install db-branch
+sudo db-branch init --pool &lt;zpool&gt;</code></pre>
+<p>The repository signing key fingerprint is <code>3F404C4E5D49FA653F8385692C6E89E341D4D7A5</code>. <code>db-branch init</code> prints the initial admin password once.</p>
+<h2>First branch</h2>
+<pre><code>db-branch runtime install postgres@18.6
+db-branch base create prod --runtime postgres@18.6 --dump prod.sql.gz
+db-branch branch create feature-x --base prod --ttl 72h
+db-branch branch dsn feature-x
+db-branch branch checkpoint feature-x --name before-migration
+db-branch branch restore feature-x before-migration
+db-branch branch reset feature-x
+db-branch branch delete feature-x</code></pre>
+<h2>How it works</h2>
+<p>A base is a ZFS dataset holding a loaded database. A branch is a ZFS clone of a base snapshot, so creating one copies nothing, and each branch runs its own database server on its own port. Optionally, ProxySQL routes client connections to the right branch by user name (or by a <code>/*db_branch='name'*/</code> query comment). Several nodes form a Raft cluster that shares bases, branches, settings and users.</p>
+<h2>Editions</h2>
+<ul>
+ <li><strong>Core (this repository), Apache-2.0:</strong> branches, bases, runtimes, clustering, CLI, API, web console, MCP, monitoring, notifications, anonymous (no sign-in) branches with limits, scheduled base refresh, backup of cluster state.</li>
+ <li><strong>Free modules</strong> in the same apt repository: <code>proxysql</code>, <code>greenmask</code>, <code>greenmask-mysql</code>, <code>anon</code> (routing and data masking).</li>
+ <li><strong>Paid modules</strong> (auth/SSO, audit, history, diff, FSx storage) are separate, closed-source packages, self-hosted and enabled with a license key (monthly or yearly).</li>
+</ul>
+<p>There is no hosted or cloud version of db-branch.</p>
+<h2>License</h2>
+<p>Apache-2.0.</p>
+<h2>日本語</h2>
+<p>db-branch は、ZFS クローンで MySQL / PostgreSQL のデータベースブランチを発行・リセット・破棄するツールです。現在は Beta で、1.0 までに API が変わる可能性があります。コアは Apache-2.0 で、有償モジュールは別パッケージです。</p>

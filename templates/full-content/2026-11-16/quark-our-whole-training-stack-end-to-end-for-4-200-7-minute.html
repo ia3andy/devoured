@@ -1,0 +1,209 @@
+<p>Before we spend serious money on a large model, we want to know that every part of our stack works: data, architecture, pretraining at scale, context extension, reinforcement learning, evaluation and release. Quark is that test, run end to end. It is a language model with about 165M parameters (140M without embeddings), and we took it through every stage, from the first data-generation job to the last reinforcement-learning step, for about $4,200 of compute, about 1,300 H100-hours. That total includes a discarded first design, failed attempts, data generation and every evaluation. Compute for this work was partly sponsored by lium.io.</p>
+<p>It reads up to 128K tokens, it has the best benchmark average among open models of its size trained on similar token budgets, and one version learned to answer, think and call tools from reinforcement learning alone, with no supervised fine-tuning stage and no distillation. All four checkpoints are on Hugging Face today under Apache-2.0.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Model</th>
+   <th>What it is</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Quark-150M-32K-Raw</td>
+   <td>The pretraining checkpoint before its final anneal, at 472B tokens</td>
+  </tr>
+  <tr>
+   <td>Quark-150M-32K-Base</td>
+   <td>The base model after a 28B-token anneal at 32K context</td>
+  </tr>
+  <tr>
+   <td>Quark-150M-128K-Base</td>
+   <td>The base model after another 10B tokens at 128K context</td>
+  </tr>
+  <tr>
+   <td>Quark-150M-128K-Zero</td>
+   <td>The 128K base trained with reinforcement learning alone</td>
+  </tr>
+ </tbody>
+</table>
+<p>The technical report has the details: the architecture, the training stages, the full cost breakdown, every evaluation and its limits.</p>
+<h2>The stack, stage by stage</h2>
+<p><strong>Architecture.</strong> Most of what a language model does is local, so most of Quark's 16 layers only look nearby. Twelve local layers combine attention over the last 256 tokens with a short convolution, and every fourth layer is global and attends to the whole context. Each attention after the first layer also reuses the first layer's values through a learned gate, the multi-head gated value residuals from our MGVR work. The design pays off at inference: only the four global layers keep a full key and value cache, so at 128K tokens the cache takes about 0.5 GiB in bf16, a quarter of the 2 GiB the same model would need with every layer global.</p>
+<p><strong>Pretraining.</strong> A warmup-stable-decay schedule on 500B tokens on a single 8×H100 node: a short warmup at 1K context, 470B tokens at 4K context with a constant learning rate, then a 28B-token anneal at 32K context. The data is mostly English web text, math and code, with multilingual web text, reasoning traces with verified answers and synthetic long-context documents. We also release the last checkpoint before the anneal, Quark-150M-32K-Raw, because pre-anneal weights are the natural starting point for continued pretraining and are rarely published.</p>
+<p><strong>Reliability.</strong> During pretraining, the node went down seven times, with no spike in the loss at any restart. We resumed the first two by hand; after that, automatic recovery restarted training within two to four minutes of the node coming back. Resuming is exact: the data order follows from the step count alone, so a restarted run sees the same tokens it would have seen.</p>
+<p><strong>Context extension.</strong> The 128K model branches from shortly before the end of that run and trains on another 10B tokens of 128K-token sequences: books, long documents, arXiv papers, long-context instruction following and synthetic tool-use sessions.</p>
+<p><strong>Reinforcement learning.</strong> Quark-150M-128K-Zero starts from the 128K base and was trained with GRPO, with no supervised fine-tuning stage and no distillation: no text written by another model was ever a training target. About 95% of the rewards came from code: exact answers, format rules, unit tests and file checks in real sandboxes. LLM judges scored the rest, such as chat replies, creative writing and second opinions on value questions, and no human labels were used. The run took under 1,300 steps and about 32 hours. We stopped it early to stay within budget while its scores were still rising.</p>
+<p><strong>Evaluation and release.</strong> Every number below comes from our own runs, with the same harness and settings for Quark and for the models we compare against. The four checkpoints ship with their modeling code, tokenizer, chat template and model cards that show unselected samples, failures included.</p>
+<h2>How it compares</h2>
+<p>We ran nine zero-shot benchmarks with the lm-eval harness (0.4.13) on Quark and on open models of 120M to 170M parameters trained on up to about 500B tokens, all in our own runs in November 2026. Scores are in %.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Model</th>
+   <th>Tokens</th>
+   <th>LAMBADA</th>
+   <th>HellaSwag</th>
+   <th>PIQA</th>
+   <th>ARC-E</th>
+   <th>ARC-C</th>
+   <th>WinoGrande</th>
+   <th>SciQ</th>
+   <th>OBQA</th>
+   <th>BLiMP</th>
+   <th>Average</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Quark-150M-128K-Base</td>
+   <td>506B</td>
+   <td>39.0</td>
+   <td>38.3</td>
+   <td>64.4</td>
+   <td>55.4</td>
+   <td>27.7</td>
+   <td>54.5</td>
+   <td>84.3</td>
+   <td>31.4</td>
+   <td>80.0</td>
+   <td>52.8</td>
+  </tr>
+  <tr>
+   <td>Quark-150M-32K-Base</td>
+   <td>500B</td>
+   <td>34.9</td>
+   <td>36.6</td>
+   <td>63.2</td>
+   <td>50.1</td>
+   <td>27.1</td>
+   <td>54.0</td>
+   <td>83.6</td>
+   <td>30.8</td>
+   <td>77.4</td>
+   <td>50.9</td>
+  </tr>
+  <tr>
+   <td>Mamba-130M</td>
+   <td>300B</td>
+   <td>43.5</td>
+   <td>35.1</td>
+   <td>64.7</td>
+   <td>47.6</td>
+   <td>24.4</td>
+   <td>52.3</td>
+   <td>78.1</td>
+   <td>29.6</td>
+   <td>80.4</td>
+   <td>50.6</td>
+  </tr>
+  <tr>
+   <td>OPT-125M</td>
+   <td>180B</td>
+   <td>38.8</td>
+   <td>31.6</td>
+   <td>62.4</td>
+   <td>42.8</td>
+   <td>22.1</td>
+   <td>50.9</td>
+   <td>78.2</td>
+   <td>29.0</td>
+   <td>82.7</td>
+   <td>48.7</td>
+  </tr>
+  <tr>
+   <td>RWKV-4 169M</td>
+   <td>330B</td>
+   <td>32.4</td>
+   <td>32.3</td>
+   <td>64.4</td>
+   <td>47.5</td>
+   <td>23.8</td>
+   <td>51.5</td>
+   <td>75.1</td>
+   <td>27.4</td>
+   <td>82.5</td>
+   <td>48.5</td>
+  </tr>
+  <tr>
+   <td>GPT-Neo 125M</td>
+   <td>300B</td>
+   <td>37.6</td>
+   <td>30.5</td>
+   <td>62.6</td>
+   <td>43.7</td>
+   <td>23.0</td>
+   <td>50.8</td>
+   <td>76.2</td>
+   <td>26.0</td>
+   <td>80.9</td>
+   <td>47.9</td>
+  </tr>
+  <tr>
+   <td>GPT-2 124M</td>
+   <td>not published</td>
+   <td>31.0</td>
+   <td>31.3</td>
+   <td>62.1</td>
+   <td>44.2</td>
+   <td>22.6</td>
+   <td>51.7</td>
+   <td>73.3</td>
+   <td>27.2</td>
+   <td>83.2</td>
+   <td>47.4</td>
+  </tr>
+  <tr>
+   <td>Pythia-160M</td>
+   <td>300B</td>
+   <td>35.4</td>
+   <td>30.3</td>
+   <td>62.3</td>
+   <td>43.6</td>
+   <td>23.6</td>
+   <td>51.3</td>
+   <td>75.4</td>
+   <td>26.8</td>
+   <td>77.5</td>
+   <td>47.4</td>
+  </tr>
+  <tr>
+   <td>SmolLM2-135M</td>
+   <td>2T</td>
+   <td>43.0</td>
+   <td>43.1</td>
+   <td>68.1</td>
+   <td>64.2</td>
+   <td>29.7</td>
+   <td>52.7</td>
+   <td>84.0</td>
+   <td>33.2</td>
+   <td>80.1</td>
+   <td>55.3</td>
+  </tr>
+ </tbody>
+</table>
+<p>HellaSwag, ARC-Challenge and OpenBookQA use normalized accuracy, BLiMP is the mean over its 67 subtasks, and Pythia ran in float32 because it degrades in bf16. Quark-150M-128K-Base has the best average in its group, 52.8, and leads on six of nine tasks. Mamba-130M is ahead on LAMBADA and narrowly on PIQA, and BLiMP is Quark's weakest task. No other model in the group was trained on sequences longer than 8K tokens. SmolLM2-135M, in the last row, was trained on 2T tokens, four times as many with about three times the compute, and scores higher on seven of nine tasks. Quark leads it on WinoGrande and SciQ.</p>
+<p>For long context, we score teacher-forced token-check accuracy on held-out synthetic tasks: the reference text is given up to the answer, and the model's predictions must match the answer tokens. At 128K tokens, the 128K model passes every check in five of eight task families: needle retrieval, conversation recall, event counting, ledger arithmetic and variable tracking. Key-value lookup passes four of eight, and quote attribution fails at every length. These checks show whether the model retrieves the right value, not whether a free generation reaches it.</p>
+<h2>What reinforcement learning taught it</h2>
+<p>Before reinforcement learning, the base model wrote tool calls but invented their results: in 1,152 audited replies, only 3 got a right answer after a call. After reinforcement learning alone, in training rollouts on simple terminal tasks across 15 emulated coding-agent harnesses with real sandboxes, the share solved rose from 3% to 65%. Harnesses added late in the run started at 42% to 54% solved, so the skill carried over between formats. On our in-house task suite, well-formed replies rose from 71% to 96% and correct answers from 13% to 36%.</p>
+<p>The model can also think in a private monologue before it answers. On the commonsense puzzles in our suite, making it always think first raises accuracy from 44% to 67%, compared with our normal setting, in which about half the tasks ask for a direct answer and the rest leave the choice to the model.</p>
+<p>It is still a small model. Asked who it is, it says "I am quark, and I am here to chat with you." Given the classic bat-and-ball puzzle with thinking switched on, it confidently answers $2.10. The model cards on Hugging Face show more samples, including failures.</p>
+<h2>What did not work</h2>
+<p>Web search did not improve during reinforcement learning, and in one of the samples on its model card the model opens a tool call and writes an answer inside it. One of the 15 harness formats never worked, and long-context scores fell during the RL stage. The agentic numbers are training rollouts on simple tasks, not a held-out agent benchmark. Quark knows little about the world, makes factual and reasoning errors and states them confidently, and it was trained mainly on English. Its only safety training is a small set of refusal tasks in the RL stage, and it has not been safety-evaluated. These are research artifacts, not products.</p>
+<h2>Using it</h2>
+<p>You need transformers 5.23 or newer. The modeling code ships with the weights:</p>
+<pre><code>import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+repo = "empero-ai/Quark-150M-128K-Zero"
+tok = AutoTokenizer.from_pretrained(repo, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(repo, trust_remote_code=True, dtype=torch.bfloat16).to("cuda")
+
+messages = [\{"role": "user", "content": "Explain in two sentences why the sky is blue."}]
+inputs = tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt",
+                                 return_dict=True).to("cuda")
+out = model.generate(**inputs, max_new_tokens=256)
+print(tok.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True))</code></pre>
+<p>The model cards describe the chat format, how to switch thinking on and how to offer tools.</p>
+<h2>What comes next</h2>
+<p>Every stage of the stack ran end to end on a small budget, and each one produced something we could measure. That is what we built Quark to find out. Next we want to scale the same pipeline to a larger model, run the RL stage to its full length, fix quote attribution at long range and find out how far it can go on real agentic work. If you build on Quark, find something we should fix, or want to help us scale it, write to [email protected].</p>

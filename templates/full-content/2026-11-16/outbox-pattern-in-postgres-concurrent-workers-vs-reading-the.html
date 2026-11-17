@@ -1,0 +1,114 @@
+<p>The <strong>outbox pattern</strong> saves a message in the same database transaction as the data change it describes, then uses a background worker to send it. Concurrent workers can drain the outbox table with <code>FOR UPDATE SKIP LOCKED</code>, but new messages wait for the next poll. Reading the Postgres write-ahead log with logical replication delivers them in about a millisecond at low load, at the cost of a replication slot and a cleanup job.</p>
+<p>If you build distributed systems, you probably heard about the <strong>Outbox pattern</strong>.</p>
+<p>Your API saves an order, then crashes before it can send the message announcing that order.</p>
+<p>The order is in the database, but other services waiting for that message never hear about it. The <strong>outbox pattern</strong> handles this by saving the message in a separate table, in the same <strong>database transaction</strong> as the order.</p>
+<p>Either both are saved or neither is. This is the A in <strong>ACID</strong>. Atomicity.</p>
+<p>A background worker reads the saved messages and publishes them to a message broker for other services to receive. If the API crashes after saving the order, the message is still there for the worker to send. Querying the table repeatedly for pending messages is called <strong>polling</strong>.</p>
+<p>Polling is a good starting point for an outbox processor. It's decently fast and easy to implement. But the delay between checks is a tradeoff. Checking more often means more database queries, while waiting longer delays new messages.</p>
+<p>I want to reduce that wait by having Postgres <strong>tell me</strong> when there's something to process, and see how that compares with the polling workers.</p>
+<h2>Concurrent Workers Draining the Table</h2>
+<p>For this walkthrough, we'll use an order API on Postgres that saves each <code>OrderCreated</code> message in an <code>outbox_messages</code> table, with <strong>RabbitMQ</strong> as the broker.</p>
+<p>I want to run several workers at once, and Postgres row locks stop two of them from grabbing the same message.</p>
+<p>Each worker starts a transaction and claims a batch with this query, using <strong>Dapper</strong>:</p>
+<pre><code>SELECT id, type, content
+FROM outbox_messages
+WHERE processed_on_utc IS NULL
+ORDER BY occurred_on_utc
+LIMIT 1000
+FOR UPDATE SKIP LOCKED
+</code></pre>
+<p><code>FOR UPDATE</code> locks the rows this worker picked until its transaction ends. <code>SKIP LOCKED</code> makes the next worker take other rows instead of waiting. The locks live in Postgres, so these workers can run in one process or in several.</p>
+<p>The worker keeps that transaction open while it publishes with <strong>RabbitMQ.Client</strong>, then sets <code>processed_on_utc</code> and commits once RabbitMQ confirms.</p>
+<p>When a worker runs out of rows, it sleeps for one second with <code>Task.Delay</code> and tries again.</p>
+<p>If a worker crashes before it commits, those rows are still unprocessed, and a worker picks them up again. Some of those messages may have already reached RabbitMQ, so the same message can arrive twice.</p>
+<p>That makes this <strong>at-least-once delivery</strong>, so your consumers must be <strong>idempotent</strong>.</p>
+<h2>Why Not Just LISTEN/NOTIFY?</h2>
+<p>Postgres has a built-in way to wake those workers. With <strong><code>LISTEN</code>/<code>NOTIFY</code></strong>, one connection runs <code>LISTEN outbox_new</code>, and Postgres tells it when another connection runs <code>NOTIFY outbox_new</code> and commits.</p>
+<p>My first implementation sent <code>NOTIFY</code> from a database trigger on the outbox table. It needs no API changes and worked well at 100 orders per second. But with 100 concurrent users, throughput fell from 8,070 orders per second with polling to 256.</p>
+<p>The trigger runs inside the order transaction. Before that transaction commits, Postgres takes a lock and holds it until after the commit. Every transaction that sends a notification takes the same lock.</p>
+<p>A commit normally waits for a disk flush, and concurrent transactions can share one, which is called <strong>group commit</strong>. With the lock, each order waits for the one in front of it to finish its own flush.</p>
+<p>Sending <code>NOTIFY</code> after the commit, from a separate connection, avoids that lock. At 100 users the API handled 7,674 orders per second, about 5% below polling, and at 100 orders per second a message took 1.91 ms from commit to consumer.</p>
+<p>But now I'm running a notifier, a listener, and a fallback poll for notifications sent while the listener is disconnected, all to wake the same workers. Postgres already has a record of every new row, so let's read that instead.</p>
+<h2>Read the Outbox From the WAL</h2>
+<p>Postgres writes every change to the <strong>write-ahead log (WAL)</strong>. <strong>Logical replication</strong> streams committed changes to my app, so there's no polling and no wake-up to miss.</p>
+<p>You need <code>wal_level=logical</code>, which takes a restart on Postgres 18. Then create a publication and a <strong>replication slot</strong>:</p>
+<pre><code>CREATE PUBLICATION outbox_pub FOR TABLE outbox_messages WITH (publish = 'insert');
+SELECT pg_create_logical_replication_slot('outbox_slot', 'pgoutput');
+</code></pre>
+<p>The slot remembers how far my reader has confirmed, so it can resume after a restart.</p>
+<p>Let's read the stream with an <strong>Npgsql replication connection</strong>:</p>
+<pre><code>await using var connection = new LogicalReplicationConnection(connectionString);
+await connection.Open(cancellationToken);
+
+var slot = new PgOutputReplicationSlot("outbox_slot");
+var options = new PgOutputReplicationOptions("outbox_pub", PgOutputProtocolVersion.V1);
+
+await foreach (var message in connection.StartReplication(slot, options, cancellationToken))
+\{
+    if (message is InsertMessage insert)
+    \{
+        await PublishAsync(insert, cancellationToken);
+    }
+    else if (message is CommitMessage commit)
+    \{
+        connection.SetReplicationStatus(commit.TransactionEndLsn);
+    }
+}
+</code></pre>
+<p><code>PublishAsync</code> publishes to RabbitMQ and waits for the confirm. I only confirm a position after that, when the <code>CommitMessage</code> arrives, so a crash replays messages instead of losing them.</p>
+<p>This loop only suits low rates, because waiting on every message drained about 1,600 per second. So the reader I measured publishes first and waits for confirms, in order, in a separate task.</p>
+<p>While the reader is down, the slot keeps all the server's WAL on disk, so a long outage can fill it. You can cap that with <strong><code>max_slot_wal_keep_size</code></strong>, but Postgres invalidates a slot past the cap.</p>
+<p>This reader is a prototype, and I haven't tested it through a failover or on managed Postgres.</p>
+<h2>Workers vs the WAL Reader</h2>
+<p>The main benchmark comes from my <strong>scaling article</strong>: I seeded a backlog, started the processor, and counted what RabbitMQ had after one minute, in <strong>messages per second (MPS)</strong>. To keep it fair, the WAL reader also marks rows as processed in batches, so it does the same <code>UPDATE</code> as the workers. This ran on one machine, with Postgres 18 and RabbitMQ 4 in Docker:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Setup</th>
+   <th>MPS after 1 minute</th>
+   <th>Average commit to consumer, 100 orders/s</th>
+   <th>Average commit to consumer, 100 users</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <th>1 worker</th>
+   <td>14,516 to 15,050</td>
+   <td>500 ms</td>
+   <td>8.5 s</td>
+  </tr>
+  <tr>
+   <th>5 workers</th>
+   <td>22,216 to 24,133</td>
+   <td>419 ms</td>
+   <td>54 to 85 ms</td>
+  </tr>
+  <tr>
+   <th>WAL reader</th>
+   <td>27,962 to 34,930</td>
+   <td>0.83 ms</td>
+   <td>8.6 ms</td>
+  </tr>
+ </tbody>
+</table>
+<p>One worker already moves about 15,000 messages per second, and five get to about 23,000. The WAL reader leads at about 31,000, and it reached about 57,600 without the <code>UPDATE</code>. Both move thousands of messages per second, so throughput alone isn't a reason to switch.</p>
+<p>Latency is the real difference. New messages wait for a worker's one-second sleep, so five workers average 419 ms at 100 orders per second, while the reader stays under a millisecond. At 100 users, one worker fell 8.5 seconds behind, five workers averaged 54 to 85 ms, and the reader held 8.6 ms.</p>
+<p>A crash goes the other way. A hard kill partway through 200,000 rows lost nothing, but the workers sent 4,536 duplicates and the WAL reader 31,095, because it replays from its last confirmed position.</p>
+<p>Workers also scale out, because you can add more in any process. A slot has one reader, which keeps commit order, but I can't scale it out.</p>
+<h2>Summary</h2>
+<p>Keep polling if the delay is acceptable for your application. Add workers when you need more throughput, because the row locks already handle the concurrency.</p>
+<p>Read the WAL if you need new messages right away and can run a replication slot and a cleanup job. If you use <code>NOTIFY</code> instead, send it after the commit and keep a fallback poll.</p>
+<p>A worker can still crash after publishing but before committing its processed markers, causing a message to be sent again. Consumers must be <strong>idempotent</strong>: processing the same message twice must not repeat its effects.</p>
+<h2>Frequently Asked Questions</h2>
+<h3>How do concurrent outbox workers avoid publishing the same message twice?</h3>
+<p>Each worker starts a transaction and claims a batch with FOR UPDATE SKIP LOCKED. FOR UPDATE locks the selected rows until the transaction ends, and SKIP LOCKED makes other workers take different rows instead of waiting. The locks live in Postgres, so workers can run in one process or in several. A crash before the commit releases the locks, so another worker publishes those rows again, which makes delivery at least once.</p>
+<h3>Why not send NOTIFY from a trigger inside the transaction?</h3>
+<p>A transaction that sends a notification takes a lock in Postgres and holds it until its commit is done. So these transactions commit one at a time, and each waits for the previous one to finish its disk write. In my k6 runs with 100 users, that cut the API from about 8,070 to 256 orders per second. Sending NOTIFY after the commit, from a separate connection, avoids the lock and held 7,674 orders per second, but it adds a notifier, a listener, and a fallback poll.</p>
+<h3>Is a Postgres notification durable?</h3>
+<p>No. Postgres only delivers a notification to connections that are listening at that moment, so a listener that is disconnected when the commit happens never sees it. Keep a fallback poll, for example every 5 seconds, so idle workers check for messages even if they miss a notification.</p>
+<h3>What does polling the outbox cost when there is nothing to process?</h3>
+<p>With five workers and no delay, the claim query ran about 289,000 times a minute and kept the Postgres container at 118 percent CPU. A one-second delay after an empty batch brought that to 305 queries a minute. A logical replication reader runs no outbox queries while idle.</p>
+<h3>How many outbox messages per second can workers and a WAL reader publish?</h3>
+<p>Over a one-minute drain of a backlog, one worker published about 15,000 messages per second and five workers about 23,000. A logical replication reader doing the same batched UPDATE published about 31,000, with two runs at 27,962 and 34,930, and about 57,600 without the UPDATE. These are results from one machine, with Postgres and RabbitMQ in Docker.</p>
+<h3>When should an outbox read the Postgres write-ahead log instead of using polling workers?</h3>
+<p>Read the write-ahead log when you need new messages right away and you can run a replication slot. At 100 orders per second, the commit-to-consumer average was 0.83 ms with the reader and 419 ms with five workers polling after a one-second sleep. It needs wal_level=logical, a slot that keeps WAL on disk while the reader is down, and a cleanup job, because the reader does not mark rows as processed by itself. After a hard kill it sent more duplicates, 31,095 against 4,536 of 200,000 rows, and neither design lost a message.</p>
