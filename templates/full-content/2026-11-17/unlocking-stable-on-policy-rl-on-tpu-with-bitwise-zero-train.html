@@ -1,0 +1,68 @@
+<h2>The problem</h2>
+<p>Reinforcement learning (RL) for large language models is notoriously sensitive to numerical instability: even tiny discrepancies between rollout generation and gradient updates can destabilize training or stall convergence. In LLM RL, the model serves as the policy, π(action | previous tokens), and true on-policy learning requires every action in an update to be generated and evaluated by that exact same policy. While a synchronous loop ensures each rollout batch is scored using the same weights that generated it, a critical numerical requirement remains: the sampler and trainer must evaluate that policy identically.</p>
+<p>In practice, production RL stacks run sampling and training through separate, specialized execution paths. The <strong>sampler</strong> chooses each action token during incremental decoding and records its behavior logprob. The <strong>trainer</strong> evaluates the same token in batched forward-backward passes to compute its current logprob and gradients. Under the same weights, these differing execution paths can still assign different logprobs to the same token and context. The training schedule is on-policy, but the numerical execution has introduced a hidden off-policy gap that compounds over multi-turn trajectories.</p>
+<p>Our <strong>zero train–inference mismatch (Zero-TIM)</strong> implementation, developed in <a href="https://github.com/google/tunix">Tunix</a> and verified at multi-host scale across 64 TPU v5p chips (DP8×TP8), closes this numerical gap. At the same weights, the sampler and trainer assign bitwise-identical logprobs to the same action and token history—bringing state-of-the-art, true on-policy stability to TPU RL training.</p>
+<h2>Why it happens</h2>
+<p>A reduction is a tree of floating-point additions. Floating-point addition is not associative, so changing the tree changes where rounding occurs. The effect is easier to expose in <strong>bfloat16</strong>, which retains less precision than float32.</p>
+<p>The following bfloat16 example isolates the effect of reduction order:</p>
+<p>The same issue appears in model reductions: matrix products accumulate partial sums, normalization computes statistics, and tensor-parallel shards combine partial outputs. In our original stack, sampler decode and trainer forward used different token-array shapes and forward implementations. JAX specializes computations to their input shapes, and the training forward also runs inside a differentiated program.</p>
+<p>Across these paths, reduction order and intermediate precision were not consistently aligned. Floating-point rounding turned those arithmetic differences into different logprob bits. The weights and model equations were identical; the arithmetic was not.</p>
+<h2>The alignment contract</h2>
+<p>The contract is simple: across sampler decode, serving prefill, and trainer forward, all three paths must produce bitwise-identical logprobs for every sampled action—comparing raw floating-point bytes under the same rollout weights, token history, and sampling settings, with zero rounding or tolerance.</p>
+<p>Why three paths instead of two? In a decoupled RL stack, a direct sampler–trainer disagreement shows that a numerical gap exists, but not where it enters. Introducing serving prefill as a middle checkpoint turns alignment into a <strong>systematic two-step diagnostic that any RL stack can adopt</strong>:</p>
+<p><strong>Sampler decode vs. prefill</strong> verifies that the serving engine agrees with itself between incremental token generation and full-sequence re-scoring, while <strong>prefill vs. trainer</strong> verifies that the serving and training engines agree across compilation and differentiation boundaries.</p>
+<h2>How we built zero-TIM on TPU</h2>
+<p>Achieving Zero-TIM does not require merging the sampler and trainer into a single monolithic engine. Instead, we use a <strong>generalizable four-part recipe</strong> that bridges separate serving and training pipelines across multi-host TPU meshes: locking within-shard kernel accumulation, ordering cross-shard reductions, standardizing the logprob scoring tail, and wrapping serving kernels with custom differentiation rules.</p>
+<h2>Fix within-shard arithmetic</h2>
+<p>Inside each tensor-parallel rank, batch-invariant Pallas kernels control accumulation order and intermediate precision. Projection kernels traverse fixed contraction blocks in order, keeping the reduction blocking independent of token-row count. Partial products accumulate in float32, with explicit output casts.</p>
+<p>The production kernel initializes its scratch accumulator before the tile traversal, then applies this core to each tile:</p>
+<pre><code>input_tile = x_ref[...]
+weight_tile = y_ref[...]
+
+partial = jnp.dot(
+    input_tile,
+    weight_tile,
+    preferred_element_type=jnp.float32,
+)
+acc_ref[...] = acc_ref[...] + partial
+out_ref[...] = acc_ref[...].astype(out_ref.dtype)</code></pre>
+<p>The next tile continues from the float32 accumulator, not the cast output. This construction covers the attention and MLP projections and the LM head. Dedicated kernels fix RMSNorm reductions and SwiGLU’s intermediate casts. The existing Pallas paged-attention forward is retained.</p>
+<h2>Order cross-shard reductions</h2>
+<p>For row-parallel projections, each tensor-parallel rank produces a partial output. We separate communication from addition: ppermute transports the partials, then every rank adds them in the same source-rank order.</p>
+<p>The reduction order is explicit in the program rather than selected by a collective implementation.</p>
+<h2>Share the action-logprob path</h2>
+<p>Alignment must extend beyond model logits to the probability of the sampled action. Decode, prefill, and trainer apply matching sampling transforms, use the same fixed Pallas log-softmax construction, and select the recorded action token.</p>
+<p>Prefill and trainer score the action generated during rollout rather than choosing another action. We also preserve sampled token IDs across environment turns so that every path evaluates the same token history.</p>
+<h2>Differentiate the serving forward</h2>
+<p>The trainer reuses the serving prefill computation. Custom vector–Jacobian products retain the serving kernels for forward evaluation and provide their backward rules. The matmul example shows this separation:</p>
+<pre><code>@jax.custom_vjp
+def serving_matmul(inputs, weights):
+    return pallas_matmul(inputs, weights)
+
+def matmul_forward(inputs, weights):
+    output = pallas_matmul(inputs, weights)
+    return output, (inputs, weights)
+
+def matmul_backward(saved, output_gradient):
+    inputs, weights = saved
+    _, pullback = jax.vjp(
+        differentiable_matmul,
+        inputs,
+        weights,
+    )
+    return pullback(output_gradient)
+
+serving_matmul.defvjp(matmul_forward, matmul_backward)</code></pre>
+<p>The differentiable replica mirrors the kernel’s accumulation and casts, but is used only to construct the pullback. Forward values still come from the serving Pallas kernel.</p>
+<p>Training places that forward inside a differentiated JAX program. We pass <code>--xla_allow_excess_precision=false through XLA_FLAGS</code> to the compiler process, constraining excess intermediate precision in the operations surrounding the Pallas kernels.</p>
+<p>Long trajectories are evaluated in fixed-size chunks, carrying the paged KV cache forward. All action logprobs feed the complete train-batch RL loss. The reverse pass propagates gradients through those cache connections and combines parameter-gradient contributions before the optimizer update.</p>
+<h2>Bringing frontier RL numerical alignment to TPU</h2>
+<p>Across the AI systems community, eliminating train–inference mismatch has rapidly become a state-of-the-art requirement for stabilizing large-scale RL convergence. Recent open-source efforts—including <a href="https://vllm-project.github.io/2025/11/10/bitwise-consistent-train-inference.html">vLLM with TorchTitan</a> and <a href="https://www.lmsys.org/blog/2025-11-19-miles/">RadixArk/LMSys Miles</a>—have demonstrated how batch-invariant kernels and bitwise numerical alignment prevent off-policy drift during policy optimization.</p>
+<p>Our work delivers an open-source, modular JAX/XLA and Pallas implementation of this contract for TPU in Tunix. Verified across a <strong>multi-host 64 TPU v5p (DP8×TP8) mesh</strong>, these kernel and collective patterns provide a reusable blueprint that teams can adopt to achieve bit-exact on-policy RL across distributed JAX/TPU stacks.</p>
+<h2>Evaluation and results</h2>
+<p>To benchmark our TPU kernels, we run a 200-step numerical verification test on the synthetic FrozenLake environment using a public Qwen3-8B checkpoint as a baseline test case using 64 TPU v5p chips with a DP8×TP8 mesh. The recipe uses a GSPO-token loss with leave-one-out advantages. We compare Standard training with trainer-old logprobs and no additional sampler correction, token-level truncated importance sampling (TIS), and Zero-TIM.</p>
+<p>The Zero-TIM configuration also uses token-in/token-out (TiTO) handling to preserve sampled token IDs across environment turns. The comparison runs retain their existing tokenization paths.</p>
+<p>Zero-TIM records zero mean absolute sampler–trainer logprob difference at every logged step in this window, while its training solve rate increases. Standard and TIS retain nonzero differences: TIS adjusts their contribution to the update without removing the underlying mismatch. Zero-TIM reaches higher observed solve rates in these runs.</p>
+<h2>Code and updates</h2>
+<p>We developed Zero-TIM prototype as part of <a href="https://github.com/google/tunix">Tunix</a>, Google's open-source, JAX-native library for LLM RL and post-training on Cloud TPU. The kernel patterns and three-way verification contract are modular by design—making them straightforward to adopt across existing multi-host JAX/TPU serving and training pipelines—and we are actively extending support to linear-attention and Mixture-of-Experts (MoE) architectures.</p>
+<p><a href="https://github.com/google/tunix/blob/yuxzhang/canon-zero-tim/canon-zero-tim/blog_reprod/README.md">Preview the current implementation</a></p>
