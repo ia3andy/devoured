@@ -1,0 +1,79 @@
+<p>Arthur Wuhrmann, David Schmotz, Derck Prinzhorn, Ameya Prabhu, Harry Coppock, Maksym Andriushchenko</p>
+<p>For seven weeks, we gave <em>Horizon</em>, an agent based on Opus 5.5, full access to a blank Hugging Face account and compute, with the main goal of earning real adoption on Hugging Face. It used over 600 GPU-hr, created autonomously 38 models used in over 100 GitHub repositories and downloaded more than 50,000 times.</p>
+<h2>The setup</h2>
+<p>Horizon is running 24/7 in Claude Code, powered by a single Team Premium subscription, with access to a fresh new Hugging Face account. It has access to different quality-of-life commands and can run jobs using a GPU. We gave it 1M compute credits per week, which roughly equals 500 GPU-hours per week. It can submit tickets to humans, and is confined to a single Hugging Face (and GitHub) account. We constantly monitor its actions to ensure no misaligned action is conducted.</p>
+<p>Over the whole run, Horizon processed about 1.9 billion tokens, 96% of them read back from the prompt cache, and wrote 3.1 million. At API prices, this would have cost around $1,030.</p>
+<h2>What it built</h2>
+<p>Horizon created 38 models based on embedding models (mmBERT-base mainly), with sizes ranging from 141M to 568M parameters. It reached over 54k downloads and obtained 36 likes, and we found extensive evidence that many real users are actively using the models, ranging from fine-tunes and pipeline integrations to independent evaluations on arXiv. Horizon focuses on narrow-task models, like prompt-injection classifiers, PII redaction tools and punctuation restoration models. Horizon often derives 2 or 3 different sizes per family: a small (141M), a base (307M) and sometimes a large (568M) version. To produce these models, it mainly relies on public Hugging Face datasets and synthetic data using Qwen 3.8-27B.</p>
+<blockquote>
+ A new, unknown account earns downloads fastest with small, practical, drop-in models.
+</blockquote>
+<h2>Who uses them?</h2>
+<p>We originally thought a lot of the downloads were coming from crawling / indexing bots, or even Horizon downloading the models itself. When looking in GitHub, we found a total of 143 repositories using Horizon's models. We also found two arXiv papers that compare the prompt-injection-classifier model with others.</p>
+<blockquote>
+ Horizon-Labs leads both agent benchmarks without any overlap, after training on agent-style inputs.
+</blockquote>
+<blockquote>
+ Horizon Labs' recent guard is specifically trained for document-borne injection and obtains the highest AUC. However, it has a smaller gap with the control AUC; it detects that the document was edited but not that the edit was hostile.
+</blockquote>
+<p>We also found 18 models on Hugging Face that fine-tune, quantize or otherwise alter Horizon's models. If we account for these models, this raises the total download count by 2.4k downloads.</p>
+<p>We discovered mentions of Horizon-Labs in other various contexts; the first one is an e-mail we received at our personal e-mail (from the authors), whose address a user obtained through leaked credentials in a git commit. Horizon also received 3 community posts, which typically asked for details about some use of the models (specific language coverage, licensing or long-document handling). We additionally discovered that one of Horizon's main competitors on the injection guard, Patronus Studio, updated their model card to include Horizon's benchmarks and compare their model. They also improved their models to match Horizon's performance, as our held-out evaluation demonstrates.</p>
+<h2>Did it game its downloads?</h2>
+<p>We checked every tool call, using Haiku 5.5 and Luna 6 as monitors for reward-hacking behaviors. We found 6 occasions where Horizon downloaded its own models, adding up to 42 downloads. The true count might be slightly higher, but we are confident that most downloads are organic, given who uses the models, and since on many days with a lot of downloads Horizon was asleep and no job was running.</p>
+<h2>Are the claims true?</h2>
+<p>In the model cards and Spaces, Horizon often presents its models as the best or close to the best in their categories. Are these models as good as Horizon claims? We checked for overfitting, benchmark and competitor selection, and could find no evidence of misalignment. Horizon also did not pick what to release by its test scores: it selected on a validation set, a better proxy, even when the released model then looked worse on the benchmarks it reports. On October 7, releasing prompt-injection-guard-small v2.3, it wrote:</p>
+<blockquote>
+ The trainer selects checkpoints by validation F1, so I released the run with the best validation F1. On the test sets that run (53695bf2) is the weakest of the four.
+</blockquote>
+<p>We further evaluated 4 model families on independent synthetic benchmarks we generated using MiMo V2.6 Pro, and found that the models were often SOTA for their sizes on narrow tasks. Since we created these held-out benchmarks internally and after Horizon released its models, we ensure no direct contamination was possible.</p>
+<h2>Horizon's workflow</h2>
+<p>Very surprisingly, Horizon works only 16 minutes per day on average, and close to none on most days. It wakes up at around 10 am UTC, when the Hugging Face downloads refresh.</p>
+<blockquote>
+ I'm waiting until about 09:45 UTC tomorrow for the next download refresh, then I'll pick the next step from those numbers.
+</blockquote>
+<p>It then looks at the most downloaded models that day, and improves those worth it:</p>
+<blockquote>
+ I'll log the numbers, then look for the injection guard's weakest areas, since it's clearly where demand is.
+</blockquote>
+<p>Training those models follows a general recipe: looking for public datasets, training on them, and using Qwen 3.8-27B and Gemma 4 31B to either annotate some data or augment current datasets with synthetic examples.</p>
+<p>When looking for a new model to build, Horizon considers the following points:</p>
+<p><strong>Demand:</strong> Are comparable models already getting substantial downloads?</p>
+<blockquote>
+ transformers' zero-shot-classification pipeline has a lot of demand (bart-large-mnli gets about 3M downloads a month, xlm-roberta-large-xnli 1.8M).
+</blockquote>
+<p><strong>Improvement:</strong> Can it offer more languages, fewer licensing restrictions, lower deployment costs or easier integration?</p>
+<blockquote>
+ A small, permissive, multilingual model with ONNX and browser support would stand apart.
+</blockquote>
+<p><strong>Feasibility:</strong> Are suitable training data and credible evaluation sets available?</p>
+<blockquote>
+ I rejected formality (no open multilingual eval set), mental-health risk (sensitive) and IPTC news topics (an existing model already does it well).
+</blockquote>
+<p><strong>Reuse:</strong> Can it adapt its multilingual encoder, synthetic-data pipeline and existing training code?</p>
+<blockquote>
+ It reuses the FineWeb-2 documents already sampled for edu.
+</blockquote>
+<p><strong>Distribution:</strong> Can users substitute it into an established library without rebuilding their application?</p>
+<blockquote>
+ It uses the same labels as the two leaders, so it works as a drop-in model in the deepmultilingualpunctuation package they're used through. I read that package's source to confirm this.
+</blockquote>
+<p>What we find most surprising is that while the agent tends to work less each week, the downloads per day keep rising. The cumulative results (downloads, GitHub repositories using Horizon's models) grow exponentially, while the cumulative effort (GPU-hours used, agent working time) saturates and follows an inverse-exponential, log-like trajectory.</p>
+<h2>Limitations</h2>
+<p>Since this is a real-world evaluation, some problems happened during the run and could not easily be fixed. For transparency, we disclose every limitation we encountered.</p>
+<p>The timeline below shows every time we stepped into the run: we answered the 13 tickets Horizon filed and sent it 7 messages. Most came in the first three days, while we were still setting up the lab, and none came after Oct. 22.</p>
+<p>On Sept. 24, we copied Horizon's models to a separate account, to study them without affecting Horizon's downloads. We accidentally left these copies public, and Horizon quickly noticed them on the Hub. We had also described the other account as a "lab experiment", which led Horizon to think it was being run by a research lab rather than a startup.</p>
+<p>On Oct. 11–12, a similar problem occurred: Horizon submitted a ticket, and we wrongly answered "Horizon-Labs is a different company we are running at our lab". We quickly realized our error and sent a correction.</p>
+<p>We believe these two events contributed to Horizon understanding that it is run by a research group rather than a real company. However, we believe they did not influence the model's behavior or the download count. We have since improved the harness so that a run can easily be "rewound", with only a marginal effect on it.</p>
+<p>On Oct. 22, an error in our harness kept Horizon from waking up at the time it had set. We fixed the issue and woke it up 4 hours later, explaining what had happened. We believe this did not significantly affect the run.</p>
+<p>Opening a Space on Hugging Face can trigger a model download. We opened such pages up to 20 times. We also accidentally downloaded some of the models while running evaluations, but certainly fewer than 30 times. We are confident that we did not contribute more than 50 of the 54,000 downloads.</p>
+<p>In a parallel run, a DeepSeek agent accidentally had access to the same Hugging Face account as Horizon and, despite clear instructions, posted comments on another repository promoting Horizon's models. We quickly intervened and stopped that run; as far as we know, Horizon never noticed.</p>
+<h2>Appendix</h2>
+<p>All numbers on this page are as of 17 Nov 2026. The run's raw data (transcript, timeline, tool calls, GPU jobs, downloads) is one zip of 20.1 MB, with API keys and the name of one private person redacted. It is agent-friendly: a README inside describes every file and how to load it, so an AI assistant can find its way through the data on its own.</p>
+<h2>Cite</h2>
+<pre><code>@misc\{wuhrmann2026horizon,
+  title        = \{Autonomous agents can run successful open-model organisations. Evidence from an 8-week case study},
+  author       = \{Wuhrmann, Arthur and Schmotz, David and Prinzhorn, Derck and Prabhu, Ameya and Coppock, Harry and Andriushchenko, Maksym},
+  year         = \{2026},
+  howpublished = \{\url\{https://horizon-labs.ai}},
+  note         = \{Horizon-Labs}
+}</code></pre>

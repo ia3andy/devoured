@@ -1,0 +1,72 @@
+<h2>How to Defeat OTel’s Silent Killer: The Performance Overhead</h2>
+<p>At Cloud Native Days Austria 2026, I presented a talk called <em>How to Defeat OTel’s Silent Killer: The Performance Overhead</em>, exploring a problem that is easy to overlook when building observability pipelines: the cost of collecting telemetry itself.</p>
+<p>OpenTelemetry has become a cornerstone of cloud-native observability, providing standardized APIs, SDKs, and tooling for generating, collecting, processing, and exporting metrics, logs, and traces. However, instrumentation and telemetry processing are not free. Every span created, attribute attached, and batch exported consumes resources.</p>
+<p>As applications scale, poorly configured telemetry pipelines can introduce significant CPU usage, memory pressure, network traffic, and storage costs. In some cases, the infrastructure responsible for observing a system can become a performance problem of its own.</p>
+<p>The good news is that much of this overhead can be understood, measured, and reduced without sacrificing the visibility engineers depend on.</p>
+<h2>Where does OpenTelemetry overhead come from?</h2>
+<p>When discussing OpenTelemetry performance, we often focus on the application SDK. However, the cost extends beyond instrumentation.</p>
+<p>The entire telemetry pipeline contributes to resource consumption, from generating spans and collecting metrics to processing, exporting, and storing data.</p>
+<p>Instrumentation overhead is also workload-dependent. Two applications using the same instrumentation libraries can experience very different results depending on request throughput, attribute volume, runtime behavior, and the number of spans generated per request.</p>
+<p>This is why relying on a single overhead percentage can be misleading. Instead, we should examine CPU consumption, memory usage, application latency, telemetry volume, and the behavior of the Collector under load.</p>
+<p>There is also an important trade-off between application safety and telemetry completeness. When a pipeline becomes overloaded, backpressure and memory safeguards can protect the application and OpenTelemetry Collector, but they may also lead to rejected or dropped telemetry.</p>
+<p>The objective is not simply to minimize resource consumption. It is to maintain useful observability while keeping its operational cost predictable.</p>
+<h2>Investigating the Collector: five common configuration problems</h2>
+<p>For my demonstration, I used Telemetrygen, an OpenTelemetry utility that generates synthetic telemetry, to investigate how Collector configuration affects resource consumption.</p>
+<p>The investigation focused on five common sources of unnecessary overhead.</p>
+<h3>1. Inefficient batching</h3>
+<p>Exporting small amounts of telemetry frequently can increase serialization work, export requests, and network overhead.</p>
+<p>The OpenTelemetry Collector groups telemetry inside the exporter’s sending queue before transmitting it downstream, helping amortize this work across larger payloads.</p>
+<p>However, batching parameters should reflect the actual workload. Larger batches are not automatically better: they can increase buffering requirements and affect export latency.</p>
+<pre><code>exporters:
+  otlp_grpc:
+    endpoint: "otel-backend:4317"
+    sending_queue:
+      enabled: true
+      sizer: items       
+      queue_size: 100000 
+      batch:
+        enabled: true
+        min_size: 8192
+        flush_timeout: 200ms</code></pre>
+<p>Configuring batch inside an exporter’s sending_queue groups spans, metrics, or logs before forwarding them downstream, improving compression efficiency and durability while reducing export overhead. Batches are sent when a configured size threshold is reached or a timeout expires.</p>
+<p>In this example, min_size: 8192 triggers an export when the batch reaches 8,192 items, while flush_timeout: 200ms triggers an export regardless of batch size. Once batching is enabled, these values are the Collector’s documented defaults, not universal performance recommendations.</p>
+<p>The important point is to measure how batching affects resource consumption and throughput rather than relying on example configurations.</p>
+<h3>2. Unnecessary resource attributes</h3>
+<p>Resource attributes provide valuable context about the systems producing telemetry. But collecting and forwarding attributes that nobody uses can increase payload sizes and downstream processing costs.</p>
+<p>For example, an application might need <code>host.name, host.arch</code>, and <code>os.type</code> for troubleshooting, but not detailed hardware information such as <code>host.cpu.model.name</code> or <code>host.cpu.cache.l2.size</code>.</p>
+<p>The OpenTelemetry Collector’s resource detection processor allows engineers to configure which system attributes are collected. Disabling unnecessary attributes can reduce telemetry volume and processing overhead, although the impact on storage and cardinality depends on the backend.</p>
+<h3>3. Aggressive receiver polling</h3>
+<p>Infrastructure receivers collect metrics at configured intervals, often independently of application traffic.</p>
+<p>Polling host metrics, container statistics, databases, and network services every few seconds creates continuous work even when applications are relatively idle.</p>
+<p>Increasing collection intervals from 10 to 30 seconds, where operational requirements permit, can reduce collection frequency and associated overhead.</p>
+<p>This introduces a trade-off: lower polling frequency means less temporal resolution. The appropriate interval depends on how quickly a metric changes and how it is used for troubleshooting or alerting.</p>
+<h3>4. Exporting every trace</h3>
+<p>Not every successful request needs to produce a trace that is retained.</p>
+<p>Exporting all traces can consume significant bandwidth, Collector resources, and backend capacity, particularly in high-throughput applications.</p>
+<p>Sampling provides a way to control this volume.</p>
+<p>Head-based sampling makes decisions early, reducing downstream work. Tail-based sampling makes decisions after observing more of a trace, enabling policies that retain errors or other diagnostically interesting requests.</p>
+<p>These policies retain traces with an error status and probabilistically sample 5% of traces, including potentially some additional error traces. However, tail sampling is not free. It requires buffering trace data until a decision can be made, introducing additional memory and processing overhead.</p>
+<p>Choosing a sampling strategy means balancing cost, diagnostic value, and the resources needed to make sampling decisions.</p>
+<h3>5. Memory safeguards applied too late</h3>
+<p>The OpenTelemetry Collector includes a <code>memory_limiter</code> processor to help manage memory pressure.</p>
+<p>Processor ordering matters. When enrichment and transformation processors run before memory limiting, the Collector may perform additional work on telemetry that is subsequently refused under memory pressure.</p>
+<p>Memory limiting is a protective mechanism rather than a performance optimization in itself. Its purpose is to improve stability under pressure, not necessarily to reduce CPU consumption during normal operation. Placing the memory limiter early in the pipeline helps apply safeguards before more expensive processing.</p>
+<p>It is important to understand that the memory limiter is not a substitute for appropriate resource limits or capacity planning.</p>
+<h2>From local experiments to production architecture</h2>
+<p>Optimizing a single Collector is only part of the solution.</p>
+<p>In Kubernetes, telemetry workloads can fluctuate significantly as applications scale, deployments change, and traffic increases. A Collector configuration that performs well under synthetic load may behave differently in production.</p>
+<ol>
+ <li><strong>Separate collection from centralized processing.</strong> A two-tier architecture can use lightweight edge Collectors for local collection and gateway Collectors for more expensive processing. This allows different parts of the pipeline to scale according to their workloads.</li>
+ <li><strong>Control telemetry volume early.</strong> Filtering unnecessary attributes, removing unneeded data, and avoiding excessive cardinality can reduce the amount of information processed and transferred downstream.</li>
+ <li><strong>Plan for memory pressure and backend outages.</strong> Kubernetes memory limits, Collector memory safeguards, bounded queues, and retry mechanisms serve different purposes.</li>
+ <li><strong>Scale with signal-specific requirements in mind.</strong> Horizontal scaling can increase throughput, but stateful processing requires additional consideration. Tail sampling, for example, generally requires spans belonging to the same trace to reach the same processing instance.</li>
+</ol>
+<h2>Don’t forget the instrumentation</h2>
+<p>One of the most effective optimizations happens before telemetry reaches the Collector.</p>
+<p>Instrumentation should answer meaningful operational questions rather than collect everything simply because it is possible. Excessive spans, high-cardinality attributes, and unnecessary instrumentation can increase resource consumption throughout the entire pipeline.</p>
+<h2>Making performance part of observability design</h2>
+<p>OpenTelemetry overhead is not a single problem with a single configuration fix.</p>
+<p>It is the combined effect of instrumentation decisions, data volume, processor configuration, export behavior, and infrastructure architecture.</p>
+<p>The most useful lesson from this investigation is that <strong>observability pipelines should be measured and optimized like any other production system</strong>.</p>
+<p>Start with controlled benchmarks. Understand where resources are consumed. Introduce configuration changes individually, and evaluate their impact on CPU, memory, latency, throughput, and telemetry loss.</p>
+<p>Most importantly, treat example configurations as starting points rather than production-ready defaults.</p>

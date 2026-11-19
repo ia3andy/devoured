@@ -1,0 +1,56 @@
+<h1>Accelerating development for massive Git repositories</h1>
+<p>Android’s source code is big – the Android 17 open source release has <strong>1,084</strong> Git repositories, <strong>1.62 million</strong> files, and takes <strong>300 GB</strong> for a built workspace. Additionally, in a typical Android source tree with hardware vendor code and first-party applications, the size increases by <strong>2-3x</strong>.</p>
+<p>Traditionally, it took over 30 minutes to fetch Android Open Source Project (AOSP) source code and well over an hour to build on even highly capable developer workstations. As software development evolved over the last 2 years, modern coding harnesses and LLMs have accelerated the development of many projects. These tools are used today for Android operating system development, but the long sync and build times make them less efficient. Both human developers and agents need quick setup, parallel workspaces, and fast build-and-test iteration times.</p>
+<p>We built Another Build File Service (ABFS) to address these bottlenecks. ABFS is a full suite of software across a Linux kernel filesystem module, user-space daemons, and server-side infrastructure. ABFS uses content-addressability across the entire stack to lazy-load and cache source code, developer workspaces, intermediate build files, and build results.</p>
+<p>Today, we are excited to announce that ABFS is open source on GitHub.</p>
+<p>The impact of ABFS to Android is:</p>
+<ul>
+ <li>Reduced checkout times from ~36 minutes to <strong>under 8 seconds</strong>.</li>
+ <li>Reduced full build times from ~80 minutes to <strong>just over 2 minutes</strong>.</li>
+ <li>Enabled parallel agentic workflows across multiple workspaces and agent orchestrators.</li>
+ <li>Shared cache reuses up to <strong>100%</strong> of build actions across continuous integration (CI) and developer workspaces.</li>
+</ul>
+<p>ABFS already powers parallel workflows for developers and agents in Android, but it is designed to scale to other massive Git-based projects.</p>
+<h2>Case Study: Android</h2>
+<p>In the Android build system, developers define build rules in Blueprint files (<code>Android.bp</code>), Soong compiles them into Ninja files, and Ninja executes the final build graph. Similar to the Make build tool, Ninja is <strong>timestamp-based</strong>. If a build step’s input file is newer than the existing output file, Ninja rebuilds the output file.</p>
+<h3>Code Size</h3>
+<p>Analyzing the AOSP code for Android 17 shows the sheer disk footprint and file count involved in a single checkout and build.</p>
+<p>In a typical Android tree that includes hardware-specific repositories, board support packages, first-party applications, form-factor-specific code, etc., the code size is 2–3 times the size of AOSP <strong>(over 3,000 Git repositories),</strong> compounded across multiple active SKU and legacy maintenance branches.</p>
+<h3>Build Cacheability</h3>
+<p>Building the Cuttlefish emulator target executes a build graph with <strong>192,249</strong> Ninja actions. While local incremental builds are fast once a tree is already built, every new workspace, branch switch, or ephemeral agent session starts cold.</p>
+<p>Even though typical developer changes touch only 1-10 different Git projects, someone building locally without any remote execution might waste up to <strong>80 minutes on a 64-core</strong> machine repeating work their CI system already built. Even if a developer edits a core library like <code>system/libbase</code>, <strong>97%</strong> of the build graph is identical to the CI build.</p>
+<h3>Unspecified Dependencies</h3>
+<p>Sharing cached build outputs across CI and local machines is also tricky in a codebase of Android's age and rate of change. Build rules occasionally introduce <strong>hidden dependencies</strong> (such as passing an undeclared schema file inside raw compiler flags), <strong>over-declared inputs</strong>, or <strong>undeclared outputs</strong>. In timestamp-based builds, hidden dependencies silently produce stale incremental artifacts, forcing developers to wipe output directories and run clean builds.</p>
+<h2>Solution: ABFS</h2>
+<p>ABFS makes building Android fast by replacing massive local source checkouts with a virtual, content-addressable filesystem (CASFS). ABFS streams files on demand only when a build actually touches them and utilizes shared build caching to help eliminate redundant downloads and compilation.</p>
+<p>On the server side, <strong>Git-pushers</strong> continuously ingest new Git objects from Gerrit or other Git hosts into a horizontally scalable gRPC <strong>ABFS Content-Addressable Storage (CAS) Server</strong> that indexes Git content, workspace snapshots, and build step results. On the developer host, a local Least Recently Used (LRU) <strong>Cacheman</strong> daemon, <strong>Mount Daemon</strong>, and <strong>Tap</strong> utility connect user-space build tools to the kernel filesystem so checkouts and builds stream only what they need.</p>
+<h3>Filesystem</h3>
+<p>At the core of the client is a virtual filesystem called Content-Addressable Storage Filesystem (CASFS), a Linux kernel module that exposes Git SHA content hashes via extended attributes. When a file's hash is set, CASFS populates its metadata immediately and downloads file bytes via Cacheman only when needed:</p>
+<pre><code>$ touch hello
+$ abfs hash --set cc628ccd10742baea8241c5924df992b5c019f71 hello   # metadata only
+$ ls -l hello      # name and size are available; content is not downloaded yet
+-rw-r----- 1 user primarygroup 6 Nov  3 00:11 hello
+$ cat hello        # content is lazy-loaded on first read
+world</code></pre>
+<p>Initial checkouts download only lightweight directory metadata prepopulated with Git hashes. CASFS uses Git's object model natively, allowing standard <code>git</code> and repo operations to work transparently.</p>
+<h3>Correct two-phase build caching</h3>
+<p>CASFS can also <em>tap</em> build processes. <em>Tapping</em> records every file actually read, written, or deleted into lists called <em>patches</em>, which are stored alongside cached build outputs. Ninja-go replaces timestamp checks with two-phase content-addressable caching:</p>
+<ol>
+ <li><strong>Phase 1 - Declared key lookup:</strong> Ninja-go hashes a step’s command, environment, and declared input hashes to fetch candidate results from prior CI or developer builds.</li>
+ <li><strong>Phase 2 - Read-patch verification:</strong> Before accepting and applying a candidate result, ABFS verifies the candidate’s recorded read patch against the current CASFS state. In the common case, this read patch will match the filesystem state and then the write patch is applied. If even a hidden dependency has a different hash on disk, ABFS rejects the stale candidate and reruns the step with tapping enabled.</li>
+</ol>
+<h2>Unlocking agent development</h2>
+<p>Because ABFS does lazy loading and local cache deduplication, developers and their agents can now mount multiple concurrent Android workspaces on a single machine, benefit from a shared local build cache, and achieve massive scale in development time.</p>
+<pre><code># Mount 5 distinct Android release branches side-by-side in under 8 seconds each
+$ abfs mount -b android-latest-release   /ws/a17
+$ abfs mount -b android16-qpr2-release   /ws/a16qpr2
+$ abfs mount -b android16-release        /ws/a16
+$ abfs mount -b android15-release        /ws/a15
+$ abfs mount -b android14-release        /ws/a14</code></pre>
+<p>An agent can check out a full Android tree in <strong>under 10 seconds</strong> and perform a full build<strong> in under 10 minutes</strong>. Agent swarms are empowered to iterate, review, and test in parallel, which can lead to higher quality solutions and speed.</p>
+<h2>Extending beyond Google and Android</h2>
+<p>We released ABFS as open source because we want developers, Android partners, and any large-scale Git-based project to benefit from what we have learned and be able to scale.</p>
+<p>While Android’s Soong/Ninja pipeline was the first acceleration target, ABFS was built to be extensible to other build systems. Content-addressable build systems like Bazel map naturally onto CASFS and there is already a proof-of-concept integration with Bazel. Chromium, the Android Common Kernel, and other Google projects are exploring ABFS compatibility.</p>
+<h2>Acknowledgements</h2>
+<p>We’d like to extend a special thanks to our significant contributors for their work on this project:</p>
+<p><em>Haamed Gheibi, Erik Sanders, Rob Seymour, Taylor Santiago, Andrew Hsieh, Eric Taseski, Kiyoung Kim, Hung-Wei Chen, Jose “Pepe” Galmes, Ronald Li, Yu-Che Wang, Roger Ellis, Sandeep Patil, Amith Dsouza and the entire Android Build team</em></p>
