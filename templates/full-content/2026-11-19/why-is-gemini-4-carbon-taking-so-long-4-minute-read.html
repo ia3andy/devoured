@@ -1,0 +1,38 @@
+<h2>Why is Gemini 4 Carbon taking so long?</h2>
+<p>While benchmarking Gemini 4 Carbon on one of our private evals, we found something surprising: it spent close to an hour completing tasks that routinely took Opus and Astra only a few minutes.</p>
+<p>Turns out we weren't alone in noticing this.</p>
+<p>I don't really know how to properly emphasize this. Gemini 4 Carbon is unacceptably slow in real world usage.</p>
+<p>To find out why, we traced every step of Carbon's runs and quantified what contributes to the slowness.</p>
+<h2>The Task</h2>
+<p>In each task, the agent gets a codebase from just before a bug was fixed, along with a report that describes the bug only by its symptoms. Its job is to diagnose the bug and fix it, without making any unrelated changes.</p>
+<p>Much of the task's difficulty comes from engineering judgment rather than raw intelligence: tracing the user's symptoms to the right code path, ruling out rival explanations, putting the fix in the right place, and knowing when to stop.</p>
+<h2>Slow inference, or more work?</h2>
+<p>The first (and easiest) factor to separate out was inference speed: queueing at the provider, network latency, prompt processing and generation speed. Together, these set how long each step takes.</p>
+<p>Slower inference accounts for part of the gap: 16–30% of Carbon’s extra time compared with Astra, and 45–49% compared with Opus. The rest comes from longer trajectories. Carbon simply does more work per task, as the step counts, tool calls and tokens below show.</p>
+<p>Carbon takes about seven times as many steps as Astra, and eleven times as many actions such as reading a file or running a command. It writes seven times as much and, because every step re-sends a longer and longer conversation, it processes more than sixteen times as much input.</p>
+<h2>Ruling out the obvious</h2>
+<p>Before looking inside the runs, we checked two simpler explanations.</p>
+<ul>
+ <li><strong>The harness.</strong> We also ran Carbon inside two other coding agents, opencode and mini-SWE-agent, and saw no meaningful difference.</li>
+ <li><strong>Mismatched reasoning levels.</strong> Effort settings aren't standardized across providers, so Carbon's "high" may sit closer to the other models' maximum settings, and the fairer comparison might have been Carbon on low. But on low, Carbon often failed to produce a fix at all: it went in circles, re-reading code it had already read instead of making the fix.</li>
+</ul>
+<h2>Reading the traces</h2>
+<p>We labelled every step of the Astra and Carbon runs by what it was for, and then counted how many steps went to each kind of work.</p>
+<p>Half of Carbon’s steps went into work the ticket never asked for:</p>
+<ul>
+ <li><strong>Auditing code beyond the bug.</strong> Once it had found the cause, Carbon kept widening its search, checking every related path through the system and auditing code the fix never needed to touch.</li>
+ <li><strong>Closing loopholes the ticket had already ruled out.</strong> Carbon defended against cases the ticket's facts had already excluded, hardening the code against problems nobody had reported.</li>
+</ul>
+<p>In this sample trial, both models identified the cause early, Astra within a minute and Carbon within about six. Astra had its fix written three minutes later; Carbon didn't write any code for another 25 minutes.</p>
+<p>Carbon might not have been sure it had the cause (a knowledge gap), or it might have known and kept going anyway (a general habit, learned from training that rewards right answers more than it penalises extra steps). To tell them apart, we re-ran one of the trials in a modified harness that automatically injects the same check-in every five turns: "do you already have enough to make the fix?"</p>
+<p>With check-ins, Carbon finished in 28 minutes instead of 37, and the wait between naming the cause and editing shrank from 25 minutes to about 10. This implies that the slowness seems to come from how Carbon behaves, not what it knows.</p>
+<h2>Carbon's necessary work is also slower</h2>
+<p>Even within the steps the fix needed, we found some additional low-hanging fruit: Carbon got less done with each step, and it kept re-reading code it had already seen.</p>
+<p>Astra made more than two tool calls per step, often reading several files at once — Carbon, on the other hand, made about one, usually reading a single file. Carbon also re-read far more: 39% of the lines it read were ones it had already seen, against 7% for Astra. We estimate that these two "mechanical" inefficiencies account for roughly 25% of Carbon's excess runtime.</p>
+<h2>Conclusion</h2>
+<p>On difficult bug-fixing tasks, Carbon took close to an hour where Opus and Astra took minutes. We traced that gap to three sources:</p>
+<ul>
+ <li><strong>Slower inference.</strong> Each step takes longer, which explains 16–30% of the gap against Astra and about half against Opus.</li>
+ <li><strong>Unnecessary work.</strong> About half of Carbon's steps went on work the tickets never asked for: auditing code the fix didn't need and closing loopholes the ticket had already ruled out.</li>
+ <li><strong>Mechanical inefficiencies.</strong> Fewer tool calls per step and frequent re-reading slow Carbon down; we estimate that fixing them alone would cut its runtime by roughly a quarter.</li>
+</ul>

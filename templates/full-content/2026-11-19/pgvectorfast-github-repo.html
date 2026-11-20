@@ -1,0 +1,120 @@
+<h1>pgvectorfast</h1>
+<p><strong>pgvectorfast is a high-performance drop-in enhancement for pgvector that accelerates vector similarity search and analytical queries in PostgreSQL using a fast shared buffer pool.</strong></p>
+<p>Based on pgvector, pgvectorfast is a standard PostgreSQL extension on unmodified PostgreSQL 18 and 19 servers for fast vector similarity search. It preserves complete SQL and on-disk compatibility with all <code>pgvector</code> data types (<code>vector</code>, <code>halfvec</code>, <code>bit</code>, <code>sparsevec</code>), distance operators, and index types (<code>hnsw</code>, <code>ivfflat</code>). See the pgvector Documentation for the full SQL API, index parameters, and usage guide.</p>
+<h2>Benchmark Results</h2>
+<p>See Detailed Benchmark Results for measured recall, latency breakdowns, and experimental configurations.</p>
+<h2>How It Works</h2>
+<p>PostgreSQL's default buffer manager translates every page reference through a partitioned shared hash table and acquires atomic pins and buffer content locks on every page read. Across vector index lookups and analytical scans/joins—and especially during HNSW graph traversal, which performs thousands of irregular neighbor lookups per query—page translation, pin/unpin atomic traffic, and synchronous random I/O become major bottlenecks.</p>
+<p>pgvectorfast replaces PostgreSQL's shared buffer manager with the <strong>Calico</strong> buffer pool (<em>Making Array-Based Translation Practical for Modern, High-Performance Buffer Management</em>), combining three techniques:</p>
+<ol>
+ <li><strong>Array-Based Page Translation &amp; Path Caching</strong>: Replaces PostgreSQL's shared buffer lookup hash table and partition locks on hot paths with two-level direct array indexing backed by lazily allocated virtual memory regions, paired with a per-backend relation prefix cache (~100% hit rate on HNSW indexes).</li>
+ <li><strong>Lock-Free Optimistic Reads (<code>calico.optimistic_reads</code>)</strong>: Encodes lock and version state in each 64-bit translation entry so HNSW traversal reads neighbor vectors and computes L2 or inner-product distances (including normalized cosine search) speculatively without atomic pin/unpin operations or content locks, falling back seamlessly to pinned reads whenever concurrent writes or evictions occur.</li>
+ <li><strong>Workload-Aware Group Prefetch (<code>hnsw.enable_prefetch</code>)</strong>: Batches neighbor page lookups at each HNSW graph hop to issue parallel translation loads and targeted CPU cache prefetches (<code>__builtin_prefetch</code>) for resident pages (memory-level parallelism), alongside batched asynchronous reads via PostgreSQL AIO / <code>io_uring</code> for non-resident pages (I/O-level parallelism).</li>
+</ol>
+<h2>Installation</h2>
+<h3>Docker</h3>
+<p>Pull and run a ready-to-use image for x86-64 (<code>linux/amd64</code>) with PostgreSQL 18, matching debug symbols (<code>postgresql-18-dbgsym</code>), and <code>shared_preload_libraries = 'vectorfast'</code> preconfigured:</p>
+<pre><code>docker run -d \
+  --name pgvectorfast \
+  -e POSTGRES_PASSWORD=mysecretpassword \
+  -p 5432:5432 \
+  zxjcarrot/pgvectorfast:pg18</code></pre>
+<p>Available tags: <code>pg18</code> / <code>latest</code> (<code>postgres:18-trixie</code>), <code>pg18-trixie</code>, <code>pg18-bookworm</code>, and <code>&lt;version&gt;-pg18</code> on release tags.</p>
+<p>To build the image locally:</p>
+<pre><code>docker build --build-arg PG_MAJOR=18 -t pgvectorfast .</code></pre>
+<h3>APT (Debian)</h3>
+<p>Prebuilt <code>postgresql-18-pgvectorfast</code> packages for Linux x86-64 (<code>amd64</code>) are published for Debian 12 (<code>bookworm</code>) and Debian 13 (<code>trixie</code>) against the PostgreSQL PGDG APT repository. They declare <code>Conflicts</code>/<code>Replaces</code>/<code>Provides</code> for <code>postgresql-18-pgvector</code> and depend on matching <code>postgresql-18-dbgsym</code> symbols. (Ubuntu PGDG packages compile PostgreSQL with <code>-flto=auto</code>, which Calico rejects at startup because LTO inlines internal buffer-manager routines; on Ubuntu, use the Docker image or build from source against a non-LTO PostgreSQL build.)</p>
+<ol>
+ <li>Ensure the PostgreSQL APT repository (PGDG) is enabled (for example via <code>postgresql-common</code> / <code>/usr/share/postgresql-common/pgdg/apt.postgresql.org.sh</code>).</li>
+ <li>Add the <code>pgvectorfast</code> APT signing key and repository, then install:</li>
+</ol>
+<pre><code>sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://mitdbg.github.io/pgvectorfast/pgvectorfast.asc | sudo tee /etc/apt/keyrings/pgvectorfast.asc &gt;/dev/null
+echo "deb [signed-by=/etc/apt/keyrings/pgvectorfast.asc] https://mitdbg.github.io/pgvectorfast $(. /etc/os-release &amp;&amp; echo "$VERSION_CODENAME") main" | sudo tee /etc/apt/sources.list.d/pgvectorfast.list
+sudo apt-get update
+sudo apt-get install -y postgresql-18-pgvectorfast</code></pre>
+<ol>
+ <li>Continue with Quick Start to preload <code>vectorfast</code> and enable the extension.</li>
+</ol>
+<h3>PGXN</h3>
+<p>Install from PGXN using <code>pgxnclient</code>. Because PGXN compiles from source against your PostgreSQL installation, first ensure you have PostgreSQL 18 or 19 development headers (<code>pg_config</code>), non-LTO server symbols (such as <code>postgresql-18-dbgsym</code> on Debian PGDG, or an unstripped source build), <code>libcapstone-dev</code> (or Python <code>pip</code>), a C compiler, and GNU Make:</p>
+<pre><code>sudo apt-get update
+sudo apt-get install -y pgxnclient build-essential libcapstone-dev postgresql-server-dev-18 postgresql-18-dbgsym
+sudo pgxn install pgvectorfast</code></pre>
+<p>If your target <code>pg_config</code> is not first on <code>PATH</code> (or you build as an unprivileged user), pass <code>--pg_config</code> and <code>--sudo</code>:</p>
+<pre><code>pgxn install --sudo --pg_config /path/to/pg_config pgvectorfast</code></pre>
+<p>Continue with Quick Start to preload <code>vectorfast</code> in <code>postgresql.conf</code> and activate Calico.</p>
+<h3>Build and Install from Source</h3>
+<h4>Prerequisites</h4>
+<ul>
+ <li>Linux x86-64</li>
+ <li>PostgreSQL 18 or 19 with server development headers (<code>pg_config</code>) and non-LTO server symbols: either an unstripped source build or a packaged build with matching debug symbols installed (e.g. <code>postgresql-18-dbgsym</code>)</li>
+ <li>C compiler (GCC or Clang) and GNU Make</li>
+ <li>Capstone (<code>libcapstone-dev</code> 4.x/5.x from system packages, or automatically bootstrapped as <code>capstone==5.0.6</code> into <code>~/.cache/pgvectorfast/python-deps</code> via Python <code>pip</code> during <code>make</code>; override with <code>CAPSTONE_PREFIX=/path/to/capstone</code>; must remain available at runtime)</li>
+</ul>
+<h4>Build and Install</h4>
+<pre><code>git clone https://github.com/mitdbg/pgvectorfast.git
+cd pgvectorfast
+make
+make install # may need sudo</code></pre>
+<p>If your target PostgreSQL installation is not first on <code>PATH</code>, pass <code>PG_CONFIG</code>:</p>
+<pre><code>make PG_CONFIG=/path/to/pg_config
+make PG_CONFIG=/path/to/pg_config install</code></pre>
+<h2>Quick Start</h2>
+<ol>
+ <li>Add <code>vectorfast</code> to <code>shared_preload_libraries</code> in <code>postgresql.conf</code> and restart PostgreSQL:</li>
+</ol>
+<pre><code>shared_preload_libraries = 'vectorfast'</code></pre>
+<ol>
+ <li>Enable pgvector and the Calico buffer pool using either approach (as superuser, outside a transaction block):</li>
+</ol>
+<p>With one command:</p>
+<pre><code>CREATE EXTENSION vectorfast;</code></pre>
+<p>Or create the extensions and activate Calico explicitly:</p>
+<pre><code>CREATE EXTENSION vector;
+CREATE EXTENSION calico;
+CALL calico.activate();</code></pre>
+<p>After subsequent PostgreSQL restarts, run <code>CALL calico.activate();</code> to reactivate the buffer pool.</p>
+<ol>
+ <li>Create an HNSW index and run similarity queries using standard pgvector SQL:</li>
+</ol>
+<pre><code>CREATE TABLE items (id bigserial PRIMARY KEY, embedding vector(128));
+CREATE INDEX ON items USING hnsw (embedding vector_l2_ops);
+SELECT * FROM items ORDER BY embedding &lt;-&gt; '[...]' LIMIT 10;</code></pre>
+<p>See the runnable getting-started example and the full pgvector Documentation for all vector types, distance operators, iterative scans, and indexing options.</p>
+<h2>Configuration</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Parameter</th>
+   <th>Context</th>
+   <th>Default</th>
+   <th>Description</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>calico.optimistic_reads</code></td>
+   <td>Session / User</td>
+   <td><code>on</code></td>
+   <td>Enables lock-free optimistic tuple reads during HNSW traversal for <code>vector_l2_ops</code>, <code>vector_ip_ops</code>, and <code>vector_cosine_ops</code>.</td>
+  </tr>
+  <tr>
+   <td><code>hnsw.enable_prefetch</code></td>
+   <td>Session / User</td>
+   <td><code>on</code></td>
+   <td>Enables batched neighbor group prefetching (CPU prefetch + async read batching) during HNSW search.</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Cite pgvectorfast</h2>
+<p>If you are using pgvectorfast, please cite our work as follows</p>
+<pre><code>@misc\{zhou2026calico,
+  title         = \{Making Array-Based Translation Practical for Modern, High-Performance Buffer Management},
+  author        = \{Xinjing Zhou and Jinming Hu and Andrew Pavlo and Michael Stonebraker},
+  year          = \{2026},
+  eprint        = \{2604.00423},
+  archivePrefix = \{arXiv},
+  primaryClass  = \{cs.DB},
+  url           = \{https://arxiv.org/abs/2604.00423}
+}</code></pre>

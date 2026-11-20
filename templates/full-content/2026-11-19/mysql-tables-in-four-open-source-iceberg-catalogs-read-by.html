@@ -1,0 +1,133 @@
+<p>A team that wants to know how much revenue came from each customer segment needs two things that live in different places: the orders, in MySQL, and the segments, in whatever the sales team uses. Someone usually exports both into one database by hand, or builds a pipeline and then looks after it.</p>
+<p>If your company already runs an Iceberg catalog, DBTrail can put the MySQL tables there. It keeps a copy of your MySQL tables as Iceberg tables and registers them in that catalog under their own names, <code>shop.orders</code>, <code>shop.customers</code>. Any engine that reads the catalog can then query them by name and join them with the other tables registered there. When MySQL changes, the next export adds only what changed.</p>
+<p>We tried this with four open source Iceberg REST catalogs and two query engines, Trino and DuckDB, and compared every answer with the same query on MySQL.</p>
+<h2>What we tested</h2>
+<p>One MySQL 8.4 server with a small shop: 200 customers and about 5,000 to 6,000 orders, with a script writing about nine statements a second (half inserts, the rest updates and deletes). DBTrail 0.133.0 followed the binlog, then exported to each catalog twice: a first load, then, after 40 more seconds of writes, an incremental export carrying the inserts, updates and deletes.</p>
+<p>Then each engine read the tables by name through the catalog, with the writes stopped, and we compared row count, the exact sum of the <code>amount</code> column, the highest id and the number of paid orders with the same query on MySQL.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Catalog</th>
+   <th>DBTrail 0.133.0</th>
+   <th>Trino 484</th>
+   <th>DuckDB 2.0.0</th>
+   <th>CRM join</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Project Nessie 0.110.0</td>
+   <td>works as is</td>
+   <td>Matches</td>
+   <td>Matches</td>
+   <td>Matches</td>
+  </tr>
+  <tr>
+   <td>LakeKeeper 0.15.1</td>
+   <td>works with remote signing turned off</td>
+   <td>Matches</td>
+   <td>Matches</td>
+   <td>Matches</td>
+  </tr>
+  <tr>
+   <td>Apache Polaris 1.9.0</td>
+   <td>refused with its storage set to “no STS”; works with two changes due in the next release</td>
+   <td>Matches</td>
+   <td>Matches</td>
+   <td>Matches</td>
+  </tr>
+  <tr>
+   <td>Apache Gravitino 1.3.0</td>
+   <td>refused; works with a change due in the next release</td>
+   <td>Matches</td>
+   <td>Matches</td>
+   <td>Matches</td>
+  </tr>
+ </tbody>
+</table>
+<p>“Matches” means every one of the five numbers matched, after the incremental export.</p>
+<h2>The export</h2>
+<p>The export command with Nessie, which needed no extra options:</p>
+<pre><code>bintrail export iceberg 
+  --index-dsn "root:...@tcp(127.0.0.1:3307)/bintrail_index" 
+  --baseline-dir /opt/rig/baselines 
+  --catalog rest 
+  --catalog-uri http://localhost:19120/iceberg 
+  --catalog-warehouse dbtrail 
+  --warehouse s3://&lt;bucket&gt;/iceberg/nessie 
+  --format json</code></pre>
+<p>The second run, after 40 seconds of writes, took 0.8 seconds:</p>
+<pre><code>"table": "customers", "verdict": "unchanged", "detail": "no events since the cursor"
+"table": "orders",    "verdict": "exported",  "detail": "374 events folded into 333 upserts and 31 deletes"</code></pre>
+<p>Run the same line from cron, or add <code>--every 15m</code> and leave it running. Each run reads only the changes since the one before. The position each table has reached is stored in the table’s own properties, in the same commit as the data, so the export keeps no progress of its own outside the catalog.</p>
+<h2>Reading the tables by name</h2>
+<p>Trino, with the stock Iceberg connector pointed at the catalog:</p>
+<pre><code>connector.name=iceberg
+iceberg.catalog.type=rest
+iceberg.rest-catalog.uri=http://localhost:19120/iceberg
+iceberg.rest-catalog.warehouse=dbtrail
+fs.native-s3.enabled=true
+s3.region=us-east-1</code></pre>
+<pre><code>SELECT count(*), sum(amount), max(id), count_if(status = 'paid'),
+       (SELECT count(*) FROM shop.customers)
+FROM shop.orders;</code></pre>
+<pre><code>"5568","1395471.20","5695","1290","200"</code></pre>
+<p>DuckDB 2.0, attaching the same catalog:</p>
+<pre><code>INSTALL iceberg; LOAD iceberg; INSTALL httpfs; LOAD httpfs; INSTALL aws; LOAD aws;
+CREATE SECRET s3c (TYPE s3, PROVIDER credential_chain, REGION 'us-east-1');
+ATTACH 'dbtrail' AS c (TYPE iceberg, URI 'http://localhost:19120/iceberg',
+                       AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE 'none');
+SELECT count(*), sum(amount), max(id), count(*) FILTER (WHERE status = 'paid')
+FROM c.shop.orders;</code></pre>
+<pre><code>5568 | 1395471.20 | 5695 | 1290</code></pre>
+<p>MySQL, at the same moment:</p>
+<pre><code>\{"orders_count": 5568, "orders_sum_amount": "1395471.20", "orders_max_id": 5695, "orders_paid": 1290}</code></pre>
+<p>Two DuckDB details. The read failed with <code>HTTP 403 ... No credentials are provided</code> until we set <code>ACCESS_DELEGATION_MODE 'none'</code>, because the catalog hands out no storage credentials, even with an S3 secret in place. And every query here reads the key column (<code>max(id)</code> above does): the export’s documentation explains that older DuckDB releases need it to apply the deletes of an incremental export. We did not check whether 2.0 still does.</p>
+<h2>The join</h2>
+<p>To stand in for data from another system, we took a CSV with one row per customer (<code>customer_id, segment, account_manager</code>) and registered it in the same catalog as <code>crm.customer_segments</code>, with PyIceberg:</p>
+<pre><code>cat = load_catalog("rig", type="rest", uri="http://localhost:19120/iceberg", warehouse="dbtrail")
+cat.create_namespace("crm")
+t = cat.create_table("crm.customer_segments", schema=tbl.schema)
+t.append(tbl)   # 200 rows from the CSV</code></pre>
+<p>Revenue per segment, with the orders from MySQL and the segments from the CSV:</p>
+<pre><code>SELECT s.segment, count(*) AS paid_orders, sum(o.amount) AS revenue
+FROM shop.orders o
+JOIN crm.customer_segments s ON s.customer_id = o.customer_id
+WHERE o.status = 'paid'
+GROUP BY s.segment
+ORDER BY revenue DESC;</code></pre>
+<p>Trino:</p>
+<pre><code>"self-serve","343","87947.70"
+"mid-market","343","84817.69"
+"smb","314","77131.70"
+"enterprise","290","73062.86"</code></pre>
+<p>DuckDB returned the same four rows, and MySQL, joining its own tables with the same segment rule, returned the same four rows. We repeated this on all four catalogs; each time the three answers were identical.</p>
+<h2>Catalog by catalog</h2>
+<p><strong>Project Nessie 0.110.0</strong> worked with the release as is. Nessie picks its own table location under the warehouse (it adds a suffix such as <code>orders_01f46bad-...</code>), which changes nothing for the readers.</p>
+<p><strong>LakeKeeper 0.15.1.</strong> A warehouse on S3 without STS defaults to remote signing: the catalog tells the client to send every S3 request to the catalog to be signed. The Iceberg library DBTrail is built on cannot do that, and the first run stopped with:</p>
+<pre><code>failed to load metadata file at s3://.../orders/metadata/00000-....gz.metadata.json:
+remote S3 request signing is not supported</code></pre>
+<p>With remote signing turned off for the warehouse (<code>"remote-signing-enabled": false</code> in its storage profile), the export used the machine’s own AWS credentials and everything matched. The two empty tables the failed run had created were loaded by the next run with no manual step.</p>
+<p><strong>Apache Polaris 1.9.0</strong> needed two changes in DBTrail. First, signing in with a client credential failed:</p>
+<pre><code>invalid_scope: The scope is invalid</code></pre>
+<p>DBTrail asks for the OAuth scope <code>catalog</code>, and Polaris wants <code>PRINCIPAL_ROLE:ALL</code>. With 0.133.0 you can fetch a token with that scope yourself and pass it in <code>BINTRAIL_ICEBERG_CATALOG_TOKEN</code>, and the sign-in works. But the token expires after an hour and nothing renews it, which is a problem for an export that runs every few minutes. A change due in the next release adds <code>--catalog-scope</code> (dbtrail/dbtrail#2928), and with it the credential signs in and is renewed on its own:</p>
+<pre><code>export BINTRAIL_ICEBERG_CATALOG_CREDENTIAL='&lt;client_id&gt;:&lt;client_secret&gt;'
+bintrail export iceberg ... --catalog rest 
+  --catalog-uri http://localhost:8182/api/catalog --catalog-warehouse dbtrail 
+  --catalog-scope PRINCIPAL_ROLE:ALL</code></pre>
+<p>Second, DBTrail asks the catalog for temporary storage credentials on every request. In production Polaris gets them by assuming an IAM role you give it. We did not set up an IAM role for this test, so we tried two other setups. With a Polaris option meant for development only (<code>SKIP_CREDENTIAL_SUBSCOPING_INDIRECTION</code>, which hands the server’s own credentials to every client, and Polaris warns about it at start), 0.133.0 with the hand-made token exported and every check matched. That is not how you would run Polaris, so we do not count it. With the storage set to “no STS available”, the setup that is closer to production without a role, Polaris refused the table:</p>
+<pre><code>Credential vending was requested for table shop.orders, but no credentials are available</code></pre>
+<p><strong>Apache Gravitino 1.3.0</strong>, its standalone Iceberg REST server with no credential provider configured, refused for the same reason:</p>
+<pre><code>No credential provider found for path s3://.../gravitino/shop/orders with scheme s3</code></pre>
+<p>We sent the same create request by hand: with the “please vend credentials” header Gravitino answered 400, and without it 200. A second change, also due in the next release, adds <code>--catalog-access-delegation none</code> (dbtrail/dbtrail#2932), which stops asking, so the files are written with the machine’s own credentials. With it, both Gravitino and Polaris with “no STS available” (signing in with the credential and <code>--catalog-scope</code>) passed every check above. A Polaris that assumes a real IAM role and vends credentials should work with 0.133.0 plus a token, but we did not test it. A Gravitino setting to watch: the container’s settings are <code>GRAVITINO_ICEBERG_REST_*</code> variables, and with the wrong names it quietly kept a default warehouse in <code>/tmp</code> inside the container.</p>
+<p><strong>Unity Catalog OSS</strong> we only tried briefly. Its Iceberg endpoint would not create a namespace (404), and table creation answered <code>S3 bucket configuration not found.</code>: for an S3 table it wants the bucket set up in its server configuration with an access key or an IAM role to hand out, and we had neither. We left it there, so it is not in the table above.</p>
+<h2>What did not work, and what we did not test</h2>
+<ul>
+ <li><strong>PyIceberg cannot read the tables after an incremental export.</strong> It stops with <code>PyIceberg does not yet support equality deletes</code>. DBTrail records an update or a delete as an Iceberg equality delete, and PyIceberg does not read those yet. It registered the CRM table without trouble. Trino and DuckDB read everything.</li>
+ <li><strong>PyIceberg could not talk to our Gravitino</strong> (<code>NotAuthorizedException</code>), so on Gravitino we registered the CRM table with Trino instead (<code>CREATE TABLE crm.customer_segments AS ...</code>). We did not dig into it.</li>
+ <li><strong>Remote signing</strong> (LakeKeeper’s default) does not work with DBTrail; turn it off for the warehouse.</li>
+ <li><strong>Not tested</strong>: Polaris or LakeKeeper with real STS credential vending (it needs an IAM role, which we did not set up), Spark, authentication on LakeKeeper, Nessie and Gravitino (they ran open, on the same machine), catalogs on another host over https, and long runs on a timetable through these catalogs.</li>
+ <li>Every catalog here ran with an in-memory or single-container backend. A production setup would use a persistent store.</li>
+</ul>
+<h2>Try it</h2>
+<p>The export is in the current DBTrail release, with <code>--catalog rest</code> for any Iceberg REST catalog and <code>--catalog glue</code> for AWS Glue. The full reference, including the flags for authentication, is in <a href="https://github.com/dbtrail/dbtrail/blob/main/docs/iceberg-export.md">the Iceberg export documentation</a>. The two options described above, <code>--catalog-scope</code> and <code>--catalog-access-delegation</code>, are merged and arrive in the next release.</p>

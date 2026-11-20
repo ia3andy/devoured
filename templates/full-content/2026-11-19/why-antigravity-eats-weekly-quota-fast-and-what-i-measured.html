@@ -1,0 +1,84 @@
+<h2>Why Antigravity Eats Weekly Quota Fast - and What I Measured</h2>
+<blockquote>
+ <p>Gemini 4 Hydrogen, Gemini 4 Argon, and <code>hy4-flash</code> via OpenCode used for the binary reverse engineering, empirical cache probing, and keep-alive tooling.</p>
+</blockquote>
+<h2>Introduction</h2>
+<p>Greetings! If you use Google Antigravity (<code>agy</code>) with the big frontier models, you have probably noticed how fast your weekly quota disappears during normal coding sessions.</p>
+<p>My suspicion was simple: <strong>a short prompt-cache lifetime</strong>. When you are coding with an agent, you don’t send messages every 10 seconds. You wait for a response, read the diff, run a test, think for 5 minutes, and then send your next prompt. If the prompt cache expires during that 5-minute pause, your next message has to re-ingest the entire conversation history at full price.</p>
+<p>Instead of just assuming that was true, I decided to actually test it and look inside the Antigravity binaries to see how caching works under the hood. What started as a quick TTL check turned into disassembling a 193 MB Go binary, discovering a dormant keep-alive engine that Google already wrote, binary-searching the exact eviction cliff down to a 15-second window, testing whether <code>/btw</code> side-questions can keep the cache warm, and finally unlocking Google’s built-in zero-trajectory keep-alive engine on a live 6-minute run.</p>
+<h2>1. Background: Implicit Caching &amp; The Idle Tax</h2>
+<p>To understand why pauses matter, let’s look at how Gemini models handle context in Antigravity.</p>
+<p>Every turn in an agentic coding session carries a massive prefix: the system prompt, tool schemas, connected MCP servers, skill definitions, and all previous turns. On Gemini 4 models, Antigravity relies exclusively on <strong>implicit caching</strong>. Unlike explicit caching (where you manually place cache breakpoints and pay for a guaranteed storage lease), implicit caching is an automatic, best-effort prefix match on Google’s backend.</p>
+<p>When your request hits the implicit cache, cached tokens (<code>cache_read_tokens</code>) get a <strong>90% discount</strong> compared to regular uncached <code>input_tokens</code>. When the cache misses, you pay 100% on the entire prefix.</p>
+<p>Google does not publish a fixed TTL for implicit caching. If that TTL is shorter than a typical code-review pause, interactive coding turns into a worst-case workload.</p>
+<h2>2. What the Binary Says</h2>
+<p>Before running live probes, I inspected the local Antigravity installation on macOS (<code>arm64</code>): the desktop app (<code>/Applications/Antigravity.app</code>, <code>v2.33.0</code>), its core Go agent binary (<code>language_server</code>), and the standalone CLI (<code>~/.gemini/bin/agy</code>, <code>v1.5.11</code> / <code>1.5.12</code>) across isolated CLI runs.</p>
+<h3>2.1 Telemetry Buckets Give Away the 5-Minute Cliff</h3>
+<p>Inspecting the Go symbol table in <code>language_server</code> immediately confirmed that Antigravity tracks cumulative context through <code>CumulativePromptHandler</code> and buckets turn gaps into two telemetry categories: <strong><code>lt_5m</code></strong> (less than 5 minutes) and <strong><code>ge_5m</code></strong> (5 minutes or more). That alone was a strong clue that 5 minutes is the magic number.</p>
+<h3>2.2 Google Already Built a Keep-Alive Engine</h3>
+<p>Digging deeper, I found a file path in the binary’s symbol table: <code>modelapiccpa/keepalive.go</code>. Disassembling its functions (<code>keepAlivePings</code>, <code>beforeRequest</code>, <code>scheduleNextPingLocked</code>, <code>ping</code>, and <code>trimLastBlock</code>) revealed that <strong>Google already built an automatic background prompt-cache keep-alive mechanism.</strong></p>
+<p>Here is how their internal keep-alive works:</p>
+<ol>
+ <li><strong>Zero-Trajectory Pollution</strong>: When a turn finishes (<code>onRequestDone</code>), the client schedules a background timer. When the timer fires, it clones the last request protobuf, calls <code>trimLastBlock</code> to replace the final prompt block with a single period (<code>"."</code>), sets <code>max_output_tokens = 1</code>, tags the request with <code>"prompt_cache_keep_alive": "true"</code>, and sends it in the background. When the 1-token response comes back, it throws it away so it <strong>never pollutes your conversation history</strong>.</li>
+ <li><strong>Exact Hardcoded Timers</strong>: 
+  <ul>
+   <li><strong>Ping interval</strong>: Hardcoded in <code>scheduleNextPingLocked</code> to <strong>4 min 30 s</strong> (<code>270s</code>).</li>
+   <li><strong>Staleness cutoff</strong>: Hardcoded in <code>ping</code> to <strong>4 min 45 s</strong> (<code>285s</code>). If the timer wakes up more than 4m 45s after the last turn (e.g., after laptop sleep), it aborts the ping because it knows the server cache is already dead.</li>
+  </ul></li>
+</ol>
+<p>Why do we still lose the cache every 5 minutes? Two gates in the binary stop it from running:</p>
+<ul>
+ <li><strong>Gate A (<code>keepAlivePings</code>)</strong>: Locked behind server-side Mendel experiment flags (<code>enable-prompt-cache-keep-alive</code> and <code>prompt_cache_keep_alive_max_pings</code>) that aren’t exposed in <code>settings.json</code> or Antigravity hooks.</li>
+ <li><strong>Gate B (<code>beforeRequest</code>)</strong>: Checks the internal model provider enum (<code>0x5</code> or <code>0xa</code>) and currently restricts background pings to explicit-cache provider enums (like Claude), completely skipping Gemini models.</li>
+</ul>
+<h2>3. Experimental Setup: Measuring Cache Hits</h2>
+<p>Since account-level quota percentages are noisy (other background agents share the same quota pool), I used <code>cache_read_tokens</code> from <code>agy --input-format stream-json --output-format stream-json</code> as the primary ground-truth signal.</p>
+<p>At the end of every turn, <code>agy</code> emits a <code>DONE</code> event for <code>agent_response</code> with three numbers:</p>
+<ul>
+ <li><strong><code>input_tokens</code></strong> (<code>T_uncached</code>): Tokens billed at full price.</li>
+ <li><strong><code>cache_read_tokens</code></strong> (<code>T_cached</code>): Prefix tokens served from the implicit cache.</li>
+ <li><strong><code>output_tokens</code></strong>: Generated response tokens.</li>
+</ul>
+<table>
+ <thead>
+  <tr>
+   <th>Observed Signal</th>
+   <th>What It Means</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Large <code>cache_read_tokens</code> (~14,770), small <code>input_tokens</code> (~2,150)</td>
+   <td><strong>Cache Hit</strong> - prefix served from cache, only tail billed at full price.</td>
+  </tr>
+  <tr>
+   <td><code>cache_read_tokens = 0</code>, large <code>input_tokens</code> (~16,820+)</td>
+   <td><strong>Cache Miss</strong> - full prefix re-ingested from scratch.</td>
+  </tr>
+ </tbody>
+</table>
+<h2>4. What I Measured</h2>
+<h3>4.1 Separate CLI Processes Don’t Share the Cache</h3>
+<p>First, I tried running two separate one-shot <code>agy -p --conversation &lt;same-id&gt;</code> commands back-to-back. Two things stood out immediately:</p>
+<ol>
+ <li>Even on a brand-new conversation with a 5-word prompt, Turn 1 sends <strong>16,816 tokens</strong> (system prompt, tool declarations, MCP servers, and skills).</li>
+ <li>In the same process, Turn 2 hits the cache for <strong>14,762 tokens</strong>, leaving only <strong>2,152 uncached tokens</strong>. Across separate one-shot <code>agy -p</code> processes, <code>cache_read</code> is always <code>0</code> because one-shot mode re-initializes the step timestamp at step 0, breaking prefix continuity.</li>
+</ol>
+<h3>4.2 The 8-Minute Idle Test (With vs. Without a Ping)</h3>
+<p>I tested an <strong>8-minute idle gap</strong> with no activity, and compared it against an 8-minute window with a single keep-alive ping at <strong>+4 minutes</strong>. This proved that without a ping, waiting 8 minutes forces Turn 2 to pay full price, and hitting the implicit cache resets its TTL timer.</p>
+<h3>4.3 Binary Search for the Exact Expiry Boundary</h3>
+<p>To find the exact cliff where the cache dies, I ran a binary search across idle intervals. The boundary is between <strong>4 min 45 s and 5 min 00 s</strong>. That matches both my initial 5-minute estimate and the <strong>4 min 45 s (<code>285s</code>)</strong> staleness cutoff hardcoded inside Google’s <code>keepalive.go</code>.</p>
+<h2>5. Cost Analysis &amp; Scaling Math</h2>
+<p>Since Gemini gives a 90% discount on cached tokens, I calculated the <strong>effective token cost</strong> (<code>C</code>) of any turn by weighting <code>cache_read_tokens</code> at <code>0.1x</code>: <code>C = T_uncached + 0.1 * T_cached</code>.</p>
+<p>Even on an empty conversation with just the 14.8k base prefix, one well-timed ping saves <strong>29-36% savings</strong>. In a 150k-token session, pausing for 5 minutes costs you <strong>133,065 extra effective tokens</strong> on your very next message.</p>
+<h2>6. The <code>/btw</code> Experiment: Can Side-Questions Keep the Cache Warm?</h2>
+<p>Sending a normal user message as a keep-alive in the CLI has one downside: each ping adds a user and assistant turn to your trajectory. Antigravity has a <code>/btw</code> slash command that lets you ask a side question in a forked thread. My tests showed <code>/btw</code> does keep the main cache warm, but it is expensive: it costs <strong>~4.9x a normal warm ping</strong> and <strong>~26% more than just accepting a cache miss</strong>.</p>
+<h2>7. Unlocking Google’s Built-In Engine &amp; Live Verification</h2>
+<p>I built a verification and binary-patching script to unlock Google’s internal <code>keepalive.go</code> engine. By patching the prologue and provider branch, I confirmed that the background <code>streamGenerateContent</code> ping fired automatically and refreshed the backend cache without adding a single character to the conversation history.</p>
+<h2>8. Wrapping Up &amp; Practical Takeaways</h2>
+<ol>
+ <li><strong>The 5-minute cache cliff is real</strong>: Both empirical binary search (<code>4m 45s - 5m 00s</code>) and Google’s own hardcoded <code>285s</code> (<code>4m 45s</code>) cutoff confirm that a 5-minute pause wipes your prompt cache.</li>
+ <li><strong>A 4m 30s keep-alive ping works, if you cap it</strong>: Refreshing the cache before expiry saves 30% to 88% of effective tokens across a pause.</li>
+ <li><strong>Google’s built-in <code>keepalive.go</code> engine works on Gemini</strong>: Once its Mendel flag and provider-enum gates are unlocked, Antigravity’s native background ping keeps Gemini caches warm across 6+ minute pauses with <strong>zero trajectory growth</strong>.</li>
+ <li><strong>Trim your baseline prefix</strong>: Disabling unused MCP servers and plugins shrinks every cold turn and cache miss across the board.</li>
+</ol>

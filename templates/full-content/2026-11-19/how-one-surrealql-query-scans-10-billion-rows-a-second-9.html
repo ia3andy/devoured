@@ -1,0 +1,164 @@
+<h1>How one SurrealQL query scans 10 billion rows a second</h1>
+<p>SurrealDB Earth reaches more than 10 billion rows a second by splitting one SurrealQL query into many small pieces of work, running them on around 1,000 Cloudflare Workers at the same time, and merging the results into one answer that reads the whole database at a single moment. This post explains each step of that path. Earth launched on 3 November 2026, alongside SurrealDB 4.</p>
+<h2>What is Earth built from?</h2>
+<p>Earth runs SurrealDB's own code on four building blocks of Cloudflare's platform:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Cloudflare building block</th>
+   <th>What it is</th>
+   <th>What Earth uses it for</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Worker</td>
+   <td>A short-lived, stateless function that runs in its own isolate, a lightweight sandbox</td>
+   <td>Leaves, which read data during a scan</td>
+  </tr>
+  <tr>
+   <td>Durable Object</td>
+   <td>A single-threaded object with a fixed identity and its own small storage</td>
+   <td>The executor, the sequencer, the gateways and the openers, which hold state that needs one strict order</td>
+  </tr>
+  <tr>
+   <td>R2</td>
+   <td>Cloudflare's object storage, similar to Amazon S3</td>
+   <td>Runs, the immutable files that hold the database's data</td>
+  </tr>
+  <tr>
+   <td>Colo cache</td>
+   <td>The cache in each Cloudflare data centre ("colo" is short for colocation facility)</td>
+   <td>Keeping recently read parts of runs close to the leaves</td>
+  </tr>
+ </tbody>
+</table>
+<p>A Durable Object and an R2 object are unrelated despite the shared word. A Durable Object is a running program with state, and an R2 object is a stored file.</p>
+<p>Everything else in this post is SurrealDB: the query engine, the roles below, the way a scan is cut into pieces, and the checks that make the result correct.</p>
+<h2>What happens when one query fans out?</h2>
+<p>A single executor receives the query, runs the SurrealDB engine, and decides whether the scan is too large for one isolate. If it is, the executor cuts the scan into <strong>morsels</strong>, which are key ranges of the table, and sends them down a tree of openers to stateless leaves.</p>
+<p>Each role does one job:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Role</th>
+   <th>Runs as</th>
+   <th>Job</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Executor</td>
+   <td>Durable Object</td>
+   <td>Runs the engine, holds the transaction, pins the snapshot, plans the scan and merges the results</td>
+  </tr>
+  <tr>
+   <td>Gateway</td>
+   <td>Durable Object</td>
+   <td>Gathers commits from many executors into batches and passes them up to the sequencer, so the sequencer never has to talk to every writer</td>
+  </tr>
+  <tr>
+   <td>Sequencer</td>
+   <td>Durable Object</td>
+   <td>Gives every commit its place in one order, and holds recent small commits until they are written to R2</td>
+  </tr>
+  <tr>
+   <td>Opener</td>
+   <td>Durable Object</td>
+   <td>Passes a group of morsels to leaves and streams their answers back</td>
+  </tr>
+  <tr>
+   <td>Leaf</td>
+   <td>Worker</td>
+   <td>Reads one morsel from R2 and streams back rows or partial results</td>
+  </tr>
+  <tr>
+   <td>Run</td>
+   <td>R2 object</td>
+   <td>Immutable, sorted data that leaves read directly</td>
+  </tr>
+ </tbody>
+</table>
+<p>The sequencer holds recent commits in its Durable Object's own storage, which Cloudflare builds on SQLite. That storage is only a short-term holding area for commits before they are written to R2 as runs. The SurrealDB engine runs every query, and the data that a scan reads comes from the runs in R2.</p>
+<h2>How is the snapshot chosen?</h2>
+<p>The scan reads at the snapshot of the open transaction, and a reader lease keeps that snapshot available throughout the scan. Before it serves a fresh read, the executor asks the sequencer for its latest position and waits until it has applied every commit up to that position.</p>
+<p>The executor then fixes a snapshot position and builds each morsel request from three things:</p>
+<ol>
+ <li>The key range of the morsel.</li>
+ <li>The run list at that position, which is every run whose first position is at or below it.</li>
+ <li>The tail, which is the commits accepted after the last write to R2 and up to the snapshot, limited to the morsel's key range.</li>
+</ol>
+<p>Because every leaf receives the same position, the same run list and its part of the same tail, each leaf sees the database exactly as it was at one moment. Commits that arrive after the snapshot are invisible to every morsel. The tail travels with the request, so a leaf never has to call back to the executor for it.</p>
+<p>The sequencer keeps a history floor that only rises, and it never lets the floor pass the oldest snapshot that an unexpired lease holds. A scan therefore reads the same runs from start to finish, even while compaction and new commits continue.</p>
+<h2>How do writes scale?</h2>
+<p>Reads are not the only part of Earth that grows by adding more of the same thing. Writes take a path of their own, and it is built the same way.</p>
+<p>A write starts at an executor, which sends its commit to a <strong>gateway</strong>. A gateway is a Durable Object that serves a group of executors. It collects the commits from them, checks that commits in the same batch do not conflict, and sends the batch up as one unit. Small commits travel with the batch itself. Large commits are written to R2 once, and only a short record of them moves up the tree.</p>
+<p>Gateways sit in levels, in the same way that openers sit between the executor and the leaves. Each level merges the batches from the level below, so the sequencer receives a few large, ordered batches instead of a message from every writer. Adding writers adds gateways, and the sequencer's job stays the same size. Every commit still receives its place in one strict order, so the snapshot rules in the section above hold no matter how many writers there are.</p>
+<p>Gateways hold no data that the sequencer or R2 does not also hold, and a gateway that has no work to do holds no connections. A quiet database costs almost nothing, and a busy one takes on more gateways as its writers grow.</p>
+<h2>What do the leaves do?</h2>
+<p>Each leaf is a Worker that runs in its own isolate. Earth deploys the same leaf code under many script names so that calls spread over many isolates.</p>
+<p>A leaf receives a morsel request on <code>POST /morsel</code>, an internal endpoint of Earth's leaf code. It reads its key range from R2 through the colo cache, merges the tail in by position, and streams the results back with running counts of rows and bytes. An aggregate such as a count returns as a partial result, and the executor adds the partial results together.</p>
+<h2>How wide does the tree get?</h2>
+<p>An executor cannot manage a thousand connections at once, so openers sit between it and the leaves. A few limits keep each part of the tree to a size that one object can manage:</p>
+<ul>
+ <li>Each node passes work to at most 32 children.</li>
+ <li>By default, the executor sends work through 6 openers.</li>
+ <li>A read keeps at most 64 R2 requests in progress at once.</li>
+</ul>
+<p>To reach more leaves, the tree adds levels instead of making any one node wider. Each leaf takes its next morsel when it finishes one, so a scan can have many more morsels than there are leaves.</p>
+<h2>How do results merge into one answer?</h2>
+<p>Morsels cover separate key ranges in ascending order, and together they cover the whole scan range. Verified rows can therefore be released in key order without a sort. Counts add up correctly because every key falls in exactly one morsel and is counted once, from a verified stream.</p>
+<p>The executor verifies every morsel before it releases a row. The stream must have consecutive sequence numbers starting from zero, running row and byte counts that match what arrived, and a final frame whose totals equal the rows, bytes and frames received. A stream that is missing, incomplete or inconsistent, or an opener that stops answering, fails the check, and the morsel runs again through another opener.</p>
+<p>A morsel gets up to 3 attempts, and each attempt may take up to 8,000 ms. A morsel that never verifies fails the whole scan, so Earth never returns a partial answer.</p>
+<p>Slow leaves are hedged. Once every morsel has started, a morsel whose leaf is slower than a threshold is also given to an idle leaf, and the first verified answer wins.</p>
+<h2>Why does the scan scale with the number of leaves?</h2>
+<p>Durable Objects hold the state that has to stay in one order. The sequencer gives every commit its place in one order, and the executor holds sessions, the transaction and the dispatch logic. Openers are a pool of Durable Objects that limits how many connections the executor manages.</p>
+<p>R2 holds all the data that has been written into runs. Runs never change, so neither the executor's cache nor the colo cache ever needs invalidating, and every leaf reads the same bytes without coordinating with any other. Leaves hold no data and no state, so any of them can stop in the middle of a scan, and the verifier turns that into a retry.</p>
+<p>No node owns a part of the data, so adding more leaves needs no data to move. That is why scan throughput grows with the number of leaves while the data stays in object storage.</p>
+<h2>What do the measurements show?</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Measure</th>
+   <th>Result</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Table size</td>
+   <td>5 billion rows</td>
+  </tr>
+  <tr>
+   <td>Query</td>
+   <td><code>SELECT count() AS n FROM t WHERE b &lt; 100 GROUP ALL</code></td>
+  </tr>
+  <tr>
+   <td>Peak rate over 100 ms</td>
+   <td>22.3 billion rows per second</td>
+  </tr>
+  <tr>
+   <td>Leaves reading at the peak</td>
+   <td>22,085</td>
+  </tr>
+  <tr>
+   <td>Best single second</td>
+   <td>4.55 billion rows</td>
+  </tr>
+  <tr>
+   <td>Morsels</td>
+   <td>24,501</td>
+  </tr>
+  <tr>
+   <td>Query wall time</td>
+   <td>14.5 s</td>
+  </tr>
+ </tbody>
+</table>
+<p>The peak is the best 100 ms window of the scan, not an average over the query. The scan starts its morsels together at a set time, so the load arrives as a burst: the work reaches its peak in about a tenth of a second, and the best full second reads 4.55 billion rows. All of these figures are computed from the leaves' own logs.</p>
+<h2>Where is the limit, and what comes next?</h2>
+<p>The executor is the next limit. Each morsel costs about 4 ms of the executor's single thread, which caps a scan of small morsels at about 200 to 280 morsels a second. Planning also takes time, because the executor reads run indexes to decide where morsel boundaries go. The next step is to move planning and the carrying of results from the executor into the node levels of the tree, so that the executor does less work for each morsel.</p>
+<p>We are also working on these improvements to Earth:</p>
+<ul>
+ <li><strong>Faster cold starts.</strong> A cold start currently takes about 300ms, and we are working to bring that down.</li>
+ <li><strong>Database branching.</strong> Branching is coming to Earth, where R2 does much of the work.</li>
+</ul>
