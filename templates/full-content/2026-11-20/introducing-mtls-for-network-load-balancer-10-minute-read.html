@@ -1,0 +1,208 @@
+<h1>Introducing mTLS for Network Load Balancer</h1>
+<p>Many teams use mutual TLS (mTLS) to verify that only trusted clients reach their applications. To implement it, they build home-grown solutions or run third-party proxies, which are hard to maintain because the X.509 libraries they depend on need frequent updates. Building and running these solutions also consumes developer time and compute resources. Today, we are bringing mTLS to Network Load Balancer (NLB).</p>
+<p>NLB operates at Layer 4 (TCP, UDP, and TLS), handles millions of requests per second at ultra-low latency, and terminates TLS for your applications. Now NLB also handles mutual authentication for you, so you no longer need to build, update, or run your own mTLS solution. NLB supports mutual authentication in verify mode. During the TLS handshake, NLB presents its server certificate, which the client verifies. NLB also authenticates clients that present X.509 certificates, checks whether their certificates have been revoked, and can restrict access to specific certificate identities with client certificate filtering. This post explains how the feature works, how to set it up, and what to consider when you design your deployment.</p>
+<h2>TLS and mTLS</h2>
+<p>NLB already supports TLS listeners, which terminate TLS connections from clients. With TLS, only the client authenticates the server. With mTLS, the client and the server authenticate each other. The server requests a certificate from the client, and the client sends one and proves it holds the matching private key. The server then validates the client certificate’s chain of trust and expiry. Figure 1 shows the mTLS handshake.</p>
+<p>Figure 1: mTLS handshake between a client and a server</p>
+<h2>Customer use cases</h2>
+<p>Use mutual authentication on NLB in situations like these:</p>
+<ul>
+ <li><strong>Central public key infrastructure (PKI), shared trust:</strong> Your central PKI team manages your certificate authorities (CAs) and revocation lists. You use AWS Private Certificate Authority, third-party CAs, or self-signed CAs. Your security team wants every application to authenticate clients against the same trust stores.</li>
+ <li><strong>Revocation without replacing the root:</strong> You need to invalidate individual client certificates, such as those of retired devices or offboarded partners, to revoke their access while the root CA that signed them stays valid.</li>
+ <li><strong>Access control finer than the CA:</strong> Your CA issues certificates to production, staging, and corporate environments, but only production clients should reach this service. With client certificate filtering, NLB admits only certificates whose fields match a filter on the listener, such as an Organizational Unit (OU) of Production, a Common Name (CN), or a Secure Production Identity Framework for Everyone (SPIFFE) ID, so you don’t need a separate CA for each access boundary.</li>
+ <li><strong>Device fleets over TCP</strong>: You run a fleet of Internet of Things (IoT) devices that connect to a TCP service behind NLB. Each device has its own SPIFFE identity, and only your devices should reach the service.</li>
+</ul>
+<h2>How NLB supports mTLS authentication</h2>
+<p>You attach a trust store to an NLB TLS listener and set mutual authentication to verify mode. During the handshake, NLB presents its server certificate as it does for any TLS listener, then checks the client certificate against your trust store, any client certificate filters, and any revocation list. Only clients that pass every check reach your targets, and targets receive no client certificate data, so your backends need no certificate inspection logic.</p>
+<p>Client certificate filtering, new with NLB mTLS, adds identity-based access control on top of trust validation. A single CA often issues certificates to many environments or teams, so trusting the CA admits all of them. With filtering, you list the identities allowed to connect, such as an Organizational Unit, a Common Name, a DNS name, or a SPIFFE ID, and NLB rejects every other certificate during the handshake. Because NLB doesn’t pass certificate fields to your targets, filtering is how you enforce client identity without adding that logic to each backend.</p>
+<p>Figure 2: NLB mTLS verify mode architecture</p>
+<p>Figure 2 shows the end-to-end flow.</p>
+<ol>
+ <li>Upload your certificate authority (CA) certificate bundle and, optionally, a certificate revocation list (CRL) to Amazon Simple Storage Service (Amazon S3).</li>
+ <li>Create a trust store from the CA bundle and optionally add the CRL to it.</li>
+ <li>Configure a TLS listener with mutual authentication in verify mode that uses the trust store. Optionally, configure client certificate filtering.</li>
+ <li>A client opens a TLS connection. NLB sends its server certificate and requests the client’s certificate.</li>
+ <li>NLB validates the client certificate. It checks the chain of trust to a root in the trust store and the expiry of every certificate in the chain. It also checks for the clientAuth purpose in the Extended Key Usage (EKU) extension. If you allow expired client certificates, NLB accepts an expired client certificate that otherwise chains to a trusted CA.</li>
+ <li>If you configured client certificate filtering, NLB compares your filters with fields in the client certificate.</li>
+ <li>If the trust store includes a CRL, NLB checks the client certificate against it.</li>
+ <li>If every check passes, NLB accepts the connection and forwards traffic to the targets. If any check in steps 5–7 fails, NLB closes the connection and records the failure in its access logs. For the full list of failure scenarios, see Mutual authentication in the User Guide for NLB.</li>
+</ol>
+<h3>How NLB evaluates client certificate filters</h3>
+<p>You can filter on four fields: <code>Subject.CN</code> (Common Name), <code>Subject.OU</code> (Organizational Unit), <code>SAN.DNS</code> (DNS names in the Subject Alternative Name), and <code>SAN.URI</code> (URIs in the Subject Alternative Name, including SPIFFE IDs). Each filter uses one of two match types:</p>
+<ul>
+ <li><code>EXACT</code> matches when the certificate field value is identical to the configured value.</li>
+ <li><code>PREFIX</code> matches when the certificate field value starts with the configured value. This suits hierarchical identities such as SPIFFE URIs and domain name prefixes.</li>
+</ul>
+<p>For the <code>Subject.CN</code>, <code>Subject.OU</code>, and <code>SAN.DNS</code> fields, matching is case-insensitive. For the <code>SAN.URI</code> field, the scheme and host are matched case-insensitively, and the rest of the URI, such as the path, is matched case-sensitively. For example, a filter value of <code>SPIFFE://EXAMPLE.COM/workload</code> matches <code>spiffe://example.com/workload</code>, but does not match <code>spiffe://example.com/Workload</code>.</p>
+<p>NLB evaluates filters with these rules:</p>
+<ul>
+ <li><strong>After cryptographic checks.</strong> The order is trust chain validation, then filtering, then the CRL check. NLB never inspects the fields of an untrusted certificate.</li>
+ <li><strong>OR logic, fail-closed.</strong> One matching filter is enough to pass filtering. If filters are configured and none match, NLB rejects the connection.</li>
+ <li><strong>Multiple values.</strong> When a field has several values, such as multiple OUs or DNS names, a filter matches if any one value matches.</li>
+ <li><strong>Missing fields.</strong> If a certificate lacks the field a filter references, that filter does not match.</li>
+ <li><strong>Per listener.</strong> Filters belong to a listener, so listeners that share a trust store can enforce different policies.</li>
+</ul>
+<p>Filtering is optional. Without filters, NLB accepts every connection that passes trust chain validation and revocation checks. Certificate filtering is included with NLB mutual authentication at no additional cost.</p>
+<h2>Prerequisites</h2>
+<p>Have the following in place, all in the same AWS Region:</p>
+<ul>
+ <li>A virtual private cloud (VPC) with at least two subnets in different Availability Zones.</li>
+ <li>A security group for the load balancer that allows TCP 443 from your clients, and a backend security group that allows the listener’s target port from the load balancer.</li>
+ <li>A TCP target group with a healthy backend.</li>
+ <li>A server certificate for the TLS listener in AWS Certificate Manager (ACM).</li>
+ <li>AWS Command Line Interface (AWS CLI).</li>
+ <li>OpenSSL, to create the test certificates.</li>
+ <li>A private Amazon S3 bucket in the same Region, to hold the CA certificate bundle.</li>
+</ul>
+<h2>Set up mTLS on NLB</h2>
+<p>In this walkthrough, you use OpenSSL and the Amazon Elastic Compute Cloud (Amazon EC2) console to create test certificates, set up an NLB with mTLS in verify mode, and test it with trusted and untrusted clients. You then add client certificate filtering to admit only specific identities.</p>
+<h3>Step 1: Create test certificates and upload the CA bundle</h3>
+<p>In this step, you create a test CA and two client certificates with OpenSSL, then upload the CA certificate to Amazon S3 so NLB can build a trust store from it. client1 is signed by your CA, so NLB accepts it. bad-client is self-signed, so NLB rejects it. If a client certificate includes an Extended Key Usage (EKU) extension, that extension must contain clientAuth, or NLB rejects the certificate. If you already have a CA, upload its certificate bundle instead and issue client certificates from it.</p>
+<pre><code>openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout ca.key -out ca.pem -subj "/CN=example-root-ca"
+
+openssl req -new -nodes -newkey rsa:2048 \
+  -keyout client1.key -out client1.csr \
+  -subj "/OU=Engineering/CN=client1.example.com"
+printf "%s\n" "extendedKeyUsage=clientAuth" &gt; client1.ext
+openssl x509 -req -days 365 -in client1.csr \
+  -CA ca.pem -CAkey ca.key -CAcreateserial \
+  -extfile client1.ext -out client1.pem
+
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout bad-client.key -out bad-client.pem -subj "/CN=rogue.example.com"</code></pre>
+<p>Upload the CA certificate to a private Amazon S3 bucket in the same Region:</p>
+<pre><code>aws s3 cp ca.pem s3://amzn-s3-demo-bucket/ca-bundle.pem</code></pre>
+<h3>Step 2: Create the Network Load Balancer and configure the TLS listener</h3>
+<p>In this step, you create an internet-facing Network Load Balancer in your VPC from the Amazon EC2 console (Figure 3). Choose two subnets in different Availability Zones for high availability, and attach the load balancer security group from the prerequisites (Figure 4).</p>
+<p>Figure 3: Basic configuration</p>
+<p>Figure 4: Network mapping and security groups</p>
+<p>Next, configure a TLS listener on port 443 that forwards to your target group. Keep the recommended security policy, and choose your server certificate from ACM (Figure 5).</p>
+<p>Figure 5: TLS listener and server certificate</p>
+<h3>Step 3: Turn on mTLS and create a trust store</h3>
+<p>In this step, you turn on mutual authentication for the listener and create a trust store from the CA bundle you uploaded in Step 1 (Figure 6). A certificate revocation list is optional, and you can add one now or after the trust store is created. The console creates the trust store together with the load balancer.</p>
+<p>Figure 6: Turning on mTLS and creating a trust store</p>
+<p>Keep the default advanced mTLS settings: NLB rejects expired client certificates and doesn’t advertise your trust store’s CA names to clients (Figure 7). Turn on CA name advertising if your clients hold several certificates, such as smart cards, so each can pick one your trust store accepts. Any connecting client can then see which CAs you trust. Leave <strong>Client certificate identity filters</strong> empty for now. You configure client certificate filtering in Step 5.</p>
+<p>Figure 7: Advanced mTLS listener settings</p>
+<h3>Step 4: Review, create, and test</h3>
+<p>In this step, you review your settings, create the load balancer, and confirm that NLB accepts only trusted clients. After the load balancer’s status changes to Active, copy its DNS name. The listener’s mTLS column shows Verify with trust store (Figure 8).</p>
+<p>Figure 8: The load balancer with mTLS in verify mode</p>
+<p>Test with curl. The load balancer’s DNS name doesn’t match the domain name on your ACM server certificate, so the commands use the -k flag to skip server certificate verification. The flag doesn’t affect client authentication. A request with client1, which your CA signed, reaches the backend:</p>
+<pre><code>curl -k --cert client1.pem --key client1.key https://&lt;nlb-dns-name&gt;/
+
+Hello from mTLS_NLB backend</code></pre>
+<p>A request with no client certificate is rejected:</p>
+<pre><code>curl -k https://&lt;nlb-dns-name&gt;/
+
+curl: (55) Send failure: Connection reset by peer</code></pre>
+<p>A request with bad-client, which isn’t signed by a CA in your trust store, is also rejected:</p>
+<pre><code>curl -k --cert bad-client.pem --key bad-client.key https://&lt;nlb-dns-name&gt;/
+
+curl: (56) Connection reset by peer</code></pre>
+<p><strong>What to look for:</strong> A rejected client gets a connection reset and no HTTP response. With TLS 1.3, the client finishes its side of the handshake before NLB rejects the certificate, so the rejection appears as a reset on the first request rather than as a handshake error. The exact curl error code and message depend on your curl and OpenSSL versions.</p>
+<h3>Step 5: Configure client certificate filtering</h3>
+<p>In this step, you edit the listener to add client certificate filtering, so NLB admits only specific trusted clients. Under <strong>Client certificate identity filters</strong>, add one filter for each identity you want to allow (Figure 9). This example uses two filters:</p>
+<table>
+ <tbody>
+  <tr>
+   <td><strong>Action</strong></td>
+   <td><strong>Field</strong></td>
+   <td><strong>Match type</strong></td>
+   <td><strong>Value</strong></td>
+  </tr>
+  <tr>
+   <td>Accept</td>
+   <td>Subject Organizational Unit (Subject.OU)</td>
+   <td>Exact</td>
+   <td>Production</td>
+  </tr>
+  <tr>
+   <td>Accept</td>
+   <td>URI Subject Alternative Name (SAN.URI)</td>
+   <td>Prefix</td>
+   <td>spiffe://example.com/ns/prod/</td>
+  </tr>
+ </tbody>
+</table>
+<p>Figure 9: Client certificate identity filters</p>
+<p>Filters are combined with OR, and Accept is the only action, so a trusted certificate that matches no filter is rejected.</p>
+<p>To test the filters, issue two more client certificates from your CA, both with the clientAuth extended key usage, then compare your results with the table that follows the commands. NLB matches the SAN URI as a string and doesn’t check which system issued the certificate, so any certificate signed by a CA in your trust store with the right URI works. In production, these IDs typically come from a SPIFFE implementation such as SPIRE. For this test, OpenSSL is enough.</p>
+<pre><code># client2: OU=Production with a prod SPIFFE ID (matches both filters)
+openssl req -new -nodes -newkey rsa:2048 \
+  -keyout client2.key -out client2.csr \
+  -subj "/OU=Production/CN=client2.example.com"
+printf "%s\n" "extendedKeyUsage=clientAuth" \
+  "subjectAltName=URI:spiffe://example.com/ns/prod/sa/orders" &gt; client2.ext
+openssl x509 -req -days 365 -in client2.csr \
+  -CA ca.pem -CAkey ca.key -CAcreateserial \
+  -extfile client2.ext -out client2.pem
+
+# client3: OU=Engineering with a prod SPIFFE ID (matches only the SAN URI filter)
+openssl req -new -nodes -newkey rsa:2048 \
+  -keyout client3.key -out client3.csr \
+  -subj "/OU=Engineering/CN=client3.example.com"
+printf "%s\n" "extendedKeyUsage=clientAuth" \
+  "subjectAltName=URI:spiffe://example.com/ns/prod/sa/payments" &gt; client3.ext
+openssl x509 -req -days 365 -in client3.csr \
+  -CA ca.pem -CAkey ca.key -CAcreateserial \
+  -extfile client3.ext -out client3.pem</code></pre>
+<p>With the filters in place, send a request with each certificate:</p>
+<pre><code>curl -k --cert client1.pem --key client1.key https://&lt;nlb-dns-name&gt;/
+curl -k --cert client2.pem --key client2.key https://&lt;nlb-dns-name&gt;/
+curl -k --cert client3.pem --key client3.key https://&lt;nlb-dns-name&gt;/</code></pre>
+<table>
+ <tbody>
+  <tr>
+   <td><strong>Client certificate</strong></td>
+   <td><strong>Result</strong></td>
+  </tr>
+  <tr>
+   <td>client1 (OU=Engineering), before filters</td>
+   <td>Accepted</td>
+  </tr>
+  <tr>
+   <td>No certificate, or bad-client (untrusted CA)</td>
+   <td>Rejected</td>
+  </tr>
+  <tr>
+   <td>client1 (OU=Engineering, no SAN URI), with filters</td>
+   <td>Rejected: matches no filter</td>
+  </tr>
+  <tr>
+   <td>client2 (OU=Production and a prod SAN URI)</td>
+   <td>Accepted: matches both filters</td>
+  </tr>
+  <tr>
+   <td>client3 (OU=Engineering and a prod SAN URI)</td>
+   <td>Accepted: matches the SAN URI filter (OR logic)</td>
+  </tr>
+ </tbody>
+</table>
+<p>Figure 10 shows how NLB evaluates a client certificate in this example and where each test certificate is accepted or rejected.</p>
+<p>Figure 10: How NLB evaluates a client certificate against trust, revocation, and filters</p>
+<h2>Design considerations</h2>
+<p>Plan for the following when you design your trust stores:</p>
+<ul>
+ <li><strong>Your existing CA or AWS Private CA:</strong> If you already have a PKI solution or vendor, upload your root CAs to the trust store. AWS Private Certificate Authority works the same way: In both cases, you upload the CA certificates as a PEM file.</li>
+ <li><strong>Size limits:</strong> Trust stores, certificate chains, client certificate filters, and revocation lists have size limits. See Quotas for your Network Load Balancers.</li>
+ <li><strong>Trust store sharing:</strong> You can manage client trust from one central account and share trust stores with other accounts, or across your organization in AWS Organizations, through AWS Resource Access Manager (AWS RAM).</li>
+ <li><strong>Certificate purpose:</strong> If a client certificate includes an Extended Key Usage (EKU) extension, it must contain clientAuth. If it includes a Key Usage (KU) extension, that extension must assert digitalSignature or keyAgreement. These checks apply whether or not you configure client certificate filtering, and a certificate that omits an extension passes that check.</li>
+ <li><strong>TLS policies and tooling:</strong> Mutual authentication works with all generally available TLS security policies, and you can configure it with AWS CloudFormation and the AWS Load Balancer Controller.</li>
+ <li><strong>Health checks:</strong> They work as before. NLB does not use client certificate information for health checks, so turning on mutual authentication requires no extra setup.</li>
+ <li><strong>Monitoring</strong>: NLB publishes Amazon CloudWatch metrics for mutual authentication, including handshake counts, error counts, handshake latency, and client certificate expiration. Use them with access logs to spot rising rejection rates or certificates that are close to expiring.</li>
+ <li><strong>Troubleshooting</strong>: NLB access logs record whether each client passed or failed mutual authentication and why. To turn them on, see Enable access logs.</li>
+</ul>
+<h2>Revoke client certificates</h2>
+<p>To revoke access for a client certificate before it expires, upload a CRL to Amazon S3, then add it on the trust store’s details page in the Amazon EC2 console. NLB imports the CRL when you add it and doesn’t read it from Amazon S3 on each connection. When your list changes, add the updated CRL to the trust store again.</p>
+<h2>Clean up</h2>
+<p>To avoid ongoing charges, delete the resources you created in this walkthrough:</p>
+<ol>
+ <li>In the Amazon EC2 console, under <strong>Load Balancing</strong>, choose <strong>Load Balancers</strong>. Select your Network Load Balancer and choose <strong>Actions</strong>, <strong>Delete load balancer</strong>. This also deletes its listeners.</li>
+ <li>Under <strong>Load Balancing</strong>, choose <strong>Trust Stores</strong>. Select your trust store and choose <strong>Actions</strong>, <strong>Delete</strong>.</li>
+ <li>Under <strong>Load Balancing</strong>, choose <strong>Target Groups</strong>. Select your target group and choose <strong>Actions</strong>, <strong>Delete</strong>. Then terminate the backend instances and delete the security groups if you created them for this walkthrough.</li>
+ <li>In the Amazon S3 console, delete <code>ca-bundle.pem</code> and any CRL file from your bucket. Delete the bucket if you created it for this walkthrough.</li>
+ <li>On your computer, delete the test certificates and private keys you created with OpenSSL.</li>
+</ol>
+<h2>Conclusion</h2>
+<p>With mTLS on NLB, only clients you trust reach your TCP and TLS applications, and you no longer run proxies or update X.509 libraries to get there. Your PKI team keeps one source of trust, and you can revoke a client without replacing its CA. Each listener admits only the identities it should serve, with no changes to your backend code.</p>
+<p>mTLS for NLB is available in all AWS Regions where NLB is available. You can configure mutual authentication through the AWS Management Console, AWS CLI, AWS SDKs, or AWS CloudFormation, and troubleshoot it with access logs. For setup details and limits, see Mutual authentication in the User Guide for NLB.</p>

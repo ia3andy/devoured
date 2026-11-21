@@ -1,0 +1,94 @@
+<h1>Introducing Tool Retrieval in the Gemini API</h1>
+<p>Today we're launching Tool Retrieval in the Gemini API, available in preview in the <a href="https://aistudio.google.com/docs/interactions-overview">Interactions API</a>.</p>
+<p>When an agent connects to dozens or even hundreds of tools, sending every full parameter schema on every request adds up fast. It inflates input token counts, adds latency, and lowers tool-selection accuracy as the candidate list grows. Tool Retrieval lets your agent keep its full tool library on standby and load parameter schemas only when the current task needs them.</p>
+<h2>How it works</h2>
+<p>To turn on Tool Retrieval, add a <code>tool_search</code> tool to your request and set <code>defer_loading: true</code> on the tools you want to hold back. The model still sees the name and description of every deferred tool, so it knows what's available, but the parameter schemas stay out of context. When the model needs a tool, it asks for it by name, the API loads the full schema, and the model calls the function, all inside the same request.</p>
+<pre><code>from google import genai
+
+client = genai.Client()
+
+tools = [
+   \{"type": "tool_search"},
+   \{
+       "type": "function",
+       "name": "issue_refund",
+       "description": "Refund an order to the original payment method.",
+       "defer_loading": True,
+       "parameters": \{
+           "type": "object",
+           "properties": \{
+               "order_id": \{"type": "string"},
+               "amount": \{"type": "number"},
+           },
+           "required": ["order_id", "amount"],
+       },
+   },
+   # ... 50+ other deferred functions (leave frequent tools undeferred)
+]
+
+interaction = client.interactions.create(
+   model="gemini-4-hydrogen",
+   input="Order A-1042 arrived damaged. Please refund 40 dollars.",
+   tools=tools,
+)</code></pre>
+<p>Inside that single API call, the model searches for <code>issue_refund</code>, the API loads its schema, and the model emits the <code>function_call</code>. All three steps appear in <code>interaction.steps</code>, making it easy to inspect which tools the model considered when debugging tool names or descriptions:</p>
+<pre><code>"steps": [
+ \{
+   "type": "tool_search_call",
+   "id": "tsc_7f2a",
+   "arguments": \{"function_names": ["issue_refund"]},
+   "signature": "..."
+ },
+ \{
+   "type": "tool_search_result",
+   "call_id": "tsc_7f2a",
+   "result": [\{"type": "function", "name": "issue_refund", "parameters": \{...}}],
+   "signature": "..."
+ },
+ \{
+   "type": "function_call",
+   "id": "fc_91c3",
+   "name": "issue_refund",
+   "arguments": \{"order_id": "A-1042", "amount": 40}
+ }
+]</code></pre>
+<p>From here it's normal function calling: your code runs the refund and sends back a <code>function_result</code>.</p>
+<p>There's no index to build or host. Gemini runs the search on the server, so the only changes to your code are the new tool and a flag on the tools you want to defer. You can keep your most-used tools loaded up front and defer the long tail.</p>
+<p>Tool Retrieval also plays well with prefix caching. Deferred schemas stay out of the start of the prompt, and the schemas the model loads are added later in the conversation, so the cached prefix stays the same from turn to turn.</p>
+<p>Tool Retrieval also works with <a href="https://ai.google.dev/gemini-api/docs/function-calling#mcp">remote MCP servers in the Gemini API</a>. Set <code>defer_loading: true</code> on an <code>mcp_server</code> tool and every tool that server exposes is loaded on demand, so you can connect a large server without listing its tools one by one.</p>
+<h2>How client-side retrieval works</h2>
+<p>If you maintain your own tool registry, embedding index, or per-user permission filter, declare the <code>tool_search</code> with <code>"execution": "client"</code> and define your search parameters. Client-side retrieval adds one round trip per search, because your app runs the lookup. Tools do not need to be declared upfront, so you can also expose new tools mid-conversation when a user connects an integration:</p>
+<pre><code>tools = [\{
+    "type": "tool_search",
+    "execution": "client",
+    "name": "search_tools",
+    "description": "Search the internal tool registry for functions.",
+    "parameters": \{
+        "type": "object",
+        "properties": \{"query": \{"type": "string"}},
+        "required": ["query"],
+    },
+}]
+
+# When the model emits a function_call for "search_tools",
+# return matching \{"type": "function", ...} schemas in function_result:
+followup = client.interactions.create(
+    model="gemini-4-hydrogen",
+    previous_interaction_id=interaction.id,
+    tools=tools,
+    input=[\{
+        "type": "function_result",
+        "name": "search_tools",
+        "call_id": step.id,
+        "result": my_registry.search(**step.arguments),
+    }],
+)</code></pre>
+<h2>How pricing and supported models work</h2>
+<p>Tool Retrieval has no separate charge. Input and output tokens are billed at the standard rates for the model you call. Turning on <code>tool_search</code> adds a small, fixed block of input tokens, and each schema the model loads is billed as input for the rest of the conversation, the same as a tool declared up front. You save tokens when the schemas you never load outweigh the ones you do, which is the usual case for large libraries. Measure it against your own traffic.</p>
+<p>Tool Retrieval works with Gemini 3.6 and later models, including <a href="https://aistudio.google.com/docs/latest-model">all Gemini 4 models</a>, in the Interactions API.</p>
+<h2>How to get started</h2>
+<ul>
+ <li><a href="https://aistudio.google.com/docs/tool-retrieval"><b>Read the documentation</b></a> — Full setup guide with examples</li>
+ <li><a href="https://aistudio.google.com/docs/choosing-a-model?e=0"><b>Compare Gemini models</b></a> — Find the best model for your use case</li>
+ <li><a href="https://discuss.ai.google.dev/"><b>Join the discussion on Discord</b></a> — Share feedback with the team</li>
+</ul>
