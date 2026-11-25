@@ -1,0 +1,97 @@
+<h1>An AI Observability Framework for Your Agentic Applications</h1>
+<p><em>Best practices for every layer, from the first prototype to production</em></p>
+<p>Agents have moved beyond proof of concept. IDC’s July 2026 survey found that 95% of enterprises now run at least one agent-enabled workflow in production, and 67% exceeded their agent budgets by more than 10% in the past year. Gartner predicts that more than 40% of agentic AI projects will be canceled by the end of 2027 because of escalating costs, unclear business value, or inadequate risk controls. Each of those causes is a visibility problem.</p>
+<p>For years, observability helped humans answer questions about deterministic software, where the same input followed the same logic defined in the code. An agent decides at runtime which tools to call, which context to trust, how many steps to take, and when to stop. Two identical requests can take different paths at very different costs, and an answer can be fluent, fast, and wrong. Knowing that a service is up tells you very little about whether an agent is behaving.</p>
+<p>This post presents a framework for observing agents across their whole lifecycle, from the first prototype to production. It breaks an agentic system into four layers: the application the agent is part of, the agent’s reasoning and tool calls, the models behind it, and the infrastructure underneath, with best practices for each one: what goes wrong, the signals that detect it, and where to start.</p>
+<h2>What changes with AI workloads</h2>
+<p>Traditional monitoring assumes that the code defines the behavior. Agents break that assumption in four ways:</p>
+<ol>
+ <li><strong>Behavior changes without a release.</strong> A model update, refreshed knowledge base, or a new tool can change what an agent does without going through your deployment pipeline.</li>
+ <li><strong>Wrong answers look like the right ones.</strong> Agents rarely fail with errors. They return a confident answer from the wrong document or report a task as done when it is never finished.</li>
+ <li><strong>Context becomes instruction, and actions carry permissions.</strong> Anything an agent reads (a document, a tool description, another agent output) can steer it, and it acts with real credentials on real systems.</li>
+ <li><strong>Cost follows reasoning, not traffic.</strong> Steps, retries, and reasoning tokens set for the bill, so the same request volume can cost very different amounts from one day to the next.</li>
+</ol>
+<p>This is how agentic systems normally behave, which is why observability has to span every layer.</p>
+<h2>The framework</h2>
+<p>An agent never runs in isolation. It is part of an application, calls models, and runs on infrastructure, and a problem rarely stays in the layer where it shows up. The framework has two dimensions. The first is the four layers an agent depends on, from the top down:</p>
+<ol>
+ <li><strong>Application:</strong> the application code, and the services, APIs and data stores it calls</li>
+ <li><strong>Agentic:</strong> the agents and the tools, retrieval, memory, and protocols they use</li>
+ <li><strong>Model:</strong> managed or self-hosted inference</li>
+ <li><strong>Infrastructure:</strong> the compute that hosts the agents and the models</li>
+</ol>
+<p>The second dimension is how a layer can fail. Any layer can stop working or give wrong answers, spend more than it should, or reach data it shouldn’t. So the framework tracks three cross-cutting concerns in every layer:</p>
+<ol>
+ <li><strong>Reliability and Quality</strong>: does it work and give the right answer</li>
+ <li><strong>Cost</strong>: what it spends</li>
+ <li><strong>Security and Governance</strong>: what it can reach, and who approved it</li>
+</ol>
+<h3>1. The application layer</h3>
+<p>Many of the problems users notice first, such as slow or failed answers, start in the services around the agent, not in the agent itself.</p>
+<p><strong>Scope.</strong> The application the agent is part of: the application code and user-facing surface, the gateways and content delivery upstream, and the microservices, databases, queues, and caches downstream that the agent calls. Most teams already monitor this layer well. The gap is that agent telemetry usually lives somewhere else.</p>
+<p><strong>Failure patterns:</strong></p>
+<ul>
+ <li><strong>Reliability and quality:</strong> a slow or failing downstream service makes the agent look slow; a stale cache feeds the agent outdated data.</li>
+ <li><strong>Cost:</strong> retries against a slow service multiply model calls and tokens.</li>
+ <li><strong>Security and governance:</strong> the agent writes to systems of record with no audit trail, or calls APIs without per-request authorization.</li>
+</ul>
+<p><strong>Detection signals:</strong></p>
+<ul>
+ <li>Request rate, errors, and duration for every service the agent calls</li>
+ <li>Database query latency, slow queries, and connection-pool saturation</li>
+ <li>Queue depth and consumer lag for work the agent hands off</li>
+ <li>Cache hit rate and freshness for data the agent reads</li>
+ <li>Writes to systems of record, tagged with the agent’s identity</li>
+</ul>
+<h3>2. The agentic layer</h3>
+<p>This is where agents fail without errors. The service is healthy, and the behavior is wrong.</p>
+<p><strong>Scope.</strong> Everything that turns a model into an agent: the agents, the tools they call, the knowledge bases behind retrieval, the protocols that connect them, and the harness that builds the context, runs the loop, calls tools, handles errors, saves state, and enforces approvals.</p>
+<p><strong>Failure patterns:</strong></p>
+<ul>
+ <li><strong>Reliability and quality:</strong> a confident answer from the wrong document, the same search repeated with rephrased inputs, calls to tools that don’t exist, an instruction lost when the harness compacts context, or a task reported done that never finished.</li>
+ <li><strong>Cost:</strong> steps, retries, and sub-agents that multiply with no limit.</li>
+ <li><strong>Security and governance:</strong> instructions hidden in a retrieved document or tool output that steer the agent, and actions outside the agent’s intended scope.</li>
+</ul>
+<p><strong>Detection signals:</strong></p>
+<ul>
+ <li>The trace tree, with one span per reasoning step, tool call, retrieval, and handoff</li>
+ <li>Tool calls per task, error rate per tool, and invalid or nonexistent tool calls</li>
+ <li>Steps per task against the task’s normal range, repeated actions, and whether each run reaches a terminal state</li>
+ <li>Retrieval relevance, and how well the answer is grounded</li>
+ <li>Approval gates requested, granted, and denied</li>
+</ul>
+<h3>3. The Model Layer</h3>
+<p>Model calls drive most of an agent’s latency and cost, and a single run often calls more than one model.</p>
+<p><strong>Scope.</strong> A single agent run can call several models: a reasoning model to plan, a decision model that routes or checks a step, embedding and reranking models for retrieval, and models constrained to a fixed output format.</p>
+<p><strong>Failure patterns:</strong></p>
+<ul>
+ <li><strong>Reliability and quality:</strong> confident routing decisions that turn out wrong, retrieval that slowly drifts, and responses that are truncated or break the required format.</li>
+ <li><strong>Cost:</strong> reasoning tokens the user never sees, and lost prompt-cache hits.</li>
+ <li><strong>Security and governance:</strong> guardrails that block legitimate requests or miss unsafe ones, sensitive data in prompts and responses, and model versions that change without review.</li>
+</ul>
+<p><strong>Detection signals:</strong></p>
+<ul>
+ <li>Time to first token (TTFT), tokens per second (TPS), and total response time</li>
+ <li>Tokens by type (input, output, reasoning) and cache hits</li>
+ <li>Cost per call, attributed to the agent, task, and team</li>
+ <li>Quota use, throttling, and provider errors</li>
+ <li>Decision-model confidence against observed accuracy</li>
+</ul>
+<h3>4. The infrastructure layer</h3>
+<p>Infrastructure problems rarely show up where they start. They surface a layer or two up, as a slow agent or one that loses its place mid-task.</p>
+<p><strong>Scope.</strong> Hosting the agents (containers, serverless functions, or managed agent runtimes) and hosting the models you serve yourself.</p>
+<p><strong>Failure patterns:</strong></p>
+<ul>
+ <li><strong>Reliability and quality:</strong> a restarted container drops an agent’s session, a slow vector store looks like a slow agent, and memory pressure evicts cached context.</li>
+ <li><strong>Cost:</strong> idle or over-provisioned GPU capacity.</li>
+ <li><strong>Security and governance:</strong> over-privileged credentials on agent runtimes.</li>
+</ul>
+<p><strong>Detection signals:</strong></p>
+<ul>
+ <li>Agent runtime CPU and memory, restarts, cold starts, and session survival</li>
+ <li>Vector store latency and index freshness</li>
+ <li>GPU utilization, key-value (KV) cache use and evictions (self-hosted)</li>
+</ul>
+<h2>Work across the layers</h2>
+<p>Signals at each layer tell you what is happening there. The most valuable insight comes from the connections between layers, achieved through <strong>shared trace context</strong> and a <strong>dependency map</strong>. Standardizing on <strong>OpenTelemetry</strong> ensures that your instrumentation survives framework or model provider changes.</p>
+<p><strong>Accountability</strong> requires matching oversight to the autonomy granted: an agent that only reads needs traces and quality scores, while an agent that changes systems needs approval gates, audit trails, and circuit breakers.</p>

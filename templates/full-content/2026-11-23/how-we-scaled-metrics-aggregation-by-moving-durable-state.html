@@ -1,2 +1,118 @@
-<p>Full article content is not available for inline reading.</p>
-<p><a href="https://www.datadoghq.com/blog/engineering/how-we-scaled-metrics-aggregation/">Read the original article &rarr;</a></p>
+<p>Each new generation of Datadog’s metrics aggregation system had to support roughly 10× the metrics volume of the generation before it. As volume grew, managing and recovering aggregation state became the system’s main scaling constraint.</p>
+<p>Metrics aggregation must keep results correct even when data arrives late, data is delivered more than once, or processing is interrupted. Our original approach met that requirement by keeping historical state close to the processing work. It worked well at its initial scale, but continued growth made recovery, horizontal scaling, and day-to-day operations increasingly difficult.</p>
+<p>We redesigned the system over three generations, moving from fixed partition ownership to transferable state and finally to a design in which storage reconciles partial aggregates, duplicate deliveries, and late data. This post explains how moving responsibility for durable correctness changed the system’s scaling and recovery model, why each architecture eventually reached its limit, and how the third-generation design allows the streaming layer to resume at the live edge without first restoring hours of historical aggregation state.</p>
+<h2>Why metrics aggregation becomes a state-management problem</h2>
+<p>Metrics arrive with many tags that describe where and how each measurement was produced. Those tags are useful, but customers do not always need every dimension to remain queryable.</p>
+<p>Datadog lets customers choose which tags remain queryable for a metric. Removing unnecessary tag dimensions reduces the volume of indexed custom metrics, which can lower costs and improve query performance while preserving mathematically accurate results across the dimensions that remain.</p>
+<p>Consider a service running on 100 pods. Each pod reports a <code>service.request.duration</code> distribution with tags such as <code>env</code>, <code>region</code>, <code>service</code>, <code>endpoint</code>, and <code>pod_name</code>. Users may want to analyze service latency by region or endpoint without retaining a separate queryable series for every pod. By retaining only <code>env</code>, <code>region</code>, <code>service</code>, and <code>endpoint</code>, Datadog can merge the pod-level distributions into fewer indexed metric series while still calculating globally accurate percentiles.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Stage</th>
+   <th>Tags</th>
+   <th>Distribution sketch or result</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Before aggregation</td>
+   <td><code>env:prod</code>, <code>region:us-east-1</code>, <code>service:api</code> ,<code>endpoint:/requests</code>, <code>pod_name:A</code></td>
+   <td>Pod A distribution sketch containing many latency measurements</td>
+  </tr>
+  <tr>
+   <td>Before aggregation</td>
+   <td><code>env:prod</code>, <code>region:us-east-1</code>, <code>service:api</code>, <code>endpoint:/requests</code>, <code>pod_name:B</code></td>
+   <td>Pod B distribution sketch containing many latency measurements</td>
+  </tr>
+  <tr>
+   <td>After aggregation</td>
+   <td><code>env:prod</code>, <code>region:us-east-1</code>, <code>service:api</code>, <code>endpoint:/requests</code></td>
+   <td>One merged distribution containing the measurements from both pods</td>
+  </tr>
+ </tbody>
+</table>
+<p>For distribution metrics, each source sends a compact DDSketch representing its observed values. These sketches can be merged without storing every individual measurement while preserving accurate percentile calculations.</p>
+<p>The backend aggregation service must:</p>
+<ul>
+ <li>Reduce timestamped data from N dimensions to M dimensions, where M is smaller than N.</li>
+ <li>Aggregate data over short time windows, such as 10 seconds.</li>
+ <li>Incorporate late-arriving data and safely handle duplicate messages by updating previously calculated results without double-counting.</li>
+</ul>
+<p>Together, these requirements make the service stateful. For each aggregation window, it must remember which data it has already incorporated and track message identifiers so retries do not produce duplicate results. After a restart or failure, that state must remain available or be reconstructed before processing can continue correctly.</p>
+<p>These requirements turn dimension reduction into a distributed systems problem. The aggregation service sits between metrics intake and storage.</p>
+<p>The three designs that follow were neither one-to-one replacements nor limited to a single metric type. Static partitioning, for example, appeared in both point- and distribution-metric systems. We present the designs as three generations because they illustrate a broader architectural progression from fixed ownership to transferable state and, finally, to a streaming layer that delegates durable reconciliation to storage. Each addressed the same underlying problem: reducing metric dimensions while preserving correctness through retries, late data, failures, and recovery.</p>
+<h2>The first generation: Stateful aggregation with static assignment</h2>
+<p>Our first distributed aggregation service grew out of our experience operating Kafka. It followed a familiar pattern: Consume payloads from a message broker, aggregate them, and pass the results to downstream storage.</p>
+<p>Incoming payloads were partitioned deterministically so that payloads with the same key always landed on the same partition. The deployment topology was static, with a fixed set of partitions assigned to specific nodes.</p>
+<p>For each payload, the service decoded and deduplicated the data, selected the configured tags, and merged the DDSketch into the corresponding aggregation bucket. Recent buckets were kept in memory, while RocksDB retained several hours of buckets and deduplication identifiers so late data could still be incorporated. The service periodically flushed the latest version of each bucket to downstream storage.</p>
+<p>This design made every aggregation instance stateful. The system accepted late-arriving data within a bounded time window. After restarting without usable local state, an instance had to consume one full interval of data before it could begin flushing results. This warm-up period made restarts operationally disruptive.</p>
+<p>Each statically assigned partition group had a leader and a follower. Both instances performed the aggregation work, but under normal conditions, only the leader wrote results downstream. If the leader failed, the follower could take over with minimal interruption because its state was nearly up to date. Rebuilding an instance from scratch, however, still required a full warm-up period. The resulting static ownership model looked like this:</p>
+<p>The leader-follower model provided high availability, but both nodes performed the same aggregation work even though only the leader normally wrote downstream. This effectively doubled aggregation compute and made horizontal scaling difficult. Because partitions were assigned to specific deployments and instance sizes, adding replicas did not automatically redistribute the work.</p>
+<p>When a partition became too large, engineers had to split its assignment manually. This required creating new partition ranges, updating configuration, deploying replacement leaders and followers, coordinating the cutover, verifying Kafka offsets and downstream output, and removing the old deployment. One documented split required approximately 1.5 hours of coordinated engineering work. The number of coordinated steps made the procedure brittle and introduced correctness risks.</p>
+<p>This architecture provided a workable starting point and supported the platform through significant growth. Eventually, duplicated compute, manual scaling work, and the correctness risks of static assignment became the main constraints. The next generation had to separate partition ownership from individual instances and make aggregation state transferable.</p>
+<h2>The second generation: Stateful aggregation with dynamic assignment</h2>
+<p>The second generation separated partition ownership from individual instances.</p>
+<p>Instead of assigning fixed partition ranges to fixed deployments, Kafka could dynamically reassign partitions as cluster membership changed during restarts and scaling events. We used sticky assignment to minimize unnecessary partition movement during restarts and short-lived disruptions.</p>
+<p>Dynamic assignment removed the need to split partition assignments across fixed aggregation nodes, but it introduced a new problem. When a partition moved to another node, the new owner had to reconstruct its aggregation state before it could continue processing.</p>
+<p>Each node maintained its local state in RocksDB. That state contained the aggregation buckets and deduplication information needed to incorporate late data and safely handle messages spanning several hours. Unlike the first-generation architecture, however, the local database was no longer the only copy. Each node continuously uploaded incremental SSTable changes to blob storage, allowing another node to reconstruct the state after a reassignment.</p>
+<p>Downloading the entire state after every reassignment would have been too expensive and slow. Because most data arrived on time, a node usually needed only the most recent state to resume processing current data. We divided the RocksDB state into time windows so that a new node could restore the most recent window first and load older windows only when late data required them. This allowed current processing to resume quickly while historical state was recovered on demand.</p>
+<p>This design improved recovery performance and reduced overall costs. It also allowed us to adopt an autoscaling model for capacity provisioning. The autoscaler had to consider more than CPU usage. It also needed to account for how much state would move, how long recovery would take, and whether the remaining nodes could continue processing while partitions were reassigned.</p>
+<p>We tuned this behavior using heuristics developed through experiments. Scaling too slowly could leave the service unable to catch up with incoming data. Scaling too aggressively could trigger many simultaneous state restorations, increasing load instead of relieving it.</p>
+<p>After the migration, we could support approximately 10× higher metrics volumes with minimal operational intervention.</p>
+<p>As our customer workloads grew, state management became the system’s dominant source of complexity. Local databases, remote snapshots, recovery windows, and partition reassignment all had to work together correctly. Upstream incidents and large backfills could force many nodes to recover or expand their state simultaneously, making state recovery the next scaling bottleneck.</p>
+<h2>Third generation: Best-effort streaming with storage-side reconciliation</h2>
+<p>The third generation began with a different premise: The streaming aggregation service did not need to own the final durable aggregate.</p>
+<p>We had previously considered moving durable aggregation state into storage, but the earlier architecture worked well enough that the added storage complexity was difficult to justify. Once state recovery became a scaling and cost constraint, the trade-off changed.</p>
+<p>We designed the new service so that aggregation and deduplication in the streaming layer were best-effort. During normal operation, it combined as much on-time data as possible and discarded retries it could recognize within its active window. Late data, backfills, and work that could not be completed immediately continued to storage instead of blocking the live pipeline. Durable correctness could no longer depend on the streaming layer remembering every prior input.</p>
+<p>Our storage system has two tiers: one optimized for recent, real-time data and another for long-term storage. Both storage tiers had to understand a format that represents partial aggregates rather than individual points. Each partial aggregate identifies its series and time bucket, specifies how it should be combined with other contributions, and includes enough information to detect duplicate deliveries. The storage system groups contributions for the same series and bucket, removes duplicates, and combines the remaining results. It applies these rules whenever records are merged, both during reads across storage levels and during background compaction. Compaction progressively consolidates the results, while the same process incorporates late or out-of-order data without replaying the original stream or recovering the aggregation worker’s previous state. The representation is preserved as data moves from recent to long-term storage, keeping reconciliation consistent across both tiers.</p>
+<p>This design changed the system’s correctness boundary. The aggregation service could prioritize current traffic without retaining several hours of durable state. Storage became responsible for combining results from the fast path with data arriving through slower paths.</p>
+<p>This responsibility was not entirely new to the storage layer. Even before we introduced streaming pre-aggregation, Datadog’s timeseries storage engine had to reconcile late and out-of-order writes. Extending that purpose-built reconciliation path allowed us to move durable aggregation state out of the streaming service instead of reproducing the same responsibility in each worker’s RocksDB database.</p>
+<p>Retries and partial failures still had to be handled correctly. Reprocessing the same input could not change the final result, and query results could not depend on whether data was aggregated in the streaming layer or deferred to storage. The system remained stateful, but its durable state moved to a layer designed to retain and reconcile it.</p>
+<p>Moving durable correctness into storage also changed the recovery model. The streaming layer could reset to the live edge while storage reconciled the deferred data outside the live processing path.</p>
+<p>Removing durable local state changed the system’s cost model as well. Streaming workers no longer needed disks sized for several hours of RocksDB state, continuously uploaded incremental state, or downloaded large snapshots whenever partitions moved. This allowed us to provision the streaming fleet for current traffic rather than for the worst-case cost of restoring many stateful workers simultaneously.</p>
+<p>This generation also marked our first use of Datadog’s Streaming Platform for an aggregation service. Operating Kafka directly required custom tooling for recovery, consumer-group management, state inspection, overload handling, and resetting consumers to the live edge. These capabilities were necessary, but maintaining them was not where the aggregation team wanted to spend its time. Moving to a platform that provided them eliminated much of that operational work and allowed the team to focus on the aggregation system itself.</p>
+<p>The rollout validated the new recovery model in production. During one incident, we needed to reset processing to the live edge. An operator performed the reset directly through the Streaming Platform UI while storage handled the deferred aggregation work.</p>
+<p>That incident demonstrated the architecture’s main benefit: Restoring current traffic no longer required reconstructing all historical aggregation state first. Across the three generations, durable state moved from fixed consumers to dynamically assigned consumers and, finally, into storage for reconciliation.</p>
+<h2>How the architecture evolved</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Generation</th>
+   <th>Partition ownership</th>
+   <th>Durable state location</th>
+   <th>Recovery model</th>
+   <th>Main limitation</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>First</td>
+   <td>Static</td>
+   <td>Local RocksDB</td>
+   <td>Follower takeover or, when rebuilding, process one late-arrival window before flushing</td>
+   <td>Disruptive restarts, manual partition splitting, and duplicated compute</td>
+  </tr>
+  <tr>
+   <td>Second</td>
+   <td>Kafka-managed dynamic assignment</td>
+   <td>Local RocksDB backed up to blob storage</td>
+   <td>Restore recent state first and load older windows on demand</td>
+   <td>Recovery cost and state-management complexity</td>
+  </tr>
+  <tr>
+   <td>Third</td>
+   <td>Platform-managed dynamic assignment</td>
+   <td>Timeseries storage</td>
+   <td>Resume at the live edge and reconcile deferred data in storage</td>
+   <td>Reconciliation complexity in storage and query paths</td>
+  </tr>
+ </tbody>
+</table>
+<p>No design was universally better. Each matched the scale and operational constraints the system faced at the time.</p>
+<h2>Moving state out of the critical recovery path</h2>
+<p>Across three generations, the central challenge was deciding where state should live and how much had to be recovered before processing could continue. Static ownership kept correctness local, but scaling required engineers to change the deployment topology manually. A correctness constraint had become a scaling constraint. Making state transferable enabled dynamic scaling, but moving and reconstructing it eventually became the next bottleneck.</p>
+<p>The third architecture changed the recovery model. The streaming layer can resume at the live edge without first restoring hours of historical state, while storage reconciles partial aggregates, duplicate deliveries, late data, and backfills. We can now provision the streaming fleet for current traffic instead of the worst-case cost of restoring many stateful workers at once.</p>
+<p>The broader lesson is that state does not have to disappear for a processing layer to become easier to scale. When recovery becomes a bottleneck, moving state between workers may not be enough. Placing durable state in a layer designed to retain and reconcile it can preserve correctness while keeping historical state out of the critical path for current work.</p>
+<h2>Acknowledgments</h2>
+<p>This post reflects the collective expertise and work of current and former members of the metrics aggregation team. Although I wrote the final draft, many others shaped the technical direction, contributed code, drove the implementation, and operated these systems in production.</p>
+<p>Special thanks to Artem Krylysov, Christian Damianidis, David Dos Santos, and Dmitriy Gromov for reviewing the post, and to Cecil Gregg, Chelsea Liu, Edward Farber, Evan Bender, Ivy Cao, Javier Arguello Sosa, Joel Barciauskas, Justin Jaffray, Mathias Thomas, Pawel Knap, Quentin François, Rohan Pillai, Shang Wang, Stefan Karaivanov, Vivek Nelamangala, and the many others who helped design, build, migrate, and operate these systems over the years.</p>

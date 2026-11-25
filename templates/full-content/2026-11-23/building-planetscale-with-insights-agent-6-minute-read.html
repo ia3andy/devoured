@@ -1,0 +1,134 @@
+<h1>Building PlanetScale with Insights Agent</h1>
+<p>We've always used PlanetScale to build PlanetScale. So when we built Insights Agent, our own databases were the first place we ran it to see what kind of gains we could get. Insights Agent identifies problematic queries or schema using Query Insights, finds the code responsible for them, and opens a pull request with a fix. Our Rails API is a large, busy app, which makes it a good testing ground.</p>
+<p>We know a thing or two about databases over here, so our databases are already quite well optimized. Even so, Insights Agent has been able to find a bunch of wins for us, continuing our drive towards the most efficient database possible.</p>
+<p>Here are three (of many) examples of how we tested and used Insights Agent in the weeks leading up to launch, and how we used these experiences to make the product better.</p>
+<h2>A feature flag check we didn't need</h2>
+<p>Our Rails API checks feature flags with Flipper. On top of Flipper, we have an override that can turn a flag off for specific records. Checking the flag requires reading it from the database. Our code checked the override first, every time:</p>
+<p>Each lookup took about a millisecond, which doesn't raise any significant slow-query concerns at first look. However, when this happens ~28 million times per day, it added up to more than nine hours of database CPU time. Insights Agent found it by the aggregate time instead of individual execution time. The override can only turn a flag off, so Insights Agent moved it after the Flipper check.</p>
+<pre><code>  def feature_enabled?(name)
+-   if override_disables?(name)
+-     false
+-   else
+-     Flipper.enabled?(name, actor)
+-   end
++   Flipper.enabled?(name, actor) &amp;&amp; !override_disables?(name)
+  end
+</code></pre>
+<p>If a flag is already off, there's nothing to override. The app behavior remains exactly the same as before, but now with far fewer lookups on these values:</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>Before</th>
+   <th>After</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Calls per day</td>
+   <td>28.7 million</td>
+   <td>8.3 million</td>
+  </tr>
+  <tr>
+   <td>Database time per day</td>
+   <td>33,379 s</td>
+   <td>9,625 s</td>
+  </tr>
+  <tr>
+   <td>Share of all query time</td>
+   <td>3.6%</td>
+   <td>1.1%</td>
+  </tr>
+ </tbody>
+</table>
+<p>In this case, the traffic volume to the database did not change, but by careful inspection of both the database load and the codebase, the Insights Agent was able to significantly reduce load here.</p>
+<h2>An index that made a query slower</h2>
+<p>Next, we asked Insights Agent to fix a slower query. This query looks up billing prices for an account, about 570,000 times a day (names simplified):</p>
+<pre><code>select prices.* from prices
+where prices.owner_id = ?
+  and prices.metric in (&lt;elements&gt;)
+  and prices.owner_type = ?
+  and prices.region_id is not null
+</code></pre>
+<p>Insights showed this query reading about 122 rows for every returned row. This is often a tell that a query can be sped up. Insights Agent observed that the index MySQL used for this lookup had a range on <code>region_id</code> ahead of <code>metric</code>, and decided to add a new index with <code>metric</code> first. This might seem reasonable at first glance, but we merged it, and the query got slower:</p>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>Before the index</th>
+   <th>After the index</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Average</td>
+   <td>27.3 ms</td>
+   <td>47.6 ms</td>
+  </tr>
+  <tr>
+   <td>p99</td>
+   <td>129 ms</td>
+   <td>222 ms</td>
+  </tr>
+ </tbody>
+</table>
+<p>MySQL wasn't using the new index!</p>
+<h2>Insights Agent was missing... something</h2>
+<p>Insights Agent was working from a summary that left out a few important bits of context.</p>
+<p>First, almost none of these calls return a row, because most accounts have no prices to show. When the number of rows returned is zero (or near-zero), rows read per row returned looks terrible.</p>
+<p>Second, our Insights extension collapses <code>IN</code> lists when it normalizes SQL, which means <code>&lt;elements&gt;</code> was hiding 645 metric names, about 18 KB of SQL on every call. MySQL builds a lookup range for each of these values for every index that could use them. The new index gave it one more index to do that for.</p>
+<p>So we stopped sending the list of elements. The query now loads the few dozen regional prices an account has and filters them in Ruby:</p>
+<pre><code>account.regional_prices.select do |price|
+  price.region_id == region.id &amp;&amp; BILLABLE_METRICS.include?(price.metric)
+end
+</code></pre>
+<table>
+ <thead>
+  <tr>
+   <th></th>
+   <th>Old query</th>
+   <th>New query</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Database time per day</td>
+   <td>16,212 s</td>
+   <td>1,129 s</td>
+  </tr>
+  <tr>
+   <td>Average</td>
+   <td>28.5 ms</td>
+   <td>1.95 ms</td>
+  </tr>
+  <tr>
+   <td>p99</td>
+   <td>137 ms</td>
+   <td>8.0 ms</td>
+  </tr>
+ </tbody>
+</table>
+<p>That's about 14 times less database time. The new query also uses the index Insights Agent added, so we kept it.</p>
+<h3>Teaching Insights Agent what we learned</h3>
+<p>We have updated Insights Agent to look at more evidence to be better at these types of investigations. For these, it must look at rows read and returned per call <em>and</em> the size of the SQL sent, including how many values are collapsed. And we're extending our eval harness to cover cases like this one, including the cases where the best option is to leave the query as-is. Sometimes no change is better than adding an index.</p>
+<h2>More indexing work</h2>
+<p>Yet another indexing adventure here. A job in our Rails API runs every minute to find schema snapshots that need to be reconciled (query simplified):</p>
+<pre><code>select snapshot.id from snapshot
+join branch on branch.id = snapshot.branch_id
+where snapshot.ready = ?
+  and snapshot.failed_at is null
+  and snapshot.created_at &gt; ?
+  and branch.ready = ?
+order by snapshot.id asc
+limit ?
+</code></pre>
+<p>The only index MySQL could use for this was one created on <code>(ready, migration_applied_at)</code>. This index helps MySQL find unready snapshots. However, it does not help with the other filters because <code>failed_at</code> and <code>created_at</code> are not in it (as well as a few others which were removed). MySQL had to read every unready snapshot (<code>ready = false</code>) and check the additional columns on every row.</p>
+<p>There are a lot of unready snapshots in the database, but only a very small subset are both <code>recent</code> and not failed. MySQL had to find every match before it could sort by <code>id</code> and return the first few. Each call was reading 100s of thousands of rows to return, typically, less than 100 and was taking multiple seconds. The rows read / rows returned ratio on this query was really bad.</p>
+<p>Insights Agent suggested adding an index on <code>(ready, failed_at, created_at)</code>:</p>
+<pre><code>add_index :snapshot, [:ready, :failed_at, :created_at]
+</code></pre>
+<p>With <code>ready</code> and <code>failed_at</code> now included, MySQL can jump straight to the right range of <code>created_at</code> instead of reading every unready snapshot. Another query that counts unready snapshots for alerting had a similar issue, and was given a fix by the agent. In this case, the only change needed to the app-side code was a database migration.</p>
+<p>Both p50 and p95 dropped from seconds per call to millisecond-scale.</p>
+<h2>Wrapup</h2>
+<p>We spent weeks testing, improving, and optimizing the experience with Insights Agent in the weeks leading up to launch. While doing so, we used it to automate the discovery of a bunch of places where we could improve our code, our database schema, and our queries. If you want a faster database (and we know you do) go give Insights Agent a try on your database, today.</p>
+<p>If you prefer doing all these kinds of optimizations in your own agent harness, we have some docs to get you up and running on this as well.</p>

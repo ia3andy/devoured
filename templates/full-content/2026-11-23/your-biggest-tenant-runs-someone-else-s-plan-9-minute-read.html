@@ -1,2 +1,140 @@
-<p>Full article content is not available for inline reading.</p>
-<p><a href="https://boringsql.com/posts/planner-cost-and-buffers">Read the original article &rarr;</a></p>
+<h2>One tenant two hundred times bigger</h2>
+<p>The lab is sensor readings with the usual lookup tables hanging off them. A site is the tenant, and <code>readings</code> stands in for whichever tenant-scoped table grows fastest in your schema:</p>
+<pre><code>CREATE TABLE vendors (id int PRIMARY KEY, name text NOT NULL);
+CREATE TABLE models  (id int PRIMARY KEY, vendor_id int NOT NULL REFERENCES vendors, name text NOT NULL);
+CREATE TABLE units   (id int PRIMARY KEY, symbol text NOT NULL);
+CREATE TABLE sites   (id int PRIMARY KEY, name text NOT NULL);
+CREATE TABLE sensors (
+    id       int PRIMARY KEY,
+    site_id  int NOT NULL REFERENCES sites,
+    model_id int NOT NULL REFERENCES models,
+    unit_id  int NOT NULL REFERENCES units,
+    label    text NOT NULL
+);
+CREATE TABLE readings (
+    id        bigint PRIMARY KEY,
+    site_id   int NOT NULL REFERENCES sites,
+    sensor_id int NOT NULL REFERENCES sensors,
+    taken_at  timestamptz NOT NULL,
+    value     double precision NOT NULL
+);
+
+CREATE INDEX readings_site_time ON readings (site_id, taken_at);</code></pre>
+<p>There are 2,000 sites. Most have about 15 sensors and 1,000 readings over two years, and site 1 has 500 sensors and 200,000 readings. Every multi-tenant table I've worked with has had a site 1. Readings are inserted in random time order, so a week of any site is scattered across the heap, and <code>readings</code> carries <code>site_id</code> as a deliberate denormalization so a site's readings can be found through one index without going through <code>sensors</code>.</p>
+<p>The query is a dashboard tile, the 50 highest readings at a site in a time window:</p>
+<pre><code>PREPARE top(int, timestamptz, timestamptz) AS
+SELECT r.id, r.taken_at, r.value,
+       s.label, m.name AS model, v.name AS vendor, u.symbol AS unit
+FROM readings r
+JOIN sensors s ON s.id = r.sensor_id
+JOIN models  m ON m.id = s.model_id
+JOIN vendors v ON v.id = m.vendor_id
+JOIN units   u ON u.id = s.unit_id
+WHERE r.site_id = $1
+  AND r.taken_at &gt;= $2 AND r.taken_at &lt; $3
+ORDER BY r.value DESC, r.id
+LIMIT 50;</code></pre>
+<p>No index returns readings in <code>value</code> order, so any plan reads the whole window and sorts it. Plans differ in how much work they put into rows that end up outside the top 50. For a small site that's a handful of rows. For site 1 it's most of the query.</p>
+<p>It's a <code>PREPARE</code> because that's how it reaches the server from most applications. The production endpoint went through pgx, which prepares by default (so does the Rails adapter); pgJDBC and psycopg 3 switch to server-side prepared statements after a few executions.</p>
+<h2>How a prepared statement picks its plan</h2>
+<p>A prepared statement exists to skip planning on repeat calls. On data like this a plan made without the parameters has to guess them, so PostgreSQL doesn't commit straight away. The first five executions each get a custom plan built with the actual values. From the sixth on it also builds a generic plan, once, with <code>$1</code>..<code>$3</code> unknown, and <code>choose_custom_plan()</code> in <code>plancache.c</code> switches to it whenever its cost is below the average of the custom plans so far. Each custom plan is charged a little extra in that comparison for the planning it costs.</p>
+<p>The dashboard opens on ordinary sites far more often than on site 1, so I ran it for six of them and asked <code>pg_prepared_statements</code> which plans it had used:</p>
+<pre><code>SELECT name, generic_plans, custom_plans FROM pg_prepared_statements;</code></pre>
+<pre><code> name | generic_plans | custom_plans
+------+---------------+--------------
+ top  |             1 |            5</code></pre>
+<p>Each ordinary site's custom plan cost about 135 with the planning charge, and the generic plan costs 82. Once the generic plan is in use no new custom plans get built, so the average it's compared against never moves again, and when site 1 arrives it gets the generic plan without being planned at all.</p>
+<p>Prepared statements live in one backend, so behind a connection pool each connection makes this choice separately from whichever tenants reached it first. Because <code>pg_prepared_statements</code> is session-local, you can only check those counters from inside one of the app's own pooled connections.</p>
+<p>The 82 itself is arithmetic on defaults. For <code>site_id = $1</code> the planner assumes the average site, 2.2 million rows over 2,000 sites, 1,100 rows. For the <code>taken_at</code> range against two unknowns, <code>clauselist_selectivity</code> falls back to <code>DEFAULT_RANGE_INEQ_SEL</code>, 0.5%. That's 5.5 rows, and six rows through four nested-loop lookups on primary keys is cheap. No parameter reaches that arithmetic, so the window doesn't either.</p>
+<h2>Seeing the plan production runs</h2>
+<p>Copying the query from the log, pasting in the values and running <code>EXPLAIN ANALYZE</code> won't show any of this. With literals the planner sees site 1 and a real date range, and you get a custom plan. To get what the application gets, repeat the warm-up: <code>PREPARE</code>, execute it five times with ordinary sites, then <code>EXPLAIN (ANALYZE) EXECUTE top(1, ...)</code>. <code>SET plan_cache_mode = force_generic_plan</code> skips the warm-up, and since PostgreSQL 16 <code>EXPLAIN (GENERIC_PLAN)</code> shows the generic plan's estimates without running it.</p>
+<p>Site 1, one week, under the generic plan:</p>
+<pre><code> Limit  (cost=81.55..81.57 rows=6 width=59) (actual rows=50.00 loops=1)
+   Buffers: shared hit=21823
+   -&gt;  Sort  (cost=81.55..81.57 rows=6 width=59) (actual rows=50.00 loops=1)
+         Sort Key: r.value DESC, r.id
+         -&gt;  Nested Loop  (cost=1.28..81.48 rows=6 width=59) (actual rows=1983.00 loops=1)
+               -&gt;  Nested Loop  (cost=1.14..80.54 rows=6 width=60) (actual rows=1983.00 loops=1)
+                     -&gt;  Nested Loop  (cost=1.00..79.52 rows=6 width=54) (actual rows=1983.00 loops=1)
+                           -&gt;  Nested Loop  (cost=0.72..77.73 rows=6 width=44) (actual rows=1983.00 loops=1)
+                                 -&gt;  Index Scan using readings_site_time on readings r  (cost=0.43..27.90 rows=6 width=28) (actual rows=1983.00 loops=1)
+                                       Buffers: shared hit=1993
+                                 -&gt;  Index Scan using sensors_pkey on sensors s  (cost=0.29..8.30 rows=1 width=24) (actual rows=1.00 loops=1983)
+                                       Buffers: shared hit=5949
+                           -&gt;  Index Scan using models_pkey on models m  (cost=0.28..0.30 rows=1 width=18) (actual rows=1.00 loops=1983)
+                                 Buffers: shared hit=5949
+                     -&gt;  Index Scan using vendors_pkey on vendors v  (cost=0.14..0.17 rows=1 width=14) (actual rows=1.00 loops=1983)
+                           Buffers: shared hit=3966
+               -&gt;  Index Scan using units_pkey on units u  (cost=0.14..0.16 rows=1 width=7) (actual rows=1.00 loops=1983)
+                     Buffers: shared hit=3966</code></pre>
+<p>Sorting after the joins is the right call for the six rows the planner expected, but with 1,983 every reading gets its four lookups before all but 50 are thrown away. Warm, a week of this runs about as fast as the custom plan. A month is 8,080 readings, 88,909 buffer accesses and 24 ms, at a cost of 81.57.</p>
+<h2>What the buffer count counts</h2>
+<p>21,823 looks like a lot for a dashboard tile. It adds up exactly once you know how tall each index is, which <code>pageinspect</code> reads from the metapage:</p>
+<pre><code>SELECT c.relname, (bt_metap(c.relname)).level
+FROM pg_class c
+WHERE c.relname IN ('readings_site_time', 'sensors_pkey', 'models_pkey', 'vendors_pkey', 'units_pkey');</code></pre>
+<pre><code>      relname       | level
+--------------------+-------
+ units_pkey         |     0
+ sensors_pkey       |     1
+ vendors_pkey       |     0
+ models_pkey        |     1
+ readings_site_time |     2</code></pre>
+<p>A lookup in one of these unique indexes touches <code>level + 1</code> index pages plus one heap page, 3 for <code>sensors</code> and <code>models</code> and 2 for <code>vendors</code> and <code>units</code>, which is 19,830 across all the lookups. The <code>readings</code> scan is the other 1,993: 11 index pages and 1,982 heap pages for 1,983 rows. The counter only ticks when a scan moves to a different buffer, and only once in this week do two consecutive rows share a heap page.</p>
+<h2>When the planner sees site 1</h2>
+<p>Forced to plan site 1 for a week, the planner gets the estimate close (1,888 rows against 1,983) and picks a plan for volume: the bitmap scan over the window, <code>sensors</code>, <code>models</code> and <code>vendors</code> read whole into hash tables, and <code>units</code>, with only 20 distinct keys, behind a <code>Memoize</code> node. Its cost is 6,536 and it takes about 6 ms, a good part of it spent hashing 30,000 sensor rows to use 1,983 of them.</p>
+<p>The plan it rejected is faster. With <code>enable_hashjoin</code> and <code>enable_mergejoin</code> off the runner-up shows up: it sorts the window first and joins only the top 50. It costs 6,563, 0.4% more, and runs in about 3 ms, half the time of the plan that beat it.</p>
+<h2>Moving the LIMIT below the joins</h2>
+<p>Every fast plan above picked the top 50 from <code>readings</code> before joining anything. The query can ask for that order directly, which is usually called a deferred join:</p>
+<pre><code>PREPARE top_late(int, timestamptz, timestamptz) AS
+SELECT r.id, r.taken_at, r.value,
+       s.label, m.name AS model, v.name AS vendor, u.symbol AS unit
+FROM (
+    SELECT id, sensor_id, taken_at, value
+    FROM readings
+    WHERE site_id = $1
+      AND taken_at &gt;= $2 AND taken_at &lt; $3
+    ORDER BY value DESC, id
+    LIMIT 50
+) r
+JOIN sensors s ON s.id = r.sensor_id
+JOIN models  m ON m.id = s.model_id
+JOIN vendors v ON v.id = m.vendor_id
+JOIN units   u ON u.id = s.unit_id
+ORDER BY r.value DESC, r.id;</code></pre>
+<p>A subquery with a <code>LIMIT</code> isn't pulled up into the outer join (<code>is_simple_subquery()</code> in <code>prepjointree.c</code> refuses it), so the planner can't flatten it back into the original. The outer <code>ORDER BY</code> needs no second sort as long as the joins are nested loops, which keep the subquery's order.</p>
+<table>
+ <thead>
+  <tr>
+   <th>site 1, ms (warm / cold)</th>
+   <th>custom, week</th>
+   <th>generic, week</th>
+   <th>custom, month</th>
+   <th>generic, month</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>original</td>
+   <td>5.9 / 11.7</td>
+   <td>5.7 / 16.8</td>
+   <td>4.0 / 10.9</td>
+   <td>24 / 43</td>
+  </tr>
+  <tr>
+   <td>deferred join</td>
+   <td>0.9 / 5.6</td>
+   <td>0.8 / 10.2</td>
+   <td>2.3 / 9.1</td>
+   <td>2.6 / 15.2</td>
+  </tr>
+  <tr>
+   <td>deferred join, covering index</td>
+   <td>0.4 / 0.8</td>
+   <td>0.4 / 0.8</td>
+   <td>1.1 / 2.0</td>
+   <td>1.1 / 1.6</td>
+  </tr>
+ </tbody>
+</table>
+<p>The covering index has a price. It's 123 MB, against 66 MB for <code>readings_site_time</code> and 126 MB for the table, and every new reading writes its value, sensor and id into it, plus the WAL. With the same leading columns it can replace <code>readings_site_time</code>, which makes the difference 57 MB.</p>

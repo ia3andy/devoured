@@ -1,0 +1,95 @@
+<h1>Karpenter v1.15: GPU-aware provisioning, smarter node repair, and more</h1>
+<p>Kubernetes runs in production at over 80% of organizations that use containers, according to the Cloud Native Computing Foundation (CNCF) 2025 Annual Cloud Native Survey. But the workloads have changed. Distributed training jobs, stateful databases, and mixed-instance fleets now require GPU topology awareness, high-speed networking, and persistent storage. These requirements sit below the abstraction layer that Kubernetes resource requests were designed to express. When provisioning cannot account for the physical hardware layer, the result is unnecessary node launches, scheduling failures, and underutilized capacity. The community has responded. According to Datadog’s State of Containers and Serverless report, Karpenter adoption surged 22% in two years, reflecting growing demand for hardware-aware node provisioning.</p>
+<p>AWS created Karpenter in 2021 and open sourced it as a Kubernetes node lifecycle manager that provisions right-sized compute in real time. In 2023, AWS contributed the vendor-neutral core to the Kubernetes Special Interest Group (SIG) Autoscaling under the CNCF. Karpenter reached general availability (GA) with v1.0 in August 2024, establishing the first stable release.</p>
+<p>Building on that foundation, v1.15 addresses three areas. Provisioning now understands the physical hardware layer before a node launches. Repair coordinates with your existing availability controls instead of overriding them. Consolidation aligns with your own scaling decisions. The following sections describe what changed, why it matters, and how to activate each capability.</p>
+<p>Throughout this post, version references use “1.15” rather than a specific patch. Always run the latest patch release for your version.</p>
+<h2>1.0 Provisioning that understands the hardware</h2>
+<p>Three enhancements give Karpenter visibility into the physical hardware layer before it launches a node.</p>
+<h3>NVIDIA GPU and EFA DRA support</h3>
+<p>GPU and Elastic Fabric Adapter (EFA) workloads have a placement requirement that ordinary resource counting cannot capture: The devices must share the same Peripheral Component Interconnect Express (PCIe) root complex. When an NVIDIA GPU and an EFA adapter share a PCIe root complex, they transfer data directly over the PCIe fabric without routing through the CPU and system memory. This peer-to-peer path reduces latency and frees memory bandwidth for collective operations such as AllReduce that underpin large-scale distributed training.</p>
+<p>Karpenter 1.15 adds Dynamic Resource Allocation (DRA) support for the AWS provider, accounting for NVIDIA GPUs with system-mediated time-slicing and EFA networking through DRANET when sizing new nodes. Without DRA, Karpenter and the Kubernetes scheduler can only reason about resources based on generic counts, with no ability to specify constraints between devices.With DRA support, Karpenter evaluates device availability and topology as part of the provisioning decision, before the node is requested.</p>
+<p>This DRA path also establishes the infrastructure for GPU time-slicing scenarios, where multiple pods share a single physical GPU by dividing its execution time. Time-slicing requests flow through the same DRA path. Karpenter can then reason about how many virtual devices a node can serve, rather than treating the GPU as a single indivisible unit.</p>
+<p>DRA support is available on EKS 1.34+ and time-slicing support is available on EKS 1.36+. To turn on DRA support, use the <code>DRANVIDIAGPU</code> and <code>DRAEFA</code> AWS feature gates, or set <code>settings.enableDRA</code> in Helm.</p>
+<h3>Volume-limit-aware provisioning</h3>
+<p>Workloads with many PersistentVolumeClaims (PVCs) previously triggered a provisioning loop: Karpenter would launch a node, discover it could not attach enough Amazon Elastic Block Store (Amazon EBS) volumes, and then launch another. This happened because Karpenter did not account for instance-level volume attach limits until after a node was running.</p>
+<p>In 1.15, Karpenter checks those limits before requesting an instance. It knows that an <code>m5.xlarge</code> supports up to 25 attached Amazon EBS volumes and factors that into scheduling decisions from the start. Workloads with many persistent volumes land on appropriately sized nodes the first time.</p>
+<h3>Nitro Enclaves support on EC2NodeClass</h3>
+<p>With the new <code>spec.enclaveOptions</code> field on EC2NodeClass, you can run confidential computing workloads on Amazon Elastic Compute Cloud (Amazon EC2) instances using AWS Nitro Enclaves through Karpenter. Karpenter filters automatically for enclave-capable instance types and passes the enclave configuration through to the Amazon EC2 launch template.</p>
+<p>Before this change, enclave workloads required a separate, static node group maintained outside Karpenter, which meant giving up dynamic scaling and cost optimization for that part of the fleet. Now those workloads benefit from the same provisioning and consolidation as everything else.</p>
+<h2>2.0 Repair that respects your workloads</h2>
+<p>When a node becomes unhealthy, how Karpenter responds determines whether your workloads experience a planned, coordinated transition or an abrupt interruption. Karpenter 1.15 gives the repair system the same availability controls that govern intentional disruption and adds a targeted reboot path for faults that do not require a full replacement.</p>
+<h3>Node repair as voluntary disruption</h3>
+<p>In 1.15 is that repair is now classified as a voluntary disruption. This means it participates in the same budget and Pod Disruption Budget (PDB) machinery that governs intentional operations like drift and consolidation. With this change, the repair system now provides three key guarantees for workloads with strict availability requirements such as distributed training jobs, stateful services, or multi-replica applications with tight PDB windows:</p>
+<ol>
+ <li>Karpenter honors NodePool disruption budgets when repairing nodes, surfacing a new Unhealthy reason in budget accounting.</li>
+ <li>Karpenter respects Pod Disruption Budgets during the drain.</li>
+ <li>Karpenter applies a per-condition termination grace period to bound how long each drain can take.</li>
+</ol>
+<p>In earlier releases, a repair action could exceed your intended concurrency budget or drain pods faster than a PDB permitted. The voluntary disruption model closes that gap by routing repair through the same controls as every other planned operation.</p>
+<h3>Reboot as a repair action</h3>
+<p>Not every node fault warrants replacing the instance. Transient GPU XID errors, wedged kubelets, and hung container runtimes are often cleared by a reboot. Replacing the instance in those cases incurs unnecessary latency, risks losing a capacity reservation slot, and generates more churn than the situation requires.</p>
+<p>Repair policies can now match on condition reason and select either <code>RebootNode</code> or <code>ReplaceNode</code>. On AWS, the Amazon Elastic Kubernetes Service (Amazon EKS) Node Monitoring Agent identifies some GPU XID errors as reboot-clearable. Those errors trigger an in-place <code>ec2:RebootInstances</code> call instead of a full instance replacement.</p>
+<p>The node stays in the fleet and the capacity reservation slot is preserved. Recovery through a reboot is typically faster than launching and initializing a new instance, which can take several minutes depending on the Amazon Machine Image size and bootstrap scripts.</p>
+<p>Repair coverage also now extends to nodes that register with the cluster but never complete initialization. Those nodes are now included in the repair lifecycle.</p>
+<h3>Terminate-first disruption</h3>
+<p>When a NodePool is at its node limit or backed by a full Capacity Reservation, Karpenter cannot stage a replacement before removing the current node because there is no room. The TerminateFirstDrift and TerminateFirstRepair feature gates (alpha) activate a terminate-first path for those environments. Karpenter terminates the drifted or unhealthy node first, then launches the replacement.</p>
+<h2>3.0 Consolidation and configuration</h2>
+<p>Karpenter’s consolidation logic and your workload scaling logic can pull in different directions. When they do, the result is nodes that remain occupied longer than intended or kubelet configurations that require more NodeClass resources to manage than necessary. Karpenter 1.15 introduces two features that align these systems.</p>
+<h3>Pod deletion cost management</h3>
+<p>Karpenter identifies which nodes to remove during consolidation, but the Kubernetes ReplicaSet controller independently decides which pods to terminate during a scale down. When those decisions conflict, the nodes Karpenter wants to consolidate remain occupied by pods that the ReplicaSet controller chose to keep. Karpenter 1.15 introduces a pod deletion cost management controller (feature gate: PodDeletionCostManagement) that resolves this conflict. Karpenter manages the <code>controller.kubernetes.io/pod-deletion-cost</code> annotation so that Deployment scale down preferentially removes pods from the nodes Karpenter has targeted for consolidation.</p>
+<h3>CEL expressions in kubelet configuration</h3>
+<p>Heterogeneous fleets typically require separate EC2NodeClass resources for each distinct kubelet configuration, because fields like <code>maxPods</code>, <code>kubeReserved</code>, and <code>systemReserved</code> vary by instance type. The NodeClassCEL AWS feature gate introduces Common Expression Language (CEL) support in kubelet configuration. You can compute those values dynamically per instance type within a single EC2NodeClass.</p>
+<p>A single expression can scale reserved memory proportionally to instance size, eliminating the need to maintain parallel NodeClass definitions for each instance family.</p>
+<h2>Get started</h2>
+<p>To start using these capabilities on Amazon EKS, see Device management. Before upgrading, review the Upgrade Guide for breaking changes. Key changes in 1.15 include standardized lowercase values for the <code>reason</code> metric label and updated <code>consolidation_type</code> label behavior on <code>queue_failures_total</code>. Several 1.15 capabilities ship behind feature gates. Core gates are set with <code>--feature-gates</code>. AWS specific gates are set with <code>--aws-feature-gates</code>.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Feature</th>
+   <th>Gate</th>
+   <th>Purpose</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Node Auto Repair (voluntary disruption)</td>
+   <td>NodeRepair (core)</td>
+   <td>Replace unhealthy nodes under NodePool Disruption Budgets and PDBs instead of forceful termination</td>
+  </tr>
+  <tr>
+   <td>Reboot as repair action</td>
+   <td>RebootForRepair (AWS)</td>
+   <td>Clear transient GPU XID faults with an in-place reboot instead of a full replacement. Requires NodeRepair also enabled and ec2:RebootInstances on the controller role</td>
+  </tr>
+  <tr>
+   <td>Terminate-first on drift</td>
+   <td>TerminateFirstDrift (core)</td>
+   <td>Allow drift replacement when a NodePool is at its node limit or a Capacity Reservation is full</td>
+  </tr>
+  <tr>
+   <td>Terminate-first on repair</td>
+   <td>TerminateFirstRepair (core)</td>
+   <td>Allow repair in the same no-headroom cases as above</td>
+  </tr>
+  <tr>
+   <td>Pod deletion cost management</td>
+   <td>PodDeletionCostManagement (core)</td>
+   <td>Steer Deployment scale-in to remove pods from nodes Karpenter wants to consolidate, so whole nodes empty</td>
+  </tr>
+  <tr>
+   <td>DRA (NVIDIA GPU + EFA)</td>
+   <td>DRANVIDIAGPU, DRAEFA (AWS gates)</td>
+   <td>Include DRA devices from the NVIDIA GPU and EFA (DRANET) drivers when sizing new nodes. Also needs IGNORE_DRA_REQUESTS=false (Helm settings.enableDRA handles both gates and that setting)</td>
+  </tr>
+  <tr>
+   <td>CEL in kubelet config</td>
+   <td>NodeClassCEL (AWS)</td>
+   <td>Compute maxPods, kubeReserved, systemReserved per instance type in one EC2NodeClass instead of maintaining parallel NodeClasses</td>
+  </tr>
+  <tr>
+   <td>Nitro Enclaves on EC2NodeClass</td>
+   <td>Spec.enclaveOptions.enabled (no gate)</td>
+   <td>Run confidential-computing workloads on Karpenter-managed nodes instead of static side group</td>
+  </tr>
+ </tbody>
+</table>

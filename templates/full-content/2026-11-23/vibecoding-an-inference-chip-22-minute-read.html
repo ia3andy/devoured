@@ -1,0 +1,82 @@
+<h1>Vibecoding an inference chip</h1>
+<p>Or rather, I vibe-coded an FPGA into running an LLM. And it… just worked.</p>
+<p>One of the more entertaining things about programming recently is that coding agents let me work in entirely new domains by giving me access to new programming languages and paradigms. Lately, that has meant hacking on hardware, now that writing low-level software is much easier. So, in this blog post, I’m going to try to recount the experience of vibe coding an FPGA, going through a series of “oh shit” moments several times, and giving myself a new appreciation for what’s possible if you have a large token budget (thanks YC) and interesting problems to point the models at.</p>
+<p>I overheard some founders recently talk about how FPGAs work. I’ll admit I was relatively naive about them. I’d never really experimented with them in my startup or in college, so I knew little about them before. The basic idea I was familiar with: you can program a circuit into a reprogrammable chip. So rather than having a general purpose computing architecture (like a CPU) you can have a reprogrammable one, i.e. the configuration loaded onto the chip determines how its logic and routing are connected, and that (in theory) enables performance advantages. I also know that it took a mountain of C++ to write and involved manually analyzing waveforms for simulation and verification. I had never done this before though and it seemed cumbersome.</p>
+<p>That’s about what I knew going into this.</p>
+<p>Naturally, my ML brain thought “could we use these for AI inference”. I’m not the first to think this — there are a few repos attempting to port ML models to FPGAs on Github. But I hadn’t actually seen a writeup on whether coding agents are good at writing the low level C++ and Verilog code to program them and verifying the outputs so that they actually run accurately. (Spoiler alert, they are incredible at programming them.)</p>
+<p>So I decided I needed to get my hands on one. AWS has F2 instances with FPGA hardware, and that seemed easier than going and buying physical hardware, so I asked Codex to spin up a reservation and got cooking. It had a relatively limited memory of 16 GB of FPGA HBM. Around the same time, I was working with the DeepGrove founders who were discussing their new ternary weight architecture that is well suited for memory limited cases. It’s SOTA on Mac hardware with actual agentic tool calling, so I figured why not, let’s see if I can get this working on an FPGA and fast enough to be useful.</p>
+<p>What followed was a cloud agent running in Conductor for several days with me mostly just encouraging it periodically while it both (1) got a model fully running and (2) increased its speed by 33× from the first full-model bit-exact baseline to get it to a real-time relevant speed. It was one of the most mind blowing autoresearch loops I’ve run, ultimately writing roughly 3M lines across the experiment history and parsing 30M lines of output files, burning only $10,000 in Claude and OpenAI tokens to run hundreds of experiments. Most of the code is C++ and some Verilog. It’s been probably a decade since the last time I wrote any serious amount of C++ and I’ve never written Verilog. I honestly don’t know the first thing about Verilog. Most of my prompts were not particularly clever: they consisted mostly of me saying things like “you’re a superintelligent model, time to be more creative” and “let’s go for 2x faster, you got this”. Sometimes I brought some ML knowhow like “hey it’s time to consider speculative decoding” or “why is that running on CPU, you should port it”. But for the most part, it was just vibes and I’m pretty sure that with enough time the model would have figured out those things. Also, it seemed that both Astra and Opus (new Fable wasn’t out yet) were pretty capable at this and I could use them interchangeably. I’m sure someone has a good benchmark for which is smarter but both passed my smart-enough threshold.</p>
+<h2>From “it works” to 213 tokens per second</h2>
+<p>The chart follows the measured optimization sequence: <strong>6 → 213 tokens/s</strong>, or <strong>33×</strong> the baseline.</p>
+<h2>How much did the human advice help?</h2>
+<p>At one point, around when it got to 10 TPS, I messaged the DeepGrove founders about this, and they replied surprised that it was working so easily, saying they had tried this a few months back and the models were not quite good enough to be particularly effective. They sent me a prompt that summarizes some of their lessons and I copy-pasted it into my session to see if it’d matter. It was essentially the most significant piece of actual guidance I added to this session.</p>
+<h3>MATMUL (TERNARY ENGINE)</h3>
+<ul>
+ <li>No multipliers. A 2-bit weight drives a 3:1 mux that picks x, ~x, or 0. The unused 4th code raises an error flag, so corrupt weights get caught.</li>
+ <li>Negation is ~x + 1. Lanes flag negatives, and the row reducer adds the +1s once per row instead of once per lane.</li>
+ <li>Activations are grouped integers: INT12, or INT16 where we needed more range (MLP down projection). Reduce as integers, apply FP32 group scales, accumulate in FP32.</li>
+ <li>The pre-projection RMSNorm is deferred: quantize the activation first, apply the normalization scale after accumulation. It’s cheaper and numerically equivalent.</li>
+ <li>8 cores in two clusters. Projections that are independent (gate/up) run at the same time on separate core groups.</li>
+ <li>Result: about half the DSPs of an INT8/INT16 design at the same rate, traded for more LUTs.</li>
+</ul>
+<h3>MEMORY</h3>
+<ul>
+ <li>Weights are packed at 2 bits, 8x more per transfer than 16-bit. At batch 1, weight fetch costs far more energy and time than the math.</li>
+ <li>Weights stream from HBM straight into the compute lanes and skip the on-chip buffers (they’re used once per token). Activations are cached next to each core and reused across rows.</li>
+ <li>HBM routing is one chain per memory channel instead of a big crossbar. Lay out data so all 32 channels stay busy.</li>
+ <li>On-chip buffers are typed slots with an explicit lifecycle (open -&gt; write -&gt; commit -&gt; read -&gt; release). Each slot has a side memory for scales/exponents. The buffer checks format, range and producer, which catches scheduling bugs in hardware.</li>
+ <li>The KV cache is MXINT8: 8-bit values with one shared exponent per 32-channel block. That’s small enough to stream, with accuracy held.</li>
+ <li>For MoE: stripe each expert across every channel, and map expert ID to address at runtime instead of using a fixed program.</li>
+</ul>
+<h3>ATTENTION</h3>
+<ul>
+ <li>Attention streams over the cache in 64-token tiles with an online softmax (FP32 running max/sum). The full score matrix is never stored.</li>
+ <li>Probabilities are UINT16 and the context accumulates in FP32.</li>
+ <li>Each attention unit interleaves two independent jobs on one datapath (C-slow), which hides pipeline latency without duplicating hardware.</li>
+ <li>Q/K head norm and RoPE got their own small vector unit, so they don’t block the general vector path. The V projection overlaps with that work.</li>
+ <li>New K/V is appended to HBM as soon as it’s produced. We used a sliding window to bound cache reads.</li>
+</ul>
+<h3>SCHEDULING</h3>
+<ul>
+ <li>One controller issues work in program order, with tags and barriers. Engines overlap only when the buffer dependencies are explicit, so we got overlap without races.</li>
+ <li>For MoE: the router is the new critical path, because nothing can fetch until it finishes. Keep it in FP32 (lower precision changed which experts were picked), and overlap whatever you can around it.</li>
+</ul>
+<h3>CORRECTNESS</h3>
+<ul>
+ <li>We fixed a numerics contract first (formats, rounding points, operation order) and built hardware to match it. Vector ops must match the reference model’s order and precision, not just be “close”.</li>
+ <li>Verification ladder: 
+  <ol>
+   <li>Per-block cocotb unit tests.</li>
+   <li>One full layer co-simulated against the real checkpoint.</li>
+   <li>Multi-token, full 24-layer decode compared token-for-token with a reference oracle.</li>
+   <li>Byte-level accounting of KV cache writes.</li>
+  </ol></li>
+ <li>We kept simulation results, timing signoff and board results separate, and never claimed one from another.</li>
+ <li>Every published number links to the report it came from.</li>
+</ul>
+<h3>PHYSICAL DESIGN</h3>
+<ul>
+ <li>The chip has 3 regions (SLRs). Keep wide datapaths inside one region and register every crossing. Long links use credits, not combinational ready.</li>
+ <li>We placed engines next to their data: memory logic near HBM, attention in the DSP-dense region.</li>
+ <li>Screen logic depth (10 levels max at 250 MHz) right after synthesis, and fix it with pipelining, sharding, or C-slow. Full place-and-route is saved for integration.</li>
+ <li>Dev loop: small change -&gt; lint -&gt; unit test -&gt; quick synthesis -&gt; depth/timing check -&gt; restructure.</li>
+</ul>
+<p>The coding agent diligently considered these asks, but it didn’t seem to make all that much of a difference qualitatively. Indeed, when I asked it later to read all of the logs and determine which of these instructions it actually used, it said:</p>
+<p>Its biggest design ideas were already in my plan before you pasted it. You pasted it on Oct 29 at 21:50 UTC: 4,741 characters describing what someone else did for a dense, batch-1, ternary FPGA decoder. Within 70 seconds I had sorted it into ten ideas to adopt and five to reject, and written that into every design agent’s brief. The shorter remark from your friend Edward, about using lookup tables as logic gates, came 24 minutes earlier and left nothing on the speed line.</p>
+<p><strong>Design ideas I adopted: mostly confirmation.</strong></p>
+<ul>
+ <li>Already planned: streaming weights straight into the compute lanes, running rows in parallel, and reading the attention cache in bursts were all in the design brief I’d launched 35–40 minutes earlier.</li>
+ <li>Match what was later built: interleaved lanes in the router, a separate unit for head norms and RoPE, a program-order sequencer, and a registered boundary on every crossing between dies.</li>
+</ul>
+<p><strong>Ideas I rejected: all five numerics shortcuts.</strong> Lower-precision activations, a deferred norm, an 8-bit KV cache, online softmax and 16-bit probabilities each change the output bits. That is where their design got its efficiency, and your bit-exact rule ruled it out.</p>
+<p><strong>Process advice: this changed things right away.</strong></p>
+<ul>
+ <li>What you asked: not to do things that take hours.</li>
+ <li>What I stopped: a simulation that had run for about 24 hours, and two 250 MHz builds.</li>
+ <li>What I switched to: a short loop of C tests, synthesis and a logic-depth check, with one place-and-route per integration.</li>
+</ul>
+<p>In other words, for most of the actual design ideas it is unclear but there is good reason to believe the model would have figured them out, especially because it came up with them many cycles later after several compaction cycles. But the process advice was useful immediately for getting to hardware results sooner and increasing iteration speed. In other words, the humans are still useful at defining how to iterate fast and what correctness looks like, and the agents are great to manage the exploration.</p>
+<h2>The optimization log</h2>
+<p>Here are the changes the autoresearch loop found. Interestingly, it’s mostly a series of modest improvements that compound 1.5x ish every time, rather than one or two giant ones.</p>
+<h2>Where this puts us</h2>
+<p>This was a fun project. I’m not sure I’m ever going to use this specific chip architecture in this specific way, and I’m certainly not claiming that an 8,192-token-context model running on an FPGA is the way I’d recommend anyone use something like this in production. But it’s pretty epic that this <em>just works</em>. Capability like this completely shifts the overton window for what a committed team of engineers can work on. It should mean that entirely new types of ideas (scientific discoveries, products, startups) are possible if you can point the models in the right direction. I’m excited to see what everyone builds.</p>
