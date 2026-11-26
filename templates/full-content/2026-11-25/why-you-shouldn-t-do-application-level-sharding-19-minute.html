@@ -1,0 +1,89 @@
+<h1>Why you shouldn't do application-level sharding</h1>
+<p>This is application-level sharding.</p>
+<p>When an OLTP database like Postgres or MySQL grows so large that it no longer "fits" on one server, the common approach to scaling is sharding. One way to do it is app-level sharding, where all the logic for which data goes to which server is embedded in your application code.</p>
+<p>Companies that grow fast tend to face this problem, and app-level sharding seems like the easy, obvious solution. However, there be dragons. To find them, let's walk through the first thousand days of a fast-growing online store after sharding.</p>
+<h2>Sharding in the application</h2>
+<p>The store is a marketplace: buyers, sellers, orders and payments all live in one Postgres database, and as traffic grows, that database starts to fall behind.</p>
+<p>You might think the answer is read replicas. And you should use them. But they have no impact on your writes, which still all go to the primary. A bigger server can buy you time, but there's a cap to how big a server you can buy. Even before that moment, the sheer size of the database will cause you issues: backups and restores taking hours, or even replicas falling behind on write spikes. The operational challenges of running a large database are not for the faint of heart.</p>
+<p>So you decide to shard. You pick <code>user_id</code> as the shard key and split the store's users across four databases, where each one stores and serves its own share. Buyers and sellers are both users, and each user's data lives on their shard: a buyer's orders and balance, a seller's listings and payouts.</p>
+<p>The first version is usually one function.</p>
+<pre><code>SHARDS = [
+    connect("db0"), connect("db1"),
+    connect("db2"), connect("db3"),
+]
+
+
+def shard_for(user_id):
+    return SHARDS[user_id % 4]
+
+
+def get_user(user_id):
+    return shard_for(user_id).query(
+        "SELECT * FROM users WHERE id = %s", user_id
+    )
+</code></pre>
+<p>Writing it takes an afternoon. The new infrastructure is three additional databases to run. But your queries look the same as yesterday, as long as you have a <code>user_id</code> in hand.</p>
+<p>Before <code>shard_for</code> can be deployed, however, every user needs to move to their assigned shard. For example, user 13 belongs on shard 1, since 13 % 4 = 1. Moving them with minimal downtime takes six steps:</p>
+<ol>
+ <li>Copy user 13's rows from the original database to shard 1, and move shard 1's ID counter past them.</li>
+ <li>Keep copying new writes from the original database to shard 1 until the deploy.</li>
+ <li>Check that user 13's rows match on both databases.</li>
+ <li>Deploy <code>shard_for</code>, so user 13's reads and writes go to shard 1.</li>
+ <li>Keep copying new writes from shard 1 back to the original database, in case you need to roll back.</li>
+ <li>Once you're sure you won't, delete user 13's rows from the original database.</li>
+</ol>
+<p><code>% 4</code> as a sharding algorithm is brittle. But it's easy to follow, so it's what we'll use to walk through the problems. Most production teams will use something better, like consistent hashing, but they will face similar problems.</p>
+<p>Day 1 is over and you have four functioning shards.</p>
+<h2>Resharding from four shards to eight</h2>
+<p>The store keeps growing, and with Black Friday a few weeks out, it's clear your four shards won't keep up.</p>
+<p>You can double the number of shards from four to eight. This is a pretty easy change in your code. Just add four more database connections to <code>SHARDS</code> and change <code>% 4</code> to <code>% 8</code>.</p>
+<p>But user 13's rows are on shard 1, where <code>% 4</code> put them. Once you deploy <code>% 8</code>, <code>shard_for</code> sends user 13's queries to shard 5, which is currently empty. Half the users on the original four shards have the same problem.</p>
+<p>So you run the same six steps again, this time from shard 1 to shard 5.</p>
+<p>Step 4, deploying <code>% 8</code>, is the riskiest part, because your store doesn't run as one process. All of your processes (web apps, workers, cron jobs) have their own <code>shard_for</code>. They don't deploy at the same time either, so for a few minutes they can disagree about where user 13 lives.</p>
+<p>The issue arises when you have a worker and your web app on different versions. For example, say user 13 cancels an order on the web, which is deployed using <code>% 8</code>, so the cancel goes to shard 5. Behind the scenes, you are copying that back to shard 1. Your worker, which sets up shipments, marks the order as shipped on shard 1, since it hasn't been deployed with <code>% 8</code> yet. But nothing is copying that change from shard 1 to shard 5 anymore. And so when you deploy the new worker, it reads shard 5, and you lose that shipment.</p>
+<h2>When a query doesn't have a <code>user_id</code></h2>
+<p>You make it through Black Friday with your new topology of eight shards. A week later though, a customer emails support with an order number of 1042 and nothing else. This exposes a number of issues in your application layer that you now have to handle. How do you know which shard holds the order you are querying for if you don't have <code>user_id</code>?</p>
+<h3>Pass the <code>user_id</code> along</h3>
+<p>Most of the time, this issue doesn't come up, because your chain of function calls has a <code>user_id</code> <em>somewhere</em>. You decide to just pass it down to any function that needs it:</p>
+<p>Every function that didn't take <code>user_id</code> as a parameter now does.</p>
+<h3>Ask every shard</h3>
+<p>The simplest way is to send <code>SELECT * FROM orders WHERE id = 1042</code> to all eight shards and check each response for a result. That's eight Postgres queries for one order lookup. And in this situation, it actually returns two orders.</p>
+<h3>Put the shard in the ID</h3>
+<p>Another way is to build the shard into the ID itself. With this ID structure, you can read a row's shard straight out of the ID with a bit shift. This fixes the duplicate orders problem, since every ID carries its own shard number.</p>
+<p>But there is a catch. This assumes that any future reshard would not move the order.</p>
+<h3>Keep a lookup table</h3>
+<p>The third way is to keep a lookup table that holds the mapping between order IDs, charge IDs and <code>user_id</code>. Every request, though, would first need to access the lookup table to determine which shard to go to.</p>
+<h3>What none of these fix</h3>
+<p>Everything so far that we have discussed has helped you find one order. A real store needs more than that. What if seller 27 wants to see all of this week's orders on their dashboard? If you remember, each order lives on whatever shard its buyer is on. So seller 27's orders are spread across all eight shards. No lookup table or clever IDs will help with that. The app has to query all eight shards, merge, sort, and page the results for the user.</p>
+<h2>When one seller becomes a hot shard</h2>
+<p>Black Friday was a massive success, and a few months later, your store's marketplace attracts a big brand. One issue, though: its inventory updates and payouts write thousands of rows a second. All of those rows are keyed by the brand's <code>user_id</code>, so it all goes to the same shard. The orders spread out fine, since each lives on the buyer's shard, but the brand's shard becomes a hot shard.</p>
+<p>Another option is to give the brand its own shard. That way, its neighbors stop feeling the load of the big brand. Doing that means a reshard, but just for the big brand. <code>shard_for</code> also now needs a list of exceptions.</p>
+<h2>Cross-shard transactions</h2>
+<p>Up until now, every write that moved money only touched one user. Even the big brand's. But a year in, the store decides to launch store credit. Think of store credit as gift-card money you spend in the store. Writes can now involve two users' balances, and both have to happen correctly and at the same time.</p>
+<p>On a single database, this is easy. With two databases, it doesn't work that way. There isn't a shared transaction. Most teams decide not to use two-phase commit and instead use a saga.</p>
+<p>A saga breaks up the operation into two separate saves. It takes money from one user, then gives money to another user on a different shard. To do this, it writes to an outbox in the same transaction that takes the money. An outbox is essentially a to-do note living on the user's shard. A worker then reads the outbox and keeps retrying the credit on the other shard until it succeeds.</p>
+<h2>Schema changes across every shard</h2>
+<p>Store credit is a massive hit, and with more purchases come more refunds. You might think changing the shape of the tables is easy, but once again, sharding will make you reconsider. With a single database, it's a single DDL statement. With nine shards, however, it's not as simple, and there are nine chances for it to fail.</p>
+<p>To handle this, your team ends up building a complex rollout tool. The rollout tool has to go shard by shard, make sure each completes successfully, retry whatever fails at the point of failure, and warn about any shard that has drifted.</p>
+<h2>Failover, backups and connections</h2>
+<p>Soon enough, you get to experience your second Black Friday. And with the increased throughput and popularity of your store, shard 3's primary dies. With nine primaries, though, it happens about nine times more often.</p>
+<p>Every web server, worker, and cron job has its own connections open to the old primary. Each one has to reconnect to the new one. Most teams instead build a tool to handle this: an orchestrator that promotes the replica and tells every process where the shard lives now.</p>
+<h2>You built a sharding layer anyway</h2>
+<p>We've finally hit day 1000. Your store is thriving. It's important to reflect on everything your team has built to maintain app-level sharding:</p>
+<ul>
+ <li>Reshard tooling, plus a config service for <code>SHARDS</code> and <code>% 8</code></li>
+ <li>An ID scheme, a lookup table, <code>user_id</code> in every function, and code to merge results across shards</li>
+ <li>An exceptions list for customers too big to share a shard</li>
+ <li>A saga: an outbox, a pending state and an undo</li>
+ <li>A schema rollout tool</li>
+ <li>A failover orchestrator and a connection pooler on every shard</li>
+</ul>
+<h2>Use a sharding layer instead</h2>
+<p>This wasn't necessary. There are well-known systems like Vitess that are battle-tested and trusted by the world's largest companies. They sit in between your app and the shards, and your application can speak to them like one database.</p>
+<h2>FAQs</h2>
+<h3>What is application-level sharding?</h3>
+<p>Application-level sharding is when your application code decides which shard holds each row. It's also called app-level, client-side or application-side sharding. It usually starts as one function, like <code>shard_for(user_id)</code>, that picks a database connection based on the shard key.</p>
+<h3>Why shouldn't you do application-level sharding?</h3>
+<p>Because routing is the easy part. Once your app decides where each row lives, every problem that comes from spreading data across servers becomes your team's to solve.</p>
+<h3>What's the alternative to application-level sharding?</h3>
+<p>A sharding layer, sometimes called a sharding proxy or sharding middleware. It sits between your app and the shards, so your app connects to it as if it were one database, and it handles routing, resharding, failover and connection pooling.</p>

@@ -1,0 +1,54 @@
+<h2>About</h2>
+<p>Today we’re introducing <strong>vLLM-GR</strong>, an open-source inference and serving framework built on vLLM for generative recommendation models.</p>
+<p>Consider a video feed. Given a viewer’s history, a model such as OneRec can generate a semantic ID (SID) for a video the viewer might watch next. To assemble a feed, the application needs a set of candidates. vLLM-GR extends vLLM’s model execution and paged key-value (KV) cache with beam search that explores multiple candidate IDs in one request.</p>
+<p>The overview shows how recommendation models generate item IDs or score supplied candidates. The OneRec-1.7B example below follows the generation path, from a viewer’s history to 128 candidate SIDs.</p>
+<h2>Why vLLM-GR?</h2>
+<p>A recommendation service has to turn a long interaction history into a set of candidates within a single request’s latency budget. Generating each item ID may take only a few tokens, yet the engine must explore many paths and return items the application can serve.</p>
+<ul>
+ <li><strong>Run recommendation models on the vLLM stack.</strong> Teams can reuse vLLM’s model execution, scheduling, and paged KV cache when moving from offline evaluation to online serving on NVIDIA GPUs and Ascend NPUs.</li>
+ <li><strong>Reduce the cost of wide candidate searches.</strong> Candidate paths share the cached user history. The engine runs successive beam-search steps in one request and selects candidates on the accelerator, reducing duplicate work and per-step coordination with the host.</li>
+ <li><strong>Keep recommendations aligned with the item catalog.</strong> Catalog constraints guide the search toward IDs that map to real items. Support for model and catalog updates lets teams refresh what the service recommends as models and inventory change.</li>
+</ul>
+<h2>Inside the Architecture</h2>
+<p>vLLM-GR builds its recommendation search into the vLLM engine. vLLM supplies the scheduler, model execution, and paged KV cache. vLLM-GR adds a beam session that spans the whole search and keeps track of how candidate paths branch.</p>
+<p>EngineCore owns each beam session from admission to completion. The scheduler dispatches prefill and decode stages to a worker. At each stage, the model runner scores the next token and beam selection records the score and parent of each surviving path. The next decode uses those parent indices to read the right KV state.</p>
+<h3>Key Features</h3>
+<ul>
+ <li><strong>Simplicity.</strong> Submit a complete beam search through the offline Python interface, OpenAI-compatible HTTP, or gRPC. The engine runs the decode loop and returns candidate sequences and scores in one response.</li>
+ <li><strong>Flexibility.</strong> Search the full vocabulary or restrict generation to semantic IDs in the item catalog. Per-stage beam widths and per-parent candidate limits let a service explore more partial IDs than it ultimately returns.</li>
+ <li><strong>Performance.</strong> Sharing prompt KV across beams avoids copying the viewer’s history for each candidate. While the accelerator executes one stage, the host prepares the next, reducing the wait between decode steps.</li>
+</ul>
+<h2>Performance Evaluation</h2>
+<p>The benchmarks measure P99 latency to show how beam width and batch size affect tail latency for generative recommendation. The two overview charts hold the input length at 1,024 tokens and compare beam widths of 256 and 128 at batch sizes 1, 4, and 8 across four NVIDIA GPUs and two Ascend NPUs. The figures summarize separate benchmark runs with different timing definitions, sample counts, and backend settings.</p>
+<p>On RTX PRO 6000, vLLM-GR, SGLang Beam, and NVIDIA SID-GR ran OneRec-1.7B in BF16 and generated three tokens from the same synthetic inputs with catalog constraints disabled. Each point reports whole-batch P99 over 48 timed batches after three warmups. Timing includes returning candidate IDs and scores to the host and excludes HTTP. With beam width denoted by <em>W</em> and candidate pool size by <em>K</em>, vLLM-GR and NVIDIA SID-GR used <em>K</em> equal to <em>W</em>. SGLang Beam used its native pool of <em>2W</em> candidates.</p>
+<p>On the Ascend A2 and A5, vLLM-GR and xLLM used a catalog constraint table. The SGLang constraint setting was not recorded in the benchmark summary. Recorded L20 sample counts range from 100 to 1,000 timed batches per configuration. The available summaries do not specify exact backend revisions for these comparisons or warmup counts outside the RTX PRO 6000 run.</p>
+<p>At beam width 256, vLLM-GR recorded the lowest P99 among the backends shown at batch sizes 4 and 8 on all six accelerators. On H20 at beam width 256 and batch size 8, P99 was 369.4 ms for vLLM-GR, 1,280.1 ms for SGLang, and 428.1 ms for NVIDIA SID-GR.</p>
+<p>At beam width 256 and batch size 1 on RTX PRO 6000, NVIDIA SID-GR reported 28.25 ms versus 29.21 ms for vLLM-GR. On A2 at the same beam width and batch size 8, vLLM-GR and xLLM reported 312.69 ms and 324.60 ms, respectively, with catalog constraints enabled for both. At beam width 128, the lowest-latency backend varies by accelerator and batch size.</p>
+<h2>Future Roadmap</h2>
+<ul>
+ <li><strong>Broader model support.</strong> Extend candidate scoring to HSTU, MTGR, and RankMixer, add native serving for OneTrans, and explore serving optimizations for recommendation models with larger total parameter counts, including mixture-of-experts (MoE) models.</li>
+ <li><strong>More flexible beam search.</strong> Explore value-aware candidate selection and additional output heads for semantic IDs. Support deeper SID hierarchies across device types and variable-length generation that can stop individual beams at EOS, release their slots and KV, and admit new requests.</li>
+ <li><strong>Online batching and scheduling.</strong> Explore an online scheduler that decides when to form a batch and which queued requests to include, allowing requests with different user history lengths to run together while keeping queues bounded under overload. Group batches with similar shapes so they can reuse the same captured computation graph for replay with less padding.</li>
+ <li><strong>Long histories and KV reuse.</strong> Optimize prefill for histories of 10,000 tokens or more and explore beam search with linear or sparse attention. As a user’s history grows, reuse KV blocks for the unchanged prefix across requests to avoid repeating prefill for those tokens.</li>
+ <li><strong>Distributed inference and KV caching.</strong> Explore a distributed KV cache that lets a serving instance reuse KV blocks from another device on the same node or on a different node. Evaluate model sharding and KV transfer costs in both settings.</li>
+ <li><strong>Closer integration with upstream vLLM.</strong> Build on vLLM’s engine and platform interfaces to bring upstream improvements in scheduling and KV cache management to recommendation workloads. Regularly update vLLM-GR to newer stable vLLM releases and validate engine correctness, recommendation quality, and serving performance across supported devices.</li>
+</ul>
+<h2>Getting Started</h2>
+<p>vLLM-GR 0.30.0 is built on vLLM 0.30.0 and supports NVIDIA GPUs and Ascend NPUs.</p>
+<h3>Installation</h3>
+<p>Follow the installation guide for your accelerator, either NVIDIA CUDA or Ascend NPU.</p>
+<h3>Serving Generative Recommendation Models</h3>
+<p>Run OneRec-1.7B offline or follow the HTTP serving example or the gRPC serving example for CUDA.</p>
+<h2>Join the Community</h2>
+<p>If you’re bringing another recommendation model to vLLM-GR, tell us how it represents interaction history and what it predicts. If you’re reporting a serving bottleneck, include the model, history length, beam width, and hardware so others can reproduce it.</p>
+<h2>Acknowledgements</h2>
+<p>We thank Hongsheng Liu and Han Zhang from the InferMatrix team for first proposing that vLLM support high-performance inference for generative recommendation. We’re grateful to Roger Wang and Zhipeng Wang from Inferact for the in-depth discussions that helped shape the vLLM-GR roadmap and architecture.</p>
+<p>We also thank the following teams and community members for contributing to vLLM-GR and sharing their experience and feedback from large-scale production deployments.</p>
+<ul>
+ <li>Inferact: Zhipeng Wang, Roger Wang</li>
+ <li>InferMatrix Team: Han Zhang, Shucheng Zhang, Xiaodong Tian, Yunpeng Zhi, Yi Ding, Jierui Yu, Hongsheng Liu</li>
+ <li>openPangu: Xinming Han, Zhiwei Yi, Mengyuan Ma, Yongxiang Feng</li>
+ <li>TikTok-Global E-commerce: Bin Wang, Junhua Long</li>
+ <li>ByteDance-Commerce &amp; Advertising: Haoran Ma, Wenqiang Zhou, Junwen Guo</li>
+ <li>Lingquai: Chunxu Jin, Wuping Liu</li>
+</ul>
