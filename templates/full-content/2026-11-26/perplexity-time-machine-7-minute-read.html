@@ -1,0 +1,80 @@
+<p>One of the best ways to measure how well an agent researches and reasons is to give it a question from the past and compare its answer with what happened. For that test to be fair, the agent can only see what was available at the time.</p>
+<p>Today we're launching Time Machine for the Perplexity Search API and Context API to let developers and agents show the web as it was on a chosen date. This limits searching and full-page reading to stored copies of the web captured at or before a chosen timestamp.</p>
+<p>The live web always knows how things turned out. Ask an agent today what was known before an election or an earnings call, and it will find pages that already report the result. Time Machine lets an agent work on a question as it stood in the past, and lets developers score its answer against what happened next.</p>
+<p>That score shows how well the agent researches and forecasts, and whether a new model, prompt, or retrieval setup improved it.</p>
+<h2>How Time Machine works</h2>
+<p>Each time Perplexity crawls a page, it saves a copy along with the time it was saved. Over time, every URL builds up a version history, and Time Machine answers from that history instead of the live web.</p>
+<p>Add <code>snapshot_as_of</code> to a request and it becomes a cutoff, up to 365 days back today, and that history keeps growing. On search, retrieval only considers pages that were published or first crawled by the cutoff. Each candidate is swapped for its latest copy saved at or before the cutoff and ranking scores the query against that older text. A page that was later updated with the outcome can't rank for it, and its title, date and snippet come from the same copy.</p>
+<p>A typical workflow searches first and then reads the pages it finds, so the same cutoff applies to both steps:</p>
+<ul>
+ <li><strong>Search API:</strong> Returns pages ranked as described above, with each result's title, date and snippet taken from its copy at the cutoff.</li>
+ <li><strong>Context API:</strong> Returns the full text of each page's copy at the cutoff. The live site is never contacted.</li>
+</ul>
+<h2>Ways teams use Time Machine</h2>
+<p>The same point-in-time web works for any workflow where hindsight would invalidate the result:</p>
+<ul>
+ <li><strong>Reinforcement learning:</strong> Train agents on past questions without the answer leaking into search results, so the reward measures reasoning rather than lookup. See the example below.</li>
+ <li><strong>Forecasting and prediction markets:</strong> Replay resolved questions at several points before resolution and score a forecaster's predictions against real outcomes.</li>
+ <li><strong>Finance backtests:</strong> Test web-derived signals and research agents with a cutoff hours before earnings calls, FOMC announcements, or acquisitions.</li>
+ <li><strong>Reproducible evaluations:</strong> Pin a benchmark to one <code>snapshot_as_of</code> so score changes reflect the model, not new content on the web.</li>
+ <li><strong>Agent replay and debugging:</strong> Rerun a past agent session against the web as it was that day, to tell whether a bad answer came from the model or from what the web said at the time.</li>
+ <li><strong>Historical page checks:</strong> Read the same URL at two timestamps to see what a pricing page, terms of service, or changelog said on each date, for audits and disputes.</li>
+</ul>
+<h2>Example: Training a forecasting agent</h2>
+<p>We used reinforcement learning (RL) to train GLM-5.3 Flash to forecast real political events from 2026 listed on Polymarket.</p>
+<p>Each Polymarket question asks about a future event, such as whether a candidate will win an election. The model’s job is to estimate the chances as of the day the question was asked. In the Time Machine run, GLM-5.3 Flash can search news and polls available by that day, but not later coverage announcing the winner. Its forecast might be: “The candidate has an 80% chance of winning.”</p>
+<p>The actual result is used to grade the forecast. If the candidate wins, an 80% forecast earns a higher score than a 50% forecast. If the candidate loses, the 80% forecast earns a lower score. That score is the reward. Reinforcement learning uses rewards from many questions to adjust how the model makes future forecasts.</p>
+<p>These questions are about events that have already happened. A model searching the live web today can find an article that reports the result. Looking up the winner can earn a high score, but it doesn’t help the model predict who will win the next election. Time Machine sets <code>snapshot_as_of</code> to the date the question was asked, so search can return the polls available by then, but not a later article naming the winner.</p>
+<p>Without a cutoff, the model can simply look up the answer. Before any training, it scores 0.94 on held-out questions with the live web and 0.77 with Time Machine. The market scores 0.79 (the Polymarket price on the day each question was asked, scored the same way).</p>
+<p>To see how web search affects forecasting, we trained the model twice, once with the live web and once with Time Machine, and scored both on the same held-out questions with Time Machine on, as in real use.</p>
+<p>With the live web, every forecast finds the answer and scores the same, so about 90% of training groups have zero gradient and teach the model nothing; with Time Machine only about 25% do, and held-out reward rises from 0.77 to 0.80, above the market.</p>
+<h2>Time Machine vs Exa Snapshot</h2>
+<p>We compared Time Machine and Exa Snapshot on three sets of 1,000 queries each: a random sample of Time Machine queries, news queries, and queries from prediction-market research. We ran the same queries on both services, using the same cutoff for each query.</p>
+<p>First, we checked how often each service returned a publication date with the page. Time Machine included a date on 98.8% to 99.5% of returned pages across the three sets, compared with 66.1% to 77.7% for Exa.</p>
+<p>A publication date alone doesn’t show whether the cutoff held. An article published before an election, for example, can be updated afterward to name the winner. To check for later information, an automated judge read every returned page and flagged any that showed content from after the query’s cutoff.</p>
+<p>The judge flagged fewer than 0.5% of Time Machine pages in each set, a lower rate than Exa in all three. The largest gap was on the random sample: <strong>0.25% of Time Machine pages were flagged, compared with 1.10% of Exa pages.</strong> Across those 1,000 queries, 18 returned at least one flagged page with Time Machine, compared with 62 with Exa. The gaps were smaller on news and prediction-market queries.</p>
+<h2>Pricing</h2>
+<p>Time Machine is priced the same as any other Perplexity API call, with no surcharge for historical requests. It works today with an existing API key. Time Machine requests have a default rate limit. Contact the Perplexity API team for higher rate limits.</p>
+<table>
+ <thead>
+  <tr>
+   <th><strong>API</strong></th>
+   <th><strong>Price</strong></th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Search API</td>
+   <td>$5 per 1,000 requests</td>
+  </tr>
+  <tr>
+   <td>Context API</td>
+   <td>$1 per 1,000 URLs fetched</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Getting started</h2>
+<p>Time Machine doesn’t require a new endpoint or setup. Add <code>snapshot_as_of</code> to a Search API or Context API request you already make, and the response reflects the web as it was at that time. Leave it out and the same request returns today's web.</p>
+<h3>Search API</h3>
+<p>Search the web as it stood at the cutoff. This query searches python.org with a cutoff of October 20, 2026, so each result's title and snippet come from the page's stored copy for that time, not from today's page.</p>
+<pre><code>from perplexity import Perplexity
+client = Perplexity()
+search = client.search.create(
+    query="Latest Python 3 Release on the Python Source Releases page",
+    snapshot_as_of="2026-10-20T00:00:00Z",
+    search_domain_filter=["python.org"],
+    max_results=5,
+)
+for result in search.results:
+    print(result.title, result.url)</code></pre>
+<h3>Context API</h3>
+<p>Read a known page as it was at the cutoff. Here the Python Source Releases page lists Python 3.15.0 as the latest release, not the newer version on today's page.</p>
+<pre><code>from perplexity import Perplexity
+client = Perplexity()
+response = client.context.create(
+    urls=["https://www.python.org/downloads/source/"],
+    snapshot_as_of="2026-10-20T00:00:00Z",
+)
+page = response.results[0]
+if page.status.type == "ok":
+    print(page.markdown[:300])</code></pre>

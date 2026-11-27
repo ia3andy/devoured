@@ -1,0 +1,109 @@
+<p>Kevin Hou, who leads product engineering on Google Antigravity, recommended <code>/swarm</code> paired with Gemini 4 Neon and Orchestrator right after a quota reset.</p>
+<p>I had seen <code>/swarm</code> mentioned when Gemini 4 Carbon rolled out, but I hadn’t run it myself yet. So I opened the Antigravity desktop app on this site’s repository (<code>flaviocopes.com</code>) and put it through a real audit.</p>
+<p>The main question I wanted to answer was simple: what do you need <code>/swarm</code> for that one good agent can’t do on its own?</p>
+<h2>Orchestrator in Antigravity</h2>
+<p>Before running <code>/swarm</code>, I picked <strong>Orchestrator</strong> in the model selector.</p>
+<p>In Antigravity, Orchestrator pairs two models inside one conversation: a larger planner model explores the codebase, writes the plan, and checks progress, while a faster executor model handles searches, file edits, builds, and tests.</p>
+<p>Here is how Antigravity splits the two roles on Google AI Pro and Google AI Ultra plans:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Role</th>
+   <th>What it handles</th>
+   <th>Supported models</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Orchestrator (planner)</td>
+   <td>Exploring the codebase, writing the plan, reviewing progress</td>
+   <td>Gemini 4 Neon (default), Gemini 4 Carbon, Gemini 4 Argon, Claude Opus 5.5</td>
+  </tr>
+  <tr>
+   <td>Executor</td>
+   <td>Searches, file edits, running builds and tests</td>
+   <td>Gemini 4 Hydrogen (default), Claude Sonnet 5.5</td>
+  </tr>
+ </tbody>
+</table>
+<p>There is one small UI quirk when you open the model menu under the prompt box. Hovering <strong>Orchestrator</strong> opens a submenu with only the four planner models. Hydrogen isn’t listed in that submenu because it is the executor, already selected by default under <strong>Settings -&gt; Models -&gt; Orchestrator Settings</strong>.</p>
+<h2>Running <code>/swarm</code> on flaviocopes.com</h2>
+<p>To give <code>/swarm</code> a real job that divides cleanly across separate parts of a repo, I asked for a strictly read-only audit of three areas of <code>flaviocopes.com</code> plus a verifier to check every claim:</p>
+<pre><code>/swarm Audit three areas of flaviocopes.com with separate read-only workers: (1) scripts/check-internal-links.mjs and recent drafts for broken internal links, (2) scripts/audit-images.mjs and public/images/ for oversized or unused assets, (3) scripts/build-site.mjs and package.json for the biggest build-time bottlenecks. Have a verifier cross-check every reported file path and line number, then post one ranked summary on the board.</code></pre>
+<p>When you run <code>/swarm</code>, your main conversation becomes <code>@coordinator</code>. It spent about a minute inspecting the repo, spawned five workers (<code>@links-auditor</code>, <code>@images-auditor</code>, <code>@build-auditor</code>, <code>@verifier</code>, and a quiet <code>@monitor</code> to watch for stalls), and returned an <strong>Open the Swarm UI</strong> button while the auditors ran in parallel.</p>
+<p>That right-hand <strong>Swarm</strong> pane has four tabs: <strong>Overview</strong>, <strong>Board</strong>, <strong>Members</strong>, and <strong>Graph</strong>.</p>
+<p>The <strong>Board</strong> tab is the shared message feed where the entire team communicates in public. Posts <code>#1</code> through <code>#4</code> are the coordinator’s briefs to each worker, spelling out what they own, what they must not touch, and how to report back.</p>
+<h2>The Graph tab and what <code>@verifier</code> caught</h2>
+<p>The <strong>Graph</strong> tab lets you inspect the swarm in two ways: a <strong>Mentions</strong> graph showing who messaged whom, and a <strong>Hive</strong> view with pixel-art bees inside hexagons and a replay scrubber across every post.</p>
+<p>The Hive view is fun to watch, and the replay scrubber at the bottom is where I spotted the most useful part of the whole run. <code>@verifier</code> had checked <code>@links-auditor</code>’s first report against the actual files in the repository, caught two inaccuracies, and sent it back to be fixed before the coordinator wrote the final report.</p>
+<p>Once all three tracks passed verification, the coordinator posted the 10-item ranked summary to the board, killed the four workers, and printed the same summary in the main chat.</p>
+<p>The top findings were real bugs and bottlenecks I hadn’t noticed:</p>
+<ol>
+ <li><strong>Whole-site cache busting in the Astro build.</strong> <code>src/content.config.ts</code> loads 6,232 content files, and <code>figuresVersion</code> hashes all 330 files in <code>src/figures/</code> into one markdown plugin option. Editing a single figure invalidates cached HTML across all 6,232 entries.</li>
+ <li><strong>Throttled builds and a 1.3 GB copy.</strong> <code>astro.config.mjs</code> caps <code>build.concurrency</code> at <code>2</code> across roughly 8,721 output artifacts, while copying 1.3 GB from <code>public/</code> on every build.</li>
+ <li><strong>233 MiB of unused or shadowed assets.</strong> <code>public/images/</code> holds 7,418 files, including 1,079 completely unreferenced files.</li>
+ <li><strong>A broken image audit script.</strong> <code>scripts/audit-images.mjs</code> walks <code>.mp4</code> files alongside images, and misses 3,021 of the 3,646 images wider than 1600px.</li>
+ <li><strong>Blind spots in the internal link checker.</strong> <code>scripts/lib/site-routes.mjs</code> only reads <code>src/pages/apps/*.md</code> and misses 79 live paid apps.</li>
+</ol>
+<h2>When <code>/swarm</code> beats a single agent (and when it doesn’t)</h2>
+<p>For most daily coding, you don’t need <code>/swarm</code>. One agent on <strong>Orchestrator (Neon + Hydrogen)</strong> is simpler, finishes small edits faster, and uses far less quota.</p>
+<p>Here is where <code>/swarm</code> earns the extra tokens:</p>
+<ol>
+ <li><strong>Fresh-context verification.</strong> Asking one agent to double-check its own work in the same conversation rarely catches mistakes because it is anchored to its own assumptions.</li>
+ <li><strong>Avoiding context pollution on wide tasks.</strong> Auditing links, scanning images, and profiling a build pipeline in one thread fills a single context window with unrelated noise.</li>
+ <li><strong>Cutting wall-clock time on independent slices.</strong> When multiple workers edit code simultaneously, the coordinator can give each author its own working copy of the repository.</li>
+ <li><strong>Testing parallel hypotheses.</strong> When you don’t know which optimization or root cause will pay off, separate workers can investigate different theories at once.</li>
+</ol>
+<p>And here is where a single agent is still the better choice:</p>
+<ul>
+ <li><strong>Tightly coupled edits</strong> across two or three files that depend on each other.</li>
+ <li><strong>One deep, hard bug</strong>, like a subtle race condition.</li>
+ <li><strong>Small everyday tasks.</strong> Every swarm member is its own agent, so a swarm burns through your quota much faster.</li>
+</ul>
+<table>
+ <thead>
+  <tr>
+   <th>Mode</th>
+   <th>How you start</th>
+   <th>How agents coordinate</th>
+   <th>Verification</th>
+   <th>Plan tier</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Subagents</td>
+   <td>Automatic delegation or <code>@subagent</code></td>
+   <td>Focused side task runs in background and reports to parent</td>
+   <td>Parent checks the reply</td>
+   <td>All plans</td>
+  </tr>
+  <tr>
+   <td><code>/boost</code></td>
+   <td><code>/boost &lt;task&gt;</code></td>
+   <td>Iterative pipeline where workers implement, challenge, and fix</td>
+   <td>Improvement workers try to break prior attempts and run tests</td>
+   <td>Paid plans</td>
+  </tr>
+  <tr>
+   <td><code>/swarm</code></td>
+   <td><code>/swarm &lt;task&gt;</code></td>
+   <td>Coordinator splits work across named workers on one shared message board</td>
+   <td>Dedicated <code>@verifier</code> checks diffs and tests before sign-off</td>
+   <td>All plans</td>
+  </tr>
+  <tr>
+   <td><code>/teamwork</code></td>
+   <td><code>/teamwork &lt;goal&gt;</code> + scoping interview</td>
+   <td><code>Sentinel</code> and <code>Project Orchestrator</code> run specialized roles across milestones</td>
+   <td>Independent <code>Critic</code>, <code>Challenger</code>, <code>Auditor</code>, and <code>Success Auditor</code> gates</td>
+   <td>Paid plans</td>
+  </tr>
+ </tbody>
+</table>
+<h2>How I would use it</h2>
+<p>For normal day-to-day work, I stay on a single agent. I would pull out <code>/swarm</code> for two specific jobs:</p>
+<ul>
+ <li><strong>Periodic repo audits</strong> where read-only workers check links, images, and build performance in parallel while <code>@verifier</code> throws out false positives.</li>
+ <li><strong>Wide, mechanical changes across isolated files</strong>, especially with <code>@verifier</code> pinned to a second model to catch weakened assertions.</li>
+</ul>

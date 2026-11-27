@@ -1,0 +1,106 @@
+<h2>Backfilling Tens of Billions of Rows Next to Live Logical Replication (Part 2)</h2>
+<p>How a resumable parallel backfill, two disk-pressure incidents and a second look at the reconciliation query got tens of billions of rows across, with logical replication running the whole time.</p>
+<h2>Key Takeaways</h2>
+<ul>
+ <li>A parallel backfill has to be stoppable. ID-range segments with per-batch checkpoints let workers be restarted, added or removed mid-run without copying a row twice or skipping one. An even split by ID is not an even split by rows.</li>
+ <li>Bulk loading into a node whose WAL archiving is failing fills the disk with WAL. The safe recovery is to mark as archived only the WAL files proven to be in the backup repository, never to delete WAL by hand.</li>
+ <li>One very large source transaction can stall a subscription and pin WAL on the source. Switching the subscription to <code>streaming = parallel</code> drained the backlog without restarting anything.</li>
+ <li>The reconciliation pass from Part 1 had two flaws that only show at scale: it missed updates that changed only the <code>Information</code> column, and the planner chose a join that would read hundreds of times more rows than needed. Both are fixed, and the corrected query is below.</li>
+</ul>
+<p><b>This is Part 2 of a migration series.</b></p>
+<h2>Where We Are</h2>
+<p>All three large tables are now fully backfilled on the target, and the migration is days from cutover. When Part 1 was written the parent table was still being copied; since then <code>parent_table</code>, <code>child_table</code> and <code>child_table_2</code> have all landed, together holding tens of billions of rows.</p>
+<p>The plan held. The execution taught us things the plan could not. This part covers what broke at that scale, how each problem was handled without restarting the production cluster, and what we would do differently next time.</p>
+<h2>A Backfill You Can Stop</h2>
+<p>The backfill had to survive being stopped, restarted and re-sized in production, so every design choice served that. A single <code>COPY</code> stream would have taken weeks, so each large table was copied by several workers in parallel, each owning its own range of IDs.</p>
+<p>The upper bound was fixed before anything started. The subscription was created with <code>copy_data = false</code>, and the lowest ID the subscription wrote on the target, minus one, became the backfill’s <code>MAX_ID</code>. Everything above that line is replication’s job; everything at or below it is the backfill’s. That one number is also the dividing line the monitor in Part 1 checks on each side.</p>
+<p>How the script works:</p>
+<ol>
+ <li>On start, it reads how far each previous segment got and works out exactly which ID ranges are still missing.</li>
+ <li>It splits only those missing ranges evenly across the configured number of workers and saves that plan atomically.</li>
+ <li>Each worker copies its range in batches of 10 million IDs. One batch is one <code>COPY</code> from source to target, so a batch either lands whole or rolls back.</li>
+ <li>After each batch commits, the worker records the last ID it finished in a checkpoint file named after its own segment. No other segment can ever read it.</li>
+ <li>On restart, a quick count on both sides catches the rare batch that committed just before its checkpoint was saved, so it is marked done instead of copied twice.</li>
+</ol>
+<h3>The Stuck Worker</h3>
+<p>One morning a single worker had produced no log line for seven hours while the others moved on. On the source, its session showed <code>state = active</code> with <code>wait_event = ClientRead</code>: the server was waiting on a client that had stopped reading. A network stall had silently broken the stream.</p>
+<p>Because the batch in flight was one transaction, the fix was safe: stop the script, let that batch roll back, start again. The script re-split what was left, and the stalled range was copied again from its last checkpoint. We added TCP keepalives to the connection strings afterwards so a dead peer is noticed in minutes, not hours.</p>
+<h3>Even IDs, uneven work</h3>
+<p>The workers did not finish together. Some finished well ahead of the others. The split was even in IDs, not in actual rows. ID ranges are not uniformly dense: gaps from rolled-back inserts, deleted rows and changes in write volume over the years mean two equal ID ranges can hold very different row counts.</p>
+<h2>The Indexes You Keep During a Bulk Load</h2>
+<p>Every index on a table is written again for every row a <code>COPY</code> inserts. For a load of billions of rows, the textbook approach is to load into a table with only the indexes the load itself needs, then build the rest afterwards in one sorted pass.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Index</th>
+   <th>Keep during the load?</th>
+   <th>Why</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Primary key</td>
+   <td>Yes</td>
+   <td>Logical replication finds rows by it for every <code>UPDATE</code> and <code>DELETE</code> it applies.</td>
+  </tr>
+  <tr>
+   <td>An index leading on <code>ID</code></td>
+   <td>Yes</td>
+   <td>The restart check and the exact per-batch counts are range lookups on <code>ID</code>.</td>
+  </tr>
+  <tr>
+   <td>Secondary and unique indexes</td>
+   <td>No</td>
+   <td>Nothing reads them during the load. Rebuild them before cutover.</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Incident: WAL Grew to Tens of Terabytes on the Target</h2>
+<p>Partway through the backfill, the target’s data volume reached 95%, and almost all of it was <code>pg_wal</code>. The backfill’s <code>COPY</code> streams and the replication apply were generating WAL quickly, which is expected. What was not expected was that none of it was being removed.</p>
+<h3>Why WAL piles up</h3>
+<p>PostgreSQL only recycles a WAL segment once two things are true: a checkpoint has passed it, and, when archiving is on, the archiver has reported it safely archived. Each segment waiting for the archiver has a <code>.ready</code> marker in <code>pg_wal/archive_status</code>; a successful archive renames it to <code>.done</code>.</p>
+<h3>The safe recovery</h3>
+<ol>
+ <li>Ask the backup tool for the newest WAL segment it holds, and spot-check that segment by actually restoring it with <code>archive-get</code>.</li>
+ <li>List the WAL segments genuinely present in the repository.</li>
+ <li>Intersect that list with the <code>.ready</code> markers on the target.</li>
+ <li>For segments in both lists only, rename <code>.ready</code> to <code>.done</code>. No WAL file is touched; only the marker changes.</li>
+ <li>Run <code>CHECKPOINT</code>. PostgreSQL removes the now-archived segments on its own.</li>
+</ol>
+<h2>Incident: Replication Lag Filling the Source</h2>
+<p>Later in the backfill the pressure moved to the source. Two subscriptions had fallen behind, and their replication slots were holding WAL on the source primary.</p>
+<p>By default a subscription applies a transaction only after it has committed on the source. The source decodes the whole transaction first, spilling it to disk once it outgrows <code>logical_decoding_work_mem</code>, then sends it, and a single apply worker replays it.</p>
+<h2>Small Things That Would Have Broken Cutover</h2>
+<h3>A timezone mismatch hiding in a column default</h3>
+<p>The source cluster ran in a regional, non-UTC timezone. The new cluster ran in UTC. Several tables use <code>timestamp without time zone</code> columns with <code>DEFAULT now()</code>. After cutover, every new row would have been stamped hours apart from every historical row. The fix was to set the target’s <code>TimeZone</code> to match the source on every node.</p>
+<h3>A subscription that has failed quietly</h3>
+<p>The subscription for <code>audit_table</code> showed as enabled, but the table-sync worker had been failing. The replication role had never been granted <code>SELECT</code> on that one table. Check <code>srsubstate</code> in <code>pg_subscription_rel</code> reaches <code>r</code> (ready) for every table.</p>
+<h2>Revisiting the Reconciliation From Part 1</h2>
+<h3>Flaw 1: it compared the wrong column</h3>
+<p>The trigger captures a row when <code>Information</code> <b>or</b> <code>Timestamp</code> changes. The reconciliation only applied rows where <code>Timestamp</code> differed. The fix is to compare both columns.</p>
+<h3>Flaw 2: the plan read far more than it wrote</h3>
+<p>For this statement the right plan is a nested loop: walk the audit rows in the batch, and look up each matching <code>child_table</code> row by primary key. Turning off hash and merge joins for the batch session forces it.</p>
+<h3>The corrected statement</h3>
+<pre><code>SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+
+UPDATE "child_table" td
+SET "Information" = tu."Information"-&gt;'Information',
+    "Timestamp"   = tu."child_table_Timestamp"
+FROM "audit_table" tu
+WHERE td."ID" = tu."ID"
+  AND td."ID" &lt;= :backfill_max_id
+  AND tu."Information"-&gt;'Information' IS NOT NULL
+  AND (td."Timestamp"   IS DISTINCT FROM tu."child_table_Timestamp"
+       OR td."Information" IS DISTINCT FROM tu."Information"-&gt;'Information')
+  AND tu."ID" BETWEEN :batch_start AND :batch_end;</code></pre>
+<h2>Verifying Without COUNT(*)</h2>
+<p>At tens of billions of rows, an exact <code>COUNT(*)</code> is hours of full scans. We built confidence in layers:</p>
+<ul>
+ <li><code>reltuples</code> and <code>n_live_tup</code> estimates.</li>
+ <li><code>MIN("ID")</code> and <code>MAX("ID")</code> validation.</li>
+ <li>Rows copied, summed from the backfill’s own per-batch log.</li>
+ <li>Exact counts on randomly chosen ID windows.</li>
+</ul>
+<h2>Closing Thought</h2>
+<p>The pattern that worked every time was the same: find out what the database is actually doing before changing anything, prefer the change that can be undone, and refuse the shortcut that trades a visible problem for an invisible one.</p>

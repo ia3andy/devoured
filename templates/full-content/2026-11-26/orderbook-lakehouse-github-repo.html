@@ -1,0 +1,164 @@
+<h1>orderbook-lakehouse</h1>
+<p>A small local data lakehouse for market order-book events. Synthetic exchange events go through a bronze → silver → gold pipeline and end up as tables you can run trading analytics on. It's Scala/Spark on Apache Iceberg, with the infrastructure running in Docker.</p>
+<p>For a step-by-step walkthrough of the demo, see GUIDE.md.</p>
+<h2>The stack</h2>
+<pre><code>Producer (make generate) ──HTTP──► Redpanda Connect 4.113 (:4195)
+                                      │  NDJSON files → s3://orderbook-warehouse/landing/raw_events/
+                                      ▼
+Spark job (Scala 2.13, local mode) ◄──┘  reads landed files, writes Iceberg tables
+   │  Iceberg REST protocol: catalog + metadata
+   ▼
+Apache Polaris 1.8.0 (:8181) ──► Postgres 17   ── catalog state (persists across restarts)
+   │  S3 API
+   ▼
+SeaweedFS 4.48 (:8333)        ── S3-compatible storage, bucket orderbook-warehouse
+</code></pre>
+<ul>
+ <li>
+  <p><strong><code>docker-compose.yml</code></strong> starts the stack (<code>docker compose up -d</code>). Every image is pinned to a version. Startup order:</p>
+  <table>
+   <thead>
+    <tr>
+     <th>Service</th>
+     <th>Purpose</th>
+    </tr>
+   </thead>
+   <tbody>
+    <tr>
+     <td><code>seaweedfs</code></td>
+     <td><code>weed mini</code> all-in-one: S3 API on <code>:8333</code>, admin UI on <code>:23646</code>. Creates the <code>orderbook-warehouse</code> bucket and the <code>admin</code>/<code>password</code> S3 identity on startup</td>
+    </tr>
+    <tr>
+     <td><code>postgres</code></td>
+     <td>Polaris metastore. <code>infra/postgres/init.sql</code> creates <code>polaris_schema</code> on first init</td>
+    </tr>
+    <tr>
+     <td><code>polaris-bootstrap</code></td>
+     <td>One-off: Polaris admin tool creates the realm and the <code>root</code>/<code>s3cr3t</code> principal in Postgres. Idempotent</td>
+    </tr>
+    <tr>
+     <td><code>polaris</code></td>
+     <td>Iceberg REST catalog + management API on <code>:8181</code>, health on <code>:8182</code></td>
+    </tr>
+    <tr>
+     <td><code>polaris-init</code></td>
+     <td>One-off: <code>infra/polaris/setup.sh</code> creates the <code>orderbook</code> catalog and grants. Idempotent (409 = already exists)</td>
+    </tr>
+    <tr>
+     <td><code>redpanda-connect</code></td>
+     <td>The only way data comes in: accepts events over HTTP on <code>:4195</code> and lands them in S3</td>
+    </tr>
+   </tbody>
+  </table>
+  <p><code>docker compose down</code> keeps the data and the catalog; <code>docker compose down -v</code> wipes both together, so they never get out of sync.</p></li>
+ <li>
+  <p><strong><code>PolarisSpark.scala</code></strong> builds the shared <code>SparkSession</code>. Spark asks Polaris for table metadata but reads and writes data files directly in SeaweedFS. Endpoints and credentials come from environment variables (<code>POLARIS_*</code>, <code>S3_ENDPOINT</code>, <code>S3_ACCESS_KEY</code>, <code>S3_SECRET_KEY</code>; see <code>.env.example</code>), with defaults that match the compose stack.</p></li>
+ <li>
+  <p><strong>Makefile</strong> has shortcuts for checking Polaris (<code>make catalogs</code>, <code>make tables NAMESPACE=bronze</code>) and for running each job (<code>make help</code> lists them).</p></li>
+</ul>
+<h2>The data</h2>
+<p>The feed has five event types: <code>add</code>, <code>cancel</code>, <code>modify</code>, <code>trade</code> and <code>snapshot</code>. Each event has <code>instrument</code>, <code>timestamp</code>, <code>side</code>, <code>price</code>, <code>qty</code> and <code>seq_no</code>. <code>GenerateSyntheticEvents</code> (<code>make generate</code>) makes realistic demo data and POSTs it to Redpanda Connect, the same way any other producer would. It runs a small matching engine for each instrument. Orders that cross the book trade against resting orders (best price first), market orders hit the best bid or ask, and cancels remove orders that actually exist, so the book gold rebuilds is never crossed. Events are 1s apart by default (<code>GEN_INTERVAL</code>), so 5000 events cover about 80 minutes of one-minute bars. It doesn't emit <code>modify</code>, because gold can't apply one without an <code>order_id</code>. The same seed always gives the same data.</p>
+<h2>The pipeline</h2>
+<table>
+ <thead>
+  <tr>
+   <th>Layer</th>
+   <th>Job</th>
+   <th>What it does</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><strong>Bronze</strong> <code>bronze.raw_events</code></td>
+   <td><code>IngestRawEvents</code></td>
+   <td>Reads the NDJSON files Redpanda Connect landed in S3 with a Structured Streaming query (<code>Trigger.AvailableNow</code>: process what's new, commit, stop). Its checkpoint records which files it has read, so a rerun only picks up new files. Every column is nullable: a value that won't parse becomes null for silver to reject, instead of failing the run. Each row keeps its <code>_source_file</code> and <code>_ingested_at</code>.</td>
+  </tr>
+  <tr>
+   <td><strong>Silver</strong> <code>silver.book_events</code></td>
+   <td><code>BuildSilverEvents</code></td>
+   <td>Drops malformed rows, removes duplicates on <code>(instrument, seq_no)</code>, adds <code>event_date</code>, then <code>MERGE INTO</code>s silver, so a rerun never inserts the same event twice. It stops before writing if more than 50% of a batch is malformed. Partitioned by instrument and date.</td>
+  </tr>
+  <tr>
+   <td><strong>Gold</strong></td>
+   <td><code>BuildGoldAggregates</code></td>
+   <td>Builds <strong>1-minute OHLCV bars</strong> (open/high/low/close/volume) from trades, and <strong>top-of-book snapshots</strong> (best bid and ask each minute) by keeping a running quantity for every price level. Each run recomputes the minutes its new data touches and <code>MERGE</code>s them in by <code>(instrument, window_start)</code>, so reruns and minutes split across runs never duplicate a row. The running book is saved in <code>gold.book_state</code>, so orders from earlier runs still count.</td>
+  </tr>
+ </tbody>
+</table>
+<p>From scratch: <code>make setup &amp;&amp; make generate &amp;&amp; make pipeline</code> (<code>make pipeline</code> runs ingest, silver and gold in one JVM and Spark session; <code>make ingest</code>, <code>make silver</code>, <code>make gold</code> run them one at a time). <code>make setup</code> (re)creates every table empty and deletes the landed files and the ingest checkpoint (<code>make clear-landing</code>), so it also resets the pipeline on a running stack.</p>
+<p>Make runs each job with <code>target/run.sh</code>, a plain <code>java</code> launch on the project's classpath that <code>sbt launcher</code> writes. Make rebuilds it when the sources change, so sbt starts once instead of once per job.</p>
+<p>The Scala packages under <code>src/main/scala/orderbook/</code> follow the same layers:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Package</th>
+   <th>Contents</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td><code>common</code></td>
+   <td><code>PolarisSpark</code> (Spark session wired to Polaris + SeaweedFS), <code>OrderBookSchema</code>, <code>Watermark</code></td>
+  </tr>
+  <tr>
+   <td><code>bronze</code> / <code>silver</code> / <code>gold</code></td>
+   <td>Each layer's <code>Create*Table(s)</code> job and the job that writes it</td>
+  </tr>
+  <tr>
+   <td><code>analytics</code></td>
+   <td>Read-only query jobs</td>
+  </tr>
+  <tr>
+   <td><code>ops</code></td>
+   <td><code>CreateNamespaces</code>, <code>MaintainTables</code>, <code>ClearLanding</code>, <code>SmokeTest</code>, <code>ListCatalogs</code></td>
+  </tr>
+  <tr>
+   <td><code>tools</code></td>
+   <td><code>GenerateSyntheticEvents</code></td>
+  </tr>
+ </tbody>
+</table>
+<p>Tests mirror the same packages under <code>src/test/scala/orderbook/</code>. <code>PipelineIntegrationSpec</code> runs the real jobs end to end against a local Iceberg catalog in a temp directory (no Docker) and checks that incremental runs equal a full recompute, reruns commit nothing, duplicates and malformed events are absorbed, a gold run that crashes midway is recovered, and maintenance doesn't force a full re-read. Run everything with <code>make test</code>.</p>
+<h3>Ingest (Redpanda Connect)</h3>
+<p>Events only come in over HTTP. The <code>redpanda-connect</code> service (<code>infra/redpanda-connect/landing.yaml</code>) accepts them and writes them to <code>s3://orderbook-warehouse/landing/raw_events/</code> as newline-delimited JSON files, one file per batch (up to 5000 events or 5s). <code>make ingest</code> then runs <code>IngestRawEvents</code> against that prefix (<code>STREAM_LANDING</code>) to append the new files to bronze. Bronze loading is micro-batch: events land continuously, and each <code>make ingest</code> moves what has landed into Iceberg.</p>
+<pre><code>make generate                    # POSTs the first 5000 synthetic events of the feed
+make generate-next               # POSTs the next 5000: new seq_no, later timestamps
+make demo-dedup                  # re-sends the last batch, then ingest + silver: all skipped
+make snapshots TABLE=silver.book_events   # snapshot history + watermark, from Polaris
+make pointers                    # each table's metadata.json pointer, from Postgres
+curl --data-binary '\{"event_type":"add","instrument":"BTC-USD","timestamp":"2026-10-26T10:00:00Z","side":"buy","price":100.5,"qty":3,"seq_no":1}' \
+  http://localhost:4195/events   # or send your own
+make ingest &amp;&amp; make silver &amp;&amp; make gold</code></pre>
+<p>A request body can hold one event or many, one per line. The request returns once the events are written to S3. Lines that aren't valid JSON go to <code>landing/rejected/</code> instead. Valid JSON with bad values still reaches bronze, as nulls, and silver drops the row. Delivery is at least once; silver's dedupe on <code>(instrument, seq_no)</code> removes any duplicates.</p>
+<h3>Design points</h3>
+<ul>
+ <li><strong>Incremental processing</strong> (<code>Watermark.scala</code>): each job records the last upstream Iceberg snapshot ID it processed in the summary of its own output commit, so the data and the watermark are committed together or not at all. The next run reads only the changes since then, using <code>start-snapshot-id</code>, instead of rescanning everything.</li>
+ <li><strong>Idempotent writes:</strong> silver's insert-only <code>MERGE</code> skips events already there; gold's <code>MERGE</code>s replace recomputed minutes; <code>gold.book_state</code>, the one output that can't be recomputed safely, is written last, in the commit that carries gold's watermark. A crash at any point is fixed by rerunning.</li>
+ <li><strong>Exact arithmetic:</strong> prices and quantities are <code>DECIMAL(18,8)</code>, so a price level that's fully cancelled nets to exactly zero and is dropped from the book.</li>
+ <li><strong>Maintenance</strong> (<code>MaintainTables</code>): runs Iceberg's data-file and manifest compaction, snapshot expiry and orphan-file cleanup on every table, with configurable retention. Its rewrite commits carry the watermarks forward and record which snapshot they rewrote, so expiring old snapshots doesn't force the next run into a full re-read.</li>
+ <li><strong>Known limitation, documented in the code:</strong> <code>modify</code> events aren't counted in the book because the schema has no <code>order_id</code>.</li>
+</ul>
+<h2>Analytics</h2>
+<p>Standalone query jobs, each answering one trading question:</p>
+<ul>
+ <li><strong>Spread and cost:</strong> <code>SpreadOverTime</code>, <code>EffectiveVsQuotedSpread</code>, <code>VwapVsClose</code></li>
+ <li><strong>Volatility:</strong> <code>RealizedVolatility</code> (rolling standard deviation of log returns), <code>ParkinsonVolatility</code> (based on each bar's high/low range)</li>
+ <li><strong>Microstructure signals:</strong> <code>BookImbalanceVsNextBar</code> (does bid/ask imbalance predict the next bar's direction?), <code>LiquidityDryUpWindows</code>, <code>TradeThroughDetection</code></li>
+ <li><strong>Surveillance:</strong> <code>CancelToAddRatio</code>, a classic warning sign for spoofing or quote-stuffing</li>
+</ul>
+<p>Several of these join trades against the snapshot from the previous minute, so the results are approximate.</p>
+<h2>Other things to know</h2>
+<ul>
+ <li><strong>It's a demo setup, not production.</strong> Credentials are hardcoded, and there's no STS.</li>
+ <li><strong>Tests</strong> (munit, <code>sbt test</code>) cover the transform functions (<code>clean</code>, <code>ohlcvBars</code>, <code>topOfBookSnapshots</code>, <code>conform</code>). Those functions don't do any I/O, so they're tested on small in-memory DataFrames.</li>
+ <li><strong>No scheduler</strong> is set up yet; you run jobs by hand or with an external cron.</li>
+</ul>
+<h2>Setup notes</h2>
+<ol>
+ <li><strong><code>stsUnavailable: true</code></strong> on the catalog's <code>storageConfigInfo</code> (<code>infra/polaris/setup.sh</code>). SeaweedFS has no STS, so Polaris doesn't try to hand out scoped credentials, and Spark uses the S3 keys directly.</li>
+ <li><strong>Two S3 endpoints on the catalog.</strong> Polaris returns the catalog's <code>endpoint</code> to clients, and it takes precedence over the client's own <code>s3.endpoint</code>. Spark runs on the host, so <code>endpoint</code> is <code>http://localhost:8333</code>. Polaris also writes each new <code>metadata.json</code> itself, from inside the Compose network, so <code>endpointInternal</code> is <code>http://seaweedfs:8333</code>.</li>
+ <li><strong>S3A for <code>remove_orphan_files</code>.</strong> That maintenance procedure lists files through Hadoop's <code>FileSystem</code> API rather than <code>S3FileIO</code>, so <code>PolarisSpark</code> also registers <code>S3AFileSystem</code> (<code>hadoop-aws</code>) for the <code>s3://</code> scheme against the same endpoint.</li>
+ <li><strong>Polaris + Postgres.</strong> Polaris doesn't create its database schema (<code>infra/postgres/init.sql</code> does), and with JDBC storage the realm and root principal come from the admin tool's <code>bootstrap</code> command, not from <code>POLARIS_BOOTSTRAP_CREDENTIALS</code>. Keep <code>apache/polaris</code> and <code>apache/polaris-admin-tool</code> on the same version when upgrading.</li>
+</ol>
+<h2>License</h2>
+<p>Licensed under the Apache License, Version 2.0.</p>

@@ -1,0 +1,77 @@
+<h1>Writing to S3, Parallel Writes, ALP: Hardwood 1.1.0.CR1 Is Out</h1>
+<p>When the first preview of Hardwood’s writer shipped with 1.1.0.Beta1, it came with two notable gaps: it was single-threaded, and it couldn’t write to S3. Both are closed now, and I’m happy to announce the first release candidate for Hardwood 1.1!</p>
+<p>Besides rounding out the writer, this release brings support for the latest Parquet file format additions (ALP encoding, <code>FILE</code> logical type), and it substantially improves the performance of local as well as remote file reads. We’ve also hardened the reader against untrusted files and set up a nightly benchmark suite for catching performance regressions.</p>
+<p>You can fetch the Hardwood library JARs from Maven Central. Binaries for the Hardwood CLI are available on the GitHub releases page. Let’s dig in!</p>
+<h2>Writing to S3 and Parallel Writes</h2>
+<p>Just like Hardwood’s reader, which had S3 support early on, the writer can now write Parquet files directly to S3 and S3-compatible object stores. The <code>S3Source</code> object which you already use for reading has been expanded to hand out output files, too:</p>
+<pre><code>List&lt;Event&gt; events = ...;
+
+try (S3Source s3 = S3Source.builder()
+        .region("eu-west-1")
+        .credentials(S3Credentials.of(accessKeyId, secretKey))
+        .build();
+     ParquetFileWriter writer = ParquetFileWriter.create(
+         s3.outputFile("s3://my-bucket/events/2026-11.parquet"),
+         schema)) \{
+
+    RowWriter rows = writer.rowWriter();
+    for (Event event : events) \{
+        rows.writeRow(row -&gt; row
+                .setDate("day", event.day())
+                .setLong("id", event.id())
+                .setString("payload", event.payload()));
+    }
+}</code></pre>
+<p>Larger files are streamed to S3 as a multipart upload while they are written: whenever a part (8 MiB by default, configurable via <code>uploadPartSize()</code>) is full, it is uploaded in the background, with up to four uploads in flight while the writer continues with the next part.</p>
+<p>The second big change to the writer is that it now makes use of multiple CPU cores. When a row group is flushed, its column chunks are encoded and compressed in parallel. By default, the writer uses one thread per available processor. If you want to control the number of threads, or share one thread pool between several writers and readers, pass a <code>HardwoodContext</code> when creating the writer, e.g. <code>HardwoodContext.create(4)</code> to use up to four threads, or <code>create(0)</code> to run all encoding and decoding work on the calling thread.</p>
+<h2>Further Writer Additions</h2>
+<p>Some other writer additions made it into this release:</p>
+<ul>
+ <li>For codecs like <code>ZSTD</code> you can now set the compression level, allowing you to trade write time for file size.</li>
+ <li>If your rows are sorted, you can declare the sort order via <code>sortingColumns()</code>. It is recorded in the metadata of each row group, so that query engines can take advantage of it. The writer verifies the declared order as rows come in, failing the write when a row is out of order.</li>
+ <li>Optionally, data pages can be written in the <code>DATA_PAGE_V2</code> format, which keeps repetition and definition levels uncompressed and states each page’s row count in its header, letting readers skip pages or locate nulls without decompressing them.</li>
+</ul>
+<pre><code>WriterConfig config = WriterConfig.builder()
+        .compression(Compression.zstd().level(9))
+        .sortingColumns(
+                SortingColumn.ascending("vendor", NULLS_LAST),
+                SortingColumn.descending("pickup_ts", NULLS_LAST))
+        .dataPageVersion(DataPageVersion.V2)
+        .build();</code></pre>
+<p>Finally, <code>StructBuilder.setValue()</code> accepts values in the form the reader’s <code>getValue()</code> returns them, making it easy to copy rows from one file to another without having to dispatch on each field’s type.</p>
+<h2>New Format Features</h2>
+<p>Hardwood 1.1.0.CR1 supports two recent additions to the Parquet format specification. First, ALP (Adaptive Lossless Floating-Point), a new encoding for <code>FLOAT</code> and <code>DOUBLE</code> columns:</p>
+<blockquote>
+ <p>Many floating-point values in practice are decimals with a fixed, small number of fractional digits, such as prices or sensor measurements. ALP multiplies such values by a power of ten, turning for instance 12.34 into the integer 1234, and bit-packs these integers relative to the smallest one of each block of 1,024 values, so that the closer together the values of a block are, the fewer bits each one takes up. Values which can’t be represented that way are stored as-is, so the encoding is lossless.</p>
+</blockquote>
+<p>ALP is currently marked as a preview feature in the Parquet spec, so make sure your consumers can read it before using it. Hardwood reads ALP-encoded columns, and writes them when requested:</p>
+<pre><code>WriterConfig config = WriterConfig.builder()
+    .encoding("latitude", ColumnEncoding.ALP)
+    .build();</code></pre>
+<p>Second, the new <code>FILE</code> logical type for a group describing a binary object, such as an image or a PDF document, either stored inline or in external storage, referenced by a URI (optionally with an offset and size, e.g. pointing to an entry in a larger archive). Hardwood reads such groups as validated <code>PqFile</code> objects, and writes them via <code>setFile()</code>.</p>
+<p>Besides these spec additions, Hardwood now also supports field ids (as used by Apache Iceberg, Delta Lake and DuckLake to identify columns independently of their names), which are exposed on <code>ColumnSchema</code> and <code>SchemaNode</code>, can be set when building a schema, and are retained when rewriting a file.</p>
+<h2>Performance Improvements</h2>
+<p>To enable further improvements to Hardwood’s performance, we have decided to completely rethink how the fetching and decoding of pages is organized within the read engine. The idea is simple: a read is now split into small jobs, such as fetching a byte range or decoding a page. They are executed by a scheduler, which runs them in the order of the rows they serve. Fetching happens on virtual threads and decoding on the thread pool of the read’s <code>HardwoodContext</code>, so neither has to wait for the other. And as requests are capped at 16 MiB, decoding starts as soon as the first chunk of a column has arrived, keeping all cores busy.</p>
+<p>Further improvements include:</p>
+<ul>
+ <li>An S3 object of up to 256 KiB is read in the single request which opens it; for larger files, the footer and the page index usually come with that first request.</li>
+ <li>Multi-file reads open the next files ahead of time, fetching their footers and first data while earlier files are still being read.</li>
+ <li>Uncompressed fixed-width values are read in place from the page, and row readers projecting only flat columns take a faster path.</li>
+ <li>Batches, dictionaries and decompressed pages no longer become humongous G1 objects on heaps below 4 GB, avoiding the associated GC overhead.</li>
+</ul>
+<p>To spot regressions early, we set up an automated performance benchmark suite. It runs every night, recording wall-clock time, CPU time, allocations and peak live set of each scenario, and uses Apache Otava to detect change points in the resulting time series.</p>
+<h2>Also in This Release</h2>
+<p>To harden reads of untrusted files, the reader now validates every size, count and length a file declares before allocating anything based on it, failing with a <code>ParquetReadException</code> instead of allocating without bound. The parsing of footers and page headers, page decoding, and decompression are fuzzed with Jazzer.</p>
+<p>Other notable changes include:</p>
+<ul>
+ <li>Reads fail with an exception instead of hanging when they can no longer make progress, e.g. after running out of heap.</li>
+ <li>S3: public buckets can be read without credentials (<code>S3Source.Builder.anonymous()</code>), a read fails if the object was replaced after opening, and stalled responses are retried.</li>
+ <li>Fixes for shredded Variants and for files using the deprecated <code>BIT_PACKED</code> level encoding.</li>
+ <li>CLI: <code>--log-file</code> captures detailed logs, such as the byte ranges fetched from S3, and S3 reads fall back to unsigned requests when no credentials are configured.</li>
+ <li>CLI releases ship with checksums and build provenance attestations, verifiable via <code>gh attestation verify</code>.</li>
+</ul>
+<h2>Wrapping Up</h2>
+<p>A big thank you to everyone who contributed to this release: Alex Petrov, Alex Sorokoumov, André Rouél, Arnab Nandy, Chandan Dhamande, Fawzi Essam, Jeronimo López, Manish, Matt Van Horn, Matthew Mullett, Omar Abdelmawgoud, ommkd, Perfloop Agent, and Rion Williams.</p>
+<p>As for next steps, we’re planning to release a second candidate in about two weeks, with the public API of Hardwood 1.1 in its final shape, followed by Hardwood 1.1.0.Final as an early Christmas present before the holidays.</p>
+<p>Beyond that, Hardwood 1.2 will bring a higher-level API for copying and transforming Parquet files, which copies unchanged data as-is and only re-encodes what a transformation touches, e.g. for compacting small files or dropping a column. Other potential additions include support for Parquet modular encryption, a strict memory quota for reads, and several additions around the <code>VARIANT</code> column type.</p>
+<p>Until then, please give the release candidate a try, in particular the new writer features such as writing to S3, and let us know your feedback via GitHub issues and discussions!</p>

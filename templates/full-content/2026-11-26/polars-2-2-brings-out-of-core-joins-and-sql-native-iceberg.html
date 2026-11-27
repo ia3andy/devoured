@@ -1,0 +1,156 @@
+<h1>Announcing Polars 2.2</h1>
+<p>Polars 2.2 brings out-of-core joins, SQL that changes tables, Iceberg table writes and maintenance from SQL, scan_database and over 100 performance improvements.</p>
+<p>Polars 2.2 is out. This post gives an overview of the highlights grouped by area. Everything else is in the <a href="https://github.com/pola-rs/polars/releases/tag/py-2.2.0">release notes</a>.</p>
+<p>Upgrade with:</p>
+<pre><code>pip install -U polars</code></pre>
+<h2>Before you upgrade</h2>
+<p>Six changes may need your attention:</p>
+<ul>
+ <li><code>#31026</code> – Return character offsets in <code>str.find</code> and <code>str.find_many</code>. <code>pl.Series(["héllo"]).str.find("l")</code> used to return the byte offset <code>3</code> and now returns <code>2</code>. For byte offsets, use the new <code>bin.find</code> and <code>bin.find_many</code></li>
+ <li><code>#30914</code> – Require scalar function arguments at plan time. Arguments such as the <code>n</code> of <code>head</code>, the <code>k</code> of <code>top_k</code> or the quantile of <code>quantile</code> must now be a scalar when the query is planned. <code>pl.col("a").head(pl.col("n").head(1))</code> used to run when it happened to return one row and now raises a <code>ShapeError</code>; use <code>.first()</code> or <code>.item()</code> instead</li>
+ <li><code>#30869</code> – Make SQL <code>DELETE</code> change the registered table in a <code>SQLContext</code>. Later queries on the table no longer see the deleted rows, and <code>DELETE FROM (subquery)</code> is an error</li>
+ <li><code>#30942</code> – Make <code>median</code>, <code>mean</code>, <code>quantile</code> and <code>sum</code> consistent across dtypes and contexts. <code>Series.mean()</code> and <code>Series.median()</code> on <code>String</code>, <code>Categorical</code>, <code>List</code>, <code>Struct</code> and similar dtypes used to return <code>None</code> and now raise, as the expressions already did. <code>sum</code> of a <code>Date</code>, <code>Datetime</code>, <code>Time</code>, <code>Categorical</code> or <code>Enum</code> column now raises in every context, also in a <code>group_by</code> where it used to return nulls</li>
+ <li><code>#30493</code> – Return <code>Int64</code> from SQL string length, position and date part functions. They used to return <code>UInt32</code> or <code>Int32</code></li>
+ <li><code>#30243</code> – Raise on extra keys in <code>from_dicts</code>. Keys that didn’t appear in the first <code>infer_schema_length</code> dicts used to be dropped silently. Increase <code>infer_schema_length</code> or pass the full <code>schema</code></li>
+</ul>
+<h2>Out-of-core joins</h2>
+<p>In 2.1 the group-by learned to spill to disk. In this release joins follow. When the build side of a streaming equi-join doesn’t fit in the memory budget, the join splits it into partitions by key hash, builds the hash tables of the partitions that fit in memory and spills the rest to disk. This release Polars is also better at the bookkeeping required to spill.</p>
+<ul>
+ <li><code>#30679</code> – Run equi-joins out of core when the build side is larger than the memory budget</li>
+ <li><code>#30558</code> – Make the build side of the streaming equi-join fully spillable</li>
+ <li><code>#30524</code> – Add a memory grant system, so operators that need hash tables share the memory budget instead of each taking a fixed share</li>
+ <li><code>#30496</code> – Store rows once in unordered streaming windows under memory pressure</li>
+ <li><code>#30749</code> – Use a purge-before-grow dirty page strategy in jemalloc while running out of core</li>
+ <li><code>#30838</code> – Lower the default out-of-core dirty page limit to 0.8 of total memory</li>
+</ul>
+<h2>SQL</h2>
+<p>SQL is again the largest area of this release. Tables registered in a <code>SQLContext</code> can now be changed with <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code> and <code>COPY</code>, and many statements and functions from other databases now work in Polars.</p>
+<ul>
+ <li><code>#30958</code> – Support <code>INSERT</code> and <code>UPDATE</code> on registered tables</li>
+ <li><code>#30975</code> – Support <code>COPY &lt;table&gt; FROM '&lt;file&gt;'</code> on registered tables</li>
+ <li><code>#30834</code> – Support <code>COPY ... TO '&lt;file&gt;'</code></li>
+ <li><code>#30778</code> – Support <code>CREATE VIEW</code>, <code>DROP VIEW</code> and <code>DESCRIBE</code></li>
+ <li><code>#30840</code> – Support query parameters, passed with <code>SQLContext.execute(..., params=...)</code></li>
+ <li><code>#30852</code> – Support SQL macros</li>
+ <li><code>#30799</code> – Support <code>PIVOT</code>, <code>UNPIVOT</code> and <code>POSITIONAL JOIN</code></li>
+ <li><code>#30467</code> – Support derived tables that read the relations joined before them (<code>LATERAL</code>)</li>
+ <li><code>#30453</code> – Support correlated subqueries with <code>GROUP BY</code></li>
+ <li><code>#30763</code> – Add <code>BOOL_AND</code>, <code>BOOL_OR</code>, <code>ANY_VALUE</code>, <code>COUNT_IF</code>, <code>MAX_BY</code>, <code>MIN_BY</code>, <code>APPROX_COUNT_DISTINCT</code> and <code>REGEXP_EXTRACT</code></li>
+ <li><code>#30809</code> – Add <code>TO_CHAR</code>, <code>TO_DATE</code>, <code>TO_TIMESTAMP</code>, <code>TYPEOF</code>, <code>REGEXP_MATCHES</code> and JSON text access</li>
+ <li><code>#30442</code> – Support <code>PERCENTILE_CONT</code> and <code>PERCENTILE_DISC</code> with <code>WITHIN GROUP</code></li>
+ <li><code>#30849</code> – Support offsets in <code>RANGE</code> window frames</li>
+ <li><code>#31017</code> – Support <code>UNNEST ... WITH ORDINALITY</code></li>
+ <li><code>#30819</code> – Support <code>SELECT</code> alias reuse and <code>information_schema.columns</code></li>
+ <li><code>#30825</code> – Add <code>SQLContext(allow_file_reads=False)</code> to turn off reading files from SQL</li>
+</ul>
+<h2>Iceberg</h2>
+<p>In 2.1 you could attach an Iceberg catalog to a <code>SQLContext</code> and create and drop tables in it. Now you can also write to those tables, change them and maintain them from SQL.</p>
+<ul>
+ <li><code>#30463</code> – Support <code>INSERT INTO</code> and <code>INSERT OVERWRITE</code> on attached catalog tables</li>
+ <li><code>#30603</code> – Support <code>UPDATE</code> on attached catalog tables</li>
+ <li><code>#30530</code> – Support <code>DELETE</code> on attached catalog tables</li>
+ <li><code>#30633</code> – Support <code>MERGE INTO</code> on attached catalog tables</li>
+ <li><code>#30267</code> – Support <code>CREATE TABLE ... AS SELECT</code> in attached catalogs</li>
+ <li><code>#30436</code> – Support <code>ALTER TABLE</code> on attached catalog tables</li>
+ <li><code>#30756</code> – Support partition evolution on attached catalog tables</li>
+ <li><code>#30751</code> – Support time travel on attached catalog tables</li>
+ <li><code>#30888</code> – Support tags and branches on attached catalog tables</li>
+ <li><code>#30697</code> – Read Iceberg metadata tables in SQL (<code>lake.ns.t$snapshots</code>)</li>
+ <li><code>#30856</code> – Support <code>CALL rewrite_data_files</code> to compact catalog tables</li>
+ <li><code>#30974</code> – Support <code>CALL add_files</code> on attached catalog tables</li>
+ <li><code>#30690</code> – Answer min, max and counts over an Iceberg scan from manifest statistics</li>
+ <li><code>#30620</code> – Accept a catalog name in <code>scan_iceberg</code>, resolved where the plan runs</li>
+</ul>
+<h2>Databases, Delta and Parquet</h2>
+<ul>
+ <li><code>#30331</code> – Add <code>scan_database</code> to read a database table or query lazily, with projections, filters and limits pushed into the SQL</li>
+ <li><code>#30721</code> – Write Delta tables with the native Parquet sink, in parallel</li>
+ <li><code>#30359</code> – Allow using a KMS for Parquet encryption</li>
+ <li><code>#30816</code> – Make Parquet encryption and decryption properties serializable</li>
+ <li><code>#30737</code> – Support per-row bounding box (bbox covering) columns in experimental GeoParquet</li>
+</ul>
+<h2>Smaller additions</h2>
+<ul>
+ <li><code>#30950</code> – Support a pattern per row in <code>str.replace</code> and <code>str.replace_all</code></li>
+ <li><code>#30835</code> – Add format specifications to <code>pl.format</code> and SQL <code>PRINTF</code> and <code>FORMAT</code></li>
+ <li><code>#30875</code> – Allow reading other columns in <code>list.eval</code>, <code>arr.eval</code> and <code>cumulative_eval</code></li>
+ <li><code>#30826</code> – Add <code>str.from_code_point</code> and SQL <code>CHR</code></li>
+ <li><code>#30318</code> – Support more dtypes in <code>approx_quantile</code></li>
+ <li><code>#30861</code> – Release free-threaded Python wheels using the stable ABI</li>
+</ul>
+<h2>Performance</h2>
+<p>This release has 111 performance PRs. These are the ones you are most likely to notice:</p>
+<h3>Joins</h3>
+<ul>
+ <li><code>#30708</code> – Pack multi-column join and group-by keys into fixed-width integers</li>
+ <li><code>#30681</code> – Use estimated rows to choose the build side of streaming equi-joins</li>
+ <li><code>#30662</code> – Use an exact bitset as runtime filter for integer join keys in a small range</li>
+ <li><code>#30651</code> – Use a hash join for outer joins on an equality and a condition on one input</li>
+ <li><code>#30692</code> – Skip the probe side of joins without non-null build keys</li>
+</ul>
+<h3>Group-by and aggregations</h3>
+<ul>
+ <li><code>#30813</code> – Reduce runs of consecutive rows of one group as slices in the streaming group-by</li>
+ <li><code>#30808</code> – Reduce runs of equal groups locally in <code>sum</code>, <code>mean</code>, <code>min</code> and <code>max</code></li>
+ <li><code>#30569</code> – Compute quantiles and quantile and rank bins by selection instead of sorting</li>
+ <li><code>#31062</code> – Run streaming cumulative aggregations in parallel</li>
+ <li><code>#29445</code> – Speed up <code>rolling_min</code> and <code>rolling_max</code> with a van Herk block scan</li>
+ <li><code>#30636</code> – Use the streaming group-by for <code>value_counts</code> with <code>sort</code> or <code>normalize</code></li>
+</ul>
+<h3>Optimizer</h3>
+<ul>
+ <li><code>#30694</code> – Move inner, semi and anti joins below left joins in more cases</li>
+ <li><code>#30680</code> – Use column equalities between joined inputs as join keys when reordering joins</li>
+ <li><code>#30598</code> – Prune unused struct fields in projection pushdown</li>
+ <li><code>#30802</code> – Skip files by predicates on the <code>include_file_paths</code> column</li>
+ <li><code>#30773</code> – Rewrite <code>get(arg_max())</code> to <code>max_by</code></li>
+</ul>
+<h3>Parquet, CSV and cloud</h3>
+<ul>
+ <li><code>#30522</code> – Keep dictionary-encoded Parquet <code>String</code> columns as dictionaries in memory</li>
+ <li><code>#30601</code> – Speed up decoding of Parquet <code>Struct</code>, <code>Map</code>, <code>Array</code> and <code>List</code> rows</li>
+ <li><code>#30982</code> – Avoid redundant dictionary scans and byte-array copies in Parquet writes</li>
+ <li><code>#30639</code> – Parse CSV a column at a time over a mask-based field index</li>
+ <li><code>#30102</code> – Let the cloud read rate limiter follow demand</li>
+ <li><code>#30966</code> – Abandon stalled cloud reads after a stall timeout</li>
+</ul>
+<h3>Kernels</h3>
+<ul>
+ <li><code>#30704</code> – Vectorize <code>Decimal</code> mean and sum</li>
+ <li><code>#30777</code> – Compute date parts with integer arithmetic</li>
+ <li><code>#30604</code> – Add a dedicated kernel for <code>concat_list</code></li>
+ <li><code>#30261</code> – Trim leading and trailing <code>.*</code> from <code>str.contains</code> regexes</li>
+</ul>
+<h2>Bug fixes</h2>
+<p>Some of the bug fixes in this release:</p>
+<h3>Wrong results</h3>
+<ul>
+ <li><code>#30682</code> – Don’t create spurious nulls in <code>when/then/otherwise</code></li>
+ <li><code>#30315</code> – Keep row order for <code>when/then/otherwise</code> with literal branches</li>
+ <li><code>#30310</code> – Keep null rows for <code>is_null() &amp; ~is_in(..., nulls_equal=True)</code> filters</li>
+ <li><code>#30330</code> – Use the exact join column mapping in projection and predicate pushdown</li>
+ <li><code>#30817</code> – Keep deleted rows deleted in <code>delete_iceberg</code> and <code>sink_iceberg</code> overwrites</li>
+ <li><code>#30412</code> – Fix a slice returning too many rows when an Iceberg position delete is past the end of the file</li>
+ <li><code>#30454</code> – Apply Delta deletion vectors to files in escaped partition paths</li>
+ <li><code>#30313</code> – Don’t drop rows after an empty chunk in <code>write_json</code></li>
+ <li><code>#30743</code> – Return null instead of silently overflowing in the temporal <code>total_*</code> functions</li>
+ <li><code>#31048</code> – Fix a streaming window over a literal returning 0 rows</li>
+</ul>
+<h3>Hangs, panics and crashes</h3>
+<ul>
+ <li><code>#31021</code> – Fix a race condition in the spill token waiters</li>
+ <li><code>#30361</code> – Prevent a <code>to_pandas()</code> deadlock with <code>map_elements</code> on another thread</li>
+ <li><code>#30665</code> – Avoid a segfault on environment changes after a cloud scan</li>
+ <li><code>#30458</code> – Fix segfaults and leaked references with <code>Object</code> values in group contexts</li>
+ <li><code>#30886</code> – Turn panics in Arrow C stream callbacks into stream errors</li>
+ <li><code>#30940</code> – Don’t panic on extreme counts in string, binary and list slicing</li>
+</ul>
+<h3>Other fixes</h3>
+<ul>
+ <li><code>#30897</code> – Lower the cloud connect timeout from 300 to 10 seconds and add <code>POLARS_HTTP_READ_TIMEOUT_SECONDS</code> and <code>POLARS_HTTP_REQUEST_TIMEOUT_SECONDS</code></li>
+ <li><code>#30279</code> – Don’t finish a sink’s output file when its query fails</li>
+ <li><code>#29450</code> – Report the failing object path in object-store errors</li>
+ <li><code>#30052</code> – Load Delta partition values from the log in <code>scan_delta</code></li>
+</ul>
+<h2>Last words</h2>
+<p>Thanks to everyone who contributed code or filed an issue for this release. If something breaks after upgrading, please <a href="https://github.com/pola-rs/polars/issues">let us know</a>.</p>

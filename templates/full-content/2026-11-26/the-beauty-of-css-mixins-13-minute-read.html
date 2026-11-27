@@ -1,0 +1,227 @@
+<h1>The beauty of CSS mixins</h1>
+<p>I've been playing with CSS mixins recently, and I'm super excited about what this new CSS construct will bring to the way we write CSS. I think the CSS we'll write when CSS mixins are available will look very different from the CSS we write today.</p>
+<h2>What's a mixin?</h2>
+<p>In its simplest form, a mixin is a named piece of CSS code that you define once and can reuse elsewhere in a style sheet. In that sense, it's very similar to a custom property (also known as a CSS variable) or a CSS function.</p>
+<p>The big difference is what mixins can hold:</p>
+<ul>
+ <li>A custom property holds a single value (or part of a value).</li>
+ <li>A CSS function is similar: it can only be used as part of a CSS property value.</li>
+ <li>A mixin, however, holds any number of declarations, including nested rules.</li>
+</ul>
+<p>So, instead of just returning the value <code>red</code>, a mixin can return <code>background: red; color: white; border-radius: 2px;</code> all at once.</p>
+<h2>Why now?</h2>
+<p>My team at Microsoft is implementing mixins in the Chromium open source project. They've covered a lot of ground, and we're getting ready to ship this in Chromium-based browsers. Native CSS mixins are getting very close!</p>
+<p>I can't wait for other browsers to catch up, so that we can all use mixins in earnest.</p>
+<blockquote>
+ <p>CSS mixins are experimental. To try the code snippets and demo in this article, use a recent Chromium browser, open <code>about://flags</code>, and enable the <strong>Experimental Web Platform features</strong> flag.</p>
+</blockquote>
+<h2>Learn to use mixins</h2>
+<p>You define a mixin with the <code>@mixin</code> rule, and you use it with <code>@apply</code>. Mixin names start with two dashes, like custom properties.</p>
+<p>Let's define the <code>--visually-hidden</code> mixin:</p>
+<pre><code>@mixin --visually-hidden \{
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}</code></pre>
+<p>And now, let's use it somewhere else in our code:</p>
+<pre><code>.skip-link \{
+  @apply --visually-hidden;
+}</code></pre>
+<p>That's all you need to do. The browser will apply the mixin's declarations to the element as if they were written directly in the element's style block, so it's exactly as if you had written:</p>
+<pre><code>.skip-link \{
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}</code></pre>
+<p>Except now, you have a nice little reusable mixin that you can apply wherever you need it.</p>
+<h2>Mixin parameters</h2>
+<p>That's not all, a mixin can take parameters, with optional types and default values too. Consider this <code>--button</code> mixin:</p>
+<pre><code>@mixin --button(--bg &lt;color&gt;: royalblue, --fg &lt;color&gt;: white) \{
+  background: var(--bg);
+  color: var(--fg);
+  padding: .5em 1em;
+
+  &amp;:hover \{ background: color-mix(in oklch, var(--bg), black 20%); }
+}</code></pre>
+<p>It applies some colors and spacing to a button-like element, checking that the supplied colors have the right type and falling back to default values if needed. It even handles hover states automatically.</p>
+<p>You can use this mixin either with its default values or by passing your own arguments:</p>
+<pre><code>/* Using the default button styles. */
+.primary \{ @apply --button; }
+
+/* Overriding one of the default button colors. */
+.danger \{ @apply --button(crimson); }
+
+/* Overriding both default button colors. */
+.custom \{ @apply --button(palegreen, black); }</code></pre>
+<p>If you pass more arguments than the mixin has parameters, the <code>@apply</code> does nothing.</p>
+<h2>Conditional mixins</h2>
+<p>A mixin can also hold conditional rules, such as <code>@media</code>, <code>@supports</code> and <code>@container</code>.</p>
+<p>For example, you can create a mixin that applies styles conditionally to the viewport size:</p>
+<pre><code>@mixin --tablet-up \{
+  background: lightgray;
+
+  @media (width &gt;= 48rem) \{
+    background: darkgray;
+  }
+}</code></pre>
+<p>This becomes even more powerful when combined with <code>@contents</code>. See the next section.</p>
+<h2>Mixin contents</h2>
+<p>Arguments are not the only way to customize a mixin. A mixin can also accept an entire block of CSS from the call site. Inside the mixin, <code>@contents</code> marks the spot where that block goes.</p>
+<p>For example, here's a <code>--card</code> mixin that defines a couple of declarations and accepts a block of CSS from where the mixin is used:</p>
+<pre><code>@mixin --card \{
+  padding: 1rem;
+  border: 1px solid;
+
+  @contents;
+}</code></pre>
+<p>When calling the mixin, you can pass other declarations inside a block, which will be inserted at the <code>@contents</code> location within the mixin:</p>
+<pre><code>.note \{
+  @apply --card \{
+    background: lightyellow;
+  }
+}</code></pre>
+<p>Here, <code>.note</code> gets the padding and border from the mixin, and then its own background, in the place where <code>@contents</code> appears.</p>
+<p><code>@contents</code> can have a fallback, which applies when the caller passes no block: <code>@contents \{ background: white; }</code>. If the caller passes an empty block, <code>@apply --card \{}</code>, the fallback does not apply.</p>
+<p>The ability to provide your own block of styles when applying a mixin is very useful, for example when using a mixin as a condition. Consider this mixin:</p>
+<pre><code>@mixin --if-dark-mode \{
+  @media (prefers-color-scheme: dark) \{
+    @contents;
+  }
+}</code></pre>
+<p>You can use it to define styles that only apply in dark mode, while keeping the rest of your CSS unaffected. For example:</p>
+<pre><code>.header \{
+  background: white;
+  color: black;
+  
+  @apply --if-dark-mode \{
+    background: black;
+    color: white;
+  }
+}</code></pre>
+<p>Conditional mixins combined with <code>@contents</code> gives us something we've been wanting for a long time: <strong>named breakpoints</strong>:</p>
+<pre><code>@mixin --mobile \{
+  @media (width &lt; 40rem) \{
+    @contents;
+  }
+}
+
+@mixin --tablet \{
+  @media (40rem &lt;= width &lt; 64rem) \{
+    @contents;
+  }
+}
+
+@mixin --desktop \{
+  @media (width &gt;= 64rem) \{
+    @contents;
+  }
+}</code></pre>
+<p>These mixins don't apply any styles of their own, they just conditionally apply styles that are given to them depending on the media query. This is great because we now have a way to give custom names to a series of responsive design breakpoints that can be maintained in one place.</p>
+<p>Let's use them here to see how clean our responsive design code can be:</p>
+<pre><code>.sidebar \{
+  @apply --mobile \{
+    display: none;
+  }
+
+  @apply --tablet \{
+    inline-size: 12rem;
+  }
+
+  @apply --desktop \{
+    inline-size: 20rem;
+  }
+}</code></pre>
+<h2>Private variables</h2>
+<p>Finally, a mixin can keep private variables to itself, by declaring them in an <code>@private</code> block. The element that applies the mixin can't see these variables:</p>
+<pre><code>@mixin --gradient-text(--from: tomato, --to: gold) \{
+  @private \{
+    --angle: 90deg;
+  }
+  background: linear-gradient(var(--angle), var(--from), var(--to));
+  background-clip: text;
+  color: transparent;
+}</code></pre>
+<h2>An experiment: theming with mixins</h2>
+<p>Mixins are very versatile. You will find many ways to use them, and I don't think there will be one good way and one bad way to use them. Different teams will work out what works for them.</p>
+<p>In this section, I explored one way in which mixins might be used. I don't know if it will make sense in a real project yet, but I found it interesting to try.</p>
+<p>Imagine a white-label website. You own the site and control its markup and default CSS. But you also want your customers to be able to theme the site to match their brand.</p>
+<p>Here's the idea:</p>
+<ol>
+ <li>You write clean, semantic HTML, which contains all of the content.</li>
+ <li>You write the basic CSS for it. This is your white-label version. It has the basic layout, the headers and the sidebars, but no strong colors, no animations, no design direction.</li>
+ <li>You apply <em>undefined</em> mixins in all the logical places of your site. For example, you apply a mixin at the overall page level, another one in the header, another one for the sidebar, and so on. These mixins are not defined, so they do nothing, and you continue to see the default look.</li>
+ <li>You let customers define the mixins. A customer's design is a style sheet that uses the <code>@mixin</code> rule to actually define the mixins which your basic CSS code uses. When that style sheet loads, the definitions apply at every place that uses them.</li>
+</ol>
+<p>In your style sheet, you'd apply mixins like this:</p>
+<pre><code>body      \{ @apply --page; }
+header    \{ @apply --masthead; }
+header h1 \{ @apply --site-title; }</code></pre>
+<p>And your customer could define the mixins something like this:</p>
+<pre><code>@mixin --page \{
+  font: 1.2rem/1.6 Georgia, serif;
+  background: lightyellow;
+}
+
+@mixin --masthead \{
+  background: darkblue;
+  color: white;
+}
+
+@mixin --site-title \{
+  font-size: 2rem;
+  font-weight: bold;
+}</code></pre>
+<h2>But why?</h2>
+<p>You might remember the CSS Zen Garden. It had one HTML page, and anyone could submit a new design by writing a new style sheet for it. It showed the power of clean, semantic HTML, with styles, layouts and animations in a separate file. The designs were wildly different from one another and extremely creative.</p>
+<p>But there's a problem when you do this for customers. You expose your entire markup and it becomes a public API. Customers start writing very specific selectors that depend on how your HTML is organized, and you can't change that HTML any more without breaking their customizations. I've done this at a previous job, and I know how painful this can be.</p>
+<p>The other option is to expose CSS variables. You keep control of your entire HTML and CSS, and only expose a set of customization variables that are used throughout your code. For example, you define a set of color palette variables, a set of spacing variables, typography variables, etc.</p>
+<p>Customers override values only, which is very safe, but can also be limiting. What if they later ask you to have access to the page layout? You now need to expose more variables and make sure they continue working correctly.</p>
+<p>Mixins sit somewhere in between. You remain in control of your HTML and can change it whenever you want. You expose logically named mixins that correspond to the various areas and surfaces of your page.</p>
+<p>As long as you keep applying the same mixins in the right places, customizations continue to work.</p>
+<p>But you can also go much further than variables. Each mixin is an entry point where a customer can add any declarations, pseudo-elements, media queries and animations.</p>
+<h2>The Mixin Zen Garden</h2>
+<p>I built a small demo, heavily inspired by the CSS Zen Garden, to test this: the Mixin Zen Garden (this will only work with a browser that supports CSS mixins).</p>
+<p>It's a simple webpage that has static HTML. The HTML never changes, but you can view the page with different designs that all use CSS mixins as described above:</p>
+<p>Try the six designs:</p>
+<ul>
+ <li>Midnight</li>
+ <li>Paper</li>
+ <li>Brutalist</li>
+ <li>Newspaper</li>
+ <li>Sunset</li>
+ <li>Terminal</li>
+</ul>
+<p>Here are some things I learned while building it:</p>
+<ul>
+ <li>
+  <p>Mixins that do nothing are fine.</p>
+  <p>A design doesn't need to define every mixin. This makes small designs very short.</p></li>
+ <li>
+  <p>One mixin per logical area of the page is more than enough.</p>
+  <p>A design can put colors, spacing, typography, and decorations in the same mixin.</p></li>
+ <li>
+  <p>Name mixins by role.</p>
+  <p>Choose a mixin by what the role of the element is, such as <code>--sidebar-heading</code>, not by how it should look or what it currently is. Every design can decide what that role looks like, and you can change the HTML structure without changing the mixin names.</p></li>
+</ul>
+<p>But, I also discovered limits:</p>
+<ul>
+ <li>
+  <p>Well, I've said this already, but it bears repeating: mixins are experimental.</p>
+  <p>They work in Chromium only, behind a flag.</p></li>
+ <li>
+  <p>Nested selectors can reach into your markup again.</p>
+  <p>A custom design can define a nested selector in a mixin to reach into the HTML markup. For example: <code>@mixin --masthead \{ &amp; h2 \{ ... }}</code>.</p>
+  <p>Doing this exposes your HTML markup again, making it part of the API contract, which we wanted to avoid. Now, if this were to become a real customization mechanism, we could validate custom designs to ensure they only use allowed selectors within mixins.</p></li>
+</ul>
+<h2>What's next</h2>
+<p>Theming is only one use of mixins. Other ideas I want to try:</p>
+<ul>
+ <li>More uses of named breakpoints, because they allow breakpoints to be defined once for the whole site and reused consistently.</li>
+ <li>Mixins across shadow DOM boundaries. A document-level mixin applies inside shadow roots and this feels like a great way to style a component's insides from the page.</li>
+ <li>Enforcing accessibility and progressive enhancement best practices in a central place to ensure your team policies are applied consistently. If developers just apply mixins in their style sheets, then you can ensure best practices from within the mixins themselves.</li>
+</ul>
+<p>CSS mixins might change the way we write and organize CSS pretty profoundly. I'm looking forward to seeing what you build with them. If you try the demo, or experiment with mixins on your own projects, let me know!</p>
