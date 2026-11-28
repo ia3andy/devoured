@@ -1,0 +1,115 @@
+<p>When you fine-tune a large mixture-of-experts (MoE) model, you can end up adding GPUs just to fit the training state. LayerStream, our training engine at Nebius, reduces that memory burden so more of your GPU budget goes into training.</p>
+<p>It keeps optimizer state and saved activations in host memory, then streams each layer’s working state through the GPU when that layer runs.</p>
+<p>On the same 16 NVIDIA H200 GPUs, Qwen3.8-Flash-Next completed a pass over our 25.8-million-token dataset in <strong>7.1 minutes instead of 22.4</strong>. Training throughput was 3.15× that of our tuned Megatron-LM-based trainer, with 68% lower GPU cost per token. Other tested configurations used fewer B300 GPUs or lower-priced H100 GPUs.</p>
+<ul>
+ <li>LayerStream keeps optimizer state and saved activations in host memory, streaming each layer’s working state through the GPU.</li>
+ <li>On the same 16 NVIDIA H200 GPUs, Qwen3.8-Flash-Next trained 3.15× faster at 68% lower GPU cost per token than our tuned Megatron-based trainer.</li>
+ <li>For GLM-5.3-Flash, 16 B300 GPUs delivered 2.97× the throughput of a 24-B300 baseline at 78% lower GPU cost per token.</li>
+ <li>Separate matched-data checks show closely matching loss over one epoch. They do not establish equivalent downstream quality or longer-term convergence.</li>
+</ul>
+<h2>Why a sparse model still needs so much memory</h2>
+<p>MoE models have hundreds of billions of parameters, but each token uses only a small fraction of them. Training still needs to store state for the full model. Under the conventional layout used for our memory estimate, weights, gradients, a full-precision copy and optimizer state require about 18 bytes per parameter. For a 313-billion-parameter model, that is about 5.6 TB before accounting for activations.</p>
+<p>Spreading that state across more GPUs makes the model fit, but it can also increase communication and cost. When experts are distributed across nodes, tokens travel over the network to reach them. GPUs with less memory can require a larger cluster just to hold the model, even when their compute would otherwise be useful.</p>
+<p>LayerStream reduces that memory requirement by changing which state must remain on the GPU throughout training.</p>
+<h2>How LayerStream works</h2>
+<p>When all training state lives in GPU memory, it competes with activations for capacity, and the job is sized by memory instead of compute. LayerStream keeps the optimizer state and saved activations in host memory, and streams each layer’s working state through the GPU only while that layer runs. Four techniques reduce the memory, communication and recomputation overhead.</p>
+<ul>
+ <li><strong>Layer-at-a-time state.</strong> Keep the optimizer state in host memory and build each layer’s working weights on the GPU only while it computes that layer.</li>
+ <li><strong>In-pass updates.</strong> Apply each layer’s weight update during the backward pass, overlapping it with the remaining computation.</li>
+ <li><strong>Tokens stay local.</strong> Tokens reach their experts over the fast links inside a node; what crosses the network between nodes is fixed in size and overlaps with computation.</li>
+ <li><strong>Reuse intermediate results.</strong> Retain expensive forward-pass results for the backward pass, and balance work across GPUs.</li>
+</ul>
+<h3>Layer-at-a-time state</h3>
+<p>GPU memory is scarce and fast. Host memory is large and cheap. LayerStream puts each piece of training state where it is used. The optimizer’s running averages are needed once per step, so they live in host memory and visit the GPU only for their layer’s update. The 16-bit working weights exist only for the layer being computed. A layer’s gradients are used for its update and then freed, so the full set of gradients never sits in GPU memory.</p>
+<h3>In-pass updates</h3>
+<p>The backward pass runs from the last layer to the first. Once it finishes a layer, that layer’s gradients are final, so LayerStream applies the update right away, on the GPU, while the backward pass moves on to the next layer. Each layer’s optimizer state is copied in from host memory ahead of its update and back out afterwards, overlapping with computation. The update follows standard AdamW arithmetic.</p>
+<h3>Tokens stay local</h3>
+<p>In the conventional multi-node expert-parallel layout, each layer’s experts are spread across nodes. Tokens cross the network to reach remote experts and return. That traffic grows with the batch and sits on the critical path. LayerStream arranges expert computation so that tokens reach their experts over the fast links inside a node. What still crosses the network between nodes has a fixed size per layer, whatever the batch, and is scheduled to overlap with computation.</p>
+<h3>Reuse intermediate results</h3>
+<p>Memory-saving trainers usually recompute each layer’s forward pass during the backward pass. LayerStream keeps the expensive intermediate results from the first pass and reuses them. It also sizes large buffers once and balances work across GPUs by modeled cost, to reduce time spent waiting for other GPUs.</p>
+<h3>Training kernels</h3>
+<p>The four techniques above are the design. Kernels are a separate layer on top of it, tuned for each model and GPU generation. LayerStream builds on open-source and vendor kernel libraries, and we wrote or reworked kernels where profiling showed the time was going: mainly in attention, and in fusing several small operations into one pass.</p>
+<h2>Results across three MoE models</h2>
+<p>We evaluate LayerStream on full fine-tuning of three open mixture-of-experts models, in three settings: the same GPUs, fewer GPUs of the same type, and older, cheaper GPUs.</p>
+<table>
+ <thead>
+  <tr>
+   <th>Model</th>
+   <th>Parameters</th>
+   <th>Active per token</th>
+   <th>Experts per layer</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Qwen3.8-Flash-Next</td>
+   <td>177 B</td>
+   <td>6.67 B</td>
+   <td>512, 10 used per token</td>
+  </tr>
+  <tr>
+   <td>GLM-5.3-Flash</td>
+   <td>313 B</td>
+   <td>17.4 B</td>
+   <td>288, 8 used per token</td>
+  </tr>
+  <tr>
+   <td>MiniMax-M3.1-Flash</td>
+   <td>427 B</td>
+   <td>23.5 B</td>
+   <td>128, 4 used per token</td>
+  </tr>
+ </tbody>
+</table>
+<h3>Throughput and GPU cost</h3>
+<table>
+ <thead>
+  <tr>
+   <th>Setting</th>
+   <th>Model</th>
+   <th>GPUs: baseline → LayerStream</th>
+   <th>Throughput ratio</th>
+   <th>GPU cost per token</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Same GPUs</td>
+   <td>Qwen3.8-Flash-Next</td>
+   <td>16 H200 → 16 H200</td>
+   <td>3.15×</td>
+   <td>68% lower</td>
+  </tr>
+  <tr>
+   <td>Fewer GPUs</td>
+   <td>GLM-5.3-Flash</td>
+   <td>24 B300 → 16 B300</td>
+   <td>2.97×</td>
+   <td>78% lower</td>
+  </tr>
+  <tr>
+   <td>Cheaper GPUs</td>
+   <td>GLM-5.3-Flash</td>
+   <td>24 B300 → 32 H100</td>
+   <td>3.1×</td>
+   <td>80% lower</td>
+  </tr>
+  <tr>
+   <td>Cheaper GPUs</td>
+   <td>MiniMax-M3.1-Flash</td>
+   <td>32 B300 → 32 H100</td>
+   <td>1.08×</td>
+   <td>56% lower</td>
+  </tr>
+ </tbody>
+</table>
+<h2>Loss parity on matched data</h2>
+<p>We also checked whether the changes alter the training trajectory: GLM-5.3-Flash trained for one full epoch (25.8 million tokens, 18 steps) with LayerStream and with our Megatron-based trainer, on the same data, the same packs at every step, and matching optimizer hyperparameters.</p>
+<ul>
+ <li><strong>Closely matching loss curves.</strong> From the first update on, the Megatron-based run stays within 0.003 of LayerStream at every step, as close as two LayerStream runs are to each other.</li>
+ <li><strong>Small loss differences with 16-bit optimizer state.</strong> Against the Megatron-based trainer with full 32-bit optimizer state, LayerStream with 16-bit state stays within 0.0022 from the first update on.</li>
+ <li><strong>AdamW update checks.</strong> With 32-bit optimizer state, LayerStream’s update performs the same operations in the same order as PyTorch’s reference AdamW, so every updated weight is bit-identical.</li>
+</ul>
+<p>All reported runs train without gradient clipping. LayerStream updates layers before the full-model gradient norm is available, so exact global gradient clipping is not supported by this update scheme.</p>
+<h2>What to compare for your own workload</h2>
+<p>For your own workload, compare three things together: whether the model fits, how quickly the complete job processes tokens, and the GPU cost of processing them. Use matched data and training settings, then evaluate the resulting model on your tasks. A lower hourly GPU price is useful only if the full configuration delivers the throughput and quality you need.</p>

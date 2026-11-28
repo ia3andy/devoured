@@ -1,0 +1,54 @@
+<h1>Plato’s Key</h1>
+<p>The Platonic Representation Hypothesis (PRH) posits that neural networks converge toward a shared representation of reality. Prior work shows that separately trained models learn geometrically similar representations, but similar does not mean interchangeable. Can one LLM use another’s representations in place of its own, without gradient descent?</p>
+<p>Yes, and the map is surprisingly simple. A rotation and one global scale, fit in closed form, let one LLM use another’s representations. We demonstrate this on factual recall across 12 base LLMs from eight families (1.5B–27B parameters).</p>
+<p>For example, a recipient LLM prompted with “The capital of Germany is” answers “Berlin”. We take a donor LLM’s hidden state at “France”, rotate and scale it, and swap it in for the recipient’s state at “Germany”. The recipient’s answer flips to “Paris”.</p>
+<p><strong>Extract.</strong> Take the donor’s hidden state at “France”.</p>
+<p><strong>Map.</strong> Rotate and scale the state into the recipient’s representation space.</p>
+<p><strong>Swap.</strong> Replace the recipient’s state at “Germany”. The recipient now answers “Paris” instead of “Berlin”.</p>
+<p>Our main findings:</p>
+<ol>
+ <li><strong>Rotations transfer factual representations across LLMs.</strong> Our map achieves a median transfer accuracy of 41%, compared to 55% when we swap in the recipient’s own “France” state (self-swap). More flexible maps (e.g., ridge regression) rarely transfer better.</li>
+ <li><strong>Rotations chain across LLMs and work in lower dimensions.</strong> A chain of rotations (A → B → C) retains a median 99% of a direct rotation’s accuracy (A → C). A rotation using just 256 principal components per LLM retains a median 74% of a full rotation’s accuracy.</li>
+ <li><strong>Rotations unlock dark memories in another LLM.</strong> A rotated donor state recovers 18% of the recipient’s dark memories, facts it stores but fails to recall. This suggests that factual recall can fail because of an ineffective representation rather than missing knowledge in the LLM’s weights.</li>
+</ol>
+<p>These findings point toward a shared, lower-dimensional structure across LLMs, opening up new research directions such as latent communication.</p>
+<h2>1 Rotations transfer factual representations</h2>
+<p>Geometric similarity does not show whether one LLM can use another’s representations, so we test this directly on factual recall.</p>
+<p>Factual recall in LLMs resembles a key–value lookup: early-to-middle layers build a key at the last subject token (“France”), which later layers use to retrieve the value (“Paris”) from the weights. We swap the key rather than the value, leaving the recipient’s later layers to retrieve the answer. If this single hidden-state swap changes the answer to “Paris”, the representation has transferred.</p>
+<p>Our map aligns keys across frozen LLMs using only a rotation and one global scale, fit in closed form on fewer than 5,000 training facts that both LLMs recall.</p>
+<p>Let μA, μB be the mean keys and Z~A, Z~B the centered key matrices (one key per column) of the donor and recipient, respectively. We compute the orthogonal Procrustes rotation R via a thin SVD and choose the global scale s to roughly match the recipient’s overall spread: z^B = μB + sR(zA − μA), R = UV⊤, Z~B Z~A⊤ = UΣV⊤, s = ∥Z~A∥F / ∥Z~B∥F</p>
+<p>Here, “rotation” includes reflections and semi-orthogonal maps between different hidden dimensions.</p>
+<p>We test the map on 20 model pairs using 8,800 facts, each a subject and its answer under one of 16 relations, such as capitals and authors. Our 12 base LLMs span eight families (1.5B–27B parameters). For each pair, we use only facts that both LLMs recall on their own. We measure transfer accuracy as the percentage of swaps that make the recipient generate the donor’s answer. We split facts by subject into training, validation, and test sets: we fit the map on training facts, select the swap layers (ℓA in the donor and ℓB in the recipient) that maximize validation transfer accuracy, and report test results.</p>
+<ul>
+ <li><strong>Our rotation achieves a median transfer accuracy of 41%</strong> (range: 34–46%). For comparison, self-swap achieves a median accuracy of 55%. In a self-swap, we replace the recipient’s key for “Germany” with its own key for “France” at layer ℓB. Since information about “Germany” remains in other tokens and layers, the answer does not always flip. We use self-swap as our reference since it requires no cross-model mapping. Across model pairs, our rotation retains a median 73% of self-swap accuracy (range: 60–93%). Retention is similar for cross-family and within-family pairs (75% vs. 69%).</li>
+ <li><strong>Other maps rarely beat our rotation.</strong> At the same swap layers (ℓA, ℓB), ridge regression without rescaling, a whitened rotation, and a trained MLP significantly outperform our rotation in only 7% of comparisons. Rescaling makes ridge regression competitive, while a least-squares scale never significantly improves transfer accuracy. Both suggest that keeping the recipient’s usual scale matters, and least-squares fits underestimate it. Even without paired facts, Wasserstein Procrustes achieves a median 87% of our rotation’s accuracy.</li>
+ <li><strong>Geometric similarity does not guarantee functional transfer.</strong> We use mutual nearest-neighbor similarity (mKNN), the primary metric in the PRH paper, to select swap layers. On the same validation set, selecting layers by mKNN yields a median transfer accuracy of 4.5%, about a tenth of what selecting by transfer accuracy achieves. mKNN usually peaks within the first 5% of the recipient’s depth, while transfer accuracy peaks at 22–38% of the depth.</li>
+</ul>
+<p>Representations can be geometrically similar without being functionally interchangeable. Yet a simple change of coordinates lets one LLM use another’s representations.</p>
+<h2>2 Rotations chain and work in lower dimensions</h2>
+<p>Rotations align pairs of LLMs, but do all LLMs share one underlying geometry? If so, a chain of rotations (A → B → C) should transfer nearly as well as a direct rotation (A → C). We also ask how many dimensions factual transfer needs.</p>
+<p><strong>Chaining.</strong> A chain of rotations (A → B → C) retains a median 99% of the transfer accuracy of a direct rotation (A → C).</p>
+<p><strong>Compression.</strong> A rotation fit on the top 256 principal components retains a median 74% of the full rotation’s transfer accuracy. With just 16 components, the median drops to 4%.</p>
+<p><strong>Shared space?</strong> Both results are consistent with LLMs being rotated views of one shared, lower-dimensional space.</p>
+<ul>
+ <li><strong>A chain of rotations retains a median 99% of the direct rotation’s transfer accuracy.</strong> For LLMs A, B, and C, we compose the (A → B) and (B → C) maps without using the direct (A → C) map or running B. The recipient layer of (A → B) is the donor layer of (B → C). We evaluate both the chained and direct maps at the same endpoint layers on test facts that all three LLMs recall. Of the 47 chains, 40 retain at least 95% of the direct rotation’s accuracy, and none falls below 92%.</li>
+ <li><strong>A rotation using 256 principal components per LLM retains a median 74% of the full rotation’s transfer accuracy.</strong> We reduce each LLM’s original width (1,536–5,120 dimensions) to its top principal components, fit the map, and set the recipient’s remaining components to their training mean. The median relative accuracy rises from 4% with 16 components to 87% with 512, with diminishing gains beyond 256 components.</li>
+</ul>
+<p>Rather than a map for every pair, each LLM might need just one rotation into a shared, lower-dimensional space.</p>
+<h2>3 Rotations unlock dark memories</h2>
+<p>So far, we have used rotations to change what an LLM recalls, but could we also use this shared geometry to rescue failed recall? Prior work shows that LLMs store facts they fail to recall, which we call dark memories. As a proof of concept, we use a rotated key from another LLM to unlock them.</p>
+<p><strong>Own key.</strong> With its own key for “Interstellar”, the recipient answers “Denis Villeneuve”.</p>
+<p><strong>Donor key.</strong> We swap in the donor’s rotated and scaled key for “Interstellar”.</p>
+<p><strong>Unlock.</strong> The donor’s key retrieves the stored answer from the recipient’s memory: “Christopher Nolan”.</p>
+<ul>
+ <li><strong>More than half of the misses we test qualify as dark memories.</strong> We collect 2,600 misses from our 20 model pairs: test facts that the donor recalls on a direct prompt but the recipient does not. We count a miss as a dark memory if the recipient passes at least one of three checks: answering correctly with three in-context examples, answering correctly under a paraphrased prompt, or ranking the correct answer first among up to 50 answers within the same relation. In total, 56% of the recipient’s misses (1,463) qualify as dark memories.</li>
+ <li><strong>A rotated donor key recovers 18% of these dark memories.</strong> We recover 267 of the recipient’s dark memories by swapping in rotated donor keys, without updating any weights. No control recovers more than 1.1% of them.</li>
+</ul>
+<p>Some failures of factual recall can be rescued by changing the key rather than the weights. A simple change of coordinates lets one LLM unlock another’s dark memories.</p>
+<h2>Looking ahead</h2>
+<p>A closed-form rotation and scale let one LLM use another’s representations for factual recall. We read this as functional evidence for the PRH: the representations are not just similar but partly interchangeable. This also fits our lab’s view of MLPs as Hebbian memories, and suggests that one LLM’s rotated keys can query another’s memory.</p>
+<p>We’re very excited to explore two directions:</p>
+<ul>
+ <li><strong>Understanding the shared geometry.</strong> Exploring whether LLMs share a universal representation space and whether our findings extend to multi-hop reasoning, post-trained LLMs, larger models, and other modalities.</li>
+ <li><strong>Building more efficient systems.</strong> Porting knowledge across models without retraining, reusing each other’s hidden states for cheaper inference, and communicating directly through latent representations (Neuralese).</li>
+</ul>

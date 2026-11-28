@@ -1,0 +1,104 @@
+<h1>Why I'm Bullish on MCP for 2027</h1>
+<p>MCP went through the full hype cycle in the last 18 months. Early excitement turned into backlash and confusion fast, with context bloat as the main complaint. When Skills arrived, most developers moved to CLIs and progressive disclosure instead. I never believed in that, and that sentiment is now changing.</p>
+<p>At Linear and Notion, agents now create roughly half of all issues (~2.4M/week) and pages, with Notion reporting 60x MCP traffic growth. At Atlassian, MCP handles over 5M tool calls per workday, and 44% of those users sit outside software teams where CLIs were never an option. At Neon, agent usage over MCP grows 14% week over week, and even Apple now ships local MCP servers for Pages, Numbers, and Keynote.</p>
+<p>The protocol is healthy and actively improving. The 2026-07-28 spec dropped stateful sessions and added official extensions, and clients are getting smarter about how they use them.</p>
+<p>I'm bullish on MCP going into 2027.</p>
+<h2>Code Mode, structured outputs, and multimodality</h2>
+<p>Real tasks almost always take more than 1 tool call, e.g. you list open issues, grab details, check errors, and write a summary.</p>
+<p>With plain tool calling, every step needs another model turn and dumps information into the context. Joining data across 2 MCP servers uses the model's context as memory for intermediate payloads.</p>
+<p>Code Mode is changing how agents call MCP servers. Instead of putting 50 tool schemas into the prompt and calling 1 tool per turn, the harness gives the model a sandbox and exposes MCP tools as callable functions. It's already becoming the default in OpenCode 2.0, Claude Code, OpenAI Codex, Pi, and Factory Droid.</p>
+<p>Code Mode works best when the model knows what a tool returns before writing code. When an MCP server declares <code>outputSchema</code> alongside <code>inputSchema</code>, the client can generate typed stubs upfront and pass back <code>structuredContent</code> directly. The model chains multiple calls in 1 script, filters and joins in memory where compute is cheap, and returns only what matters.</p>
+<pre><code>// Auto-generated from MCP inputSchema + outputSchema
+// interface LinearIssue \{ identifier: string; title: string; priority: number }
+// interface SentryStats \{ count24h: number; p95Ms: number }
+//
+// declare const linear: \{
+//   listIssues(args: \{ team: string; state: "open" | "closed" }): Promise&lt;\{ items: LinearIssue[] }&gt;;
+// };
+// declare const sentry: \{
+//   getIssueStats(args: \{ query: string }): Promise&lt;SentryStats&gt;;
+// };
+ 
+// Model writes 1 script instead of N tool-calling turns
+const issues = await linear.listIssues(\{ team: "core", state: "open" });
+const p0s = issues.items.filter(i =&gt; i.priority === 1);
+ 
+const errors = await Promise.all(
+  p0s.map(i =&gt; sentry.getIssueStats(\{ query: i.identifier }))
+);
+ 
+// Only the joined summary enters model context
+return p0s.map((i, idx) =&gt; (\{
+  id: i.identifier,
+  title: i.title,
+  events24h: errors[idx].count24h,
+}));</code></pre>
+<p>Compared to CLIs, MCP servers are natively multimodal. A tool call can return typed <code>structuredContent</code> for code alongside separate image, audio, or embedded resource blocks.</p>
+<p>Auth is also cleaner. CLIs and raw <code>curl</code> force you to store API keys on disk or in environment variables with broad permissions. An MCP client handles per-user OAuth 2.1 login flows and scoped tool permissions outside the sandbox, so connecting a remote SaaS product works without handing raw credentials to the agent.</p>
+<h2>Skills move inside MCP</h2>
+<p>The debate of Skills plus a CLI versus MCP might come to an end as well. So far teams shipped CLIs or MCP servers and maintained separate <code>SKILL.md</code> files to teach agents how to use them.</p>
+<p>The Skills extension (<code>io.modelcontextprotocol/skills</code>) brings Agent Skills inside MCP. Each skill exposes a <code>skill://</code> URI, parsed YAML frontmatter, and a file manifest with SHA-256 digests. Those digests solve one of the biggest headaches with Agent Skills: keeping them updated across a team. When a vendor updates a skill on the server, the digest changes and clients pull the new version automatically instead of relying on manual file syncs.</p>
+<p>Anthropic just shipped Skills over MCP in public beta across Claude and Claude Code, letting servers like Shopify, HubSpot, and Atlassian serve playbooks tailored to each logged-in user's account or organization.</p>
+<p>The lifecycle stays light on context:</p>
+<ol>
+ <li>On connect, the harness calls <code>skills/list</code> and injects only the short <code>name</code> and <code>description</code> from <code>frontmatter</code> into the system instructions.</li>
+ <li>When the agent needs a skill, the harness calls <code>resources/read</code> (or <code>skills/get</code> for unlisted skills) to load the full <code>SKILL.md</code> into context, or caches the files to a local path keyed by the <code>sha256</code> digest so the agent can read them from disk.</li>
+</ol>
+<pre><code>// 1. skills/list response (metadata goes into system instructions)
+\{
+  "uri": "skill://jira/SKILL.md",
+  "frontmatter": \{
+    "name": "jira-triage",
+    "description": "Format and route bug tickets for engineering teams"
+  },
+  "resources": [
+    \{ "uri": "skill://jira/SKILL.md", "size": 2410, "sha256": "sha256:9f3a...c812" }
+  ]
+}</code></pre>
+<h2>Always-on and multiplayer agents with MCP Events</h2>
+<p>The next step for agents is multiplayer and always-on workflows. Until recently, MCP integrations were strictly pull-based: they couldn't receive notifications or wake an agent up when something happened in an external system.</p>
+<p>The MCP Events extension (now in beta) changes that. A server advertises <code>io.modelcontextprotocol/events</code> in <code>server/discover</code> and lists available events via <code>events/list</code>. A harness can expose a subscribe tool or user actions across servers, and the MCP client runs the subscription in the background using 1 of 3 delivery modes:</p>
+<ul>
+ <li><strong>Webhook (<code>events/subscribe</code>):</strong> The server sends signed HTTP POST requests to a host callback URL while the user is away.</li>
+ <li><strong>Push (<code>events/stream</code>):</strong> The server streams live updates over an open connection, like build or deploy logs.</li>
+ <li><strong>Poll (<code>events/poll</code>):</strong> The client checks on a timer. Useful for local CLIs and desktop apps without a public URL.</li>
+</ul>
+<p>Take a P0 security alert at 2 a.m. or an urgent customer email. When an event fires, the MCP client tracks the <code>cursor</code>, deduplicates by <code>eventId</code>, and hands the payload to the harness. The harness wakes the agent, which pulls logs or recent thread history and posts a triage summary before anyone checks their inbox. Early servers like Shop MCP (order updates) and Vercel (<code>deployment.succeeded</code>) already ship event support. Combined with MCP Tasks (<code>io.modelcontextprotocol/tasks</code>), agents can handle async workflows without custom webhook glue.</p>
+<p>Remote or durable harnesses like ChatGPT expose a callback endpoint so agents can wake up while you're offline. The model or user sets the event filters and standing instructions once, and the MCP client registers the callback under a renewable TTL.</p>
+<pre><code>// 1. MCP client registers the harness's callback endpoint
+\{
+  "method": "events/subscribe",
+  "params": \{
+    "name": "security.alert.opened",
+    "arguments": \{ "severity": "p0" },
+    "delivery": \{
+      "type": "webhook",
+      "callbackUrl": "https://host.example/mcp/webhook/sub_01H",
+      "secret": "whsec_..."
+    }
+  }
+}
+ 
+// 2. Server POSTs the event occurrence when the alert fires
+\{
+  "eventId": "evt_9821",
+  "timestamp": "2026-11-24T02:14:00Z",
+  "name": "security.alert.opened",
+  "cursor": "cur_00491",
+  "data": \{ "alertId": "SEC-412", "service": "auth-api", "severity": "p0" }
+}</code></pre>
+<p><strong>Continuation:</strong> When a webhook POST arrives, the harness injects the event back into the <strong>same trajectory</strong> (the subscribed chat thread) or spawns a <strong>new isolated trajectory</strong> per alert.</p>
+<h2>Products are becoming agent-native with MCP Apps</h2>
+<p>Raw JSON and plain text aren't enough when you want to inspect a p95 latency chart, filter a live dashboard, or browse a design deck. MCP Apps (<code>io.modelcontextprotocol/ui</code>) let servers return sandboxed interactive HTML views (<code>text/html;profile=mcp-app</code>) directly inside compatible clients instead of forcing you across 4 browser tabs.</p>
+<h2>What still needs work</h2>
+<p>There are still real gaps to sort out:</p>
+<ul>
+ <li><strong>Observability and intent:</strong> MCP servers only see tool calls and miss the user's conversation. Passing <code>telemetry.intent</code> metadata or exposing feedback tools helps, though most servers still don't know why they were called.</li>
+ <li><strong>Discovery:</strong> Submitting your server to 5 different registries doesn't scale. We need cleaner discovery patterns like <code>/.well-known</code> with automated security scanning.</li>
+ <li><strong>Security:</strong> Untrusted webhook payloads, Code Mode sandboxes, and embedded UI iframes all widen the prompt-injection surface.</li>
+</ul>
+<h2>Beyond remote tool calls</h2>
+<p>MCP is moving past simple tool calls. Clients are growing into full runtimes that combine Code Mode, typed outputs, Agent Skills, async Tasks, Events, and embedded UI in 1 protocol.</p>
+<p>I think the best agent harnesses in 2027 will win on their MCP integration, and the harness itself should be an MCP server too.</p>
+<p>Instead of inventing a custom multi-agent protocol, a harness can expose its own MCP server so agents coordinate with the same primitives they already use. Subagents run as MCP Tasks. A shared "swarm board" exposes tools to post findings and claim work. MCP Events wake the coordinator or peer agents when a task finishes or a new update lands.</p>
+<p>Good MCP servers expose tools for agents, not agents as tools. Wrapping an entire SaaS product behind a single <code>ask_agent</code> endpoint starves it of the context your agent already holds. Keep regular servers focused on clean, typed tools and structured data so your own agent can combine them, and reserve agent-as-MCP-server for long-running coordination across subagents, teams, or companies.</p>

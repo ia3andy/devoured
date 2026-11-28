@@ -1,0 +1,96 @@
+<h2>How the Curse of Depth Changed My Perspective on Efficient AI</h2>
+<p>At first glance, moving from model compression to Looped Transformers may seem like a big leap, but once you see the Curse of Depth as the thread connecting them, I believe the journey makes sense.</p>
+<p>For years, I tried to make neural networks smaller. Eventually, that work made me question why we were making them deeper.</p>
+<p>Before the current LLM era, much of my research was about model compression: pruning weights, reducing precision, and finding ways to preserve performance with fewer resources. I became used to asking which parts of a convolutional network we could afford to remove.</p>
+<p>When I started working on LLMs, a familiar pattern reappeared. Layers were not equally sensitive to compression. Often, we could compress substantial parts of the deeper network more aggressively than the early layers.</p>
+<p>At first, that looked like good news. It gave us a useful way to allocate a compression budget. But the longer I thought about it, the more it bothered me.</p>
+<p><strong>If the deeper layers are so easy to remove, what did we gain by putting them there?</strong></p>
+<p>That question gradually changed the direction of my research. It led from LLM pruning to the Curse of Depth, from normalization to residual connections, and eventually to Looped Transformers. Looking back, these projects feel like different stages of the same investigation: how do we make additional computation actually matter?</p>
+<p>This is a personal account of that journey, rather than a survey. I use “I” for the questions that motivated me and “we” for the research carried out with my collaborators.</p>
+<h2>1. A useful compression trick becomes an uncomfortable question</h2>
+<p>Compression teaches you to look at a model differently. Instead of taking its architecture at face value, you start probing it. Remove some weights. Reduce their precision. Observe where the model breaks—and where it barely notices.</p>
+<p>A model may look uniform on paper: the same block, repeated many times. Its sensitivity to these interventions can be anything but uniform.</p>
+<p>That was the starting point of our work on Outlier Weighed Layerwise Sparsity, or OWL. Rather than assigning the same sparsity to every layer, OWL uses the layerwise distribution of outliers to allocate different pruning ratios. Layers with more outliers are treated more conservatively.</p>
+<p>For a compression researcher, this is an opportunity. At a given overall sparsity, preserving sensitive layers and pruning less sensitive ones more heavily can produce a better model than treating every layer identically.</p>
+<p>But I began to see the same observation from the opposite direction.</p>
+<p>Imagine that compression is no longer your main concern. You are designing and training the original model. You pay for those deeper layers during training and inference. You expect them to perform additional transformations—to refine a representation, develop a useful feature, or carry out another stage of computation.</p>
+<p>If substantial parts of that depth can be removed with little consequence, perhaps the model is not using its architecture as effectively as we hoped.</p>
+<p>Of course, compressibility alone does not prove that a layer is useless. Redundancy can be helpful, and removing weights is not the same experiment as removing an entire block. But it gives us a reason to investigate.</p>
+<p>The question I wanted to answer had changed. I was no longer satisfied with knowing <strong>where we could compress more</strong>. I wanted to understand <strong>why there was so much room to compress in the first place</strong>.</p>
+<h2>2. The Curse of Depth: a deep network can behave less deeply than it looks</h2>
+<p>After thinking about this for a few days, I kept returning to something that initially seemed like a small architectural detail: where normalization sits relative to the residual connection.</p>
+<p>Pre-LN and Post-LN arrange almost the same components differently. Writing one residual sublayer schematically:</p>
+<pre><code>Pre-LN: xℓ+1 = xℓ + Fℓ(LN(xℓ))
+Post-LN: xℓ+1 = LN(xℓ + Fℓ(xℓ))</code></pre>
+<p>In Pre-LN, the branch receives normalized input, but the accumulated residual stream bypasses that normalization. In Post-LN, normalization acts after the addition.</p>
+<p>We compared their behavior. In controlled models, the contrast was striking: deeper Post-LN layers became more distinct and more consequential, whereas deeper Pre-LN layers tended to change the representation less. Our Curse of Depth paper investigated this empirically and theoretically.</p>
+<p>The mechanism centers on residual-stream variance. As its scale grows, the normalized residual branch can become less influential relative to the identity path. Under the analyzed growth conditions, the block Jacobian approaches the identity: Jℓ = I + JFℓ JLN ≈ I.</p>
+<p>This is a subtle failure mode. Information can still pass through the network, but later blocks contribute progressively less transformation. A near-identity Jacobian is a statement about local sensitivity; it does not, by itself, mean the block output is exactly its input. The layer-removal and representation analyses provide complementary evidence of underused depth.</p>
+<p>We called this phenomenon the <strong>Curse of Depth</strong>.</p>
+<p>The phrase captures the distinction that had been bothering me since the pruning experiments: architectural depth is easy to count; useful computational depth has to be earned.</p>
+<p>Our first response was LayerNorm Scaling: scale the normalized branch input by 1/√ℓ. This controls variance growth and improves depth utilization while retaining the Pre-LN structure.</p>
+<p>What stayed with me was the broader lesson. The residual pathway is part of the computation. Its design influences whether the next layer meaningfully changes anything.</p>
+<h2>3. Attention Residuals: changing how a model reads its own depth</h2>
+<p>By this point, I had become increasingly interested in residual connections themselves. We had found a way to improve their behavior through scaling. But I wanted to know how much more could change if we reconsidered the way information moves across depth.</p>
+<p>Then Kimi’s Attention Residuals appeared.</p>
+<p>For me, it was a game changer conceptually. Standard residual addition accumulates previous updates with fixed unit weights. Attention Residuals lets a layer selectively combine earlier representations using learned, input-dependent weights.</p>
+<p>The idea shifts attention toward the history of computation inside the model. A layer can choose which earlier representations to read, rather than relying entirely on one accumulated sum. Full AttnRes keeps access to preceding outputs; Block AttnRes groups them to reduce overhead.</p>
+<p>This connected directly to the question that compression had raised for me. Perhaps deeper layers were underperforming partly because of the way we delivered information to them. Changing that delivery mechanism could change what additional depth was worth.</p>
+<p>We wanted to test this systematically. In DepthBench, we compared residual and normalization designs while varying the width–depth tradeoff under approximately fixed parameter budgets and a shared pretraining recipe.</p>
+<p>The results made the distinction concrete. In the tested settings, standard Pre-LN and many normalization or scaling variants gained little—or became worse—as models became deeper and narrower. Full Attention Residuals and Hyper-Connections benefited much more consistently.</p>
+<p>This was also a useful reminder of the limits of our earlier solution. LayerNorm Scaling addressed an identified pathology, but that did not mean it solved every challenge of depth scaling. DepthBench pushed us to ask a harder question: which architectures make a greater allocation of capacity to depth worthwhile?</p>
+<p>There are qualifications. Fixed parameters and a shared training recipe do not make all costs identical. Full AttnRes and Block AttnRes also behaved differently in this benchmark. The result is evidence for particular architectures and settings, rather than a claim that every attention-based residual design will always win.</p>
+<p>Still, my interpretation was clear: <strong>the residual connection helps determine whether depth is a productive scaling axis at all.</strong></p>
+<h2>4. Looped Transformers: the same question, with shared weights</h2>
+<p>Around this stage, Looped Transformers became a natural next direction for me.</p>
+<p>An ordinary deep Transformer applies different blocks in sequence. A looped model repeatedly applies shared blocks. It offers another way to increase computational depth without duplicating the main backbone parameters.</p>
+<p>That is an appealing proposition for someone who came from compression. Instead of asking how much of a large model we can remove, we can ask how much computation we can obtain from a smaller set of weights.</p>
+<p>But parameter reuse does not automatically imply useful computation reuse.</p>
+<p>Each additional loop needs to do something worthwhile. If it mostly preserves the previous state, repeats an unhelpful update, or pushes the representation farther from what the task needs, we have increased the computation without getting the benefit we wanted.</p>
+<p>Weight sharing also makes recurrence a demanding setting for residual design. The same transformations act repeatedly on their own evolving outputs. In our experiments, uncontrolled residual accumulation amplified variance growth and representation drift. For MoE models, we also observed a separate problem: shared routers could repeatedly choose similar experts, limiting diversity across loops.</p>
+<p>This is the connection to the Curse of Depth. Looping gives us more architectural computation; it does not guarantee that the model can use it.</p>
+<h3>Carry useful history without keeping all of it</h3>
+<p>Attention Residuals suggested a compelling direction: allow later computation to reuse earlier representations more selectively. But retaining and attending over an ever-growing history becomes expensive as the number of iterations increases.</p>
+<p>This led us toward a loop-friendly alternative in LOOM: a Looping Residual based on a normalized exponential moving average.</p>
+<p>Instead of retaining every output, maintain an accumulator and its normalization: N ← βN + o; D ← βD + 1; r = N / D.</p>
+<p>Here, o is the current scaled attention output. The resulting summary weights past outputs exponentially by recency. LOOM uses a fixed decay β = 0.5, with a global memory across layers and loops and a local memory that resets each loop.</p>
+<p>I think of this as carrying a central motivation of Attention Residuals into a recurrent setting: give subsequent computation access to useful history. The mechanism is different, though. A fixed-decay EMA is not content-dependent softmax attention, nor an exact replacement for it. It trades flexible retrieval of individual past states for a compact recurrent summary.</p>
+<p>A fixed decay is only a starting point. <strong>I believe we can do better by learning how quickly the model should forget.</strong></p>
+<h3>Beating Non-Looped Transformers Under Matched FLOPs</h3>
+<p>The result that matters most to me is that <strong>LOOM can outperform a non-looped Transformer under a near-matched FLOP budget.</strong> This asks whether recurrent depth is a better way to spend a given amount of computation—a direct continuation of the efficiency question that motivated my compression research.</p>
+<p>In our 700M-parameter comparison, all models are trained on 10B tokens. We keep the backbone dimensions fixed and reduce the number of activated experts per pass as we increase the number of loops, keeping the estimated per-token compute approximately constant. At five loops, LOOM reduces validation perplexity and improves average zero-shot accuracy relative to the non-looped baseline.</p>
+<p>For me, this is evidence that <strong>how we organize computation matters, even when its budget is held approximately fixed.</strong></p>
+<h3>Latent Overthinking: When More Loops Undo Earlier Progress</h3>
+<p>There is another reason why useful depth matters: additional computation can actively make a model worse.</p>
+<p>In our InfiLoop paper, we observed a phenomenon we call <strong>latent overthinking</strong>. A looped model can reach a correct intermediate deduction—or even a complete solution—and then overwrite it in subsequent iterations. More computation becomes an opportunity to lose progress.</p>
+<p>This made the limitation of the usual “carry-last” rule especially clear to me. When every new recurrent output becomes the next state, the model has to preserve everything useful through that latest output. A noisy update can damage what earlier iterations worked to establish. The newest state is not necessarily the best state to carry forward.</p>
+<p>Our answer is to change the connection between iterations. <strong>InfiLoop’s loop-native attention residual learns what to retain from earlier computation and how strongly to accept a new update.</strong> It combines content scores with learned temporal decay in a running summary, so later iterations can build on useful history without storing every past state.</p>
+<p><strong>This addresses the observed latent-overthinking failure:</strong> in the reported post-solution window, InfiLoop preserves the solutions that the carry-last baseline can lose. In longer Sudoku-Extreme evaluations, it continues improving beyond 20,000 effective steps, measured as executed Transformer layers.</p>
+<p>For me, this adds another requirement to depth scaling. A model needs to make progress, but it also needs to protect that progress. Learning when to preserve a good state is part of learning how to reason for longer.</p>
+<h2>Looking back—and forward</h2>
+<p>I did not start with a plan to move from pruning to recurrent architectures. I started with a practical question about efficiency, and an observation that became increasingly difficult to ignore.</p>
+<p>Compression showed me where a model could afford to lose capacity. The Curse of Depth made me ask why that capacity was underused. Attention Residuals and DepthBench made the information pathway itself a central object of study. Looped Transformers brought the question back to efficiency: can a compact set of parameters support a much longer sequence of useful computation?</p>
+<p>I still care about making models smaller. But I now see another side of the same goal: making the computation we retain more valuable.</p>
+<p>The question that connects this journey is simple:</p>
+<p><strong>How can we continue to improve a model’s capacity when resources are limited?</strong></p>
+<p>Several questions now guide how I think about the next steps:</p>
+<ul>
+ <li><strong>How can we reduce the computational cost of Looped Transformers?</strong></li>
+ <li><strong>How should a model decide where to spend additional computation?</strong></li>
+ <li><strong>What should a compact recurrent memory retain, and when should it forget?</strong></li>
+ <li><strong>How should we divide a limited budget between parameters and recurrent depth?</strong></li>
+ <li><strong>Can compression and recurrence be designed together?</strong></li>
+</ul>
+<p>These questions bring me back to where I started: how to get more capability from the resources we have.</p>
+<h2>Papers along the way</h2>
+<ol>
+ <li>The Unreasonable Effectiveness of Random Pruning: Return of the Most Naive Baseline for Sparse Training.</li>
+ <li>Sparse Training via Boosting Pruning Plasticity with Neuroregeneration (GraNet).</li>
+ <li>OWL: A Missing Secret Sauce for Pruning LLMs to High Sparsity.</li>
+ <li>The Curse of Depth in Large Language Models.</li>
+ <li>Attention Residuals — Kimi Team.</li>
+ <li>DepthBench: Measuring How Residual Connections Enable More Computational Depth.</li>
+ <li>Looping Beyond Twice: A Scalable Recipe for Looped Mixture-of-Experts.</li>
+ <li>Scaling to Tens of Thousands of Test-Time Iterations with Loop-Native Attention Residuals (InfiLoop).</li>
+ <li>FlashLoop: Fast and Memory-Efficient Looped Transformers via Lazy Updates.</li>
+</ol>

@@ -1,0 +1,124 @@
+<h1>Your CI Pipeline Just Failed With "System Failure" (Again). Here's What That Actually Means</h1>
+<p>Stop guessing why your CI pipeline failed. Learn how to decode opaque errors like 'exit status 1' and 'OOM killed' by finding the true cause in your logs.</p>
+<p><strong>TL;DR</strong></p>
+<ul>
+ <li><strong>Look beyond the banner:</strong> Generic step messages like "exit status 1" can hide a variety of issues; the true cause is almost always found in the detailed logs just above the error banner.</li>
+ <li><strong>Check your environment and resources:</strong> Failures across multiple parallel stages or "OOM killed" errors often point to environmental misconfigurations or insufficient memory rather than code bugs.</li>
+ <li><strong>Verify AI analysis:</strong> While AI tools provide a fast starting point for troubleshooting, always double-check the cited numbers, timeouts, and resource limits against the actual log output.</li>
+</ul>
+<p>I ran one Harness pipeline with five parallel stages against a small Python ledger service. Five stages failed and the console showed three distinct messages. Three of the stages showed the identical one, exit status 1, for three different causes: a failing assertion, a full disk and a package index that did not resolve.</p>
+<p>That gap is what this post decodes. A step message tells you how the step ended. The cause is in the log, a few lines above the banner. Below you run the same lab, read each failure and see which part of the answer lives where.</p>
+<h2>What you will run</h2>
+<p>The pipeline is Ledger Service CI. The app is a small Python service that posts ledger entries and calculates processing fees, with a pytest suite that passes in about 0.1s on a laptop. Five environment settings turn that green suite into five different failures, one per stage.</p>
+<p><strong>Two terms first.</strong> A stage is a major segment of a pipeline and a step is a series of commands that performs a task. Here every stage holds one step, so the console shows a failed stage and a failed step side by side.</p>
+<p>The five stages sit in a parallel group, so the run ends when the slowest one does. Each stage gets its own Harness Cloud machine, which is why every stage starts with an Initialize step before your command runs.</p>
+<h2>Failure zero: an image for the wrong architecture</h2>
+<p>My first run failed before a single test was executed. I had built the image on an arm64 laptop, and four of the five stages failed with the same message:</p>
+<pre><code>no matching manifest for linux/amd64 in the manifest list entries</code></pre>
+<p>The log shows the pull retried three times. Nothing in that message mentions the laptop, so the fix is to read the platform in it: the runner asked for linux/amd64 and the image had none. Rebuilding with --platform linux/amd64 fixed it. If four stages fail with one identical message and no test output, suspect the environment before the code.</p>
+<h2>One message, three causes</h2>
+<p>After the rebuild, the settings that make each stage fail were switched on. This table is from the latest run:</p>
+<table>
+ <thead>
+  <tr>
+   <th>Stage</th>
+   <th>Harness message</th>
+   <th>What the log shows</th>
+  </tr>
+ </thead>
+ <tbody>
+  <tr>
+   <td>Unit Tests</td>
+   <td>exit status 1</td>
+   <td>assert 102 == 103, 1 failed and 3 passed</td>
+  </tr>
+  <tr>
+   <td>Export Tests</td>
+   <td>exit status 1</td>
+   <td>OSError: [Errno 28] No space left on device</td>
+  </tr>
+  <tr>
+   <td>Install Dependencies</td>
+   <td>exit status 1</td>
+   <td>Name or service not known, then No matching distribution found for pytest==8.3.5</td>
+  </tr>
+  <tr>
+   <td>Load Tests</td>
+   <td>OOM killed</td>
+   <td>the log ends with Killed</td>
+  </tr>
+  <tr>
+   <td>Integration Tests</td>
+   <td>Expired</td>
+   <td>"Please Check the timeout configuration on the step to extend the duration of the step"</td>
+  </tr>
+ </tbody>
+</table>
+<p>The point: a code bug, a disk problem and a network problem look the same on the step banner. Only the log separates them.</p>
+<h3>Unit Tests: a code failure</h3>
+<pre><code>- id: run_unit_tests
+  name: Run unit tests
+  run:
+    shell: sh
+    container:
+      connector: devrel_harness_docker
+      image: sonichigo/ledger-ci-lab:1.0
+    script: |-
+      cd /app
+      FEE_MODE=legacy pytest -v tests/test_accounts.py tests/test_fees.py</code></pre>
+<p>With <code>FEE_MODE=legacy</code> the fee calculation truncates instead of rounding half up, so 2.9% of 2500 plus the 30 cent flat fee comes out as 102 instead of 103. The log carries the whole diagnosis:</p>
+<pre><code>&gt;       assert processing_fee(2500) == 103
+E       assert 102 == 103
+tests/test_fees.py:10: AssertionError
+1 failed, 3 passed in 0.02s</code></pre>
+<h3>Export Tests: a full disk</h3>
+<p>The step sets <code>EXPORT_ROWS=20000000000</code>. The export reserves its full size up front with <code>posix_fallocate</code>, which at 96 bytes per row is 1.92 TB. The log:</p>
+<pre><code>OSError: [Errno 28] No space left on device
+1 failed in 0.41s</code></pre>
+<h3>Install Dependencies: a network failure</h3>
+<p>This stage runs pip install against an index URL that does not resolve:</p>
+<pre><code>WARNING: Retrying (Retry(total=0, ...)) after connection broken by 'NewConnectionError(...: Failed to establish a new connection: [Errno -2] Name or service not known)': /simple/pytest/
+ERROR: Could not find a version that satisfies the requirement pytest==8.3.5 (from versions: none)
+ERROR: No matching distribution found for pytest==8.3.5</code></pre>
+<h3>Load Tests: OOM killed</h3>
+<pre><code>- id: run_load_tests
+  name: Run load tests
+  timeout: 15m
+  run:
+    shell: sh
+    container:
+      connector: devrel_harness_docker
+      image: sonichigo/ledger-ci-lab:1.0
+    script: |-
+      cd /app
+      FIXTURE_ROWS=150000000 pytest -s tests/test_load.py</code></pre>
+<p>The fixture builds every row in memory. The log shows pytest start collecting and then:</p>
+<pre><code>collected 1 item
+Killed</code></pre>
+<p>The actual reason might surprise you. Although the dashboard displays Linux (Small) for the Load Tests instance across both executions, Resource Insights reveals dissimilar specs underneath. During the second attempt, the stage registered 16 vCPUs and 62.79 GB, allowing the suite to succeed at 60 million records. On the third attempt, that exact stage logged 8 vCPUs and 30.36 GB, hitting max capacity right before the process was terminated.</p>
+<h3>Integration Tests: Expired, not Failed</h3>
+<pre><code>- id: run_integration_tests
+  name: Run integration tests
+  timeout: 60s
+  run:
+    shell: sh
+    container:
+      connector: devrel_harness_docker
+      image: sonichigo/ledger-ci-lab:1.0
+    script: |-
+      cd /app
+      DB_HOST=db.internal DB_WAIT_SECONDS=300 pytest -s tests/test_integration.py</code></pre>
+<p>The test waits up to 300 seconds for a database host that does not exist, and the step has a 60 second timeout. The step shows as Expired, not Failed.</p>
+<h2>What the group and the summary said</h2>
+<p>The parallel group has its own failure message, and in this run it read OOM killed. The run summary named a single failing step, Install Dependencies, even though five stages failed. If you read only the group message or the summary, you see one failure out of five.</p>
+<h2>Ask Harness AI, then check it</h2>
+<p>To get error analysis, enable Harness AI under Account Settings. I tested the Harness AI chat on the run page against an earlier version of this lab, and checked its answer against the logs. Three claims did not hold up: it described a hard memory cap that the logs do not show, it said a process exited with signal 9 when neither the message nor the log says so, and it gave 1m 17s as a step duration when that was the whole stage. Treat its answer as a fast first read and verify numbers and causes against the log.</p>
+<h2>A checklist for the next opaque failure</h2>
+<ol>
+ <li>Read the step status first: Failed and Expired point to different places</li>
+ <li>Compare the messages across stages: four stages with one identical message and no test output points at the environment</li>
+ <li>Read the log lines above the banner, not only the last one</li>
+ <li>For OOM killed, find out how much memory the machine had before changing the code</li>
+ <li>Compare Initialize time with the step timeout before blaming the step</li>
+ <li>Ask Harness AI for a first read, and verify every number it cites</li>
+</ol>
